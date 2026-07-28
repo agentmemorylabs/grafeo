@@ -3046,6 +3046,18 @@ impl GrafeoDB {
 
 impl Drop for GrafeoDB {
     fn drop(&mut self) {
+        #[cfg(feature = "close-forensics")]
+        {
+            // Tiny non-owning event only — no memory_usage(), I/O, or path clones.
+            grafeo_common::close_forensics::emit(
+                grafeo_common::close_forensics::active_instance_id(),
+                grafeo_common::close_forensics::next_component_id(),
+                grafeo_common::close_forensics::component_type::GRAFEO_DB,
+                grafeo_common::close_forensics::event_type::DROP,
+                grafeo_common::close_forensics::worker_scope::DATABASE_INSTANCE,
+                grafeo_common::close_forensics::db_ref_kind::NONE,
+            );
+        }
         if let Err(e) = self.close() {
             grafeo_error!("Error closing database: {}", e);
         }

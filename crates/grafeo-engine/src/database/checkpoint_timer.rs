@@ -41,6 +41,8 @@ pub(super) struct CheckpointTimer {
     shutdown: Arc<AtomicBool>,
     /// Thread handle (taken on stop).
     handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "close-forensics")]
+    forensics_component_id: u64,
 }
 
 #[cfg(feature = "grafeo-file")]
@@ -62,6 +64,20 @@ impl CheckpointTimer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
+        #[cfg(feature = "close-forensics")]
+        let forensics_component_id = grafeo_common::close_forensics::next_component_id();
+        #[cfg(feature = "close-forensics")]
+        {
+            grafeo_common::close_forensics::emit(
+                grafeo_common::close_forensics::active_instance_id(),
+                forensics_component_id,
+                grafeo_common::close_forensics::component_type::CHECKPOINT_TIMER,
+                grafeo_common::close_forensics::event_type::WORKER_STARTED,
+                grafeo_common::close_forensics::worker_scope::DATABASE_INSTANCE,
+                grafeo_common::close_forensics::db_ref_kind::STRONG,
+            );
+        }
+
         let handle = std::thread::Builder::new()
             .name("grafeo-checkpoint".to_string())
             .spawn(move || {
@@ -77,12 +93,25 @@ impl CheckpointTimer {
                     #[cfg(feature = "wal")]
                     wal.as_deref(),
                 );
+                #[cfg(feature = "close-forensics")]
+                {
+                    grafeo_common::close_forensics::emit(
+                        grafeo_common::close_forensics::active_instance_id(),
+                        forensics_component_id,
+                        grafeo_common::close_forensics::component_type::CHECKPOINT_TIMER,
+                        grafeo_common::close_forensics::event_type::WORKER_JOINED,
+                        grafeo_common::close_forensics::worker_scope::DATABASE_INSTANCE,
+                        grafeo_common::close_forensics::db_ref_kind::NONE,
+                    );
+                }
             })
             .expect("failed to spawn checkpoint timer thread");
 
         Self {
             shutdown,
             handle: Some(handle),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id,
         }
     }
 
@@ -90,6 +119,17 @@ impl CheckpointTimer {
     ///
     /// Returns within ~100 ms regardless of the checkpoint interval.
     pub(super) fn stop(&mut self) {
+        #[cfg(feature = "close-forensics")]
+        {
+            grafeo_common::close_forensics::emit(
+                grafeo_common::close_forensics::active_instance_id(),
+                self.forensics_component_id,
+                grafeo_common::close_forensics::component_type::CHECKPOINT_TIMER,
+                grafeo_common::close_forensics::event_type::WORKER_SHUTDOWN_REQUESTED,
+                grafeo_common::close_forensics::worker_scope::DATABASE_INSTANCE,
+                grafeo_common::close_forensics::db_ref_kind::STRONG,
+            );
+        }
         self.shutdown.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();

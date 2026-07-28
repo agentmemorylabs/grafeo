@@ -84,6 +84,8 @@ ai = ["vector-index", "text-index", "hybrid-search"]  # All AI/RAG search featur
 
 # Testing utilities (zero overhead when disabled)
 testing-crash-injection = ["grafeo-common/testing-crash-injection"]  # Deterministic crash injection for recovery testing
+# Diagnostics-only close/lifecycle forensics. Off by default.
+close-forensics = ["grafeo-common/close-forensics"]
 
 [lints]
 workspace = true

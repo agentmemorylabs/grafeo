@@ -249,6 +249,23 @@ pub struct HnswIndex {
     max_level: RwLock<usize>,
     /// Random number generator for level selection.
     rng: RwLock<rand::rngs::StdRng>,
+    #[cfg(feature = "close-forensics")]
+    forensics_component_id: u64,
+}
+
+
+#[cfg(feature = "close-forensics")]
+impl Drop for HnswIndex {
+    fn drop(&mut self) {
+        grafeo_common::close_forensics::emit(
+            grafeo_common::close_forensics::active_instance_id(),
+            self.forensics_component_id,
+            grafeo_common::close_forensics::component_type::HNSW_INDEX,
+            grafeo_common::close_forensics::event_type::DROP,
+            grafeo_common::close_forensics::worker_scope::DATABASE_INSTANCE,
+            grafeo_common::close_forensics::db_ref_kind::NONE,
+        );
+    }
 }
 
 impl HnswIndex {
@@ -260,6 +277,8 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::new_heap()),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id: grafeo_common::close_forensics::next_component_id(),
             rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
         }
     }
@@ -275,6 +294,8 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::with_capacity(capacity)),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id: grafeo_common::close_forensics::next_component_id(),
             rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
         }
     }
@@ -287,6 +308,8 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::new_heap()),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id: grafeo_common::close_forensics::next_component_id(),
             rng: RwLock::new(rand::rngs::StdRng::seed_from_u64(seed)),
         }
     }

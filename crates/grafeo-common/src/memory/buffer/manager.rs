@@ -141,6 +141,9 @@ pub struct BufferManager {
     hard_limit: usize,
     /// Shutdown flag.
     shutdown: AtomicBool,
+    /// Diagnostics-only component id (no Arc retained).
+    #[cfg(feature = "close-forensics")]
+    forensics_component_id: u64,
 }
 
 impl BufferManager {
@@ -172,6 +175,8 @@ impl BufferManager {
             evict_limit,
             hard_limit,
             shutdown: AtomicBool::new(false),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id: crate::close_forensics::next_component_id(),
         })
     }
 
@@ -645,6 +650,17 @@ impl GrantReleaser for BufferManager {
 
 impl Drop for BufferManager {
     fn drop(&mut self) {
+        #[cfg(feature = "close-forensics")]
+        {
+            crate::close_forensics::emit(
+                crate::close_forensics::active_instance_id(),
+                self.forensics_component_id,
+                crate::close_forensics::component_type::BUFFER_MANAGER,
+                crate::close_forensics::event_type::DROP,
+                crate::close_forensics::worker_scope::DATABASE_INSTANCE,
+                crate::close_forensics::db_ref_kind::NONE,
+            );
+        }
         self.shutdown.store(true, Ordering::Relaxed);
     }
 }
