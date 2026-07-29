@@ -2,6 +2,7 @@
 
 **Branch:** `perf/close-fast-path` @ worktree `/data/worktrees/grafeo-close-fast-path`  
 **Base pin:** `9781320f` (`agent/txn-session-batch-20260726`)  
+**Head:** see `git rev-parse HEAD` on this branch  
 **Does not touch:** `diagnostics/close-forensics`, AM `/data/worktrees/am-diagnostics-grafeo-close-forensics`
 
 ## Root cause (proven in code)
@@ -37,14 +38,25 @@ Open-path vector/index restore may temporarily mark flush-required; open resets 
 
 ## Correctness tests (`grafeo_file.rs`)
 
-- `clean_close_does_not_advance_checkpoint_iteration` — reopen, no writes, close; header iteration unchanged; data intact
-- `dirty_close_persists_and_advances_iteration` — mutate+close advances iteration; data durable
-- `wal_recovery_forces_checkpoint_on_close` — sibling copy with unrecovered sidecar; reopen+close folds WAL and advances iteration
-- Existing `wal_disabled_single_file_persists_on_close` must still pass (WAL-off → always Explicit)
+- `clean_close_does_not_advance_checkpoint_iteration`
+- `dirty_close_persists_and_advances_iteration`
+- `wal_recovery_forces_checkpoint_on_close`
+- Existing `wal_disabled_single_file_persists_on_close` still passes
+- `staging_clean_close_bench` (ignored) — set `GRAFEO_CLOSE_BENCH_PATH` under `/data/tmp`
 
 ## Staging measure (under `/data/tmp` only)
 
-Copy staging sidecar under `/data/tmp`, never `/data/grafeo`. Compare clean open→close wall before/after when MemAvailable allows (~11 GiB open RSS historically).
+Disposable copies of staging `am-personal.grafeo` (163205 nodes / 1403962 edges). Never `/data/grafeo`.
+
+| Build | open_ms | clean_close_ms | iteration |
+|-------|--------:|---------------:|-----------|
+| BEFORE `9781320f` | 9548 | **26318** | 448→449 (full rewrite) |
+| AFTER `perf/close-fast-path` | 17841 | **131** | 448 unchanged |
+
+~200× clean-close wall on this DB. Full code-index sidecar (~137s Phase1) not re-measured: MemAvailable was 4–7 GiB (needs ~11 GiB open RSS).
+
+Artifacts: `/data/tmp/grafeo-close-fast-path-TRACK_C_SUMMARY.md`,  
+`/data/tmp/grafeo-close-fast-path-measure-*/{before,after}-clean-close.log`
 
 ## Operational risk
 
