@@ -1602,3 +1602,47 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
+
+/// Staging / large-DB clean-close wall measurement.
+///
+/// Usage:
+///   GRAFEO_CLOSE_BENCH_PATH=/data/tmp/.../copy.grafeo \
+///     cargo test -p grafeo-engine --test grafeo_file staging_clean_close_bench --release -- --ignored --nocapture
+#[test]
+#[ignore = "manual staging bench; set GRAFEO_CLOSE_BENCH_PATH"]
+fn staging_clean_close_bench() {
+    let path = std::env::var("GRAFEO_CLOSE_BENCH_PATH")
+        .expect("GRAFEO_CLOSE_BENCH_PATH must point at a disposable .grafeo copy under /data/tmp");
+    assert!(
+        path.starts_with("/data/tmp/"),
+        "refuse paths outside /data/tmp: {path}"
+    );
+    let path = std::path::PathBuf::from(path);
+
+    eprintln!("open {}", path.display());
+    let t_open = std::time::Instant::now();
+    let db = GrafeoDB::with_config(Config::persistent(&path)).expect("open");
+    let open_ms = t_open.elapsed().as_millis();
+    let nodes = db.node_count();
+    let edges = db.edge_count();
+    let iter_before = db.file_manager().unwrap().active_header().iteration;
+    eprintln!("open_ms={open_ms} nodes={nodes} edges={edges} iteration={iter_before}");
+
+    // Optional read to mimic warm sidecar serve
+    let _ = db.session().execute("MATCH (n) RETURN count(n) LIMIT 1");
+
+    let t_close = std::time::Instant::now();
+    db.close().expect("close");
+    let close_ms = t_close.elapsed().as_millis();
+    eprintln!("clean_close_ms={close_ms}");
+
+    let db2 = GrafeoDB::with_config(Config::persistent(&path)).expect("reopen");
+    let iter_after = db2.file_manager().unwrap().active_header().iteration;
+    assert_eq!(
+        iter_after, iter_before,
+        "clean close must not rewrite container"
+    );
+    assert_eq!(db2.node_count(), nodes);
+    db2.close().unwrap();
+    eprintln!("PASS clean_close_ms={close_ms} open_ms={open_ms} iteration_unchanged={iter_before}");
+}
