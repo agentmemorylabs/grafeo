@@ -318,6 +318,11 @@ pub struct Config {
     /// Requires the `encryption` feature flag. Without it, this field is ignored.
     #[cfg(feature = "encryption")]
     pub encryption: Option<EncryptionConfig>,
+
+    /// Diagnostics-only: skip VectorStore HNSW topology restore and quantized
+    /// rehydrate on open. Graph/lexical remain available; vector search fails
+    /// closed. Default `false`.
+    pub skip_vector_index_restore: bool,
 }
 
 /// Configuration for adaptive query execution.
@@ -415,6 +420,7 @@ impl Default for Config {
             checkpoint_interval: None,
             #[cfg(feature = "encryption")]
             encryption: None,
+            skip_vector_index_restore: false,
         }
     }
 }
@@ -484,6 +490,13 @@ impl Config {
     #[must_use]
     pub fn with_spill_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.spill_path = Some(path.into());
+        self
+    }
+
+    /// Diagnostics-only: skip VectorStore HNSW topology restore on open.
+    #[must_use]
+    pub fn with_skip_vector_index_restore(mut self, skip: bool) -> Self {
+        self.skip_vector_index_restore = skip;
         self
     }
 

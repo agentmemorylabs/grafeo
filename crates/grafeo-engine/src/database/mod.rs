@@ -422,6 +422,7 @@ impl GrafeoDB {
                             &catalog,
                             #[cfg(feature = "triple-store")]
                             &rdf_store,
+                            config.skip_vector_index_restore,
                         )?;
                         #[cfg(feature = "compact-store")]
                         {
@@ -480,6 +481,7 @@ impl GrafeoDB {
                         &catalog,
                         #[cfg(feature = "triple-store")]
                         &rdf_store,
+                        config.skip_vector_index_restore,
                     )?;
                     #[cfg(feature = "compact-store")]
                     {
@@ -681,7 +683,9 @@ impl GrafeoDB {
         // Must not run inside CatalogSection::deserialize (misses CompactStore
         // base embeddings). Topology is reused; no full HNSW rebuild.
         #[cfg(all(feature = "lpg", feature = "vector-index"))]
-        db.rehydrate_quantized_vector_indexes()?;
+        if !db.config.skip_vector_index_restore {
+            db.rehydrate_quantized_vector_indexes()?;
+        }
 
         // Start periodic checkpoint timer if configured
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
@@ -1728,7 +1732,10 @@ impl GrafeoDB {
         store: &Arc<LpgStore>,
         catalog: &Arc<crate::catalog::Catalog>,
         #[cfg(feature = "triple-store")] rdf_store: &Arc<RdfStore>,
+        skip_vector_index_restore: bool,
     ) -> Result<()> {
+        #[cfg(not(feature = "vector-index"))]
+        let _ = skip_vector_index_restore;
         use grafeo_common::storage::{Section, SectionType};
 
         let dir = fm.read_section_directory()?.ok_or_else(|| {
@@ -1776,13 +1783,19 @@ impl GrafeoDB {
 
         // Restore HNSW topology (if vector indexes exist in both catalog and section)
         #[cfg(feature = "vector-index")]
-        if let Some(entry) = dir.find(SectionType::VectorStore) {
-            let data = fm.read_section_data(entry)?;
-            let indexes = store.vector_index_entries();
-            if !indexes.is_empty() {
-                let mut section = grafeo_core::index::vector::VectorStoreSection::new(indexes);
-                section.deserialize(&data)?;
+        if !skip_vector_index_restore {
+            if let Some(entry) = dir.find(SectionType::VectorStore) {
+                let data = fm.read_section_data(entry)?;
+                let indexes = store.vector_index_entries();
+                if !indexes.is_empty() {
+                    let mut section = grafeo_core::index::vector::VectorStoreSection::new(indexes);
+                    section.deserialize(&data)?;
+                }
             }
+        } else {
+            grafeo_warn!(
+                "skip_vector_index_restore=true: skipping VectorStore HNSW topology restore"
+            );
         }
 
         // Restore BM25 postings (if text indexes exist in both catalog and section)
