@@ -21,10 +21,13 @@ use grafeo_storage::file::GrafeoFileManager;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FlushReason {
-    /// Periodic checkpoint (timer-driven) or database close.
-    #[allow(dead_code)] // Used by async_ops (async-storage feature)
+    /// Periodic checkpoint (timer-driven). Dirty sections only.
+    /// Clean database close also uses this when no container rewrite is required
+    /// (see `GrafeoDB::close_needs_full_checkpoint`).
+    #[allow(dead_code)] // Used by async_ops (async-storage feature) and close fast path
     Checkpoint,
-    /// User-initiated `CHECKPOINT` command or `wal_checkpoint()` API.
+    /// User-initiated `CHECKPOINT` / `wal_checkpoint()` API, or close when
+    /// mutations/recovery require a full container rewrite.
     Explicit,
 }
 

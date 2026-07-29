@@ -34,13 +34,20 @@ impl super::GrafeoDB {
     /// ```
     pub fn create_property_index(&self, property: &str) {
         self.lpg_store().create_property_index(property);
+        #[cfg(feature = "grafeo-file")]
+        self.mark_container_flush_required();
     }
 
     /// Drops an index on a node property.
     ///
     /// Returns `true` if the index existed and was removed.
     pub fn drop_property_index(&self, property: &str) -> bool {
-        self.lpg_store().drop_property_index(property)
+        let removed = self.lpg_store().drop_property_index(property);
+        #[cfg(feature = "grafeo-file")]
+        if removed {
+            self.mark_container_flush_required();
+        }
+        removed
     }
 
     /// Returns `true` if the property has an index.
@@ -176,6 +183,8 @@ impl super::GrafeoDB {
                     "Empty vector index created: :{label}({property}) - 0 vectors, {d} dimensions, metric={metric_name}",
                     metric_name = metric.name()
                 );
+                #[cfg(feature = "grafeo-file")]
+                self.mark_container_flush_required();
                 Ok(())
             } else {
                 Err(grafeo_common::utils::error::Error::Internal(format!(
@@ -246,6 +255,8 @@ impl super::GrafeoDB {
             metric_name = metric.name()
         );
 
+        #[cfg(feature = "grafeo-file")]
+        self.mark_container_flush_required();
         Ok(())
     }
 
@@ -308,6 +319,8 @@ impl super::GrafeoDB {
         let removed = self.lpg_store().remove_vector_index(label, property);
         if removed {
             grafeo_info!("Vector index dropped: :{label}({property})");
+            #[cfg(feature = "grafeo-file")]
+            self.mark_container_flush_required();
         }
         removed
     }
@@ -460,6 +473,8 @@ impl super::GrafeoDB {
 
         self.lpg_store()
             .add_text_index(label, property, Arc::new(RwLock::new(index)));
+        #[cfg(feature = "grafeo-file")]
+        self.mark_container_flush_required();
         Ok(())
     }
 
@@ -468,7 +483,12 @@ impl super::GrafeoDB {
     /// Returns `true` if the index existed and was removed.
     #[cfg(feature = "text-index")]
     pub fn drop_text_index(&self, label: &str, property: &str) -> bool {
-        self.lpg_store().remove_text_index(label, property)
+        let removed = self.lpg_store().remove_text_index(label, property);
+        #[cfg(feature = "grafeo-file")]
+        if removed {
+            self.mark_container_flush_required();
+        }
+        removed
     }
 
     /// Rebuilds a text index by re-scanning all matching nodes.
