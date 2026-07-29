@@ -81,6 +81,8 @@ async-storage = ["grafeo-engine/async-storage"]  # Async WAL and storage backend
 # Enable platform-optimized memory allocator (10-20% faster allocations)
 jemalloc = ["tikv-jemallocator"]
 mimalloc-allocator = ["mimalloc"]
+# Diagnostics-only close/lifecycle forensics. Off by default.
+close-forensics = ["grafeo-engine/close-forensics"]
 
 [lints]
 workspace = true

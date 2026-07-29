@@ -51,6 +51,8 @@ tracing = ["dep:tracing"]
 testing-crash-injection = []
 testing-statement-injection = []
 encryption = ["dep:aes-gcm", "dep:hkdf", "dep:argon2", "dep:zeroize", "dep:sha2", "dep:rand"]
+# Diagnostics-only: tiny non-owning close/lifecycle event ring. Off by default.
+close-forensics = []
 
 [dev-dependencies]
 criterion.workspace = true

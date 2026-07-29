@@ -141,6 +141,9 @@ pub struct BufferManager {
     hard_limit: usize,
     /// Shutdown flag.
     shutdown: AtomicBool,
+    /// Diagnostics-only component id (no Arc retained).
+    #[cfg(feature = "close-forensics")]
+    forensics_component_id: u64,
 }
 
 impl BufferManager {
@@ -172,6 +175,8 @@ impl BufferManager {
             evict_limit,
             hard_limit,
             shutdown: AtomicBool::new(false),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id: crate::close_forensics::next_component_id(),
         })
     }
 
@@ -645,7 +650,56 @@ impl GrantReleaser for BufferManager {
 
 impl Drop for BufferManager {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        #[cfg(feature = "close-forensics")]
+        {
+            use crate::close_forensics::{
+                active_instance_id, component_type, db_ref_kind, drop_phase, emit, event_type,
+                worker_scope,
+            };
+            let instance = active_instance_id();
+            let cid = self.forensics_component_id;
+            emit(
+                instance,
+                cid,
+                component_type::BUFFER_MANAGER,
+                event_type::DROP_ENTER,
+                worker_scope::DATABASE_INSTANCE,
+                db_ref_kind::NONE,
+            );
+            self.shutdown.store(true, Ordering::Relaxed);
+            let consumers = std::mem::take(&mut *self.consumers.write());
+            drop(consumers);
+            emit(
+                instance,
+                cid,
+                component_type::BUFFER_MANAGER,
+                event_type::DROP_PHASE,
+                drop_phase::CONSUMERS,
+                db_ref_kind::NONE,
+            );
+            let force_ram = std::mem::take(&mut *self.force_ram_consumers.write());
+            drop(force_ram);
+            emit(
+                instance,
+                cid,
+                component_type::BUFFER_MANAGER,
+                event_type::DROP_PHASE,
+                drop_phase::FORCE_RAM,
+                db_ref_kind::NONE,
+            );
+            emit(
+                instance,
+                cid,
+                component_type::BUFFER_MANAGER,
+                event_type::DROP,
+                worker_scope::DATABASE_INSTANCE,
+                db_ref_kind::NONE,
+            );
+        }
+        #[cfg(not(feature = "close-forensics"))]
+        {
+            self.shutdown.store(true, Ordering::Relaxed);
+        }
     }
 }
 

@@ -18,6 +18,8 @@
 #![deny(unsafe_code)]
 
 pub mod collections;
+#[cfg(feature = "close-forensics")]
+pub mod close_forensics;
 pub mod fmt;
 pub mod memory;
 pub mod mvcc;

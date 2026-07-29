@@ -249,6 +249,97 @@ pub struct HnswIndex {
     max_level: RwLock<usize>,
     /// Random number generator for level selection.
     rng: RwLock<rand::rngs::StdRng>,
+    #[cfg(feature = "close-forensics")]
+    forensics_component_id: u64,
+}
+
+
+#[cfg(feature = "close-forensics")]
+impl Drop for HnswIndex {
+    fn drop(&mut self) {
+        use grafeo_common::close_forensics::{
+            active_instance_id, component_type, db_ref_kind, drop_phase, emit, event_type,
+            worker_scope,
+        };
+        let instance = active_instance_id();
+        let cid = self.forensics_component_id;
+        emit(
+            instance,
+            cid,
+            component_type::HNSW_INDEX,
+            event_type::DROP_ENTER,
+            worker_scope::DATABASE_INSTANCE,
+            db_ref_kind::NONE,
+        );
+        // Free fields first, then emit DROP_PHASE so Δt attributes the free work.
+        let nodes = std::mem::replace(
+            &mut self.nodes,
+            RwLock::new(TopologyBackend::new_heap()),
+        );
+        drop(nodes);
+        emit(
+            instance,
+            cid,
+            component_type::HNSW_INDEX,
+            event_type::DROP_PHASE,
+            drop_phase::TOPOLOGY,
+            db_ref_kind::NONE,
+        );
+        let entry = std::mem::replace(
+            &mut self.entry_point,
+            RwLock::new(None),
+        );
+        drop(entry);
+        emit(
+            instance,
+            cid,
+            component_type::HNSW_INDEX,
+            event_type::DROP_PHASE,
+            drop_phase::ENTRY_POINT,
+            db_ref_kind::NONE,
+        );
+        let max_level = std::mem::replace(&mut self.max_level, RwLock::new(0));
+        drop(max_level);
+        emit(
+            instance,
+            cid,
+            component_type::HNSW_INDEX,
+            event_type::DROP_PHASE,
+            drop_phase::MAX_LEVEL,
+            db_ref_kind::NONE,
+        );
+        let rng = std::mem::replace(
+            &mut self.rng,
+            RwLock::new(rand::rngs::StdRng::seed_from_u64(0)),
+        );
+        drop(rng);
+        emit(
+            instance,
+            cid,
+            component_type::HNSW_INDEX,
+            event_type::DROP_PHASE,
+            drop_phase::RNG,
+            db_ref_kind::NONE,
+        );
+        let config = std::mem::replace(&mut self.config, HnswConfig::default());
+        drop(config);
+        emit(
+            instance,
+            cid,
+            component_type::HNSW_INDEX,
+            event_type::DROP_PHASE,
+            drop_phase::CONFIG,
+            db_ref_kind::NONE,
+        );
+        emit(
+            instance,
+            cid,
+            component_type::HNSW_INDEX,
+            event_type::DROP,
+            worker_scope::DATABASE_INSTANCE,
+            db_ref_kind::NONE,
+        );
+    }
 }
 
 impl HnswIndex {
@@ -260,6 +351,8 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::new_heap()),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id: grafeo_common::close_forensics::next_component_id(),
             rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
         }
     }
@@ -275,6 +368,8 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::with_capacity(capacity)),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id: grafeo_common::close_forensics::next_component_id(),
             rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
         }
     }
@@ -287,6 +382,8 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::new_heap()),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
+            #[cfg(feature = "close-forensics")]
+            forensics_component_id: grafeo_common::close_forensics::next_component_id(),
             rng: RwLock::new(rand::rngs::StdRng::seed_from_u64(seed)),
         }
     }

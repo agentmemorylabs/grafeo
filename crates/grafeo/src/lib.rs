@@ -94,3 +94,7 @@ pub use grafeo_common::types::{EdgeId, NodeId, Value};
 
 // Re-export error types so users don't need to depend on grafeo-common directly
 pub use grafeo_common::utils::error::{Error, Result};
+
+/// Diagnostics-only close/lifecycle forensics (feature `close-forensics`).
+#[cfg(feature = "close-forensics")]
+pub use grafeo_common::close_forensics;
