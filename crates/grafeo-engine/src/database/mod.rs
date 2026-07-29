@@ -185,6 +185,13 @@ pub struct GrafeoDB {
     /// Whether this database is open in read-only mode.
     /// When true, sessions automatically enforce read-only transactions.
     read_only: bool,
+    /// When true, close must rewrite the `.grafeo` container (full section
+    /// serialize). Set when WAL recovery applied unrecovered records, or when
+    /// a container-affecting mutation bypasses session WAL `record_count`
+    /// (e.g. vector/text index DDL). Session graph mutations already bump WAL
+    /// `record_count`; see [`Self::close_needs_full_checkpoint`].
+    #[cfg(feature = "grafeo-file")]
+    container_flush_required: std::sync::atomic::AtomicBool,
     /// Named graph projections (virtual subgraphs), shared with sessions.
     projections:
         Arc<RwLock<std::collections::HashMap<String, Arc<grafeo_core::graph::GraphProjection>>>>,
@@ -406,6 +413,12 @@ impl GrafeoDB {
             Vec<grafeo_common::types::EdgeId>,
         )> = None;
 
+        // Sidecar/legacy WAL recovery can leave unrecovered mutations only in
+        // RAM while WalManager::record_count resets to 0 on reopen. Track that
+        // so close still forces a full container checkpoint.
+        #[cfg(feature = "grafeo-file")]
+        let mut recovered_wal_needs_flush = false;
+
         // --- Single-file format (.grafeo) ---
         #[cfg(feature = "grafeo-file")]
         let file_manager: Option<Arc<GrafeoFileManager>> = if is_read_only {
@@ -504,6 +517,9 @@ impl GrafeoDB {
                 if config.wal_enabled && fm.has_sidecar_wal() {
                     let recovery = WalRecovery::new(fm.sidecar_wal_path());
                     let records = recovery.recover()?;
+                    if !records.is_empty() {
+                        recovered_wal_needs_flush = true;
+                    }
                     Self::apply_wal_records(
                         &store,
                         &catalog,
@@ -556,6 +572,10 @@ impl GrafeoDB {
                 if !is_single_file && wal_path.exists() {
                     let recovery = WalRecovery::new(&wal_path);
                     let records = recovery.recover()?;
+                    #[cfg(feature = "grafeo-file")]
+                    if !records.is_empty() {
+                        recovered_wal_needs_flush = true;
+                    }
                     Self::apply_wal_records(
                         &store,
                         &catalog,
@@ -656,6 +676,8 @@ impl GrafeoDB {
             current_graph: RwLock::new(None),
             current_schema: RwLock::new(None),
             read_only: is_read_only,
+            #[cfg(feature = "grafeo-file")]
+            container_flush_required: std::sync::atomic::AtomicBool::new(recovered_wal_needs_flush),
             projections: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
@@ -719,6 +741,15 @@ impl GrafeoDB {
         // Must happen after register_section_consumers() which creates
         // the consumers we're about to spill.
         db.apply_force_disk_overrides();
+
+        // Open-path index restore may call create_vector_index / similar
+        // helpers that mark container_flush_required. Reset to the recovery
+        // signal only so a clean no-write session can take the close fast path.
+        #[cfg(feature = "grafeo-file")]
+        db.container_flush_required.store(
+            recovered_wal_needs_flush,
+            std::sync::atomic::Ordering::Release,
+        );
 
         Ok(db)
     }
@@ -810,6 +841,8 @@ impl GrafeoDB {
             current_graph: RwLock::new(None),
             current_schema: RwLock::new(None),
             read_only: false,
+            #[cfg(feature = "grafeo-file")]
+            container_flush_required: std::sync::atomic::AtomicBool::new(false),
             projections: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
@@ -901,6 +934,8 @@ impl GrafeoDB {
             current_graph: RwLock::new(None),
             current_schema: RwLock::new(None),
             read_only: true,
+            #[cfg(feature = "grafeo-file")]
+            container_flush_required: std::sync::atomic::AtomicBool::new(false),
             projections: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
@@ -2433,13 +2468,25 @@ impl GrafeoDB {
             if let Some(ref wal) = self.wal {
                 wal.sync()?;
             }
-            let flush_result = self.checkpoint_to_file(fm, flush::FlushReason::Explicit)?;
+
+            // Clean-close fast path: ephemeral Section wrappers from
+            // build_sections() start with dirty=false, so FlushReason::Explicit
+            // always re-serializes the full LPG (dominates ~137s sidecar close).
+            // Prefer Checkpoint (dirty-only, usually a no-op) when this session
+            // has no container-affecting work; force Explicit when WAL-disabled,
+            // WAL has new records, or recovery/index DDL marked a flush.
+            let initial_reason = if self.close_needs_full_checkpoint() {
+                flush::FlushReason::Explicit
+            } else {
+                flush::FlushReason::Checkpoint
+            };
+            let flush_result = self.checkpoint_to_file(fm, initial_reason)?;
 
             // Safety check: if WAL has records but the checkpoint was a no-op
             // (zero sections written), the container file may not contain the
             // latest data. This can happen when sections are not marked dirty
-            // despite mutations going through the WAL. Force-dirty all sections
-            // and retry before removing the sidecar.
+            // despite mutations going through the WAL. Force a full Explicit
+            // flush and retry before removing the sidecar.
             #[cfg(feature = "wal")]
             let flush_result = if flush_result.sections_written == 0 {
                 if let Some(ref wal) = self.wal {
@@ -2523,6 +2570,12 @@ impl GrafeoDB {
     /// Logs a WAL record if WAL is enabled.
     #[cfg(feature = "wal")]
     pub(super) fn log_wal(&self, record: &WalRecord) -> Result<()> {
+        // Direct CRUD / persistence helpers go through this path. Session
+        // mutations write the WAL handle directly and are covered by
+        // record_count on close; still mark flush-required so wal_disabled
+        // databases (wal=None) force Explicit checkpoint on close.
+        #[cfg(feature = "grafeo-file")]
+        self.mark_container_flush_required();
         if let Some(ref wal) = self.wal {
             wal.log(record)?;
         }
@@ -2947,6 +3000,45 @@ impl GrafeoDB {
         output_path: &std::path::Path,
     ) -> Result<()> {
         backup::do_restore_to_epoch(backup_dir, target_epoch, output_path)
+    }
+
+    /// Marks that close must rewrite the `.grafeo` container.
+    ///
+    /// Used for container-affecting mutations that do not bump WAL
+    /// `record_count` (index DDL) and for tests.
+    #[cfg(feature = "grafeo-file")]
+    pub(crate) fn mark_container_flush_required(&self) {
+        self.container_flush_required
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether close must force a full Explicit section serialize.
+    ///
+    /// Clean-close fast path is only taken when this returns false: WAL is
+    /// enabled, this session logged no WAL records, and no recovery/index DDL
+    /// required a container rewrite. Ephemeral `Section` wrappers from
+    /// [`Self::build_sections`] start clean, so `FlushReason::Checkpoint` then
+    /// writes zero sections and skips LPG serialization.
+    #[cfg(feature = "grafeo-file")]
+    fn close_needs_full_checkpoint(&self) -> bool {
+        if self
+            .container_flush_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+        #[cfg(feature = "wal")]
+        {
+            // WAL disabled (None) cannot use record_count as a dirty signal.
+            match self.wal.as_ref() {
+                None => true,
+                Some(wal) => wal.record_count() > 0,
+            }
+        }
+        #[cfg(not(feature = "wal"))]
+        {
+            true
+        }
     }
 
     /// Writes the current database state to the `.grafeo` file using the unified flush.

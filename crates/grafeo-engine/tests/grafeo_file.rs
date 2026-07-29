@@ -1430,3 +1430,219 @@ fn deleted_base_edges_stay_deleted_across_reopen() {
     drop(session);
     db.close().unwrap();
 }
+
+// =========================================================================
+// Clean-close fast path (Track C): skip full LPG serialize when durable
+// =========================================================================
+
+#[test]
+fn clean_close_does_not_advance_checkpoint_iteration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("clean_close.grafeo");
+
+    // Seed durable data with an explicit checkpoint-on-close (dirty session).
+    {
+        let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        db.session()
+            .execute("INSERT (:Person {name: 'Alix'})")
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    let iteration_before = {
+        let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        let iter = db.file_manager().unwrap().active_header().iteration;
+        // No writes — clean close should skip full Explicit serialize.
+        let t0 = std::time::Instant::now();
+        db.close().unwrap();
+        let clean_close_ms = t0.elapsed().as_millis();
+        // Tiny DB: just sanity that close returned; staging measures wall separately.
+        assert!(
+            clean_close_ms < 30_000,
+            "clean close unexpectedly slow: {clean_close_ms}ms"
+        );
+        iter
+    };
+
+    let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+    let iteration_after = db.file_manager().unwrap().active_header().iteration;
+    assert_eq!(
+        iteration_after, iteration_before,
+        "clean close must not rewrite container (iteration must stay {iteration_before})"
+    );
+    assert_eq!(db.node_count(), 1);
+    let names = extract_strings(
+        db.session()
+            .execute("MATCH (p:Person) RETURN p.name")
+            .unwrap()
+            .rows(),
+    );
+    assert_eq!(names, vec!["Alix"]);
+    db.close().unwrap();
+}
+
+#[test]
+fn dirty_close_persists_and_advances_iteration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("dirty_close.grafeo");
+
+    let iteration_seed = {
+        let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        db.session()
+            .execute("INSERT (:Person {name: 'Alix'})")
+            .unwrap();
+        db.close().unwrap();
+        // Reopen to read iteration after seed close.
+        let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        let iter = db.file_manager().unwrap().active_header().iteration;
+        db.close().unwrap();
+        iter
+    };
+
+    {
+        let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        db.session()
+            .execute("INSERT (:Person {name: 'Gus'})")
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+    let iteration = db.file_manager().unwrap().active_header().iteration;
+    assert!(
+        iteration > iteration_seed,
+        "dirty close must rewrite container: seed={iteration_seed} now={iteration}"
+    );
+    let names = extract_strings(
+        db.session()
+            .execute("MATCH (p:Person) RETURN p.name")
+            .unwrap()
+            .rows(),
+    );
+    assert_eq!(names, vec!["Alix", "Gus"]);
+    db.close().unwrap();
+}
+
+#[test]
+fn wal_recovery_forces_checkpoint_on_close() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("recovery_src.grafeo");
+    let recovery_path = dir.path().join("recovery_dst.grafeo");
+
+    // Seed a durable checkpoint.
+    {
+        let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        db.session()
+            .execute("INSERT (:Person {name: 'Alix'})")
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    let iteration_before = {
+        let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        let iter = db.file_manager().unwrap().active_header().iteration;
+        db.session()
+            .execute("INSERT (:Person {name: 'Gus'})")
+            .unwrap();
+        let wal_path = sidecar_wal_path(&path);
+        assert!(
+            wal_path.exists(),
+            "sidecar WAL must exist after mutation before close"
+        );
+        // Snapshot container (still Alix-only) + sidecar WAL (has Gus) to a
+        // sibling path, then close the source normally. Reopening the sibling
+        // simulates crash recovery: WalManager::record_count starts at 0 but
+        // unrecovered mutations exist in the sidecar.
+        std::fs::copy(&path, &recovery_path).unwrap();
+        copy_dir_recursive(&wal_path, &sidecar_wal_path(&recovery_path)).unwrap();
+        db.close().unwrap();
+        iter
+    };
+
+    // Reopen recovery copy: apply Gus from sidecar; close must Explicit-flush.
+    {
+        let db = GrafeoDB::with_config(Config::persistent(&recovery_path)).unwrap();
+        assert_eq!(db.node_count(), 2, "recovery must apply sidecar WAL");
+        db.close().unwrap();
+    }
+
+    assert!(
+        !sidecar_wal_path(&recovery_path).exists(),
+        "recovery close must remove sidecar after folding into container"
+    );
+
+    let db = GrafeoDB::with_config(Config::persistent(&recovery_path)).unwrap();
+    let iteration = db.file_manager().unwrap().active_header().iteration;
+    assert!(
+        iteration > iteration_before,
+        "recovery close must rewrite container: before={iteration_before} now={iteration}"
+    );
+    let names = extract_strings(
+        db.session()
+            .execute("MATCH (p:Person) RETURN p.name")
+            .unwrap()
+            .rows(),
+    );
+    assert_eq!(names, vec!["Alix", "Gus"]);
+    db.close().unwrap();
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), to)?;
+        }
+    }
+    Ok(())
+}
+
+
+/// Staging / large-DB clean-close wall measurement.
+///
+/// Usage:
+///   GRAFEO_CLOSE_BENCH_PATH=/data/tmp/.../copy.grafeo \
+///     cargo test -p grafeo-engine --test grafeo_file staging_clean_close_bench --release -- --ignored --nocapture
+#[test]
+#[ignore = "manual staging bench; set GRAFEO_CLOSE_BENCH_PATH"]
+fn staging_clean_close_bench() {
+    let path = std::env::var("GRAFEO_CLOSE_BENCH_PATH")
+        .expect("GRAFEO_CLOSE_BENCH_PATH must point at a disposable .grafeo copy under /data/tmp");
+    assert!(
+        path.starts_with("/data/tmp/"),
+        "refuse paths outside /data/tmp: {path}"
+    );
+    let path = std::path::PathBuf::from(path);
+
+    eprintln!("open {}", path.display());
+    let t_open = std::time::Instant::now();
+    let db = GrafeoDB::with_config(Config::persistent(&path)).expect("open");
+    let open_ms = t_open.elapsed().as_millis();
+    let nodes = db.node_count();
+    let edges = db.edge_count();
+    let iter_before = db.file_manager().unwrap().active_header().iteration;
+    eprintln!("open_ms={open_ms} nodes={nodes} edges={edges} iteration={iter_before}");
+
+    // Optional read to mimic warm sidecar serve
+    let _ = db.session().execute("MATCH (n) RETURN count(n) LIMIT 1");
+
+    let t_close = std::time::Instant::now();
+    db.close().expect("close");
+    let close_ms = t_close.elapsed().as_millis();
+    eprintln!("clean_close_ms={close_ms}");
+
+    let db2 = GrafeoDB::with_config(Config::persistent(&path)).expect("reopen");
+    let iter_after = db2.file_manager().unwrap().active_header().iteration;
+    assert_eq!(
+        iter_after, iter_before,
+        "clean close must not rewrite container"
+    );
+    assert_eq!(db2.node_count(), nodes);
+    db2.close().unwrap();
+    eprintln!("PASS clean_close_ms={close_ms} open_ms={open_ms} iteration_unchanged={iter_before}");
+}
