@@ -30,6 +30,23 @@ pub mod event_type {
     pub const WORKER_SHUTDOWN_REQUESTED: u8 = 3;
     pub const WORKER_JOINED: u8 = 4;
     pub const INSTANCE_BOUND: u8 = 5;
+    /// Drop body entered; free work follows inside timed phases.
+    pub const DROP_ENTER: u8 = 6;
+    /// Sub-phase inside Drop (`worker_scope` carries [`drop_phase`] code).
+    pub const DROP_PHASE: u8 = 7;
+}
+
+/// Phase tags for [`event_type::DROP_PHASE`] (stored in `worker_scope`).
+pub mod drop_phase {
+    pub const TOPOLOGY: u8 = 1;
+    pub const ENTRY_POINT: u8 = 2;
+    pub const MAX_LEVEL: u8 = 3;
+    pub const RNG: u8 = 4;
+    pub const CONFIG: u8 = 5;
+    pub const CONSUMERS: u8 = 6;
+    pub const FORCE_RAM: u8 = 7;
+    pub const CLOSE_FN: u8 = 8;
+    pub const FIELDS: u8 = 9;
 }
 
 /// Worker scope codes.

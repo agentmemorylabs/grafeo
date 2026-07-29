@@ -93,17 +93,8 @@ impl CheckpointTimer {
                     #[cfg(feature = "wal")]
                     wal.as_deref(),
                 );
-                #[cfg(feature = "close-forensics")]
-                {
-                    grafeo_common::close_forensics::emit(
-                        grafeo_common::close_forensics::active_instance_id(),
-                        forensics_component_id,
-                        grafeo_common::close_forensics::component_type::CHECKPOINT_TIMER,
-                        grafeo_common::close_forensics::event_type::WORKER_JOINED,
-                        grafeo_common::close_forensics::worker_scope::DATABASE_INSTANCE,
-                        grafeo_common::close_forensics::db_ref_kind::NONE,
-                    );
-                }
+                // JOINED is emitted from stop() after join so it always fires
+                // even if this thread panics before returning.
             })
             .expect("failed to spawn checkpoint timer thread");
 
@@ -133,6 +124,18 @@ impl CheckpointTimer {
         self.shutdown.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+            #[cfg(feature = "close-forensics")]
+            {
+                // Always emit JOINED after join completes (or panics).
+                grafeo_common::close_forensics::emit(
+                    grafeo_common::close_forensics::active_instance_id(),
+                    self.forensics_component_id,
+                    grafeo_common::close_forensics::component_type::CHECKPOINT_TIMER,
+                    grafeo_common::close_forensics::event_type::WORKER_JOINED,
+                    grafeo_common::close_forensics::worker_scope::DATABASE_INSTANCE,
+                    grafeo_common::close_forensics::db_ref_kind::NONE,
+                );
+            }
         }
     }
 

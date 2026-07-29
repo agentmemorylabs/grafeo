@@ -652,16 +652,54 @@ impl Drop for BufferManager {
     fn drop(&mut self) {
         #[cfg(feature = "close-forensics")]
         {
-            crate::close_forensics::emit(
-                crate::close_forensics::active_instance_id(),
-                self.forensics_component_id,
-                crate::close_forensics::component_type::BUFFER_MANAGER,
-                crate::close_forensics::event_type::DROP,
-                crate::close_forensics::worker_scope::DATABASE_INSTANCE,
-                crate::close_forensics::db_ref_kind::NONE,
+            use crate::close_forensics::{
+                active_instance_id, component_type, db_ref_kind, drop_phase, emit, event_type,
+                worker_scope,
+            };
+            let instance = active_instance_id();
+            let cid = self.forensics_component_id;
+            emit(
+                instance,
+                cid,
+                component_type::BUFFER_MANAGER,
+                event_type::DROP_ENTER,
+                worker_scope::DATABASE_INSTANCE,
+                db_ref_kind::NONE,
+            );
+            self.shutdown.store(true, Ordering::Relaxed);
+            let consumers = std::mem::take(&mut *self.consumers.write());
+            drop(consumers);
+            emit(
+                instance,
+                cid,
+                component_type::BUFFER_MANAGER,
+                event_type::DROP_PHASE,
+                drop_phase::CONSUMERS,
+                db_ref_kind::NONE,
+            );
+            let force_ram = std::mem::take(&mut *self.force_ram_consumers.write());
+            drop(force_ram);
+            emit(
+                instance,
+                cid,
+                component_type::BUFFER_MANAGER,
+                event_type::DROP_PHASE,
+                drop_phase::FORCE_RAM,
+                db_ref_kind::NONE,
+            );
+            emit(
+                instance,
+                cid,
+                component_type::BUFFER_MANAGER,
+                event_type::DROP,
+                worker_scope::DATABASE_INSTANCE,
+                db_ref_kind::NONE,
             );
         }
-        self.shutdown.store(true, Ordering::Relaxed);
+        #[cfg(not(feature = "close-forensics"))]
+        {
+            self.shutdown.store(true, Ordering::Relaxed);
+        }
     }
 }
 

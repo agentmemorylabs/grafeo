@@ -3048,16 +3048,50 @@ impl Drop for GrafeoDB {
     fn drop(&mut self) {
         #[cfg(feature = "close-forensics")]
         {
-            // Tiny non-owning event only — no memory_usage(), I/O, or path clones.
-            grafeo_common::close_forensics::emit(
-                grafeo_common::close_forensics::active_instance_id(),
-                grafeo_common::close_forensics::next_component_id(),
-                grafeo_common::close_forensics::component_type::GRAFEO_DB,
-                grafeo_common::close_forensics::event_type::DROP,
-                grafeo_common::close_forensics::worker_scope::DATABASE_INSTANCE,
-                grafeo_common::close_forensics::db_ref_kind::NONE,
+            use grafeo_common::close_forensics::{
+                active_instance_id, component_type, db_ref_kind, drop_phase, emit, event_type,
+                next_component_id, worker_scope,
+            };
+            let instance = active_instance_id();
+            let cid = next_component_id();
+            emit(
+                instance,
+                cid,
+                component_type::GRAFEO_DB,
+                event_type::DROP_ENTER,
+                worker_scope::DATABASE_INSTANCE,
+                db_ref_kind::NONE,
+            );
+            if let Err(e) = self.close() {
+                grafeo_error!("Error closing database: {}", e);
+            }
+            // Emit CLOSE_FN after close() so Δt ENTER→CLOSE_FN is close wall.
+            emit(
+                instance,
+                cid,
+                component_type::GRAFEO_DB,
+                event_type::DROP_PHASE,
+                drop_phase::CLOSE_FN,
+                db_ref_kind::NONE,
+            );
+            emit(
+                instance,
+                cid,
+                component_type::GRAFEO_DB,
+                event_type::DROP_PHASE,
+                drop_phase::FIELDS,
+                db_ref_kind::NONE,
+            );
+            emit(
+                instance,
+                cid,
+                component_type::GRAFEO_DB,
+                event_type::DROP,
+                worker_scope::DATABASE_INSTANCE,
+                db_ref_kind::NONE,
             );
         }
+        #[cfg(not(feature = "close-forensics"))]
         if let Err(e) = self.close() {
             grafeo_error!("Error closing database: {}", e);
         }
