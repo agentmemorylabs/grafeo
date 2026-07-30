@@ -148,8 +148,12 @@ impl SectionDirectory {
         let mut entries = Vec::with_capacity(count);
         for i in 0..count {
             let offset = 8 + i * SectionDirectoryEntry::SIZE;
-            let entry = read_entry(&data[offset..offset + SectionDirectoryEntry::SIZE])?;
-            entries.push(entry);
+            // Unknown optional section types are skipped so older binaries can
+            // open files that carry newer optional indexes. Unknown required
+            // types fail closed (see `read_entry`).
+            if let Some(entry) = read_entry(&data[offset..offset + SectionDirectoryEntry::SIZE])? {
+                entries.push(entry);
+            }
         }
 
         Ok(Self { entries })
@@ -182,8 +186,14 @@ fn write_entry(buf: &mut [u8], entry: &SectionDirectoryEntry) {
     buf[28..32].copy_from_slice(&[0, 0, 0, 0]); // reserved
 }
 
-fn read_entry(buf: &[u8]) -> Result<SectionDirectoryEntry> {
+/// Parse one directory entry.
+///
+/// Returns `Ok(None)` when the type id is unknown and the entry is optional
+/// (`flags.required == false`), so older readers can skip newer optional
+/// sections. Returns an error when the type is unknown and required.
+fn read_entry(buf: &[u8]) -> Result<Option<SectionDirectoryEntry>> {
     let type_val = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let flags = SectionFlags::from_byte(buf[5]);
     let section_type = match type_val {
         1 => SectionType::Catalog,
         2 => SectionType::LpgStore,
@@ -195,20 +205,24 @@ fn read_entry(buf: &[u8]) -> Result<SectionDirectoryEntry> {
         12 => SectionType::RdfRing,
         20 => SectionType::PropertyIndex,
         other => {
-            return Err(Error::Serialization(format!(
-                "unknown section type: {other}"
-            )));
+            if flags.required {
+                return Err(Error::Serialization(format!(
+                    "unknown required section type: {other}"
+                )));
+            }
+            // Optional unknown: skip without failing open.
+            return Ok(None);
         }
     };
 
-    Ok(SectionDirectoryEntry {
+    Ok(Some(SectionDirectoryEntry {
         section_type,
         version: buf[4],
-        flags: SectionFlags::from_byte(buf[5]),
+        flags,
         offset: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
         length: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
         checksum: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -435,17 +449,55 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_unknown_section_type() {
+    fn from_bytes_unknown_optional_section_type_is_skipped() {
         let mut buf = vec![0u8; DIRECTORY_PAGE_SIZE];
-        // 1 entry
+        // 2 entries: known Catalog + unknown optional type 99
+        buf[0..4].copy_from_slice(&2u32.to_le_bytes());
+
+        // Entry 0: Catalog (required), version 2
+        let e0 = 8;
+        buf[e0..e0 + 4].copy_from_slice(&(SectionType::Catalog as u32).to_le_bytes());
+        buf[e0 + 4] = 2;
+        buf[e0 + 5] = SectionType::Catalog.default_flags().to_byte();
+        buf[e0 + 8..e0 + 16].copy_from_slice(&SECTION_DATA_OFFSET.to_le_bytes());
+        buf[e0 + 16..e0 + 24].copy_from_slice(&64u64.to_le_bytes());
+        buf[e0 + 24..e0 + 28].copy_from_slice(&0u32.to_le_bytes());
+
+        // Entry 1: unknown type 99, optional (required bit clear)
+        let e1 = 8 + SectionDirectoryEntry::SIZE;
+        buf[e1..e1 + 4].copy_from_slice(&99u32.to_le_bytes());
+        buf[e1 + 4] = 1;
+        buf[e1 + 5] = SectionFlags {
+            required: false,
+            mmap_able: true,
+        }
+        .to_byte();
+        buf[e1 + 8..e1 + 16].copy_from_slice(&(SECTION_DATA_OFFSET + 4096).to_le_bytes());
+        buf[e1 + 16..e1 + 24].copy_from_slice(&128u64.to_le_bytes());
+        buf[e1 + 24..e1 + 28].copy_from_slice(&1u32.to_le_bytes());
+
+        let dir = SectionDirectory::from_bytes(&buf).expect("optional unknown must not fail open");
+        assert_eq!(dir.len(), 1, "optional unknown entry must be skipped");
+        assert!(dir.find(SectionType::Catalog).is_some());
+    }
+
+    #[test]
+    fn from_bytes_unknown_required_section_type_fails_closed() {
+        let mut buf = vec![0u8; DIRECTORY_PAGE_SIZE];
+        // 1 entry: unknown type 99 with required flag set
         buf[0..4].copy_from_slice(&1u32.to_le_bytes());
-        // Write an unknown section type (99) at entry offset
         buf[8..12].copy_from_slice(&99u32.to_le_bytes());
+        buf[12] = 1; // version
+        buf[13] = SectionFlags {
+            required: true,
+            mmap_able: false,
+        }
+        .to_byte();
         let result = SectionDirectory::from_bytes(&buf);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("unknown section type"),
+            err.contains("unknown required section type") && err.contains("99"),
             "unexpected error: {err}"
         );
     }
