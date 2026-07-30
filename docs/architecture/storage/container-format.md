@@ -88,7 +88,7 @@ Maximum capacity: 127 sections (`(4096 - 8) / 32`).
 | Offset | Size | Type | Field | Description |
 |--------|------|------|-------|-------------|
 | 0 | 4 | `u32 LE` | `section_type` | Section type ID (see table below) |
-| 4 | 1 | `u8` | `version` | Per-section format version |
+| 4 | 1 | `u8` | `version` | Per-section format version (see Truthful directory versions) |
 | 5 | 1 | `u8` | `flags` | Bit 0: required, Bit 1: mmap-able |
 | 6 | 2 | `u16 LE` | `reserved` | Zero |
 | 8 | 8 | `u64 LE` | `offset` | Byte offset from file start |
@@ -98,19 +98,45 @@ Maximum capacity: 127 sections (`(4096 - 8) / 32`).
 
 Remaining bytes after the last entry are zero-filled to 4 KiB.
 
+### Truthful directory versions (G-F0.1)
+
+The directory entry `version` byte is the per-section format version declared
+by that section's `Section::version()` implementation.
+
+- **New writers** (`GrafeoFileManager::write_versioned_sections`, used by
+  engine flush) record each section's declared version in the directory.
+- **Legacy callers** of `write_sections` still emit directory version `1` for
+  every section (tests and opaque-byte writers).
+- **Historical caveat:** shared writers prior to G-F0.1 often recorded outer
+  directory version `1` for every section even when the payload itself was a
+  later format (for example CompactStore payload v2/v3 with outer entry v1).
+  Readers must continue to dispatch from the **payload** header (for example
+  the CompactStore `GCST` version byte), not require outer directory version
+  equals payload version. Do **not** add a strict outer-equals-payload gate
+  that would reject valid historical files.
+- **Unknown section types:** if the type id is not recognized and
+  `flags.required` is clear, the entry is skipped so older binaries can open
+  files that carry newer optional indexes. If `flags.required` is set, open
+  fails closed.
+
 ---
 
 ## Section Types
 
+Values and default flags match `SectionType` / `SectionType::default_flags`
+in `grafeo-common`.
+
 | Value | Name | Required | Mmap-able | Description |
 |-------|------|----------|-----------|-------------|
-| 1 | `CATALOG` | yes | no | Schema defs, index metadata, epoch, config |
-| 2 | `LPG_STORE` | yes | no | Nodes, edges, properties, named graphs |
-| 3 | `RDF_STORE` | no | no | RDF triples, named graphs |
-| 10 | `VECTOR_STORE` | no | yes | Embeddings + HNSW topology |
-| 11 | `TEXT_INDEX` | no | yes | BM25 postings + term dictionary |
-| 12 | `RDF_RING` | no | yes | Wavelet trees + dictionary |
-| 20 | `PROPERTY_INDEX` | no | yes | Property hash/btree indexes |
+| 1 | `Catalog` | yes | no | Schema defs, index metadata, epoch, config |
+| 2 | `LpgStore` | yes | no | Nodes, edges, properties, named graphs |
+| 3 | `RdfStore` | no | no | RDF triples, named graphs |
+| 4 | `CompactStore` | yes | yes | Columnar compact base (`GCST` payload) |
+| 5 | `OverlayDeletions` | no | no | Layered base-deletion tombstones |
+| 10 | `VectorStore` | no | yes | Embeddings + HNSW topology |
+| 11 | `TextIndex` | no | yes | BM25 postings + term dictionary |
+| 12 | `RdfRing` | no | yes | Wavelet trees + dictionary |
+| 20 | `PropertyIndex` | no | yes | Property hash/btree indexes |
 
 **Type ranges:**
 
@@ -123,12 +149,13 @@ Remaining bytes after the last entry are zero-filled to 4 KiB.
 - **Bit 0 (required):** If set, older binaries that don't recognize this
   section type must refuse to open the file. If clear, the section can be
   safely skipped (the database opens without that index).
-- **Bit 1 (mmap-able):** If set, the section uses a fixed binary layout
-  suitable for zero-copy memory-mapped access. If clear, the section must
-  be deserialized into RAM (bincode format).
+- **Bit 1 (mmap-able):** Capability flag: the section layout is intended to
+  support memory-mapped access. It does **not** mean the current container
+  open path always mmaps that section.
 
 **Empty sections** are omitted from the directory entirely. If no RDF data
-exists, there is no `RDF_STORE` entry.
+exists, there is no `RdfStore` entry. CompactStore appears only after
+`compact()` (or an equivalent layered write).
 
 ---
 
@@ -145,19 +172,21 @@ boundary after the previous section ends.
 ...
 ```
 
-### Data Section Encoding (Catalog, LPG, RDF)
+### Per-type encoding
 
-Data sections use **bincode** serialization (standard configuration). They
-are fully deserialized into RAM on load. The internal format is
-version-specific (the `version` byte in the directory entry allows
-independent evolution).
+Encoding is **not** uniformly bincode:
 
-### Index Section Encoding (Vector, Text, Ring, Property)
+| Section | Encoding | Notes |
+|---------|----------|-------|
+| `Catalog`, `LpgStore`, `RdfStore` | bincode | Fully deserialized into RAM on ordinary open |
+| `CompactStore` | Custom **`GCST`** payload | Column codecs + section-level strings; CRC32 trailer |
+| `OverlayDeletions` | dedicated deletions codec | Base tombstones for layered reopen |
+| `VectorStore`, `TextIndex`, `RdfRing`, `PropertyIndex` | section-specific codecs | `mmap_able` marks intended zero-copy layouts |
 
-Index sections use **bincode** serialization currently (version 1). Future
-versions may switch to fixed binary layouts for zero-copy mmap access.
-The `mmap_able` flag indicates whether the section can be memory-mapped
-after being written.
+Payload version dispatch is owned by each section deserializer. Directory
+version metadata is advisory for tooling and independent evolution; historical
+outer-v1 files with supported payloads remain readable (see Truthful directory
+versions above).
 
 ---
 

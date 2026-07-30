@@ -62,11 +62,17 @@ pub(super) fn flush(
     maybe_crash("flush:before_serialize");
 
     // Collect sections to write based on flush reason
-    // Write all sections (dirty or not for Explicit, only dirty for Checkpoint)
-    let mut targets: Vec<(SectionType, Vec<u8>)> = Vec::new();
+    // Write all sections (dirty or not for Explicit, only dirty for Checkpoint).
+    // Retain each section's declared format version for the directory entry
+    // (G-F0.1); do not hard-code version 1 at the shared writer.
+    let mut targets: Vec<(SectionType, u8, Vec<u8>)> = Vec::new();
     for section in sections {
         if reason == FlushReason::Explicit || section.is_dirty() {
-            targets.push((section.section_type(), section.serialize()?));
+            targets.push((
+                section.section_type(),
+                section.version(),
+                section.serialize()?,
+            ));
         }
     }
     // If nothing is dirty on a periodic checkpoint, skip the write entirely.
@@ -81,11 +87,13 @@ pub(super) fn flush(
 
     maybe_crash("flush:after_serialize");
 
-    // Write sections to container
-    let section_refs: Vec<(SectionType, &[u8])> =
-        targets.iter().map(|(t, d)| (*t, d.as_slice())).collect();
+    // Write sections to container with truthful per-section directory versions.
+    let section_refs: Vec<(SectionType, u8, &[u8])> = targets
+        .iter()
+        .map(|(t, v, d)| (*t, *v, d.as_slice()))
+        .collect();
 
-    fm.write_sections(
+    fm.write_versioned_sections(
         &section_refs,
         context.epoch,
         context.transaction_id,
@@ -95,7 +103,7 @@ pub(super) fn flush(
 
     // Mark all written sections as clean
     for section in sections {
-        if targets.iter().any(|(t, _)| *t == section.section_type()) {
+        if targets.iter().any(|(t, _, _)| *t == section.section_type()) {
             section.mark_clean();
         }
     }
