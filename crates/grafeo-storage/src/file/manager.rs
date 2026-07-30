@@ -1727,10 +1727,7 @@ mod tests {
             let entry = section_dir
                 .find(section_type)
                 .unwrap_or_else(|| panic!("missing {section_type:?}"));
-            assert_eq!(
-                entry.version, version,
-                "{section_type:?} directory version"
-            );
+            assert_eq!(entry.version, version, "{section_type:?} directory version");
             let data = manager.read_section_data(entry).unwrap();
             assert_eq!(data, payload, "{section_type:?} payload");
         }
@@ -1788,7 +1785,13 @@ mod tests {
         {
             let manager = GrafeoFileManager::create(&path).unwrap();
             manager
-                .write_sections(&[(SectionType::CompactStore, payload.as_slice())], 1, 1, 0, 0)
+                .write_sections(
+                    &[(SectionType::CompactStore, payload.as_slice())],
+                    1,
+                    1,
+                    0,
+                    0,
+                )
                 .unwrap();
             manager.close().unwrap();
         }

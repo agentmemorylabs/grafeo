@@ -121,10 +121,8 @@ fn historical_outer_v1_compact_payload_still_opens() {
             let data = manager.read_section_data(entry).unwrap();
             rewritten.push((entry.section_type, data));
         }
-        let refs: Vec<(SectionType, &[u8])> = rewritten
-            .iter()
-            .map(|(t, d)| (*t, d.as_slice()))
-            .collect();
+        let refs: Vec<(SectionType, &[u8])> =
+            rewritten.iter().map(|(t, d)| (*t, d.as_slice())).collect();
         // write_sections always records directory version 1 (legacy path).
         manager
             .write_sections(&refs, 1, 1, 1, 0)
@@ -202,10 +200,7 @@ fn checkpoint_records_vector_store_declared_version() {
     }
 
     let declared = VectorStoreSection::new(Vec::new()).version();
-    assert_eq!(
-        directory_version(&path, SectionType::VectorStore),
-        declared
-    );
+    assert_eq!(directory_version(&path, SectionType::VectorStore), declared);
 }
 
 #[test]
@@ -242,7 +237,11 @@ fn property_index_directory_version_via_shared_writer() {
     let manager = GrafeoFileManager::create(&path).unwrap();
     manager
         .write_versioned_sections(
-            &[(SectionType::PropertyIndex, 1, b"prop-index-payload".as_slice())],
+            &[(
+                SectionType::PropertyIndex,
+                1,
+                b"prop-index-payload".as_slice(),
+            )],
             1,
             1,
             0,
@@ -254,7 +253,10 @@ fn property_index_directory_version_via_shared_writer() {
         .unwrap()
         .expect("directory");
     assert_eq!(
-        section_dir.find(SectionType::PropertyIndex).unwrap().version,
+        section_dir
+            .find(SectionType::PropertyIndex)
+            .unwrap()
+            .version,
         1
     );
     manager.close().unwrap();

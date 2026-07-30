@@ -103,10 +103,7 @@ pub(super) fn flush(
 
     // Mark all written sections as clean
     for section in sections {
-        if targets
-            .iter()
-            .any(|(t, _, _)| *t == section.section_type())
-        {
+        if targets.iter().any(|(t, _, _)| *t == section.section_type()) {
             section.mark_clean();
         }
     }
