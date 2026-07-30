@@ -186,6 +186,7 @@ CRC32: u32 LE over all preceding payload bytes
 | 2 | `u16` LE | Read-only compatibility |
 | 3 | `u16` LE | Read-only compatibility |
 | **4** | **`u32` LE** | **Current writer** |
+| 5 | `u32` LE | Selected by G-EM0.R0; not emitted or read until G-EM0.1 |
 
 “Section-level string” means labels, property keys, edge types, and zone-map
 `Value::String` min/max fields (the path that previously panicked above
@@ -200,10 +201,11 @@ and are unchanged in v4.
   dictionaries, zone maps, and ID lookup ranges without copying the section.
   See [CompactStore v5 mapped layout](compact-store-v5-mapped-layout.md) for
   the source inventory, exact header/directory contract, compatibility rules,
-  and RED verification list. Existing v1-v4 readers remain supported.
-- New readers accept v1–v4.
+  and RED verification list.
+- Current E-0 readers accept v1–v4. Version 5 is selected but not emitted or
+  read until G-EM0.1 lands; existing v1–v4 readers remain supported throughout.
 - Old binaries that only understand ≤v3 must **fail closed** on v4 (no silent
-  misparse).
+  misparse). Binaries that understand ≤v4 must fail closed on v5.
 - Overflow of the active length width returns `Error::Serialization`
   (`GRAFEO-X002`), never a panic in a destructor.
 

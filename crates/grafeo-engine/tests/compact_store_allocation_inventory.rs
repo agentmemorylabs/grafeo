@@ -228,9 +228,80 @@ mod linux {
             "fresh-process anonymous reopen delta must expose the current proportional allocation path; small={small:?}, large={large:?}",
         );
 
+        reconcile_to_inventory(&small, &large);
+
         eprintln!("G-EM0.R0 CompactStore allocation inventory");
         eprintln!("small: {small:?}");
         eprintln!("large: {large:?}");
+    }
+
+    /// Reconciles the measured anonymous reopen delta to the field inventory
+    /// using the declared R0 tolerance.
+    ///
+    /// The attributable lower bound is `estimated_compact_heap_bytes +
+    /// compact_section_bytes`: the `CompactStore::memory_bytes` estimate plus
+    /// the retained `Bytes` payload copy. This is a lower bound because it
+    /// double-counts column data that is both sliced from the `Bytes` and
+    /// counted in `heap_bytes`, and because `memory_bytes` excludes dictionary
+    /// `Arc<str>` allocations, schemas, zone maps, statistics, `FxHashMap`
+    /// overhead, and process baseline.
+    ///
+    /// Declared tolerance: the unexplained overhead (anonymous delta minus
+    /// attributable lower bound) must NOT scale proportionally with the graph.
+    /// Concretely, the overhead ratio between large and small snapshots must
+    /// stay below the payload ratio. If overhead scaled at the payload ratio,
+    /// an unaccounted proportional retained structure would exist and the
+    /// packet would fail.
+    fn reconcile_to_inventory(small: &OpenInventory, large: &OpenInventory) {
+        let payload_ratio = large.compact_section_bytes as f64 / small.compact_section_bytes as f64;
+
+        for (name, inv) in [("small", small), ("large", large)] {
+            let anonymous_delta_bytes = inv.anonymous_delta_kib.saturating_mul(1024);
+            let attributable = inv
+                .estimated_compact_heap_bytes
+                .saturating_add(inv.compact_section_bytes);
+            // The attributable lower bound can exceed the measured anonymous
+            // delta because `memory_bytes` double-counts codec data that is
+            // sliced from the retained `Bytes` copy. Saturate at zero rather
+            // than reporting a negative overhead.
+            let overhead = anonymous_delta_bytes.saturating_sub(attributable);
+            eprintln!(
+                "reconcile[{name}]: anonymous_delta={anonymous_delta_bytes} B \
+                 attributable_lower_bound={attributable} B overhead={overhead} B"
+            );
+        }
+
+        let small_anon = small.anonymous_delta_kib.saturating_mul(1024) as f64;
+        let large_anon = large.anonymous_delta_kib.saturating_mul(1024) as f64;
+        let small_attributable = (small
+            .estimated_compact_heap_bytes
+            .saturating_add(small.compact_section_bytes)) as f64;
+        let large_attributable = (large
+            .estimated_compact_heap_bytes
+            .saturating_add(large.compact_section_bytes)) as f64;
+        let small_overhead = (small_anon - small_attributable).max(0.0);
+        let large_overhead = (large_anon - large_attributable).max(0.0);
+
+        // Overhead must not scale proportionally with the graph. Require the
+        // overhead ratio to stay strictly below the payload ratio; a ratio at
+        // or above the payload ratio would indicate an unaccounted
+        // proportional retained structure.
+        let overhead_ratio = if small_overhead > 0.0 {
+            large_overhead / small_overhead
+        } else {
+            0.0
+        };
+        eprintln!(
+            "reconcile: payload_ratio={payload_ratio:.2} overhead_ratio={overhead_ratio:.2} \
+             small_overhead={small_overhead:.0} B large_overhead={large_overhead:.0} B"
+        );
+        assert!(
+            overhead_ratio < payload_ratio,
+            "unexplained anonymous overhead scaled proportionally with the graph \
+             (overhead_ratio={overhead_ratio:.2} >= payload_ratio={payload_ratio:.2}); \
+             an unaccounted proportional retained structure would fail R0; \
+             small={small:?}, large={large:?}"
+        );
     }
 }
 
