@@ -199,12 +199,7 @@ pub fn read_u32_le(data: &[u8], pos: &mut usize) -> Result<u32, &'static str> {
     if *pos + 4 > data.len() {
         return Err("truncated u32");
     }
-    let v = u32::from_le_bytes([
-        data[*pos],
-        data[*pos + 1],
-        data[*pos + 2],
-        data[*pos + 3],
-    ]);
+    let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
     *pos += 4;
     Ok(v)
 }

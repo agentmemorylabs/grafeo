@@ -7,19 +7,21 @@ use bytes::Bytes;
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey};
 use grafeo_common::utils::hash::FxHashMap;
 
+use super::CompactStore;
 use super::column::ColumnCodec;
 use super::csr::CsrAdjacency;
 use super::mapped::{
-    build_string_segments, parse_segment_directory, slice_segment_checked, write_edge_id_record,
-    write_node_id_record, CompactMemoryAccounting, MappedEdgeIdLookup, MappedNodeIdLookup,
-    MappedStringDictionary, SegmentKind, U32View, DIRECTORY_ENTRY_LEN, FORMAT_VERSION_V5,
-    HEADER_LEN, SCHEMA_OWNER_BUDGET_BYTES,
+    CompactMemoryAccounting, DIRECTORY_ENTRY_LEN, DictionaryCodeIndex, FORMAT_VERSION_V5,
+    HEADER_LEN, MappedEdgeIdLookup, MappedNodeIdLookup, MappedStringDictionary,
+    SCHEMA_OWNER_BUDGET_BYTES, SegmentKind, U32View, ZONE_MAP_RECORD_LEN,
+    build_dictionary_code_index, build_string_segments, build_zone_map_segments,
+    parse_block_zone_maps, parse_segment_directory, parse_table_zone_maps, slice_segment_checked,
+    write_edge_id_record, write_node_id_record,
 };
 use super::node_table::NodeTable;
 use super::rel_table::RelTable;
 use super::schema::{ColumnDef, ColumnType, EdgeSchema, TableSchema};
 use super::zone_map::ZoneMap;
-use super::CompactStore;
 use crate::codec::DictionaryEncoding;
 use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 
@@ -89,14 +91,7 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
 
     let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
     let (off_bytes, str_bytes) = build_string_segments(&str_refs);
-    segments.push((
-        SegmentKind::StringOffsets,
-        1,
-        0x0001,
-        8,
-        8,
-        off_bytes,
-    ));
+    segments.push((SegmentKind::StringOffsets, 1, 0x0001, 8, 8, off_bytes));
     segments.push((SegmentKind::StringBytes, 1, 0x0001, 1, 1, str_bytes));
 
     // ── Metadata
@@ -151,10 +146,7 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
         .sum::<usize>() as u64;
     write_u64(&mut meta, total_nodes);
     write_u64(&mut meta, total_edges);
-    segments.insert(
-        0,
-        (SegmentKind::Metadata, 1, 0x0001, 1, 0, meta),
-    );
+    segments.insert(0, (SegmentKind::Metadata, 1, 0x0001, 1, 0, meta));
 
     // ── Node / rel table directories + columns + CSR
     let mut node_dir = Vec::new();
@@ -249,22 +241,8 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
         }
     }
 
-    segments.push((
-        SegmentKind::NodeTableDirectory,
-        1,
-        0x0001,
-        8,
-        24,
-        node_dir,
-    ));
-    segments.push((
-        SegmentKind::RelTableDirectory,
-        1,
-        0x0001,
-        8,
-        24,
-        rel_dir,
-    ));
+    segments.push((SegmentKind::NodeTableDirectory, 1, 0x0001, 8, 24, node_dir));
+    segments.push((SegmentKind::RelTableDirectory, 1, 0x0001, 8, 24, rel_dir));
     segments.push((SegmentKind::ColumnDirectory, 1, 0x0001, 8, 24, col_dir));
     segments.push((
         SegmentKind::ColumnBlockIndex,
@@ -275,39 +253,11 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
         col_block_index,
     ));
     segments.push((SegmentKind::ColumnBodies, 1, 0x0001, 1, 0, col_bodies));
-    segments.push((
-        SegmentKind::ForwardCsrOffsets,
-        1,
-        0x0001,
-        4,
-        4,
-        fwd_offsets,
-    ));
-    segments.push((
-        SegmentKind::ForwardCsrTargets,
-        1,
-        0x0001,
-        4,
-        4,
-        fwd_targets,
-    ));
+    segments.push((SegmentKind::ForwardCsrOffsets, 1, 0x0001, 4, 4, fwd_offsets));
+    segments.push((SegmentKind::ForwardCsrTargets, 1, 0x0001, 4, 4, fwd_targets));
     if has_reverse {
-        segments.push((
-            SegmentKind::ReverseCsrOffsets,
-            1,
-            0x0001,
-            4,
-            4,
-            rev_offsets,
-        ));
-        segments.push((
-            SegmentKind::ReverseCsrTargets,
-            1,
-            0x0001,
-            4,
-            4,
-            rev_targets,
-        ));
+        segments.push((SegmentKind::ReverseCsrOffsets, 1, 0x0001, 4, 4, rev_offsets));
+        segments.push((SegmentKind::ReverseCsrTargets, 1, 0x0001, 4, 4, rev_targets));
         segments.push((
             SegmentKind::ForwardPositions,
             1,
@@ -354,37 +304,43 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
                 }
             }
         }
+        segments.push((SegmentKind::NodeIdLookup, 1, 0x0001, 8, 24, node_lookup));
+        segments.push((SegmentKind::EdgeIdLookup, 1, 0x0001, 8, 24, edge_lookup));
+        segments.push((SegmentKind::NodeOriginalIds, 1, 0x0001, 8, 8, node_orig));
+        segments.push((SegmentKind::EdgeOriginalIds, 1, 0x0001, 8, 8, edge_orig));
+    }
+
+    // ── Zone maps (kinds 18–19) + dictionary code index (kind 20)
+    let (table_zm, block_zm) = build_zone_map_segments(store, &string_index)?;
+    if !table_zm.is_empty() {
         segments.push((
-            SegmentKind::NodeIdLookup,
+            SegmentKind::TableZoneMaps,
             1,
             0x0001,
             8,
-            24,
-            node_lookup,
+            ZONE_MAP_RECORD_LEN as u32,
+            table_zm,
         ));
+    }
+    if !block_zm.is_empty() {
         segments.push((
-            SegmentKind::EdgeIdLookup,
+            SegmentKind::BlockZoneMaps,
             1,
             0x0001,
             8,
-            24,
-            edge_lookup,
+            ZONE_MAP_RECORD_LEN as u32,
+            block_zm,
         ));
+    }
+    let code_index_body = build_dictionary_code_index(&str_refs);
+    if !code_index_body.is_empty() {
         segments.push((
-            SegmentKind::NodeOriginalIds,
+            SegmentKind::DictionaryCodeIndex,
             1,
             0x0001,
             8,
-            8,
-            node_orig,
-        ));
-        segments.push((
-            SegmentKind::EdgeOriginalIds,
-            1,
-            0x0001,
-            8,
-            8,
-            edge_orig,
+            16,
+            code_index_body,
         ));
     }
 
@@ -494,16 +450,22 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
     }
 
     let directory = parse_segment_directory(data_bytes, payload.len())?;
-    let string_offsets = slice_segment_checked(
-        data_bytes,
-        directory.require(SegmentKind::StringOffsets)?,
-    )?;
+    let string_offsets =
+        slice_segment_checked(data_bytes, directory.require(SegmentKind::StringOffsets)?)?;
     let string_bytes =
         slice_segment_checked(data_bytes, directory.require(SegmentKind::StringBytes)?)?;
     let global_dict = MappedStringDictionary::new(string_offsets, string_bytes)?;
+    let code_index_bytes = directory
+        .get(SegmentKind::DictionaryCodeIndex)
+        .map(|e| slice_segment_checked(data_bytes, e))
+        .transpose()?;
+    let code_index = match code_index_bytes {
+        Some(bytes) => Some(DictionaryCodeIndex::new(bytes, &global_dict)?),
+        None => None,
+    };
+    let code_index_raw = code_index.as_ref().map(DictionaryCodeIndex::bytes);
 
-    let meta_bytes =
-        slice_segment_checked(data_bytes, directory.require(SegmentKind::Metadata)?)?;
+    let meta_bytes = slice_segment_checked(data_bytes, directory.require(SegmentKind::Metadata)?)?;
     let meta = parse_metadata(meta_bytes.as_ref(), &global_dict)?;
 
     let node_dir_bytes = slice_segment_checked(
@@ -514,10 +476,8 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
         data_bytes,
         directory.require(SegmentKind::RelTableDirectory)?,
     )?;
-    let col_dir_bytes = slice_segment_checked(
-        data_bytes,
-        directory.require(SegmentKind::ColumnDirectory)?,
-    )?;
+    let col_dir_bytes =
+        slice_segment_checked(data_bytes, directory.require(SegmentKind::ColumnDirectory)?)?;
     let col_block_bytes = slice_segment_checked(
         data_bytes,
         directory.require(SegmentKind::ColumnBlockIndex)?,
@@ -546,6 +506,23 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
         .map(|e| slice_segment_checked(data_bytes, e))
         .transpose()?;
 
+    // Zone maps (kinds 18–19); absent segments yield empty maps (legacy fallback).
+    let table_count = meta.node_tables.len();
+    let table_zone_maps = match directory.get(SegmentKind::TableZoneMaps) {
+        Some(entry) => {
+            let bytes = slice_segment_checked(data_bytes, entry)?;
+            parse_table_zone_maps(bytes.as_ref(), &global_dict, table_count)?
+        }
+        None => (0..table_count).map(|_| FxHashMap::default()).collect(),
+    };
+    let block_zone_maps = match directory.get(SegmentKind::BlockZoneMaps) {
+        Some(entry) => {
+            let bytes = slice_segment_checked(data_bytes, entry)?;
+            parse_block_zone_maps(bytes.as_ref(), &global_dict, table_count)?
+        }
+        None => (0..table_count).map(|_| FxHashMap::default()).collect(),
+    };
+
     // Build node tables
     let mut node_tables = Vec::with_capacity(meta.node_tables.len());
     let mut label_to_table_id = FxHashMap::default();
@@ -559,10 +536,7 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
     for (tid, nt_meta) in meta.node_tables.iter().enumerate() {
         let rec = read_node_table_record(&node_dir_bytes, tid)?;
         if rec.id as usize != tid {
-            return Err(format!(
-                "NodeTableDirectory id {} != index {tid}",
-                rec.id
-            ));
+            return Err(format!("NodeTableDirectory id {} != index {tid}", rec.id));
         }
         if rec.row_count as usize != nt_meta.row_count {
             return Err("NodeTableDirectory row_count mismatch with Metadata".into());
@@ -571,12 +545,14 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
         let mut col_defs = Vec::new();
         for c in 0..rec.column_count as usize {
             let col_idx = rec.column_start as usize + c;
-            let col_meta = nt_meta
-                .columns
-                .get(c)
-                .ok_or("metadata column missing")?;
+            let col_meta = nt_meta.columns.get(c).ok_or("metadata column missing")?;
             let body = column_body_slice(&col_block_bytes, &col_bodies, col_idx)?;
-            let codec = read_column_body(&body, col_meta.disc, &global_dict)?;
+            let codec = read_column_body_with_index(
+                &body,
+                col_meta.disc,
+                &global_dict,
+                code_index_raw.clone(),
+            )?;
             let key = PropertyKey::new(&col_meta.key);
             col_defs.push(ColumnDef::new(
                 &col_meta.key,
@@ -585,7 +561,15 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
             columns.insert(key, codec);
         }
         let schema = TableSchema::new(&nt_meta.label, tid as u16, col_defs);
-        let table = NodeTable::from_columns(schema, columns, FxHashMap::default(), nt_meta.row_count);
+        let zone_maps = table_zone_maps.get(tid).cloned().unwrap_or_default();
+        let block_zms = block_zone_maps.get(tid).cloned().unwrap_or_default();
+        let table = NodeTable::from_columns_with_block_stats(
+            schema,
+            columns,
+            zone_maps,
+            block_zms,
+            nt_meta.row_count,
+        );
         label_to_table_id.insert(ArcStr::from(nt_meta.label.as_str()), tid as u16);
         table_id_to_label.push(ArcStr::from(nt_meta.label.as_str()));
         node_tables.push(table);
@@ -657,7 +641,12 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
                 .get(c)
                 .ok_or("rel metadata column missing")?;
             let body = column_body_slice(&col_block_bytes, &col_bodies, col_idx)?;
-            let codec = read_column_body(&body, col_meta.disc, &global_dict)?;
+            let codec = read_column_body_with_index(
+                &body,
+                col_meta.disc,
+                &global_dict,
+                code_index_raw.clone(),
+            )?;
             let key = PropertyKey::new(&col_meta.key);
             prop_defs.push(ColumnDef::new(
                 &col_meta.key,
@@ -681,14 +670,7 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
             dst_label.as_str(),
             prop_defs,
         );
-        let table = RelTable::new(
-            schema,
-            fwd,
-            bwd,
-            properties,
-            rec.src_tid,
-            rec.dst_tid,
-        );
+        let table = RelTable::new(schema, fwd, bwd, properties, rec.src_tid, rec.dst_tid);
         let et = ArcStr::from(rt_meta.edge_type.as_str());
         edge_type_to_rel_id
             .entry(et.clone())
@@ -736,14 +718,10 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
             data_bytes,
             directory.require(SegmentKind::EdgeIdLookup)?,
         )?)?;
-        let node_orig = slice_segment_checked(
-            data_bytes,
-            directory.require(SegmentKind::NodeOriginalIds)?,
-        )?;
-        let edge_orig = slice_segment_checked(
-            data_bytes,
-            directory.require(SegmentKind::EdgeOriginalIds)?,
-        )?;
+        let node_orig =
+            slice_segment_checked(data_bytes, directory.require(SegmentKind::NodeOriginalIds)?)?;
+        let edge_orig =
+            slice_segment_checked(data_bytes, directory.require(SegmentKind::EdgeOriginalIds)?)?;
         let node_counts: Vec<usize> = meta.node_tables.iter().map(|n| n.row_count).collect();
         let edge_counts: Vec<usize> = meta
             .rel_tables
@@ -920,9 +898,7 @@ fn read_node_table_record(bytes: &Bytes, index: usize) -> Result<NodeTableRec, S
     }
     let column_start = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
     let column_count = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
-    let row_count = u64::from_le_bytes([
-        b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19],
-    ]);
+    let row_count = u64::from_le_bytes([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]);
     let reserved_b = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
     if reserved_b != 0 {
         return Err("NodeTableDirectory reserved_b non-zero".into());
@@ -959,9 +935,7 @@ fn read_rel_table_record(bytes: &Bytes, index: usize) -> Result<RelTableRec, Str
     }
     let column_start = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
     let column_count = u32::from_le_bytes([b[12], b[13], b[14], b[15]]);
-    let edge_count = u64::from_le_bytes([
-        b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23],
-    ]);
+    let edge_count = u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]);
     Ok(RelTableRec {
         id,
         src_tid,
@@ -972,11 +946,7 @@ fn read_rel_table_record(bytes: &Bytes, index: usize) -> Result<RelTableRec, Str
     })
 }
 
-fn column_body_slice(
-    block_index: &Bytes,
-    bodies: &Bytes,
-    col_idx: usize,
-) -> Result<Bytes, String> {
+fn column_body_slice(block_index: &Bytes, bodies: &Bytes, col_idx: usize) -> Result<Bytes, String> {
     let base = col_idx * 12;
     if base + 12 > block_index.len() {
         return Err("ColumnBlockIndex truncated".into());
@@ -1032,6 +1002,15 @@ fn read_column_body(
     expected_disc: u16,
     global_dict: &MappedStringDictionary,
 ) -> Result<ColumnCodec, String> {
+    read_column_body_with_index(body, expected_disc, global_dict, None)
+}
+
+fn read_column_body_with_index(
+    body: &Bytes,
+    expected_disc: u16,
+    global_dict: &MappedStringDictionary,
+    code_index: Option<Bytes>,
+) -> Result<ColumnCodec, String> {
     let bytes = body.as_ref();
     if bytes.is_empty() {
         return Err("empty column body".into());
@@ -1044,19 +1023,18 @@ fn read_column_body(
         // v5 mapped dict: [disc=1][codes_len u32][global codes...]
         let mut pos = 1usize;
         let codes_len = read_u32(bytes, &mut pos)? as usize;
-        let need = codes_len
-            .checked_mul(4)
-            .ok_or("dict codes overflow")?;
+        let need = codes_len.checked_mul(4).ok_or("dict codes overflow")?;
         if pos + need > bytes.len() {
             return Err("truncated dict codes".into());
         }
         let codes_bytes = body.slice(pos..pos + need);
         return Ok(ColumnCodec::Dict(
-            DictionaryEncoding::from_mapped_strings(
+            DictionaryEncoding::from_mapped_strings_with_index(
                 global_dict.offsets_bytes(),
                 global_dict.string_bytes(),
                 codes_bytes,
                 codes_len,
+                code_index,
             )?,
         ));
     }
@@ -1125,11 +1103,7 @@ fn append_u32_array(buf: &mut Vec<u8>, values: &[u32]) {
 
 fn estimate_schema_bytes(store: &CompactStore) -> usize {
     // Lower-bound estimate of bounded schema/owner heap.
-    let labels: usize = store
-        .table_id_to_label
-        .iter()
-        .map(|s| s.len() + 32)
-        .sum();
+    let labels: usize = store.table_id_to_label.iter().map(|s| s.len() + 32).sum();
     let types: usize = store
         .rel_table_id_to_type
         .iter()
@@ -1165,12 +1139,7 @@ fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, String> {
     if *pos + 4 > data.len() {
         return Err("truncated u32".into());
     }
-    let v = u32::from_le_bytes([
-        data[*pos],
-        data[*pos + 1],
-        data[*pos + 2],
-        data[*pos + 3],
-    ]);
+    let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
     *pos += 4;
     Ok(v)
 }

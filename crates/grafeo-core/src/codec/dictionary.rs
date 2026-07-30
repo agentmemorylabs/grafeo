@@ -148,6 +148,9 @@ enum StringTable {
         bytes: Bytes,
         /// Number of dictionary entries (offsets.len()/8 - 1).
         len: usize,
+        /// Optional kind-20 sorted code index: `(off:u64, len:u32, code:u32)` × N.
+        /// Enables O(log D) string→code; when absent, encode falls back to O(D).
+        code_index: Option<Bytes>,
     },
 }
 
@@ -162,7 +165,12 @@ impl StringTable {
     fn get(&self, code: usize) -> Option<&str> {
         match self {
             Self::Heap(d) => d.get(code).map(|s| s.as_ref()),
-            Self::Mapped { offsets, bytes, len } => {
+            Self::Mapped {
+                offsets,
+                bytes,
+                len,
+                ..
+            } => {
                 if code >= *len {
                     return None;
                 }
@@ -193,7 +201,12 @@ impl StringTable {
 
     fn mapped_bytes(&self) -> usize {
         match self {
-            Self::Mapped { offsets, bytes, .. } => offsets.len() + bytes.len(),
+            Self::Mapped {
+                offsets,
+                bytes,
+                code_index,
+                ..
+            } => offsets.len() + bytes.len() + code_index.as_ref().map_or(0, Bytes::len),
             Self::Heap(_) => 0,
         }
     }
@@ -204,6 +217,11 @@ impl StringTable {
                 .iter()
                 .position(|s| s.as_ref() == value)
                 .and_then(|i| u32::try_from(i).ok()),
+            Self::Mapped {
+                len,
+                code_index: Some(index),
+                ..
+            } => encode_with_code_index(self, index, value, *len),
             Self::Mapped { len, .. } => {
                 for i in 0..*len {
                     if self.get(i) == Some(value) {
@@ -214,6 +232,37 @@ impl StringTable {
             }
         }
     }
+}
+
+/// Binary search over a kind-20 code index body.
+fn encode_with_code_index(
+    table: &StringTable,
+    index: &Bytes,
+    value: &str,
+    dict_len: usize,
+) -> Option<u32> {
+    const REC: usize = 16;
+    if !index.len().is_multiple_of(REC) {
+        return None;
+    }
+    let count = index.len() / REC;
+    if count != dict_len {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let base = mid * REC;
+        let code = u32::from_le_bytes(index.get(base + 12..base + 16)?.try_into().ok()?);
+        let s = table.get(code as usize)?;
+        match s.cmp(value) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Some(code),
+        }
+    }
+    None
 }
 
 #[inline]
@@ -289,6 +338,18 @@ impl DictionaryEncoding {
         codes_bytes: Bytes,
         code_count: usize,
     ) -> Result<Self, String> {
+        Self::from_mapped_strings_with_index(offsets, string_bytes, codes_bytes, code_count, None)
+    }
+
+    /// Like [`from_mapped_strings`](Self::from_mapped_strings) but attaches a
+    /// sorted dictionary code index for O(log D) string→code lookup.
+    pub fn from_mapped_strings_with_index(
+        offsets: Bytes,
+        string_bytes: Bytes,
+        codes_bytes: Bytes,
+        code_count: usize,
+        code_index: Option<Bytes>,
+    ) -> Result<Self, String> {
         if !offsets.len().is_multiple_of(8) || offsets.len() < 8 {
             return Err("mapped dictionary offsets must be non-empty u64 array".into());
         }
@@ -311,18 +372,27 @@ impl DictionaryEncoding {
         for i in 0..dict_len {
             let start = read_u64_at(&offsets, i).unwrap() as usize;
             let end = read_u64_at(&offsets, i + 1).unwrap() as usize;
-            std::str::from_utf8(&string_bytes[start..end]).map_err(|_| {
-                format!("invalid UTF-8 in mapped dictionary entry {i}")
-            })?;
+            std::str::from_utf8(&string_bytes[start..end])
+                .map_err(|_| format!("invalid UTF-8 in mapped dictionary entry {i}"))?;
         }
         if codes_bytes.len() < code_count.saturating_mul(4) {
             return Err("mapped dictionary codes truncated".into());
+        }
+        if let Some(ref idx) = code_index {
+            const REC: usize = 16;
+            if !idx.len().is_multiple_of(REC) || idx.len() / REC != dict_len {
+                return Err(format!(
+                    "code index length {} incompatible with dict_len {dict_len}",
+                    idx.len()
+                ));
+            }
         }
         Ok(Self {
             dictionary: StringTable::Mapped {
                 offsets,
                 bytes: string_bytes,
                 len: dict_len,
+                code_index,
             },
             codes: CodeStore::Mapped(codes_bytes),
             code_count,

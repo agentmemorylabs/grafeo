@@ -17,9 +17,15 @@ use grafeo_common::types::{NodeId, PropertyKey, Value};
 use grafeo_core::graph::{Direction, traits::GraphStore};
 use grafeo_engine::{CompactBacking, Config, GrafeoDB};
 
+// GraphStore is used for neighbors + find_nodes_by_property on the compact base.
+
 const SMALL_NODES: usize = 256;
-const LARGE_NODES: usize = 1_024; // 4× nodes → ≥4× edges with fanout 4
+/// 8× nodes / edges so CompactStore payload clearly clears the ≥4× gate
+/// after fixed header/directory overhead (4× nodes alone was ~3.94×).
+const LARGE_NODES: usize = 2_048;
 const EDGE_FANOUT: usize = 4;
+/// Target serialized CompactStore section size ratio (≥4× per G-EM0.2 §9).
+const MIN_PAYLOAD_RATIO: u64 = 4;
 
 fn build_snapshot(path: &std::path::Path, node_count: usize) -> Vec<(NodeId, String, i64)> {
     let mut db = GrafeoDB::with_config(Config::persistent(path)).expect("create db");
@@ -64,10 +70,7 @@ fn assert_graph_parity(path: &std::path::Path, expected: &[(NodeId, String, i64)
     );
     assert!(*mapped_bytes > 0);
 
-    let base = db
-        .compact_tiered()
-        .expect("compact base")
-        .store();
+    let base = db.compact_tiered().expect("compact base").store();
     let acc = base
         .memory_accounting()
         .expect("v5 mapped open must record accounting");
@@ -82,6 +85,17 @@ fn assert_graph_parity(path: &std::path::Path, expected: &[(NodeId, String, i64)
     assert!(
         acc.mapped_payload_index_bytes > 0,
         "mapped payload/index bytes must be reported"
+    );
+
+    // Table zone maps must be present on mapped reopen (not dropped).
+    let rank_key = PropertyKey::new("rank");
+    let has_zone = base
+        .node_table("CodeSymbol")
+        .and_then(|nt| nt.zone_map(&rank_key))
+        .is_some();
+    assert!(
+        has_zone,
+        "v5 mapped open must restore table zone maps for prune"
     );
 
     // Deterministic point lookups across the node set.
@@ -100,6 +114,17 @@ fn assert_graph_parity(path: &std::path::Path, expected: &[(NodeId, String, i64)
         let inc = base.neighbors(*id, Direction::Incoming);
         assert_eq!(inc.len(), EDGE_FANOUT, "reverse degree for {id:?}");
     }
+
+    // Zone-map prune path: impossible rank must not match.
+    let pruned = base.find_nodes_by_property("rank", &Value::Int64(i64::MAX));
+    assert!(pruned.is_empty(), "zone map should prune impossible rank");
+
+    // High-cardinality string equality via dictionary code index.
+    if let Some((id, name, _)) = expected.first() {
+        let hits = base.find_nodes_by_property("name", &Value::from(name.as_str()));
+        assert!(hits.contains(id), "string find_eq via mapped dict index");
+    }
+
     db.close().expect("close");
 }
 
@@ -115,15 +140,7 @@ fn readonly_graph_parity_at_two_sizes_with_bounded_accounting() {
     assert_graph_parity(&small_path, &small_nodes);
     assert_graph_parity(&large_path, &large_nodes);
 
-    // Payload size ratio ≥ 4× (nodes 4×, edges 4×).
-    let small_bytes = std::fs::metadata(&small_path).unwrap().len();
-    let large_bytes = std::fs::metadata(&large_path).unwrap().len();
-    assert!(
-        large_bytes >= small_bytes.saturating_mul(3),
-        "expected large snapshot substantially bigger: small={small_bytes} large={large_bytes}"
-    );
-
-    // Re-open and compare accounting scaling: mapped grows, proportional stays 0.
+    // CompactStore payload (mapped_payload_index_bytes) ratio ≥ 4×.
     let small_db = GrafeoDB::open_read_only(&small_path).unwrap();
     let large_db = GrafeoDB::open_read_only(&large_path).unwrap();
     let small_acc = small_db
@@ -144,8 +161,10 @@ fn readonly_graph_parity_at_two_sizes_with_bounded_accounting() {
     assert_eq!(large_acc.anonymous_proportional_structure_bytes, 0);
     assert!(
         large_acc.mapped_payload_index_bytes
-            >= small_acc.mapped_payload_index_bytes.saturating_mul(3),
-        "mapped bytes must scale with graph size: small={} large={}",
+            >= small_acc
+                .mapped_payload_index_bytes
+                .saturating_mul(MIN_PAYLOAD_RATIO as usize),
+        "mapped CompactStore payload must grow ≥{MIN_PAYLOAD_RATIO}×: small={} large={}",
         small_acc.mapped_payload_index_bytes,
         large_acc.mapped_payload_index_bytes
     );
@@ -158,4 +177,52 @@ fn readonly_graph_parity_at_two_sizes_with_bounded_accounting() {
         schema_ratio < mapped_ratio,
         "schema/owner must not scale with payload: schema_ratio={schema_ratio} mapped_ratio={mapped_ratio}"
     );
+}
+
+/// 96 KiB string property survives v5 mapped reopen with zone-map extremes.
+#[test]
+fn readonly_96kib_string_zone_map_and_property() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("large_string.grafeo");
+    let big = "D".repeat(96 * 1024);
+    let mut db = GrafeoDB::with_config(Config::persistent(&path)).expect("create");
+    let id = db
+        .create_node_with_props(
+            &["Doc"],
+            [
+                ("documentation_json", Value::from(big.as_str())),
+                ("rank", Value::Int64(1)),
+            ],
+        )
+        .expect("create");
+    db.compact().expect("compact");
+    db.close().expect("close");
+
+    let db = GrafeoDB::open_read_only(&path).expect("ro open");
+    let base = db.compact_tiered().expect("tiered").store();
+    assert_eq!(
+        base.memory_accounting()
+            .unwrap()
+            .anonymous_proportional_structure_bytes,
+        0
+    );
+    assert_eq!(
+        base.get_node_property(id, &PropertyKey::new("documentation_json")),
+        Some(Value::String(arcstr::ArcStr::from(big.as_str())))
+    );
+    let zm = base
+        .node_table("Doc")
+        .and_then(|nt| nt.zone_map(&PropertyKey::new("documentation_json")));
+    let zm = zm.expect("documentation_json zone map after v5 mapped open");
+    assert_eq!(
+        zm.min.as_ref().and_then(|v| v.as_str()),
+        Some(big.as_str()),
+        "zone map min must retain full 96 KiB string after mapped reopen"
+    );
+    assert_eq!(
+        zm.max.as_ref().and_then(|v| v.as_str()),
+        Some(big.as_str()),
+        "zone map max must retain full 96 KiB string after mapped reopen"
+    );
+    db.close().expect("close");
 }

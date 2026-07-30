@@ -243,7 +243,9 @@ pub fn parse_v5_header(data: &[u8]) -> Result<V5Header, String> {
         return Err("v5 data_offset overlaps directory".into());
     }
     if data_offset % 8 != 0 {
-        return Err(format!("v5 data_offset {data_offset} is not 8-byte aligned"));
+        return Err(format!(
+            "v5 data_offset {data_offset} is not 8-byte aligned"
+        ));
     }
 
     Ok(V5Header {
@@ -417,15 +419,10 @@ pub fn parse_segment_directory(
 /// # Errors
 ///
 /// Returns an error on range issues or CRC mismatch.
-pub fn slice_segment_checked(
-    data: &Bytes,
-    entry: &SegmentEntry,
-) -> Result<Bytes, String> {
+pub fn slice_segment_checked(data: &Bytes, entry: &SegmentEntry) -> Result<Bytes, String> {
     let start = usize::try_from(entry.offset).map_err(|_| "segment offset exceeds usize")?;
     let len = usize::try_from(entry.length).map_err(|_| "segment length exceeds usize")?;
-    let end = start
-        .checked_add(len)
-        .ok_or("segment end overflow")?;
+    let end = start.checked_add(len).ok_or("segment end overflow")?;
     if end > data.len() {
         return Err(format!("segment {:?} out of bounds", entry.kind));
     }
