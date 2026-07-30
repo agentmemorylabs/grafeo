@@ -59,8 +59,10 @@ impl super::GrafeoDB {
 
         // Index registration is label-scoped; do not return a cross-label
         // property hit from the shared property column or a sibling spill file.
+        // Use graph_store() (not overlay-only lpg_store) so compact-base nodes
+        // remain visible after compact → close → reopen (G-E2.RO).
         let has_label = self
-            .lpg_store()
+            .graph_store()
             .get_node(node_id)
             .is_some_and(|node| node.labels.iter().any(|l| l.as_str() == label));
         if !has_label {

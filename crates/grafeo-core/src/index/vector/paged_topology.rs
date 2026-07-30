@@ -568,6 +568,13 @@ impl MmapTopology {
         self.n_nodes == 0
     }
 
+    /// Total bytes retained by the topology buffer (file-backed when
+    /// constructed from a container mmap `Bytes` owner).
+    #[must_use]
+    pub fn mapped_bytes(&self) -> usize {
+        self.data.len()
+    }
+
     /// Returns true if `node` is present in the page index.
     #[must_use]
     pub fn contains(&self, node: NodeId) -> bool {

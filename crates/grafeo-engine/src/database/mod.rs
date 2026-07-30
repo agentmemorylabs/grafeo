@@ -116,6 +116,58 @@ pub enum CompactBacking {
     },
 }
 
+/// Observed search-topology backing for a registered vector index (G-E2.RO).
+///
+/// Distinct from "mmap_able" section flags: this reports what the live
+/// `HnswIndex` backend actually holds after open.
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VectorTopologyBacking {
+    /// Zero-copy [`MmapTopology`] over owner-backed section bytes.
+    Mmap {
+        /// Topology blob size retained via the mmap `Bytes` owner.
+        topology_bytes: usize,
+    },
+    /// Fully reconstructed anonymous neighbor graph.
+    Heap {
+        /// Estimated heap bytes for the topology HashMap.
+        heap_bytes: usize,
+    },
+}
+
+/// Observed exact-value payload path for a registered vector index (G-E2.RO).
+///
+/// Plain HNSW does not retain a second full-f32 corpus; search uses the
+/// accessor. This diagnostic names the durable/serving source.
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VectorPayloadBacking {
+    /// Exact vectors served from CompactStore mapped Float32Vector columns.
+    CompactMappedColumn,
+    /// ForceDisk spill-backed [`MmapStorage`].
+    SpilledMmap,
+    /// Property store / overlay (inline heap or non-compact property path).
+    PropertyStore,
+}
+
+/// Per-index actual backing diagnostic after open (G-E2.RO).
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VectorIndexBacking {
+    /// Index key `"label:property"`.
+    pub key: String,
+    /// Catalog dimensions.
+    pub dimensions: usize,
+    /// Distance metric name (e.g. `"cosine"`).
+    pub metric: String,
+    /// Search-topology residency.
+    pub topology: VectorTopologyBacking,
+    /// Exact-value payload path.
+    pub payload: VectorPayloadBacking,
+    /// Estimated topology heap bytes (near-zero when mmap-backed).
+    pub topology_heap_bytes: usize,
+}
+
 #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
 struct LoadedCompactBase {
     store: Arc<grafeo_core::graph::compact::CompactStore>,
@@ -456,6 +508,8 @@ impl GrafeoDB {
                             &fm,
                             &store,
                             &catalog,
+                            #[cfg(feature = "vector-index")]
+                            true,
                             #[cfg(feature = "triple-store")]
                             &rdf_store,
                         )?;
@@ -514,6 +568,8 @@ impl GrafeoDB {
                         &fm,
                         &store,
                         &catalog,
+                        #[cfg(feature = "vector-index")]
+                        false,
                         #[cfg(feature = "triple-store")]
                         &rdf_store,
                     )?;
@@ -1012,11 +1068,15 @@ impl GrafeoDB {
 
         // Named graphs are LPG-specific and outside the columnar base; move them
         // from the pre-compact overlay into the new overlay so they survive
-        // compaction.
+        // compaction. Vector/text indexes likewise live on the LPG store and
+        // must be transferred or Catalog/VectorStore checkpoint emission loses
+        // them (G-E2.RO).
         if let Some(ref old) = self.store {
             layered
                 .overlay_store()
                 .install_named_graphs(old.take_named_graphs());
+            #[cfg(any(feature = "vector-index", feature = "text-index"))]
+            Self::transfer_indexes_to_overlay(old, &layered.overlay_store());
         }
 
         self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
@@ -1050,6 +1110,31 @@ impl GrafeoDB {
         self.projections.write().clear();
 
         Ok(())
+    }
+
+    /// Transfers vector/text indexes from a retiring LPG store onto a new overlay.
+    #[cfg(all(
+        feature = "compact-store",
+        feature = "lpg",
+        any(feature = "vector-index", feature = "text-index")
+    ))]
+    fn transfer_indexes_to_overlay(from: &LpgStore, to: &LpgStore) {
+        #[cfg(feature = "vector-index")]
+        {
+            for (key, index) in from.vector_index_entries() {
+                if let Some((label, property)) = key.split_once(':') {
+                    to.add_vector_index(label, property, index);
+                }
+            }
+        }
+        #[cfg(feature = "text-index")]
+        {
+            for (key, index) in from.text_index_entries() {
+                if let Some((label, property)) = key.split_once(':') {
+                    to.add_text_index(label, property, index);
+                }
+            }
+        }
     }
 
     /// Merges the overlay back into the columnar base.
@@ -1091,10 +1176,13 @@ impl GrafeoDB {
         let current_epoch = self.transaction_manager.current_epoch();
         new_layered.overlay_store().sync_epoch(current_epoch);
 
-        // Carry named graphs forward: the old overlay is about to be dropped.
+        // Carry named graphs and indexes forward: the old overlay is about to
+        // be dropped (G-E2.RO requires vector shells/topology survive recompact).
         new_layered
             .overlay_store()
             .install_named_graphs(layered.overlay_store().take_named_graphs());
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        Self::transfer_indexes_to_overlay(&layered.overlay_store(), &new_layered.overlay_store());
 
         self.external_read_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreMut>);
@@ -1803,11 +1891,17 @@ impl GrafeoDB {
     /// Loads from a section-based `.grafeo` file (v2 format).
     ///
     /// Reads the section directory, then deserializes each section independently.
+    ///
+    /// When `prefer_vector_mmap` is true (read-only open), VectorStore is
+    /// restored via container mmap + [`VectorStoreSection::restore_from_mapped_bytes`]
+    /// so HNSW topology stays file-backed. Missing or corrupt required vector
+    /// artifacts fail closed when the Catalog registered vector shells.
     #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
     fn load_from_sections(
         fm: &GrafeoFileManager,
         store: &Arc<LpgStore>,
         catalog: &Arc<crate::catalog::Catalog>,
+        #[cfg(feature = "vector-index")] prefer_vector_mmap: bool,
         #[cfg(feature = "triple-store")] rdf_store: &Arc<RdfStore>,
     ) -> Result<()> {
         use grafeo_common::storage::{Section, SectionType};
@@ -1855,14 +1949,29 @@ impl GrafeoDB {
             section.deserialize(&data)?;
         }
 
-        // Restore HNSW topology (if vector indexes exist in both catalog and section)
+        // Restore HNSW topology (if vector indexes exist in both catalog and section).
+        // G-E2.RO: fail closed when Catalog registered shells but the durable
+        // VectorStore artifact is absent or corrupt — never open with empty
+        // shells that silently return empty search results.
         #[cfg(feature = "vector-index")]
-        if let Some(entry) = dir.find(SectionType::VectorStore) {
-            let data = fm.read_section_data(entry)?;
+        {
             let indexes = store.vector_index_entries();
             if !indexes.is_empty() {
+                let Some(entry) = dir.find(SectionType::VectorStore) else {
+                    return Err(grafeo_common::utils::error::Error::Serialization(
+                        "Catalog registers vector indexes but VectorStore section is absent (fail-closed)"
+                            .to_string(),
+                    ));
+                };
                 let mut section = grafeo_core::index::vector::VectorStoreSection::new(indexes);
-                section.deserialize(&data)?;
+                if prefer_vector_mmap {
+                    let mapped = Arc::new(fm.mmap_section(entry)?);
+                    let data = mapped.into_bytes();
+                    section.restore_from_mapped_bytes(data)?;
+                } else {
+                    let data = fm.read_section_data(entry)?;
+                    section.deserialize(&data)?;
+                }
             }
         }
 
@@ -2526,6 +2635,79 @@ impl GrafeoDB {
         self.compact_backing.as_ref()
     }
 
+    /// Returns actual per-index vector payload and topology backing after open.
+    ///
+    /// G-E2.RO: requested storage tier / directory `mmap_able` alone is not
+    /// sufficient. Callers must see whether topology is [`VectorTopologyBacking::Mmap`]
+    /// and whether payloads are served from mapped compact columns (or spill)
+    /// rather than a fully reconstructed anonymous HNSW corpus.
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    #[must_use]
+    pub fn vector_backing_diagnostics(&self) -> Vec<VectorIndexBacking> {
+        let mut out = Vec::new();
+        let has_compact = {
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            {
+                let layered = self.layered_store.is_some();
+                #[cfg(feature = "mmap")]
+                let tiered = self.compact_tiered.is_some();
+                #[cfg(not(feature = "mmap"))]
+                let tiered = false;
+                layered || tiered
+            }
+            #[cfg(not(all(feature = "compact-store", feature = "lpg")))]
+            {
+                false
+            }
+        };
+        for (key, index) in self.lpg_store().vector_index_entries() {
+            let config = index.config();
+            let topology_heap_bytes = index.heap_memory_bytes();
+            let topology = if let Some(topology_bytes) = index.mmap_topology_bytes() {
+                VectorTopologyBacking::Mmap { topology_bytes }
+            } else {
+                VectorTopologyBacking::Heap {
+                    heap_bytes: topology_heap_bytes,
+                }
+            };
+            let payload = {
+                #[cfg(all(feature = "mmap", not(feature = "temporal")))]
+                {
+                    if let Some(ref spill_map) = self.vector_spill_storages {
+                        if spill_map.read().contains_key(&key) {
+                            VectorPayloadBacking::SpilledMmap
+                        } else if has_compact {
+                            VectorPayloadBacking::CompactMappedColumn
+                        } else {
+                            VectorPayloadBacking::PropertyStore
+                        }
+                    } else if has_compact {
+                        VectorPayloadBacking::CompactMappedColumn
+                    } else {
+                        VectorPayloadBacking::PropertyStore
+                    }
+                }
+                #[cfg(not(all(feature = "mmap", not(feature = "temporal"))))]
+                {
+                    if has_compact {
+                        VectorPayloadBacking::CompactMappedColumn
+                    } else {
+                        VectorPayloadBacking::PropertyStore
+                    }
+                }
+            };
+            out.push(VectorIndexBacking {
+                key,
+                dimensions: config.dimensions,
+                metric: config.metric.name().to_string(),
+                topology,
+                payload,
+                topology_heap_bytes,
+            });
+        }
+        out
+    }
+
     /// Returns the query cache.
     #[must_use]
     pub fn query_cache(&self) -> &Arc<QueryCache> {
@@ -2931,7 +3113,8 @@ impl GrafeoDB {
         let mut sections: Vec<Box<dyn grafeo_common::storage::Section>> = Vec::new();
 
         // Layered store: serialize compact base + overlay + Catalog / non-vector
-        // indexes (G-E1.RO). Vectors remain G-E2.RO.
+        // indexes (G-E1.RO) + VectorStore (G-E2.RO). Catalog + VectorStore must be
+        // emitted after compact so RO reopen restores shells + topology.
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if let Some(ref layered) = self.layered_store {
             // Compact base section.
@@ -2940,11 +3123,42 @@ impl GrafeoDB {
             );
             sections.push(Box::new(compact_section));
 
-            // Overlay LPG section.
+            // Overlay LPG section (post-compact mutations; may be empty).
             let overlay = layered.overlay_store();
             let overlay_section =
                 grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(&overlay));
             sections.push(Box::new(overlay_section));
+
+            // Catalog (vector/text shells + schema) lives on the overlay store.
+            let catalog = catalog_section::CatalogSection::new(
+                Arc::clone(&self.catalog),
+                Arc::clone(&overlay),
+                {
+                    let tm = Arc::clone(&self.transaction_manager);
+                    move || tm.current_epoch().as_u64()
+                },
+            );
+            sections.push(Box::new(catalog));
+
+            // Vector indexes: persist HNSW topology to avoid rebuild on load.
+            #[cfg(feature = "vector-index")]
+            {
+                let indexes = overlay.vector_index_entries();
+                if !indexes.is_empty() {
+                    let vector = grafeo_core::index::vector::VectorStoreSection::new(indexes);
+                    sections.push(Box::new(vector));
+                }
+            }
+
+            // Text indexes: persist BM25 postings.
+            #[cfg(feature = "text-index")]
+            {
+                let indexes = overlay.text_index_entries();
+                if !indexes.is_empty() {
+                    let text = grafeo_core::index::text::TextIndexSection::new(indexes);
+                    sections.push(Box::new(text));
+                }
+            }
 
             // Overlay deletion log: persists base-node/edge tombstones
             // that have not yet been merged into the base. Without this,

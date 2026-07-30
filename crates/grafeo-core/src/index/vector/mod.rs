@@ -341,6 +341,35 @@ impl VectorIndexKind {
         }
     }
 
+    /// Adopt a zero-copy [`paged_topology::MmapTopology`] as the search graph.
+    ///
+    /// Prefer this over [`Self::restore_topology`] when topology bytes come
+    /// from a file-backed container mapping (G-E2.RO read-only open).
+    pub fn adopt_mmap_topology(&self, topo: paged_topology::MmapTopology) {
+        match self {
+            Self::Hnsw(idx) => idx.adopt_mmap_topology(topo),
+            Self::Quantized(idx) => idx.adopt_mmap_topology(topo),
+        }
+    }
+
+    /// Returns true when the topology is currently mmap-backed.
+    #[must_use]
+    pub fn is_mmap_backed(&self) -> bool {
+        match self {
+            Self::Hnsw(idx) => idx.is_mmap_backed(),
+            Self::Quantized(idx) => idx.is_mmap_backed(),
+        }
+    }
+
+    /// Bytes in the mmap topology buffer, if currently mmap-backed.
+    #[must_use]
+    pub fn mmap_topology_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Hnsw(idx) => idx.mmap_topology_bytes(),
+            Self::Quantized(idx) => idx.mmap_topology_bytes(),
+        }
+    }
+
     /// Rehydrate quantized payloads without topology rebuild.
     ///
     /// No-op for plain [`Hnsw`] shells (search uses LPG property accessor).
