@@ -104,6 +104,33 @@ impl CompactStoreSection {
         Ok(())
     }
 
+    /// Deserializes from a verified direct container mapping.
+    ///
+    /// Unlike [`Self::deserialize_from_bytes`], this retains one owner handle
+    /// on the resulting [`CompactStore`] so a mapping survives even when a
+    /// particular snapshot happens not to contain a column codec slice.
+    /// `data` must originate from the checked `GrafeoFileManager::mmap_section`
+    /// path; callers cannot use this to bypass container CRC validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the mapped payload is truncated, CRC-invalid at
+    /// the CompactStore layer, or otherwise fails the standard v1–v4 codec
+    /// reader. Failures do not expose unchecked slices to the caller.
+    pub fn deserialize_from_mapped_bytes(
+        &mut self,
+        data: bytes::Bytes,
+    ) -> grafeo_common::utils::error::Result<()> {
+        let mut store = deserialize_compact_store(&data).map_err(|e| {
+            grafeo_common::utils::error::Error::Internal(format!(
+                "CompactStore deserialization failed: {e}"
+            ))
+        })?;
+        store.retain_mapped_backing(data);
+        *self.store.write() = Some(Arc::new(store));
+        Ok(())
+    }
+
     /// Serializes at the requested format version.
     ///
     /// The default [`Section::serialize`] always writes [`FORMAT_VERSION`].

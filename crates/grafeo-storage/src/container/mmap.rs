@@ -8,6 +8,9 @@
 //! VectorStore, TextIndex, RdfRing, PropertyIndex). Data sections (Catalog,
 //! LpgStore, RdfStore) must be deserialized into RAM.
 
+use std::sync::Arc;
+
+use bytes::Bytes;
 use grafeo_common::storage::SectionType;
 
 use super::page_fetcher::AccessHint;
@@ -84,6 +87,17 @@ impl MmapSection {
         self.mmap.is_empty()
     }
 
+    /// Transfers a shared mapping owner into refcounted [`Bytes`].
+    ///
+    /// Clones and slices of the returned `Bytes` retain the mapping until the
+    /// final view is dropped. This is the safe bridge used by container-backed
+    /// CompactStore reads: the bytes never borrow the file manager and no
+    /// fabricated `'static` lifetime is involved.
+    #[must_use]
+    pub fn into_bytes(self: Arc<Self>) -> Bytes {
+        Bytes::from_owner(MmapBytesOwner { mapping: self })
+    }
+
     /// Advise the OS about the expected access pattern for a range.
     ///
     /// On Unix this delegates to `madvise` via `memmap2`. On Windows
@@ -117,6 +131,19 @@ impl MmapSection {
     }
 }
 
+/// `Bytes::from_owner` needs an owner that directly exposes the mapped bytes.
+/// Keeping the `Arc` here makes every `Bytes` clone/slice participate in the
+/// mapping lifetime rather than tying it to a file-manager lock or scope.
+struct MmapBytesOwner {
+    mapping: Arc<MmapSection>,
+}
+
+impl AsRef<[u8]> for MmapBytesOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.mapping.as_bytes()
+    }
+}
+
 impl AsRef<[u8]> for MmapSection {
     fn as_ref(&self) -> &[u8] {
         &self.mmap
@@ -130,5 +157,45 @@ impl std::fmt::Debug for MmapSection {
             .field("len", &self.mmap.len())
             .field("checksum", &format_args!("{:#010X}", self.checksum))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use super::MmapSection;
+    use grafeo_common::storage::SectionType;
+
+    #[test]
+    fn bytes_views_retain_and_then_release_the_mapping_owner() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(b"mapped CompactStore bytes")
+            .expect("write payload");
+        file.flush().expect("flush payload");
+
+        #[allow(unsafe_code)]
+        let mmap =
+            unsafe { memmap2::MmapOptions::new().map(file.as_file()) }.expect("mmap payload");
+        let mapping = Arc::new(MmapSection::new(mmap, SectionType::CompactStore, 0));
+        let weak = Arc::downgrade(&mapping);
+        let bytes = Arc::clone(&mapping).into_bytes();
+        let slice = bytes.slice(7..);
+
+        drop(mapping);
+        assert!(weak.upgrade().is_some(), "Bytes must retain the mapping");
+        assert_eq!(&slice[..], b"CompactStore bytes");
+
+        drop(bytes);
+        assert!(
+            weak.upgrade().is_some(),
+            "a live Bytes slice must retain the mapping"
+        );
+        drop(slice);
+        assert!(
+            weak.upgrade().is_none(),
+            "the mapping must release after the final Bytes view drains"
+        );
     }
 }
