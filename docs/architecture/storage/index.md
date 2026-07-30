@@ -71,6 +71,12 @@ graph TB
 
     `.grafeo` file format: section-based container with crash safety.
 
+-   **[CompactStore v5 mapped layout](compact-store-v5-mapped-layout.md)**
+
+    ---
+
+    G-EM0 decision and source contract for disk-native compact reopen.
+
 -   **[Ring Index](ring-index.md)**
 
     ---
