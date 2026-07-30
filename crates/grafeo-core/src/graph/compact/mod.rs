@@ -38,6 +38,7 @@ pub use builder::{CompactStoreBuilder, from_graph_store, from_graph_store_preser
 use std::sync::Arc;
 
 use arcstr::ArcStr;
+use bytes::Bytes;
 use grafeo_common::types::{EdgeId, NodeId};
 use grafeo_common::utils::hash::FxHashMap;
 
@@ -82,6 +83,14 @@ pub struct CompactStore {
     node_offset_to_id: Option<Vec<Vec<NodeId>>>,
     /// Reverse: rel_table_id index -> vec of original `EdgeId` per CSR position.
     edge_offset_to_id: Option<Vec<Vec<EdgeId>>>,
+    /// Full container mapping retained for a direct mapped read-only reopen.
+    ///
+    /// This is an owner handle only: it does not copy the mapped payload and
+    /// is intentionally excluded from [`Self::memory_bytes`]. The mapped
+    /// graph-view work in G-EM0.2 replaces the remaining proportional decoded
+    /// structures; retaining this handle guarantees no codec-free snapshot can
+    /// accidentally unmap while readers still hold the CompactStore.
+    mapped_backing: Option<Bytes>,
 }
 
 impl std::fmt::Debug for CompactStore {
@@ -149,7 +158,24 @@ impl CompactStore {
             edge_id_map: None,
             node_offset_to_id: None,
             edge_offset_to_id: None,
+            mapped_backing: None,
         }
+    }
+
+    /// Retains the owner for a verified direct container mapping.
+    ///
+    /// The mapping is released when this `CompactStore` and every clone of the
+    /// owner `Bytes` have been dropped. Callers must only pass bytes produced
+    /// from a successfully validated immutable container section.
+    pub fn retain_mapped_backing(&mut self, mapped_bytes: Bytes) {
+        self.mapped_backing = Some(mapped_bytes);
+    }
+
+    /// Returns the direct-container mapping length when this store was opened
+    /// from one, excluding it from anonymous heap accounting.
+    #[must_use]
+    pub fn mapped_backing_bytes(&self) -> Option<usize> {
+        self.mapped_backing.as_ref().map(Bytes::len)
     }
 
     /// Resolves a table_id to its [`NodeTable`].

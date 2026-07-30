@@ -51,6 +51,8 @@ pub use admin::{
 pub use auth::{Grant, Identity, Role, StatementKind};
 pub use catalog::{Catalog, CatalogError, IndexDefinition, IndexType};
 pub use config::{AccessMode, Config, ConfigError, DurabilityMode, GraphModel};
+#[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+pub use database::CompactBacking;
 pub use database::GrafeoDB;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use database::IndexedVectorRead;

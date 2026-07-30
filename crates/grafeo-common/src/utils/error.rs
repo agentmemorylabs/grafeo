@@ -66,6 +66,8 @@ pub enum ErrorCode {
     StorageCorrupted,
     /// Recovery from WAL failed.
     StorageRecoveryFailed,
+    /// Requested direct memory mapping is unavailable for this storage layout.
+    StorageDirectMmapUnavailable,
 
     // Validation errors (V)
     /// Request validation failed.
@@ -112,6 +114,7 @@ impl ErrorCode {
             Self::StorageFull => "GRAFEO-S001",
             Self::StorageCorrupted => "GRAFEO-S002",
             Self::StorageRecoveryFailed => "GRAFEO-S003",
+            Self::StorageDirectMmapUnavailable => "GRAFEO-S004",
 
             Self::InvalidInput => "GRAFEO-V001",
             Self::NodeNotFound => "GRAFEO-V002",
@@ -350,6 +353,9 @@ pub enum StorageError {
 
     /// Checkpoint failed.
     CheckpointFailed(String),
+
+    /// The section cannot be served through the direct mapped-read path.
+    DirectMmapUnavailable(String),
 }
 
 impl StorageError {
@@ -361,6 +367,7 @@ impl StorageError {
             Self::Full => ErrorCode::StorageFull,
             Self::InvalidWalEntry(_) | Self::CheckpointFailed(_) => ErrorCode::StorageCorrupted,
             Self::RecoveryFailed(_) => ErrorCode::StorageRecoveryFailed,
+            Self::DirectMmapUnavailable(_) => ErrorCode::StorageDirectMmapUnavailable,
         }
     }
 }
@@ -373,6 +380,9 @@ impl fmt::Display for StorageError {
             StorageError::InvalidWalEntry(msg) => write!(f, "Invalid WAL entry: {msg}"),
             StorageError::RecoveryFailed(msg) => write!(f, "Recovery failed: {msg}"),
             StorageError::CheckpointFailed(msg) => write!(f, "Checkpoint failed: {msg}"),
+            StorageError::DirectMmapUnavailable(msg) => {
+                write!(f, "Direct mmap unavailable: {msg}")
+            }
         }
     }
 }

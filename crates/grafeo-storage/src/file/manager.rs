@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use grafeo_common::utils::error::{Error, Result};
+use grafeo_common::utils::error::{Error, Result, StorageError};
 use parking_lot::Mutex;
 
 use super::format::{DATA_OFFSET, DbHeader, FileHeader};
@@ -729,24 +729,49 @@ impl GrafeoFileManager {
     ///
     /// Returns an error if:
     /// - The section is not mmap-able (data section)
+    /// - The section is encrypted (typed `DirectMmapUnavailable`)
     /// - The mmap system call fails
     /// - The CRC-32 checksum does not match (corrupt data)
+    ///
+    /// # Direct-mmap support matrix (G-EM0.1)
+    ///
+    /// | Layout | Direct mmap |
+    /// | --- | --- |
+    /// | Plaintext, `mmap_able`, non-zero length CompactStore/index | yes (CRC-verified) |
+    /// | Encrypted section (AES-GCM) | no — `DirectMmapUnavailable` |
+    /// | Non-`mmap_able` data section (LPG, Catalog, …) | no — `DirectMmapUnavailable` |
+    /// | Zero-length section | no — `DirectMmapUnavailable` |
+    /// | Compressed payload (none shipped today) | would need a separate design |
+    ///
+    /// CRC validation may fault every page into the OS file cache; it must not
+    /// copy the section into an anonymous `Vec`. Callers must not fall back to
+    /// `read_section_data` while still reporting a mapped backing diagnostic.
     #[allow(unsafe_code)]
     pub fn mmap_section(
         &self,
         entry: &grafeo_common::storage::SectionDirectoryEntry,
     ) -> Result<crate::container::MmapSection> {
+        // Direct mapping is valid only for the plaintext container bytes.
+        // AES-GCM sections require whole-section decryption today, so letting
+        // callers mmap ciphertext would either expose invalid bytes or tempt a
+        // silent eager fallback. A future page-decryption design can add a
+        // distinct mapped backend without weakening this fail-closed contract.
+        #[cfg(feature = "encryption")]
+        if self.section_encryptor.is_some() {
+            return Err(Error::Storage(StorageError::DirectMmapUnavailable(
+                "encrypted sections require page decryption before direct mmap".to_string(),
+            )));
+        }
+
         if !entry.flags.mmap_able {
-            return Err(Error::Internal(format!(
-                "section {:?} is not mmap-able (data sections must be deserialized)",
-                entry.section_type
+            return Err(Error::Storage(StorageError::DirectMmapUnavailable(
+                format!("section {:?} is not mmap-able", entry.section_type),
             )));
         }
 
         if entry.length == 0 {
-            return Err(Error::Internal(format!(
-                "section {:?} has zero length, cannot mmap",
-                entry.section_type
+            return Err(Error::Storage(StorageError::DirectMmapUnavailable(
+                format!("section {:?} has zero length", entry.section_type),
             )));
         }
 
@@ -1297,7 +1322,16 @@ mod tests {
 
         let result = manager.mmap_section(lpg_entry);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not mmap-able"));
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("not mmap-able"),
+            "unexpected error text: {err}"
+        );
+        // Typed fail-closed result — never a silent eager materialization.
+        match err {
+            Error::Storage(StorageError::DirectMmapUnavailable(_)) => {}
+            other => panic!("expected DirectMmapUnavailable, got {other:?}"),
+        }
     }
 
     #[test]

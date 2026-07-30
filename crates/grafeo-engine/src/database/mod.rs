@@ -87,6 +87,41 @@ use crate::query::cache::QueryCache;
 use crate::session::Session;
 use crate::transaction::TransactionManager;
 
+/// Actual backing selected for a reopened CompactStore base.
+///
+/// This is intentionally an observed runtime diagnostic rather than a
+/// configuration echo. In particular, `ContainerMmap` is only reported after
+/// `GrafeoFileManager::mmap_section` has verified the selected section CRC and
+/// the CompactStore has accepted its owner-backed bytes.
+#[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompactBacking {
+    /// Read-only base is owned by the immutable CompactStore section mapping.
+    ContainerMmap {
+        /// Stable identifier for this immutable container artifact.
+        artifact_id: String,
+        /// CompactStore payload version reported by the verified header.
+        payload_version: u8,
+        /// Bytes mapped from the container section; file-backed, not heap.
+        mapped_bytes: usize,
+    },
+    /// Compatibility path for writable opens and legacy layouts.
+    LegacyEager {
+        /// Stable identifier for the container artifact read eagerly.
+        artifact_id: String,
+        /// CompactStore payload version reported by the verified header.
+        payload_version: u8,
+        /// Complete payload bytes allocated by the compatibility reader.
+        payload_bytes: usize,
+    },
+}
+
+#[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+struct LoadedCompactBase {
+    store: Arc<grafeo_core::graph::compact::CompactStore>,
+    backing: CompactBacking,
+}
+
 /// Your handle to a Grafeo database.
 ///
 /// Start here. Create one with [`new_in_memory()`](Self::new_in_memory) for
@@ -199,6 +234,9 @@ pub struct GrafeoDB {
     /// `layered_store` via `swap_base()`.
     #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
     compact_tiered: Option<Arc<compact_tiered::CompactStoreTiered>>,
+    /// Observed compact-base backing after a persistent reopen.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    compact_backing: Option<CompactBacking>,
 }
 
 impl GrafeoDB {
@@ -393,9 +431,7 @@ impl GrafeoDB {
         // compacted database. The post-construction wiring uses this to
         // rebuild the LayeredStore + tier wrapper + overlay consumer.
         #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
-        let mut loaded_compact_base: Option<
-            Arc<grafeo_core::graph::compact::CompactStore>,
-        > = None;
+        let mut loaded_compact_base: Option<LoadedCompactBase> = None;
 
         // Phase 5e: snapshot of the OverlayDeletions section (if present),
         // applied after the LayeredStore is wired so that previously-deleted
@@ -425,7 +461,7 @@ impl GrafeoDB {
                         )?;
                         #[cfg(feature = "compact-store")]
                         {
-                            loaded_compact_base = Self::extract_compact_base(&fm)?;
+                            loaded_compact_base = Self::extract_compact_base(&fm, true)?;
                             loaded_overlay_deletions = Self::extract_overlay_deletions(&fm)?;
                         }
                     } else {
@@ -483,7 +519,7 @@ impl GrafeoDB {
                     )?;
                     #[cfg(feature = "compact-store")]
                     {
-                        loaded_compact_base = Self::extract_compact_base(&fm)?;
+                        loaded_compact_base = Self::extract_compact_base(&fm, false)?;
                         loaded_overlay_deletions = Self::extract_overlay_deletions(&fm)?;
                     }
                 } else {
@@ -661,6 +697,8 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+            compact_backing: None,
         };
 
         // Register storage sections as memory consumers for pressure tracking
@@ -672,8 +710,9 @@ impl GrafeoDB {
         // engine sees the full picture and the read/write paths route
         // through the layered store.
         #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
-        if let Some(compact_base) = loaded_compact_base {
-            db.wire_layered_after_load(compact_base, loaded_overlay_deletions)?;
+        if let Some(loaded) = loaded_compact_base {
+            db.compact_backing = Some(loaded.backing);
+            db.wire_layered_after_load(loaded.store, loaded_overlay_deletions)?;
         }
 
         // After Catalog shells + VectorStore topology + WAL + layered wiring,
@@ -815,6 +854,8 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+            compact_backing: None,
         })
     }
 
@@ -906,6 +947,8 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+            compact_backing: None,
         })
     }
 
@@ -1524,10 +1567,20 @@ impl GrafeoDB {
     /// section file, if present. Used by the open path to reconstruct
     /// the LayeredStore wiring after a previously-compacted database
     /// reopens.
+    ///
+    /// When `direct_mmap` is true (read-only open), this path never calls
+    /// [`GrafeoFileManager::read_section_data`] and never copies the full
+    /// section into an owned payload buffer. Mapping failures — including
+    /// encrypted layouts — fail closed with
+    /// [`StorageError::DirectMmapUnavailable`](grafeo_common::utils::error::StorageError::DirectMmapUnavailable)
+    /// rather than silently falling back to eager materialization.
+    /// Writable opens keep the legacy eager path and report
+    /// [`CompactBacking::LegacyEager`]; that is not Milestone R evidence.
     #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
     fn extract_compact_base(
         fm: &GrafeoFileManager,
-    ) -> Result<Option<Arc<grafeo_core::graph::compact::CompactStore>>> {
+        direct_mmap: bool,
+    ) -> Result<Option<LoadedCompactBase>> {
         use grafeo_common::storage::{Section, SectionType};
         let Some(dir) = fm.read_section_directory()? else {
             return Ok(None);
@@ -1535,10 +1588,38 @@ impl GrafeoDB {
         let Some(entry) = dir.find(SectionType::CompactStore) else {
             return Ok(None);
         };
-        let data = fm.read_section_data(entry)?;
+        let artifact_id = format!("container:{}:{:08x}", fm.path().display(), entry.checksum);
         let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
-        section.deserialize(&data)?;
-        Ok(section.store())
+        let backing = if direct_mmap {
+            let mapped = Arc::new(fm.mmap_section(entry)?);
+            let mapped_bytes = mapped.len();
+            let data = mapped.into_bytes();
+            let payload_version = data.get(4).copied().ok_or_else(|| {
+                Error::Internal("truncated CompactStore payload after mmap validation".into())
+            })?;
+            section.deserialize_from_mapped_bytes(data)?;
+            CompactBacking::ContainerMmap {
+                artifact_id,
+                payload_version,
+                mapped_bytes,
+            }
+        } else {
+            let data = fm.read_section_data(entry)?;
+            let payload_version = data.get(4).copied().ok_or_else(|| {
+                Error::Internal("truncated CompactStore payload after read validation".into())
+            })?;
+            let payload_bytes = data.len();
+            section.deserialize(&data)?;
+            CompactBacking::LegacyEager {
+                artifact_id,
+                payload_version,
+                payload_bytes,
+            }
+        };
+        let store = section.store().ok_or_else(|| {
+            Error::Internal("CompactStore section deserialized without a store".into())
+        })?;
+        Ok(Some(LoadedCompactBase { store, backing }))
     }
 
     /// Reads the persisted overlay deletion log from the container, if
@@ -2363,6 +2444,18 @@ impl GrafeoDB {
     #[must_use]
     pub fn compact_tiered(&self) -> Option<&Arc<compact_tiered::CompactStoreTiered>> {
         self.compact_tiered.as_ref()
+    }
+
+    /// Returns the actual backing selected for a reopened CompactStore base.
+    ///
+    /// `ContainerMmap` proves that this handle owns the immutable container
+    /// mapping directly. It is distinct from the legacy spill-sidecar tier and
+    /// from a directory `mmap_able` flag, neither of which proves the normal
+    /// reopen path avoided an owned full-section read.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    #[must_use]
+    pub fn compact_backing(&self) -> Option<&CompactBacking> {
+        self.compact_backing.as_ref()
     }
 
     /// Returns the query cache.
