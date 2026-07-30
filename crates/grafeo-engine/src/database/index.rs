@@ -95,7 +95,11 @@ impl super::GrafeoDB {
         property: &str,
         value: &grafeo_common::types::Value,
     ) -> Vec<grafeo_common::types::NodeId> {
-        self.lpg_store().find_nodes_by_property(property, value)
+        // After compact(), graph_store is the LayeredStore (base+overlay). Using
+        // lpg_store() alone only sees the overlay and misses CompactStore rows
+        // when no property index is present; with a full-postings overlay index
+        // LayeredStore routes exclusively through the index (G-E1.RO).
+        self.graph_store().find_nodes_by_property(property, value)
     }
 
     // =========================================================================

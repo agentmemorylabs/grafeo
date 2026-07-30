@@ -97,9 +97,10 @@ fn build_snapshot(path: &std::path::Path, node_count: usize) -> LiveExpectations
         text_top_ids: text_hits.iter().map(|(id, _)| id.as_u64()).collect(),
     };
 
-    assert!(
-        !expectations.prop_hits_for_rank_0.is_empty(),
-        "live property index must hit rank=0"
+    assert_eq!(
+        expectations.prop_hits_for_rank_0.len(),
+        1,
+        "live property index must hit rank=0 exactly once (no double-count)"
     );
     assert_eq!(
         expectations.prop_hits_for_rank_mid.len(),
@@ -109,6 +110,19 @@ fn build_snapshot(path: &std::path::Path, node_count: usize) -> LiveExpectations
     assert!(
         !expectations.text_top_ids.is_empty(),
         "live text index must find fox docs"
+    );
+
+    // Live post-create_index: planner Cypher WHERE + layered multi-predicate
+    // uniqueness (the bug the public find_nodes_by_property-only suite missed).
+    assert_cypher_rank_count_one(&db, 0);
+    assert_cypher_rank_count_one(&db, mid_rank);
+    let layered_multi = db
+        .graph_store()
+        .find_nodes_by_properties(&[("rank", Value::Int64(0))]);
+    assert_eq!(
+        layered_multi.len(),
+        1,
+        "live layered find_nodes_by_properties must not double-count after create_property_index"
     );
 
     db.close().expect("explicit close");
@@ -233,7 +247,49 @@ fn assert_reopen_parity(path: &std::path::Path, expected: &LiveExpectations) {
         "indexed property path must not invent hits for absent values"
     );
 
+    // Planner/session path (find_nodes_by_properties via Cypher WHERE): must
+    // not double-count base nodes that are also in overlay property postings.
+    assert_cypher_rank_count_one(&db, 0);
+    assert_cypher_rank_count_one(&db, expected.mid_rank);
+
+    // Layered multi-predicate uniqueness (same API the planner uses).
+    let layered = db
+        .graph_store()
+        .find_nodes_by_properties(&[("rank", Value::Int64(0))]);
+    assert_eq!(
+        layered.len(),
+        1,
+        "LayeredStore::find_nodes_by_properties must not double-count base IDs"
+    );
+    let mut layered_ids: Vec<u64> = layered.iter().map(|id| id.as_u64()).collect();
+    layered_ids.sort_unstable();
+    assert_eq!(layered_ids, exp0, "layered multi-predicate rank=0 set");
+
     db.close().expect("close");
+}
+
+/// Cypher WHERE property equality through the planner property-index path.
+fn assert_cypher_rank_count_one(db: &GrafeoDB, rank: i64) {
+    let session = db.session();
+    let q = format!("MATCH (n:CodeSymbol) WHERE n.rank = {rank} RETURN count(n) AS c");
+    let result = session.execute(&q).expect("cypher WHERE rank");
+    let rows = result.rows();
+    assert_eq!(rows.len(), 1, "count query returns one aggregation row");
+    match &rows[0][0] {
+        Value::Int64(n) => assert_eq!(
+            *n, 1,
+            "Cypher WHERE n.rank = {rank} must count exactly one node (got {n})"
+        ),
+        other => panic!("expected Int64 count, got {other:?}"),
+    }
+    // Also prove row-level uniqueness (not only aggregate).
+    let q_rows = format!("MATCH (n:CodeSymbol) WHERE n.rank = {rank} RETURN n.rank AS r");
+    let result_rows = session.execute(&q_rows).expect("cypher WHERE rows");
+    assert_eq!(
+        result_rows.rows().len(),
+        1,
+        "Cypher WHERE n.rank = {rank} must yield exactly one result row"
+    );
 }
 
 #[test]
