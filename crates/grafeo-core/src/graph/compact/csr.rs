@@ -234,14 +234,17 @@ impl CsrAdjacency {
     ///
     /// # Errors
     ///
-    /// Returns an error string if data is truncated.
+    /// Returns an error string if data is truncated or a count would require a
+    /// pathological pre-allocation beyond the remaining payload.
     pub fn read_from(data: &[u8], pos: &mut usize) -> Result<Self, &'static str> {
         let offsets_len = read_u32_le(data, pos)? as usize;
+        ensure_count_fits(offsets_len, *pos, data.len(), 4)?;
         let mut offsets = Vec::with_capacity(offsets_len);
         for _ in 0..offsets_len {
             offsets.push(read_u32_le(data, pos)?);
         }
         let targets_len = read_u32_le(data, pos)? as usize;
+        ensure_count_fits(targets_len, *pos, data.len(), 4)?;
         let mut targets = Vec::with_capacity(targets_len);
         for _ in 0..targets_len {
             targets.push(read_u32_le(data, pos)?);
@@ -250,6 +253,7 @@ impl CsrAdjacency {
         *pos += 1;
         let edge_data = if has_edge_data == 1 {
             let ed_len = read_u32_le(data, pos)? as usize;
+            ensure_count_fits(ed_len, *pos, data.len(), 4)?;
             let mut ed = Vec::with_capacity(ed_len);
             for _ in 0..ed_len {
                 ed.push(read_u32_le(data, pos)?);
@@ -276,6 +280,25 @@ impl CsrAdjacency {
 fn write_usize_as_u32(buf: &mut Vec<u8>, v: usize) {
     let n = u32::try_from(v).expect("value exceeds u32::MAX in CSR serialization");
     buf.extend_from_slice(&n.to_le_bytes());
+}
+
+/// Ensures `count * item_bytes` fits in the remaining payload before
+/// `Vec::with_capacity`, so corrupt lengths cannot request pathological
+/// allocations.
+fn ensure_count_fits(
+    count: usize,
+    pos: usize,
+    data_len: usize,
+    item_bytes: usize,
+) -> Result<(), &'static str> {
+    let remaining = data_len.saturating_sub(pos);
+    let fits = count
+        .checked_mul(item_bytes)
+        .is_some_and(|need| need <= remaining);
+    if !fits {
+        return Err("CSR count exceeds remaining payload");
+    }
+    Ok(())
 }
 
 fn read_u32_le(data: &[u8], pos: &mut usize) -> Result<u32, &'static str> {
@@ -341,5 +364,17 @@ mod tests {
         assert_eq!(csr.num_edges(), 0);
         assert_eq!(csr.source_for_position(0), None);
         assert_eq!(csr.memory_bytes(), 4); // 1 offset entry (sentinel)
+    }
+
+    #[test]
+    fn huge_offsets_len_fails_closed_without_pathological_alloc() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // offsets_len
+        let mut pos = 0;
+        let err = CsrAdjacency::read_from(&data, &mut pos).expect_err("must reject");
+        assert!(
+            err.contains("exceeds remaining") || err.contains("truncated"),
+            "unexpected error: {err}"
+        );
     }
 }

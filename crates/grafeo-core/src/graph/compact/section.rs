@@ -359,6 +359,18 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
 
     // Node tables.
     let num_node_tables = read_u32(data, &mut pos)? as usize;
+    if num_node_tables > usize::from(u16::MAX) {
+        return Err(format!(
+            "node_tables count {num_node_tables} exceeds u16::MAX"
+        ));
+    }
+    checked_count_for_alloc(
+        num_node_tables,
+        pos,
+        data.len(),
+        min_node_table_wire_bytes(version),
+        "node_tables",
+    )?;
     let mut node_tables = Vec::with_capacity(num_node_tables);
     let mut label_to_table_id: FxHashMap<arcstr::ArcStr, u16> = FxHashMap::default();
     let mut table_id_to_label: Vec<arcstr::ArcStr> = Vec::with_capacity(num_node_tables);
@@ -369,6 +381,13 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
         let label = arcstr::ArcStr::from(label.as_str());
         let row_count = read_u32(data, &mut pos)? as usize;
         let num_cols = read_u32(data, &mut pos)? as usize;
+        checked_count_for_alloc(
+            num_cols,
+            pos,
+            data.len(),
+            min_column_entry_wire_bytes(version),
+            "node_table columns",
+        )?;
 
         let mut columns: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
         let mut zone_maps: FxHashMap<PropertyKey, ZoneMap> = FxHashMap::default();
@@ -411,6 +430,18 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
 
     // Relationship tables.
     let num_rel_tables = read_u32(data, &mut pos)? as usize;
+    if num_rel_tables > usize::from(u16::MAX) {
+        return Err(format!(
+            "rel_tables count {num_rel_tables} exceeds u16::MAX"
+        ));
+    }
+    checked_count_for_alloc(
+        num_rel_tables,
+        pos,
+        data.len(),
+        min_rel_table_wire_bytes(version),
+        "rel_tables",
+    )?;
     let mut rel_tables = Vec::with_capacity(num_rel_tables);
     let mut edge_type_to_rel_id: FxHashMap<arcstr::ArcStr, Vec<u16>> = FxHashMap::default();
     let mut rel_table_id_to_type: Vec<arcstr::ArcStr> = Vec::with_capacity(num_rel_tables);
@@ -433,6 +464,13 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
         };
 
         let num_props = read_u32(data, &mut pos)? as usize;
+        checked_count_for_alloc(
+            num_props,
+            pos,
+            data.len(),
+            min_column_entry_wire_bytes(version),
+            "rel_table properties",
+        )?;
         let mut properties: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
         let mut prop_defs = Vec::with_capacity(num_props);
         for _ in 0..num_props {
@@ -507,6 +545,13 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
     // ID maps.
     if preserves_ids {
         let node_map_len = read_u32(data, &mut pos)? as usize;
+        checked_count_for_alloc(
+            node_map_len,
+            pos,
+            data.len(),
+            ID_MAP_ENTRY_WIRE_BYTES,
+            "node_id_map",
+        )?;
         let mut node_id_map = FxHashMap::with_capacity_and_hasher(node_map_len, Default::default());
         let num_tables = store.node_tables_by_id.len();
         let mut node_offset_to_id: Vec<Vec<NodeId>> = vec![Vec::new(); num_tables];
@@ -514,17 +559,43 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
             let nid = NodeId::new(read_u64(data, &mut pos)?);
             let tid = read_u16(data, &mut pos)?;
             let off = read_u64(data, &mut pos)?;
-            node_id_map.insert(nid, (tid, off));
+            // Fail closed on unknown table ids before forward-map insert or
+            // reverse-map growth — an out-of-range tid must not leave a
+            // dangling forward entry while skipping reverse validation.
+            let tid_idx = usize::from(tid);
+            let Some(rev) = node_offset_to_id.get_mut(tid_idx) else {
+                return Err(format!(
+                    "node_id_map unknown table id {tid} (num_tables {num_tables})"
+                ));
+            };
+            // Cap reverse-map fill by the owning table length so a single
+            // malicious offset cannot request unbounded growth. (Dense
+            // growth up to a trusted table len remains O(table rows).)
             let off_idx = usize::try_from(off).unwrap_or(usize::MAX);
-            if let Some(rev) = node_offset_to_id.get_mut(tid as usize) {
-                while rev.len() <= off_idx {
-                    rev.push(NodeId::INVALID);
-                }
-                rev[off_idx] = nid;
+            let max_len = store
+                .node_tables_by_id
+                .get(tid_idx)
+                .map_or(0, NodeTable::len);
+            if off_idx >= max_len {
+                return Err(format!(
+                    "node_id_map offset {off} out of range for table {tid} (len {max_len})"
+                ));
             }
+            while rev.len() <= off_idx {
+                rev.push(NodeId::INVALID);
+            }
+            rev[off_idx] = nid;
+            node_id_map.insert(nid, (tid, off));
         }
 
         let edge_map_len = read_u32(data, &mut pos)? as usize;
+        checked_count_for_alloc(
+            edge_map_len,
+            pos,
+            data.len(),
+            ID_MAP_ENTRY_WIRE_BYTES,
+            "edge_id_map",
+        )?;
         let mut edge_id_map = FxHashMap::with_capacity_and_hasher(edge_map_len, Default::default());
         let num_rel = store.rel_tables_by_id.len();
         let mut edge_offset_to_id: Vec<Vec<EdgeId>> = vec![Vec::new(); num_rel];
@@ -532,14 +603,29 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
             let eid = EdgeId::new(read_u64(data, &mut pos)?);
             let rtid = read_u16(data, &mut pos)?;
             let csr_pos = read_u64(data, &mut pos)?;
-            edge_id_map.insert(eid, (rtid, csr_pos));
+            // Fail closed on unknown rel-table ids before forward-map insert
+            // or reverse-map growth.
+            let rtid_idx = usize::from(rtid);
+            let Some(rev) = edge_offset_to_id.get_mut(rtid_idx) else {
+                return Err(format!(
+                    "edge_id_map unknown rel table id {rtid} (num_rel_tables {num_rel})"
+                ));
+            };
             let pos_idx = usize::try_from(csr_pos).unwrap_or(usize::MAX);
-            if let Some(rev) = edge_offset_to_id.get_mut(rtid as usize) {
-                while rev.len() <= pos_idx {
-                    rev.push(EdgeId::INVALID);
-                }
-                rev[pos_idx] = eid;
+            let max_len = store
+                .rel_tables_by_id
+                .get(rtid_idx)
+                .map_or(0, RelTable::num_edges);
+            if pos_idx >= max_len {
+                return Err(format!(
+                    "edge_id_map csr_pos {csr_pos} out of range for rel table {rtid} (len {max_len})"
+                ));
             }
+            while rev.len() <= pos_idx {
+                rev.push(EdgeId::INVALID);
+            }
+            rev[pos_idx] = eid;
+            edge_id_map.insert(eid, (rtid, csr_pos));
         }
 
         store.set_id_maps(
@@ -685,6 +771,71 @@ fn write_optional_value(
 }
 
 // ── Read helpers ───────────────────────────────────────────────────
+
+/// Rejects decoded counts that cannot fit in the remaining payload before any
+/// `Vec`/`HashMap` pre-allocation.
+///
+/// `pos` must already be past the count field. `min_item_bytes` is a
+/// conservative lower bound on the on-wire size of each counted item (at least
+/// 1). Overflow and oversize counts fail closed so malformed supported
+/// payloads cannot request pathological capacity.
+fn checked_count_for_alloc(
+    count: usize,
+    pos: usize,
+    data_len: usize,
+    min_item_bytes: usize,
+    what: &str,
+) -> Result<(), String> {
+    debug_assert!(min_item_bytes >= 1);
+    let remaining = data_len.saturating_sub(pos);
+    let fits = count
+        .checked_mul(min_item_bytes)
+        .is_some_and(|need| need <= remaining);
+    if !fits {
+        return Err(format!(
+            "{what} count {count} exceeds remaining payload ({remaining} bytes)"
+        ));
+    }
+    Ok(())
+}
+
+/// Minimum on-wire bytes for an empty node table header after its count slot:
+/// label length prefix + `row_count` + `num_cols`.
+fn min_node_table_wire_bytes(version: u8) -> usize {
+    let label_len_bytes = match version {
+        FORMAT_VERSION => 4,
+        _ => 2,
+    };
+    label_len_bytes + 4 + 4
+}
+
+/// Minimum on-wire bytes for an empty relationship table header after its
+/// count slot: edge-type length prefix + src/dst table ids + empty CSR
+/// (`offsets_len`, `targets_len`, no edge_data) + bwd flag + `num_props`.
+fn min_rel_table_wire_bytes(version: u8) -> usize {
+    let edge_type_len_bytes = match version {
+        FORMAT_VERSION => 4,
+        _ => 2,
+    };
+    // CSR empty: u32 offsets_len + u32 targets_len + u8 has_edge_data(=0).
+    let csr_min = 4 + 4 + 1;
+    edge_type_len_bytes + 2 + 2 + csr_min + 1 + 4
+}
+
+/// Minimum on-wire bytes for a column/property entry after its count slot:
+/// key length prefix + zone-map flag (node columns) or codec tag alone.
+fn min_column_entry_wire_bytes(version: u8) -> usize {
+    let key_len_bytes = match version {
+        FORMAT_VERSION => 4,
+        _ => 2,
+    };
+    // Node columns: key + has_zm flag. Edge props omit the flag but still need
+    // a codec tag (≥1). Use the smaller bound so valid edge props pass.
+    key_len_bytes + 1
+}
+
+/// Fixed on-wire size of one id-map entry: id u64 + table id u16 + offset u64.
+const ID_MAP_ENTRY_WIRE_BYTES: usize = 8 + 2 + 8;
 
 fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16, String> {
     if *pos + 2 > data.len() {
@@ -1440,6 +1591,153 @@ mod tests {
         assert_eq!(section.version(), 4);
         let bytes = section.serialize().unwrap();
         assert_eq!(bytes[4], 4);
+    }
+
+    /// Malformed supported v4: CRC-valid header-only payload whose trailing
+    /// CRC bytes would otherwise be reinterpreted as `num_node_tables` and
+    /// drive a pathological `Vec::with_capacity`. Must fail closed with a
+    /// bounds error — never allocate gigabytes or abort.
+    #[test]
+    fn e0_malformed_v4_header_only_fails_closed_without_pathological_alloc() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"GCST");
+        payload.push(FORMAT_VERSION);
+        payload.push(0);
+        let crc = crc32fast::hash(&payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(payload.len(), 10);
+
+        let mut section = CompactStoreSection::empty();
+        let err = section
+            .deserialize(&payload)
+            .expect_err("header-only v4 must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds remaining payload")
+                || msg.contains("node_tables")
+                || msg.contains("truncated"),
+            "expected checked-bounds error, got: {msg}"
+        );
+    }
+
+    /// Explicit huge `num_node_tables` on a tiny CRC-valid v4 payload.
+    #[test]
+    fn e0_malformed_v4_huge_node_table_count_fails_closed_without_pathological_alloc() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"GCST");
+        payload.push(FORMAT_VERSION);
+        payload.push(0); // flags: no id maps
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // num_node_tables
+        let crc = crc32fast::hash(&payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+
+        let mut section = CompactStoreSection::empty();
+        let err = section
+            .deserialize(&payload)
+            .expect_err("huge node_tables count must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds remaining payload")
+                || msg.contains("node_tables")
+                || msg.contains("u16::MAX"),
+            "expected checked-bounds error, got: {msg}"
+        );
+    }
+
+    /// Recompute trailing CRC32 over `payload[..len-4]` after a surgical mutate.
+    fn reseal_section_crc(payload: &mut [u8]) {
+        assert!(payload.len() >= 4, "section payload too short for CRC");
+        let body_end = payload.len() - 4;
+        let crc = crc32fast::hash(&payload[..body_end]);
+        payload[body_end..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Malformed supported v4: `node_id_map` entry references a table id that
+    /// does not exist. Must fail closed before accepting an inconsistent
+    /// forward map or growing reverse vectors against an unknown table.
+    #[test]
+    fn e0_malformed_v4_invalid_node_table_id_in_id_map_fails_closed() {
+        let store = LpgStore::new().unwrap();
+        let _ = store.create_node(&["Person"]);
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        assert_eq!(compact.node_tables_by_id.len(), 1);
+        assert!(compact.preserves_ids());
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let mut bytes = section.serialize().unwrap();
+        assert_eq!(bytes[4], FORMAT_VERSION);
+        assert_ne!(bytes[5] & 0x01, 0, "preserves_ids flag must be set");
+
+        // Trailing layout before CRC:
+        //   node_map_len(4) | entry(nid u64, tid u16, off u64) | edge_map_len(4)=0
+        // tid sits 14 bytes before CRC start: edge_map_len(4) + off(8) + tid(2).
+        let tid_off = bytes.len() - 4 /*crc*/ - 4 /*edge_map_len*/ - 8 /*off*/ - 2 /*tid*/;
+        let old_tid = u16::from_le_bytes([bytes[tid_off], bytes[tid_off + 1]]);
+        assert_eq!(
+            old_tid, 0,
+            "expected sole node table id 0 before corruption"
+        );
+        // Out-of-range tid (only table 0 exists). Previously this inserted into
+        // the forward map and skipped reverse validation — fail open.
+        bytes[tid_off..tid_off + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        reseal_section_crc(&mut bytes);
+
+        let mut section2 = CompactStoreSection::empty();
+        let err = section2
+            .deserialize(&bytes)
+            .expect_err("unknown node table id must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown table id") && msg.contains("node_id_map"),
+            "expected unknown node table id error, got: {msg}"
+        );
+        assert!(
+            section2.store().is_none(),
+            "must not accept a partially decoded / inconsistent store"
+        );
+    }
+
+    /// Malformed supported v4: `edge_id_map` entry references a relationship
+    /// table id that does not exist. Must fail closed without accepting an
+    /// inconsistent edge map.
+    #[test]
+    fn e0_malformed_v4_invalid_rel_table_id_in_id_map_fails_closed() {
+        let store = LpgStore::new().unwrap();
+        let a = store.create_node(&["Person"]);
+        let b = store.create_node(&["Person"]);
+        store.create_edge(a, b, "KNOWS");
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        assert_eq!(compact.rel_tables_by_id.len(), 1);
+        assert!(compact.preserves_ids());
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let mut bytes = section.serialize().unwrap();
+        assert_eq!(bytes[4], FORMAT_VERSION);
+        assert_ne!(bytes[5] & 0x01, 0, "preserves_ids flag must be set");
+
+        // Trailing layout before CRC ends with one edge_id_map entry:
+        //   ... | edge_map_len(4)=1 | eid u64 | rtid u16 | csr_pos u64 | crc
+        // rtid sits 14 bytes before end: crc(4) + csr_pos(8) + rtid(2).
+        let rtid_off = bytes.len() - 4 /*crc*/ - 8 /*csr_pos*/ - 2 /*rtid*/;
+        let old_rtid = u16::from_le_bytes([bytes[rtid_off], bytes[rtid_off + 1]]);
+        assert_eq!(
+            old_rtid, 0,
+            "expected sole rel table id 0 before corruption"
+        );
+        bytes[rtid_off..rtid_off + 2].copy_from_slice(&1u16.to_le_bytes());
+        reseal_section_crc(&mut bytes);
+
+        let mut section2 = CompactStoreSection::empty();
+        let err = section2
+            .deserialize(&bytes)
+            .expect_err("unknown rel table id must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown rel table id") && msg.contains("edge_id_map"),
+            "expected unknown rel table id error, got: {msg}"
+        );
+        assert!(
+            section2.store().is_none(),
+            "must not accept a partially decoded / inconsistent store"
+        );
     }
 
     #[test]

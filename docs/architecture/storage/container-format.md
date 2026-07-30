@@ -88,7 +88,7 @@ Maximum capacity: 127 sections (`(4096 - 8) / 32`).
 | Offset | Size | Type | Field | Description |
 |--------|------|------|-------|-------------|
 | 0 | 4 | `u32 LE` | `section_type` | Section type ID (see table below) |
-| 4 | 1 | `u8` | `version` | Per-section format version |
+| 4 | 1 | `u8` | `version` | Per-section format version (see Truthful directory versions) |
 | 5 | 1 | `u8` | `flags` | Bit 0: required, Bit 1: mmap-able |
 | 6 | 2 | `u16 LE` | `reserved` | Zero |
 | 8 | 8 | `u64 LE` | `offset` | Byte offset from file start |
@@ -97,6 +97,27 @@ Maximum capacity: 127 sections (`(4096 - 8) / 32`).
 | 28 | 4 | `u32 LE` | `reserved` | Zero |
 
 Remaining bytes after the last entry are zero-filled to 4 KiB.
+
+### Truthful directory versions (G-F0.1)
+
+The directory entry `version` byte is the per-section format version declared
+by that section's `Section::version()` implementation.
+
+- **New writers** (`GrafeoFileManager::write_versioned_sections`, used by
+  engine flush) record each section's declared version in the directory.
+- **Legacy callers** of `write_sections` still emit directory version `1` for
+  every section (tests and opaque-byte writers).
+- **Historical caveat:** shared writers prior to G-F0.1 often recorded outer
+  directory version `1` for every section even when the payload itself was a
+  later format (for example CompactStore payload v2/v3 with outer entry v1).
+  Readers must continue to dispatch from the **payload** header (for example
+  the CompactStore `GCST` version byte), not require outer directory version
+  equals payload version. Do **not** add a strict outer-equals-payload gate
+  that would reject valid historical files.
+- **Unknown section types:** if the type id is not recognized and
+  `flags.required` is clear, the entry is skipped so older binaries can open
+  files that carry newer optional indexes. If `flags.required` is set, open
+  fails closed.
 
 ---
 
@@ -169,6 +190,11 @@ even when the payload itself was CompactStore v2/v3. Readers must continue to
 dispatch from the **payload** header (e.g. `GCST` version byte), not require
 outer directory version equals payload version. Do not add a strict
 outer-equals-payload gate that would reject valid historical files.
+
+Payload-version dispatch remains owned by each section deserializer. Directory
+version metadata records the writer-declared section version for tooling and
+independent evolution; it is not a substitute payload parser or a strict
+outer-version gate.
 
 ### CompactStore payload (`GCST`)
 
