@@ -102,15 +102,20 @@ Remaining bytes after the last entry are zero-filled to 4 KiB.
 
 ## Section Types
 
+Values and default flags match `SectionType` / `SectionType::default_flags`
+in `grafeo-common` (not every historical doc snapshot).
+
 | Value | Name | Required | Mmap-able | Description |
 |-------|------|----------|-----------|-------------|
-| 1 | `CATALOG` | yes | no | Schema defs, index metadata, epoch, config |
-| 2 | `LPG_STORE` | yes | no | Nodes, edges, properties, named graphs |
-| 3 | `RDF_STORE` | no | no | RDF triples, named graphs |
-| 10 | `VECTOR_STORE` | no | yes | Embeddings + HNSW topology |
-| 11 | `TEXT_INDEX` | no | yes | BM25 postings + term dictionary |
-| 12 | `RDF_RING` | no | yes | Wavelet trees + dictionary |
-| 20 | `PROPERTY_INDEX` | no | yes | Property hash/btree indexes |
+| 1 | `Catalog` | yes | no | Schema defs, index metadata, epoch, config |
+| 2 | `LpgStore` | yes | no | Nodes, edges, properties, named graphs |
+| 3 | `RdfStore` | no | no | RDF triples, named graphs |
+| 4 | `CompactStore` | yes | yes | Columnar compact base (`GCST` payload) |
+| 5 | `OverlayDeletions` | no | no | Layered base-deletion tombstones |
+| 10 | `VectorStore` | no | yes | Embeddings + HNSW topology |
+| 11 | `TextIndex` | no | yes | BM25 postings + term dictionary |
+| 12 | `RdfRing` | no | yes | Wavelet trees + dictionary |
+| 20 | `PropertyIndex` | no | yes | Property hash/btree indexes |
 
 **Type ranges:**
 
@@ -123,12 +128,13 @@ Remaining bytes after the last entry are zero-filled to 4 KiB.
 - **Bit 0 (required):** If set, older binaries that don't recognize this
   section type must refuse to open the file. If clear, the section can be
   safely skipped (the database opens without that index).
-- **Bit 1 (mmap-able):** If set, the section uses a fixed binary layout
-  suitable for zero-copy memory-mapped access. If clear, the section must
-  be deserialized into RAM (bincode format).
+- **Bit 1 (mmap-able):** Capability flag: the section layout is intended to
+  support memory-mapped access. It does **not** mean the current container
+  open path always mmaps that section (see Memory-Mapped Section Access).
 
 **Empty sections** are omitted from the directory entirely. If no RDF data
-exists, there is no `RDF_STORE` entry.
+exists, there is no `RdfStore` entry. CompactStore appears only after
+`compact()` (or an equivalent layered write).
 
 ---
 
@@ -139,25 +145,63 @@ page-aligned (4 KiB) offset. The next section starts at the first 4 KiB
 boundary after the previous section ends.
 
 ```
-0x4000  [CATALOG data ................] pad
-0x5000  [LPG_STORE data ..............] pad
-0xA000  [VECTOR_STORE data ...........] pad
+0x4000  [Catalog data ................] pad
+0x5000  [LpgStore data ..............] pad
+0xA000  [VectorStore data ...........] pad
 ...
 ```
 
-### Data Section Encoding (Catalog, LPG, RDF)
+### Per-type encoding
 
-Data sections use **bincode** serialization (standard configuration). They
-are fully deserialized into RAM on load. The internal format is
-version-specific (the `version` byte in the directory entry allows
-independent evolution).
+Encoding is **not** uniformly bincode:
 
-### Index Section Encoding (Vector, Text, Ring, Property)
+| Section | Encoding | Notes |
+|---------|----------|-------|
+| `Catalog`, `LpgStore`, `RdfStore` | bincode | Fully deserialized into RAM on ordinary open |
+| `CompactStore` | Custom **`GCST`** payload (see below) | Column codecs + section-level strings; CRC32 trailer |
+| `OverlayDeletions` | dedicated deletions codec | Base tombstones for layered reopen |
+| `VectorStore`, `TextIndex`, `RdfRing`, `PropertyIndex` | bincode (v1 today) | `mmap_able` marks future/optional zero-copy layouts |
 
-Index sections use **bincode** serialization currently (version 1). Future
-versions may switch to fixed binary layouts for zero-copy mmap access.
-The `mmap_able` flag indicates whether the section can be memory-mapped
-after being written.
+The directory entry `version` byte is the per-section format version.
+**Historical caveat:** shared writers prior to the truthful directory-version
+work (`G-F0.1`) often recorded outer directory version `1` for every section
+even when the payload itself was CompactStore v2/v3. Readers must continue to
+dispatch from the **payload** header (e.g. `GCST` version byte), not require
+outer directory version equals payload version. Do not add a strict
+outer-equals-payload gate that would reject valid historical files.
+
+### CompactStore payload (`GCST`)
+
+```text
+Magic: "GCST" (4 bytes)
+Payload version: u8
+Flags: u8
+… column tables, zone maps, CSR, optional ID maps …
+CRC32: u32 LE over all preceding payload bytes
+```
+
+| Payload version | Section-level string length | Status |
+|-----------------|----------------------------|--------|
+| 1 | `u16` LE | Read-only compatibility |
+| 2 | `u16` LE | Read-only compatibility |
+| 3 | `u16` LE | Read-only compatibility |
+| **4** | **`u32` LE** | **Current writer** |
+
+“Section-level string” means labels, property keys, edge types, and zone-map
+`Value::String` min/max fields (the path that previously panicked above
+65,535 bytes). Column dictionary string bodies already used `u32` lengths
+and are unchanged in v4.
+
+- New writers emit payload version **4**.
+- New readers accept v1–v4.
+- Old binaries that only understand ≤v3 must **fail closed** on v4 (no silent
+  misparse).
+- Overflow of the active length width returns `Error::Serialization`
+  (`GRAFEO-X002`), never a panic in a destructor.
+
+Truthful recording of each section’s declared directory version for *all*
+section types is specified and tested in the separate `G-F0.1` packet; E-0
+only changes the CompactStore payload codec.
 
 ---
 
@@ -193,17 +237,36 @@ alternation ensures atomicity of the commit point (step 8).
 
 ## Memory-Mapped Section Access
 
-After a checkpoint, index sections with `flags.mmap_able = true` can be
-memory-mapped for zero-copy read access. This is the foundation for tiered
-storage: when RAM is scarce, index sections are flushed to the container
-and served via mmap instead of keeping the full data in heap memory.
+`flags.mmap_able = true` is a **capability** bit (the layout is intended to
+support mmap). It is **not** proof that the current open path maps that
+section.
 
-**Lifecycle:**
+### Current container open (as of CompactStore E-0)
+
+Ordinary container reopen still:
+
+1. Reads the CompactStore section into an owned `Vec<u8>` (`read_section_data`)
+2. Copies into `Bytes` at the `Section::deserialize` boundary
+3. Reconstructs heap-resident `CompactStore` state (including dictionary strings)
+
+ForceDisk / spill can later re-serialize the live store into a sidecar and mmap
+that sidecar, but only **after** the eager load. Peak open memory therefore
+still tracks the full compact payload until a separate direct-container-mmap
+lifecycle (E-M0) lands.
+
+Do **not** advertise direct mmap reopen of the CompactStore section inside the
+`.grafeo` container until that dedicated open-path work ships. The
+`mmap_section` helper and `deserialize_from_bytes(Bytes)` entry points exist
+for that future path; they are not the default container open today.
+
+### Intended mmap lifecycle (indexes / future CompactStore)
+
+Where an implementation actually maps a section:
 
 1. Engine flushes dirty sections via checkpoint
-2. Engine calls `mmap_section()` for index sections
-3. CRC-32 is verified against the mmap'd bytes (also warms page cache)
-4. Engine drops in-memory copy of the section data
+2. Engine calls `mmap_section()` for eligible sections
+3. CRC-32 is verified against the mapped bytes (also warms page cache)
+4. Engine drops any temporary in-memory copy of the section data
 5. Reads go through the mmap (OS page cache manages eviction)
 6. Before next checkpoint: drop all mmaps, then write
 
@@ -273,4 +336,6 @@ is stopped before the final checkpoint to prevent races.
 | Version | Format | Notes |
 |---------|--------|-------|
 | v1 (0.5.0-0.5.34) | Monolithic blob at `DATA_OFFSET` | Single bincode snapshot |
-| v2 (0.5.35+) | Section-based with directory at `0x3000` | Independent sections, mmap support |
+| v2 (0.5.35+) | Section-based with directory at `0x3000` | Independent sections, mmap capability flags |
+| CompactStore payload v1–v3 | `GCST` section body | Section-level strings use `u16` lengths |
+| CompactStore payload **v4** | `GCST` section body | Section-level strings use `u32` lengths; current writer |
