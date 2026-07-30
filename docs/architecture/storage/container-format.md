@@ -192,7 +192,15 @@ CRC32: u32 LE over all preceding payload bytes
 65,535 bytes). Column dictionary string bodies already used `u32` lengths
 and are unchanged in v4.
 
-- New writers emit payload version **4**.
+- The E-0 writer emits payload version **4** (legacy/current on the accepted
+  base).
+- G-EM0.R0 selects payload version **5** for disk-native reopen. Version 5
+  keeps the outer `CompactStore` section type but adds a checked in-payload
+  range directory so readers can map metadata, columns, CSR arrays,
+  dictionaries, zone maps, and ID lookup ranges without copying the section.
+  See [CompactStore v5 mapped layout](compact-store-v5-mapped-layout.md) for
+  the source inventory, exact header/directory contract, compatibility rules,
+  and RED verification list. Existing v1-v4 readers remain supported.
 - New readers accept v1–v4.
 - Old binaries that only understand ≤v3 must **fail closed** on v4 (no silent
   misparse).
