@@ -35,9 +35,9 @@
 //! let results = index.search(&query, 10, &acc);
 //! ```
 
-use super::VectorAccessor;
 use super::quantization::{BinaryQuantizer, ProductQuantizer, QuantizationType, ScalarQuantizer};
-use super::{HnswConfig, HnswIndex, compute_distance};
+use super::VectorAccessor;
+use super::{compute_distance, HnswConfig, HnswIndex};
 use grafeo_common::types::NodeId;
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
@@ -774,6 +774,23 @@ impl QuantizedHnswIndex {
             .restore_topology(entry_point, max_level, node_data);
     }
 
+    /// Adopt a zero-copy [`MmapTopology`] for the underlying HNSW graph.
+    pub fn adopt_mmap_topology(&self, topo: super::paged_topology::MmapTopology) {
+        self.hnsw.adopt_mmap_topology(topo);
+    }
+
+    /// Returns true when the underlying topology is mmap-backed.
+    #[must_use]
+    pub fn is_mmap_backed(&self) -> bool {
+        self.hnsw.is_mmap_backed()
+    }
+
+    /// Bytes in the mmap topology buffer, if currently mmap-backed.
+    #[must_use]
+    pub fn mmap_topology_bytes(&self) -> Option<usize> {
+        self.hnsw.mmap_topology_bytes()
+    }
+
     /// Rehydrate full-precision payloads and quantized codes **without**
     /// rebuilding HNSW topology.
     ///
@@ -845,7 +862,6 @@ impl QuantizedHnswIndex {
         }
     }
 
-
     /// Drop in-process quantized payloads (codes + optional f32 map).
     /// Topology and Catalog mode remain. Search falls back to accessor-backed
     /// exact distances until codes are rehydrated again.
@@ -880,10 +896,7 @@ impl QuantizedHnswIndex {
     }
 
     /// Install binary codes without retaining full-precision vectors.
-    pub fn rehydrate_binary_codes_only(
-        &self,
-        codes: impl IntoIterator<Item = (NodeId, Vec<u64>)>,
-    ) {
+    pub fn rehydrate_binary_codes_only(&self, codes: impl IntoIterator<Item = (NodeId, Vec<u64>)>) {
         {
             let mut map = self.binary_vectors.write();
             for (id, code) in codes {

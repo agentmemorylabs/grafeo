@@ -56,6 +56,8 @@ pub use database::CompactBacking;
 pub use database::GrafeoDB;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use database::IndexedVectorRead;
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+pub use database::{VectorIndexBacking, VectorPayloadBacking, VectorTopologyBacking};
 pub use grafeo_core::graph::{GraphStore, GraphStoreMut, ProjectionSpec};
 pub use memory_usage::MemoryUsage;
 #[cfg(feature = "metrics")]

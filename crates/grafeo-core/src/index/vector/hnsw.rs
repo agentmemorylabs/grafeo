@@ -387,6 +387,18 @@ impl HnswIndex {
         matches!(*self.nodes.read(), TopologyBackend::Mmap(_))
     }
 
+    /// Bytes in the mmap topology buffer, if currently mmap-backed.
+    ///
+    /// Returns `None` for heap backends. When the buffer was sliced from a
+    /// container section mapping these bytes are file-backed, not anonymous.
+    #[must_use]
+    pub fn mmap_topology_bytes(&self) -> Option<usize> {
+        match &*self.nodes.read() {
+            TopologyBackend::Mmap(topo) => Some(topo.mapped_bytes()),
+            TopologyBackend::Heap(_) => None,
+        }
+    }
+
     /// Returns estimated heap memory in bytes for the HNSW topology.
     ///
     /// In mmap mode, returns only the small struct overhead — the

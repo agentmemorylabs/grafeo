@@ -23,8 +23,8 @@
 //! On the next checkpoint after a v1→v2 read, the section serializes
 //! the in-memory topologies as v2, completing the migration.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::types::NodeId;
 use grafeo_common::utils::error::{Error, Result};
 
-use super::paged_topology::{deserialize_topology, serialize_topology};
+use super::paged_topology::{deserialize_topology, serialize_topology, MmapTopology};
 use super::{DistanceMetric, VectorIndexKind};
 
 /// Current vector store section format version.
@@ -110,6 +110,31 @@ impl VectorStoreSection {
     /// Mark this section as dirty.
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Restore topologies from owner-backed section bytes without a full heap rebuild.
+    ///
+    /// Prefer this on read-only container open after
+    /// `GrafeoFileManager::mmap_section` + `into_bytes`. Each index adopts an
+    /// [`MmapTopology`] over a zero-copy `Bytes` slice of the section mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error on truncated/corrupt envelopes, bad magic,
+    /// unsupported version, empty topology for a matched key, or when the
+    /// section body does not restore any catalog index keys.
+    pub fn restore_from_mapped_bytes(&mut self, data: Bytes) -> Result<()> {
+        if data.is_empty() {
+            return Err(Error::Serialization(
+                "Vector Store section is empty (fail-closed)".to_string(),
+            ));
+        }
+        if data.len() >= 4 && &data[0..4] == V2_MAGIC {
+            deserialize_v2(data, &mut self.indexes, true)
+        } else {
+            // Legacy v1 is always heap-restored; mmap topology is v2-only.
+            deserialize_v1(data.as_ref(), &mut self.indexes)
+        }
     }
 }
 
@@ -195,27 +220,38 @@ fn serialize_v2(indexes: &[(String, Arc<VectorIndexKind>)]) -> Result<Vec<u8>> {
 }
 
 /// Restores indexes from a v2 paged envelope.
-fn deserialize_v2(data: &[u8], indexes: &mut [(String, Arc<VectorIndexKind>)]) -> Result<()> {
+///
+/// When `prefer_mmap` is true, each index adopts a zero-copy
+/// [`MmapTopology`] over a `Bytes` slice (file-backed when `data` is an
+/// mmap owner). When false, topology is fully decoded into a heap HashMap
+/// via [`deserialize_topology`] + [`VectorIndexKind::restore_topology`]
+/// (writable open / mutation-friendly path).
+fn deserialize_v2(
+    data: Bytes,
+    indexes: &mut [(String, Arc<VectorIndexKind>)],
+    prefer_mmap: bool,
+) -> Result<()> {
     let bincode_config = bincode::config::standard();
+    let slice = data.as_ref();
 
-    if data.len() < V2_HEADER_SIZE {
+    if slice.len() < V2_HEADER_SIZE {
         return Err(Error::Serialization(
             "Vector Store v2 header truncated".to_string(),
         ));
     }
-    if &data[0..4] != V2_MAGIC {
+    if &slice[0..4] != V2_MAGIC {
         return Err(Error::Serialization(
             "Vector Store v2 bad magic".to_string(),
         ));
     }
-    let version = data[4];
+    let version = slice[4];
     if version != VECTOR_SECTION_VERSION {
         return Err(Error::Serialization(format!(
             "Vector Store v2 unsupported version: {version}"
         )));
     }
     let n_u64 = u64::from_le_bytes(
-        data[8..16]
+        slice[8..16]
             .try_into()
             .expect("slice length 8 fits u64 array"),
     );
@@ -228,32 +264,33 @@ fn deserialize_v2(data: &[u8], indexes: &mut [(String, Arc<VectorIndexKind>)]) -
     let body_start = V2_HEADER_SIZE
         .checked_add(dir_size)
         .ok_or_else(|| Error::Serialization("v2 directory size overflow".into()))?;
-    if data.len() < body_start {
+    if slice.len() < body_start {
         return Err(Error::Serialization(format!(
             "Vector Store v2 directory truncated: expected {body_start} bytes, got {}",
-            data.len()
+            slice.len()
         )));
     }
 
+    let mut restored = 0usize;
     for i in 0..n {
         let dir_off = V2_HEADER_SIZE + i * V2_DIR_ENTRY_SIZE;
         let meta_off = u64::from_le_bytes(
-            data[dir_off..dir_off + 8]
+            slice[dir_off..dir_off + 8]
                 .try_into()
                 .expect("slice length 8 fits u64 array"),
         );
         let meta_len = u64::from_le_bytes(
-            data[dir_off + 8..dir_off + 16]
+            slice[dir_off + 8..dir_off + 16]
                 .try_into()
                 .expect("slice length 8 fits u64 array"),
         );
         let topology_off = u64::from_le_bytes(
-            data[dir_off + 16..dir_off + 24]
+            slice[dir_off + 16..dir_off + 24]
                 .try_into()
                 .expect("slice length 8 fits u64 array"),
         );
         let topology_len = u64::from_le_bytes(
-            data[dir_off + 24..dir_off + 32]
+            slice[dir_off + 24..dir_off + 32]
                 .try_into()
                 .expect("slice length 8 fits u64 array"),
         );
@@ -273,13 +310,13 @@ fn deserialize_v2(data: &[u8], indexes: &mut [(String, Arc<VectorIndexKind>)]) -
         let topology_end = topology_off_usize
             .checked_add(topology_len_usize)
             .ok_or_else(|| Error::Serialization("v2 topology range overflow".into()))?;
-        if meta_end > data.len() || topology_end > data.len() {
+        if meta_end > slice.len() || topology_end > slice.len() {
             return Err(Error::Serialization(format!(
                 "Vector Store v2 directory entry {i} out of range"
             )));
         }
 
-        let meta_bytes = &data[meta_off_usize..meta_end];
+        let meta_bytes = &slice[meta_off_usize..meta_end];
         let (meta, _): (IndexMetaV2, _) =
             bincode::serde::decode_from_slice(meta_bytes, bincode_config).map_err(|e| {
                 Error::Serialization(format!("Vector Store v2 meta deserialization failed: {e}"))
@@ -288,19 +325,48 @@ fn deserialize_v2(data: &[u8], indexes: &mut [(String, Arc<VectorIndexKind>)]) -
         // Find the matching index by key. v2 doesn't require ordering;
         // the section receives indexes in any order, so we look up by key.
         if let Some((_, index)) = indexes.iter().find(|(k, _)| *k == meta.key) {
-            // Copy the topology bytes into a Bytes so the paged decoder
-            // can hold them. Phase 7c will Bytes::from_owner the section
-            // mmap directly and slice without copying.
-            let topology_bytes = Bytes::copy_from_slice(&data[topology_off_usize..topology_end]);
-            let (entry_point, max_level, nodes) =
-                deserialize_topology(topology_bytes).map_err(|e| {
+            // Zero-copy slice of the section Bytes (mmap-owned when RO open
+            // used GrafeoFileManager::mmap_section + into_bytes).
+            let topology_bytes = data.slice(topology_off_usize..topology_end);
+            if prefer_mmap {
+                let topo = MmapTopology::from_bytes(topology_bytes).map_err(|e| {
                     Error::Serialization(format!(
                         "Vector Store v2 topology decode failed for key '{}': {e}",
                         meta.key
                     ))
                 })?;
-            index.restore_topology(entry_point, max_level, nodes);
+                if topo.is_empty() {
+                    return Err(Error::Serialization(format!(
+                        "Vector Store v2 topology for key '{}' is empty (fail-closed)",
+                        meta.key
+                    )));
+                }
+                index.adopt_mmap_topology(topo);
+            } else {
+                let (entry_point, max_level, nodes) = deserialize_topology(topology_bytes)
+                    .map_err(|e| {
+                        Error::Serialization(format!(
+                            "Vector Store v2 topology decode failed for key '{}': {e}",
+                            meta.key
+                        ))
+                    })?;
+                if nodes.is_empty() {
+                    return Err(Error::Serialization(format!(
+                        "Vector Store v2 topology for key '{}' is empty (fail-closed)",
+                        meta.key
+                    )));
+                }
+                index.restore_topology(entry_point, max_level, nodes);
+            }
+            restored += 1;
         }
+    }
+
+    if !indexes.is_empty() && restored == 0 {
+        return Err(Error::Serialization(
+            "Vector Store v2 section present but no topology matched catalog index keys"
+                .to_string(),
+        ));
     }
 
     Ok(())
@@ -340,8 +406,10 @@ impl Section for VectorStoreSection {
             return Ok(());
         }
         // Phase 7b: detect v2 packed vs v1 bincode by magic bytes.
+        // Writable / legacy path uses heap restore so subsequent inserts
+        // work without an explicit mmap→heap reload.
         if data.len() >= 4 && &data[0..4] == V2_MAGIC {
-            deserialize_v2(data, &mut self.indexes)
+            deserialize_v2(Bytes::copy_from_slice(data), &mut self.indexes, false)
         } else {
             // v1 fallback: bincode-encoded VectorStoreSnapshotV1.
             // Existing files keep loading; the next checkpoint flushes
