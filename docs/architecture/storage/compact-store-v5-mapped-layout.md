@@ -240,8 +240,8 @@ Entries are emitted in ascending numeric kind order; empty kinds are omitted.
 | 0 | `Metadata` | 0 (variable records) | 1 | yes | bounded schema/stats/label/type metadata |
 | 1 | `StringOffsets` | 8 | 1 | yes | u64 LE offset array; one entry per dictionary string + sentinel; offsets into `StringBytes` |
 | 2 | `StringBytes` | 1 | 1 | yes | raw UTF-8 dictionary string bytes; no length prefix per string (lengths derived from `StringOffsets` deltas) |
-| 3 | `NodeTableDirectory` | 24 | 1 | yes | records: `(id:u16, column_start:u32, column_count:u32, row_count:u64, reserved:u32)` = 24 bytes |
-| 4 | `RelTableDirectory` | 24 | 1 | yes | records: `(id:u16, src_tid:u16, dst_tid:u16, column_start:u32, column_count:u32, edge_count:u64)` = 24 bytes |
+| 3 | `NodeTableDirectory` | 24 | 1 | yes | fixed 24-byte records; see layout below |
+| 4 | `RelTableDirectory` | 24 | 1 | yes | fixed 24-byte records; see layout below |
 | 5 | `NodeRelationshipDirectory` | 8 | 1 | no | per-table rel-table ID lists; `(table_id:u16, rel_id:u16, direction:u16, reserved:u16)` = 8 bytes |
 | 6 | `ColumnDirectory` | 24 | 1 | yes | records: `(codec:u16, value_type:u16, block_start:u32, block_count:u32, row_count:u64, reserved:u32)` = 24 bytes |
 | 7 | `ColumnBlockIndex` | 12 | 1 | yes | records: `(byte_offset:u32, byte_len:u32, row_count:u32)` = 12 bytes; matches existing `BlockMeta` (`column.rs:1637–1641`) |
@@ -251,13 +251,76 @@ Entries are emitted in ascending numeric kind order; empty kinds are omitted.
 | 11 | `ReverseCsrOffsets` | 4 | 1 | conditional | required when backward CSR exists |
 | 12 | `ReverseCsrTargets` | 4 | 1 | conditional | required when backward CSR exists |
 | 13 | `ForwardPositions` | 4 | 1 | conditional | u32 LE backward-to-forward position mapping (replaces `edge_data`) |
-| 14 | `NodeIdLookup` | 24 | 1 | conditional | required when flags bit 0 set; sorted records: `(id:u64, table:u16, reserved:u16, internal_offset:u64)` = 24 bytes; sorted ascending by `id` |
-| 15 | `EdgeIdLookup` | 24 | 1 | conditional | required when flags bit 0 set; sorted records: `(id:u64, rel_table:u16, reserved:u16, csr_position:u64)` = 24 bytes; sorted ascending by `id` |
+| 14 | `NodeIdLookup` | 24 | 1 | conditional | required when flags bit 0 set; fixed 24-byte records sorted ascending by `id`; see layout below |
+| 15 | `EdgeIdLookup` | 24 | 1 | conditional | required when flags bit 0 set; fixed 24-byte records sorted ascending by `id`; see layout below |
 | 16 | `NodeOriginalIds` | 8 | 1 | conditional | required when flags bit 0 set; u64 LE per-table row-offset → original NodeId |
 | 17 | `EdgeOriginalIds` | 8 | 1 | conditional | required when flags bit 0 set; u64 LE per-rel-table CSR-position → original EdgeId |
 | 18 | `TableZoneMaps` | 0 (variable) | 1 | no | per-column zone-map records: `(column:u32, block:u32, min_offset:u64, max_offset:u64)` = 24 bytes; min/max are offsets into `StringBytes` for string values, inline for numeric |
 | 19 | `BlockZoneMaps` | 0 (variable) | 1 | no | per-block zone-map records, same record shape as kind 18 |
 | 20 | `DictionaryCodeIndex` | 16 | 1 | no | sorted records: `(string_offset:u64, string_len:u32, code:u32)` = 16 bytes; sorted lexicographically by UTF-8 bytes at `(string_offset, string_len)` within `StringBytes`; enables O(log D) string→code lookup |
+
+### Fixed-width record layouts (kinds 3, 4, 14, 15)
+
+Each record below is read and written only through checked little-endian
+accessors. No native struct layout or `unsafe` transmute is used. Every
+named reserved/padding field must be zero on write and rejected if non-zero
+on read. Field widths sum arithmetic-exactly to the declared
+`element_width` of 24.
+
+#### Kind 3 — `NodeTableDirectory` record (24 bytes)
+
+| offset | field | width | notes |
+| ---: | --- | ---: | --- |
+| 0 | id | u16 | node table id |
+| 2 | reserved_a | u16 | must be zero |
+| 4 | column_start | u32 | index into `ColumnDirectory` |
+| 8 | column_count | u32 | number of columns for this table |
+| 12 | row_count | u64 | number of rows |
+| 20 | reserved_b | u32 | must be zero |
+
+Total: 2+2+4+4+8+4 = **24 bytes**.
+
+#### Kind 4 — `RelTableDirectory` record (24 bytes)
+
+| offset | field | width | notes |
+| ---: | --- | ---: | --- |
+| 0 | id | u16 | rel table id |
+| 2 | src_tid | u16 | source node table id |
+| 4 | dst_tid | u16 | destination node table id |
+| 6 | reserved | u16 | must be zero |
+| 8 | column_start | u32 | index into `ColumnDirectory` |
+| 12 | column_count | u32 | number of columns for this rel table |
+| 16 | edge_count | u64 | number of edges |
+
+Total: 2+2+2+2+4+4+8 = **24 bytes**.
+
+#### Kind 14 — `NodeIdLookup` record (24 bytes)
+
+Sorted ascending by `id`. Required when header flags bit 0 is set.
+
+| offset | field | width | notes |
+| ---: | --- | ---: | --- |
+| 0 | id | u64 | original NodeId |
+| 8 | table | u16 | node table id |
+| 10 | reserved_a | u16 | must be zero |
+| 12 | reserved_b | u32 | must be zero |
+| 16 | internal_offset | u64 | row offset within the table |
+
+Total: 8+2+2+4+8 = **24 bytes**.
+
+#### Kind 15 — `EdgeIdLookup` record (24 bytes)
+
+Sorted ascending by `id`. Required when header flags bit 0 is set.
+
+| offset | field | width | notes |
+| ---: | --- | ---: | --- |
+| 0 | id | u64 | original EdgeId |
+| 8 | rel_table | u16 | rel table id |
+| 10 | reserved_a | u16 | must be zero |
+| 12 | reserved_b | u32 | must be zero |
+| 16 | csr_position | u64 | forward CSR position within the rel table |
+
+Total: 8+2+2+4+8 = **24 bytes**.
 
 ### Offset, length, and count rules
 
