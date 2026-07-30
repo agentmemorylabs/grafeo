@@ -288,6 +288,11 @@ impl super::GrafeoDB {
         query: &str,
         k: usize,
     ) -> Result<Vec<(NodeId, f64)>> {
+        // Prefer mapped TextIndex v2 restored on RO reopen (G-E1.RO).
+        if let Some(mapped) = self.lpg_store().get_mapped_text_index(label, property) {
+            return Ok(mapped.search(query, k));
+        }
+
         let index = self
             .lpg_store()
             .get_text_index(label, property)

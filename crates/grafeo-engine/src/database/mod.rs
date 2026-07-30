@@ -1818,7 +1818,7 @@ impl GrafeoDB {
             )
         })?;
 
-        // Load catalog section first (schema defs needed before data)
+        // Load catalog section first (schema defs + index registration shells)
         if let Some(entry) = dir.find(SectionType::Catalog) {
             let data = fm.read_section_data(entry)?;
             let tm = Arc::new(crate::transaction::TransactionManager::new());
@@ -1866,14 +1866,82 @@ impl GrafeoDB {
             }
         }
 
-        // Restore BM25 postings (if text indexes exist in both catalog and section)
+        // Restore PropertyIndex postings (G-E1.RO). Optional: historical files
+        // without this section keep Catalog-registered shells and fall back to
+        // scan-based lookup (never a silent “restored” claim).
+        if let Some(entry) = dir.find(SectionType::PropertyIndex) {
+            use grafeo_core::index::property::parse_property_index_section;
+            // Prefer mmap on read-only opens so postings stay file-backed.
+            let mapped_set = if fm.is_read_only() {
+                match fm.mmap_section(entry) {
+                    Ok(mapped) => {
+                        let bytes = std::sync::Arc::new(mapped).into_bytes();
+                        Some(parse_property_index_section(bytes)?)
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let mapped_set = match mapped_set {
+                Some(m) => m,
+                None => {
+                    let data = fm.read_section_data(entry)?;
+                    let mut section = grafeo_core::index::property::PropertyIndexSection::empty();
+                    section.deserialize(&data)?;
+                    section.take_mapped().ok_or_else(|| {
+                        grafeo_common::utils::error::Error::Serialization(
+                            "PropertyIndex section deserialized without mapped set".into(),
+                        )
+                    })?
+                }
+            };
+            for idx in mapped_set.indexes() {
+                store.install_mapped_property_index(std::sync::Arc::new(idx.clone()));
+            }
+            let _ = mapped_set.accounting();
+        }
+
+        // Restore BM25 postings (TextIndex). Prefer mapped v2; legacy v1
+        // hydrates heap shells created by Catalog restore.
         #[cfg(feature = "text-index")]
         if let Some(entry) = dir.find(SectionType::TextIndex) {
-            let data = fm.read_section_data(entry)?;
+            use grafeo_core::index::text::{
+                TextIndexSection, is_mapped_text_payload, parse_text_index_section,
+            };
             let indexes = store.text_index_entries();
-            if !indexes.is_empty() {
-                let mut section = grafeo_core::index::text::TextIndexSection::new(indexes);
+            if fm.is_read_only() {
+                if let Ok(mapped) = fm.mmap_section(entry) {
+                    let bytes = std::sync::Arc::new(mapped).into_bytes();
+                    if is_mapped_text_payload(&bytes) {
+                        let mapped_set = parse_text_index_section(bytes)?;
+                        for idx in mapped_set.indexes() {
+                            store.install_mapped_text_index(std::sync::Arc::new(idx.clone()));
+                        }
+                    } else {
+                        // Legacy v1 over mmap: copy into section deserialize.
+                        let mut section = TextIndexSection::new(indexes);
+                        section.deserialize(&bytes)?;
+                    }
+                } else {
+                    let data = fm.read_section_data(entry)?;
+                    let mut section = TextIndexSection::new(indexes);
+                    section.deserialize(&data)?;
+                    if let Some(mapped_set) = section.take_mapped() {
+                        for idx in mapped_set.indexes() {
+                            store.install_mapped_text_index(std::sync::Arc::new(idx.clone()));
+                        }
+                    }
+                }
+            } else {
+                let data = fm.read_section_data(entry)?;
+                let mut section = TextIndexSection::new(indexes);
                 section.deserialize(&data)?;
+                if let Some(mapped_set) = section.take_mapped() {
+                    for idx in mapped_set.indexes() {
+                        store.install_mapped_text_index(std::sync::Arc::new(idx.clone()));
+                    }
+                }
             }
         }
 
@@ -2862,7 +2930,8 @@ impl GrafeoDB {
     fn build_sections(&self) -> Vec<Box<dyn grafeo_common::storage::Section>> {
         let mut sections: Vec<Box<dyn grafeo_common::storage::Section>> = Vec::new();
 
-        // Layered store: serialize both the compact base and the overlay.
+        // Layered store: serialize compact base + overlay + Catalog / non-vector
+        // indexes (G-E1.RO). Vectors remain G-E2.RO.
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if let Some(ref layered) = self.layered_store {
             // Compact base section.
@@ -2873,7 +2942,8 @@ impl GrafeoDB {
 
             // Overlay LPG section.
             let overlay = layered.overlay_store();
-            let overlay_section = grafeo_core::graph::lpg::LpgStoreSection::new(overlay);
+            let overlay_section =
+                grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(&overlay));
             sections.push(Box::new(overlay_section));
 
             // Overlay deletion log: persists base-node/edge tombstones
@@ -2892,6 +2962,67 @@ impl GrafeoDB {
                 // dirty flag is cleared so subsequent checkpoints don't
                 // think they need to keep flushing.
                 layered.mark_deletions_clean();
+            }
+
+            // Catalog: schema + index registration (required data section).
+            let catalog = catalog_section::CatalogSection::new(
+                Arc::clone(&self.catalog),
+                Arc::clone(&overlay),
+                {
+                    let tm = Arc::clone(&self.transaction_manager);
+                    move || tm.current_epoch().as_u64()
+                },
+            );
+            sections.push(Box::new(catalog));
+
+            // PropertyIndex: prefer layered graph scan so base postings are
+            // captured (overlay-only create_property_index misses base rows).
+            {
+                let mut snaps = overlay.property_index_snapshot_entries();
+                // For every registered property index, ensure base nodes are
+                // included by scanning the layered graph when the overlay
+                // heap snapshot is empty or under-filled.
+                let keys = overlay.property_index_keys();
+                if !keys.is_empty() {
+                    let graph = self.graph_store();
+                    let mut by_name: std::collections::BTreeMap<
+                        String,
+                        grafeo_core::index::property::PropertyIndexSnapshot,
+                    > = snaps.drain(..).map(|s| (s.name.clone(), s)).collect();
+                    for prop in keys {
+                        let entry = by_name.entry(prop.clone()).or_insert_with(|| {
+                            grafeo_core::index::property::PropertyIndexSnapshot {
+                                name: prop.clone(),
+                                entries: Vec::new(),
+                            }
+                        });
+                        // Rebuild from full layered graph for durable fidelity.
+                        entry.entries.clear();
+                        let prop_key = grafeo_common::types::PropertyKey::new(&prop);
+                        for node_id in graph.node_ids() {
+                            if let Some(value) = graph.get_node_property(node_id, &prop_key) {
+                                entry.entries.push((value, node_id));
+                            }
+                        }
+                    }
+                    snaps = by_name.into_values().collect();
+                }
+                if !snaps.is_empty() {
+                    sections.push(Box::new(
+                        grafeo_core::index::property::PropertyIndexSection::from_snapshots(snaps),
+                    ));
+                }
+            }
+
+            // TextIndex: BM25 postings from overlay (create_text_index already
+            // scanned graph_store including base).
+            #[cfg(feature = "text-index")]
+            {
+                let indexes = overlay.text_index_entries();
+                if !indexes.is_empty() {
+                    let text = grafeo_core::index::text::TextIndexSection::new(indexes);
+                    sections.push(Box::new(text));
+                }
             }
 
             return sections;

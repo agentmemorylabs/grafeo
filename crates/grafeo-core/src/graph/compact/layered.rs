@@ -742,6 +742,18 @@ impl GraphStore for LayeredStore {
     fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
         let deleted = self.deleted_from_base_nodes.read();
         let dirty = self.dirty_node_ids.read();
+        let overlay = self.overlay.load();
+
+        // G-E1.RO: mapped PropertyIndex section captures base+overlay postings
+        // at checkpoint. Prefer it exclusively so we do not double-count base
+        // nodes that also appear in the overlay index.
+        if overlay.has_mapped_property_index(property) {
+            return overlay
+                .find_nodes_by_property(property, value)
+                .into_iter()
+                .filter(|id| !deleted.contains(id))
+                .collect();
+        }
 
         let mut results: Vec<NodeId> = self
             .base
@@ -751,7 +763,7 @@ impl GraphStore for LayeredStore {
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
 
-        results.extend(self.overlay.load().find_nodes_by_property(property, value));
+        results.extend(overlay.find_nodes_by_property(property, value));
         results
     }
 

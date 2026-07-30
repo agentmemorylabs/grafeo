@@ -224,6 +224,23 @@ impl CatalogSection {
         }
     }
 
+    /// Catalog index *metadata* is retained in the snapshot for operators, but
+    /// empty heap shells are **not** installed here.
+    ///
+    /// Installing empty property-index shells would make `has_property_index`
+    /// true while postings are absent, causing the indexed path to return
+    /// empty sets and suppress CompactStore scan fallback — a silent false
+    /// “restored” state. PropertyIndex / TextIndex sections install mapped
+    /// postings (or hydrate heap) when present; when those optional sections
+    /// are absent, indexes stay unregistered and lookups scan.
+    fn restore_index_shells(
+        &self,
+        property_indexes: &[String],
+        text_indexes: &[SnapshotTextIndex],
+    ) {
+        let _ = (self, property_indexes, text_indexes);
+    }
+
     /// Restore vector index shells so VectorStore can apply topology without rebuild.
     #[cfg(feature = "vector-index")]
     fn restore_vector_index_shells(
@@ -299,6 +316,10 @@ impl Section for CatalogSection {
                     ))
                 })?;
             self.restore_schema(&snapshot.schema);
+            self.restore_index_shells(
+                &snapshot.indexes.property_indexes,
+                &snapshot.indexes.text_indexes,
+            );
 
             #[cfg(feature = "vector-index")]
             {
@@ -321,9 +342,6 @@ impl Section for CatalogSection {
                 self.restore_vector_index_shells(&shells);
             }
 
-            // Text indexes: registration is handled by the engine after data load.
-            let _ = &snapshot.indexes.text_indexes;
-
             return Ok(());
         }
 
@@ -343,6 +361,10 @@ impl Section for CatalogSection {
         let _ = snapshot.version.max(CATALOG_SECTION_VERSION_V1);
 
         self.restore_schema(&snapshot.schema);
+        self.restore_index_shells(
+            &snapshot.indexes.property_indexes,
+            &snapshot.indexes.text_indexes,
+        );
 
         #[cfg(feature = "vector-index")]
         {
@@ -365,8 +387,6 @@ impl Section for CatalogSection {
                 .collect();
             self.restore_vector_index_shells(&shells);
         }
-
-        let _ = &snapshot.indexes.text_indexes;
 
         Ok(())
     }

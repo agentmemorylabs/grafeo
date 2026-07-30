@@ -33,6 +33,29 @@ impl super::GrafeoDB {
     /// let nodes = db.find_nodes_by_property("email", &Value::from("alix@example.com"));
     /// ```
     pub fn create_property_index(&self, property: &str) {
+        // After compact(), lpg_store is the overlay and its local scan misses
+        // CompactStore base rows. Build postings from graph_store (layered).
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if self.layered_store.is_some() {
+            use grafeo_common::types::PropertyKey;
+            if self.lpg_store().has_property_index(property) {
+                return;
+            }
+            let graph = self.graph_store();
+            let prop_key = PropertyKey::new(property);
+            let entries: Vec<_> = graph
+                .node_ids()
+                .into_iter()
+                .filter_map(|node_id| {
+                    graph
+                        .get_node_property(node_id, &prop_key)
+                        .map(|value| (node_id, value))
+                })
+                .collect();
+            self.lpg_store()
+                .create_property_index_from_entries(property, entries);
+            return;
+        }
         self.lpg_store().create_property_index(property);
     }
 

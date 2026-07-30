@@ -18,6 +18,8 @@
 
 pub mod adjacency;
 pub mod hash;
+/// Property hash-index section + mapped RO views (G-E1.RO).
+pub mod property;
 #[cfg(feature = "ring-index")]
 pub mod ring;
 #[cfg(feature = "text-index")]
@@ -28,6 +30,12 @@ pub mod zone_map;
 
 pub use adjacency::ChunkedAdjacency;
 pub use hash::HashIndex;
+pub use property::{
+    MappedPropertyIndex, MappedPropertyIndexSet, PropertyIndexMemoryAccounting,
+    PropertyIndexSection, PropertyIndexSnapshot, encode_property_index_section,
+    parse_property_index_section,
+};
+// PropertyIndexSnapshot re-exported above.
 #[cfg(feature = "ring-index")]
 pub use ring::{LeapfrogRing, RingIterator, SuccinctPermutation, TripleRing};
 #[cfg(feature = "text-index")]
