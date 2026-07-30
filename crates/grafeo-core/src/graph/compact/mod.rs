@@ -32,6 +32,10 @@ pub mod section;
 mod tests;
 /// Zone maps for skip-pruning predicate evaluation.
 pub mod zone_map;
+/// Mapped CompactStore v5 views and accounting (G-EM0.2).
+pub mod mapped;
+/// CompactStore payload version 5 codec.
+pub(crate) mod section_v5;
 
 pub use builder::{CompactStoreBuilder, from_graph_store, from_graph_store_preserving_ids};
 
@@ -46,6 +50,24 @@ use self::node_table::NodeTable;
 use self::rel_table::RelTable;
 use crate::graph::Direction;
 use crate::statistics::Statistics;
+
+/// Proportional anonymous heap retained by a column codec.
+fn codec_proportional_heap(codec: &column::ColumnCodec, mapped_open: bool) -> usize {
+    match codec {
+        column::ColumnCodec::Dict(d) => {
+            // Codes: charge only inline (heap) codes.
+            let codes = if d.as_codes_slice().is_some() {
+                d.code_count() * 4
+            } else {
+                0
+            };
+            d.dictionary_heap_bytes().saturating_add(codes)
+        }
+        // On a mapped open, non-dict bodies are Bytes slices into the mapping.
+        _ if mapped_open => 0,
+        other => other.heap_bytes(),
+    }
+}
 
 /// A read-only columnar graph store.
 ///
@@ -91,6 +113,20 @@ pub struct CompactStore {
     /// structures; retaining this handle guarantees no codec-free snapshot can
     /// accidentally unmap while readers still hold the CompactStore.
     mapped_backing: Option<Bytes>,
+    /// Mapped sorted NodeId lookup (v5). Mutually exclusive with `node_id_map`.
+    mapped_node_id_lookup: Option<mapped::MappedNodeIdLookup>,
+    /// Mapped sorted EdgeId lookup (v5).
+    mapped_edge_id_lookup: Option<mapped::MappedEdgeIdLookup>,
+    /// Mapped reverse original node IDs (concatenated per table).
+    mapped_node_original_ids: Option<Bytes>,
+    /// Per-table base index into `mapped_node_original_ids`.
+    mapped_node_original_bases: Option<Vec<usize>>,
+    /// Mapped reverse original edge IDs (concatenated per rel table).
+    mapped_edge_original_ids: Option<Bytes>,
+    /// Per-rel-table base index into `mapped_edge_original_ids`.
+    mapped_edge_original_bases: Option<Vec<usize>>,
+    /// Split memory accounting for Milestone R evidence.
+    memory_accounting: Option<mapped::CompactMemoryAccounting>,
 }
 
 impl std::fmt::Debug for CompactStore {
@@ -159,6 +195,13 @@ impl CompactStore {
             node_offset_to_id: None,
             edge_offset_to_id: None,
             mapped_backing: None,
+            mapped_node_id_lookup: None,
+            mapped_edge_id_lookup: None,
+            mapped_node_original_ids: None,
+            mapped_node_original_bases: None,
+            mapped_edge_original_ids: None,
+            mapped_edge_original_bases: None,
+            memory_accounting: None,
         }
     }
 
@@ -304,7 +347,7 @@ impl CompactStore {
     /// [`from_graph_store_preserving_ids`]).
     #[must_use]
     pub fn preserves_ids(&self) -> bool {
-        self.node_id_map.is_some()
+        self.node_id_map.is_some() || self.mapped_node_id_lookup.is_some()
     }
 
     /// Attaches ID maps to an already-built `CompactStore`.
@@ -329,6 +372,8 @@ impl CompactStore {
     pub(crate) fn resolve_node(&self, id: NodeId) -> Option<(u16, u64)> {
         if let Some(ref map) = self.node_id_map {
             map.get(&id).copied()
+        } else if let Some(ref lookup) = self.mapped_node_id_lookup {
+            lookup.lookup(id)
         } else {
             Some(id::decode_node_id(id))
         }
@@ -339,6 +384,8 @@ impl CompactStore {
     pub(crate) fn resolve_edge(&self, id: EdgeId) -> Option<(u16, u64)> {
         if let Some(ref map) = self.edge_id_map {
             map.get(&id).copied()
+        } else if let Some(ref lookup) = self.mapped_edge_id_lookup {
+            lookup.lookup(id)
         } else {
             Some(id::decode_edge_id(id))
         }
@@ -355,6 +402,29 @@ impl CompactStore {
                 .and_then(|v| v.get(usize::try_from(offset).ok()?))
                 .copied()
                 .unwrap_or(compact_id)
+        } else if let (Some(bytes), Some(bases)) = (
+            &self.mapped_node_original_ids,
+            &self.mapped_node_original_bases,
+        ) {
+            let (table_id, offset) = id::decode_node_id(compact_id);
+            let base = *bases.get(table_id as usize).unwrap_or(&0);
+            let idx = base.saturating_add(usize::try_from(offset).unwrap_or(0));
+            let start = idx.saturating_mul(8);
+            if start + 8 <= bytes.len() {
+                let raw = u64::from_le_bytes([
+                    bytes[start],
+                    bytes[start + 1],
+                    bytes[start + 2],
+                    bytes[start + 3],
+                    bytes[start + 4],
+                    bytes[start + 5],
+                    bytes[start + 6],
+                    bytes[start + 7],
+                ]);
+                NodeId::new(raw)
+            } else {
+                compact_id
+            }
         } else {
             compact_id
         }
@@ -370,9 +440,112 @@ impl CompactStore {
                 .and_then(|v| v.get(usize::try_from(csr_pos).ok()?))
                 .copied()
                 .unwrap_or(compact_id)
+        } else if let (Some(bytes), Some(bases)) = (
+            &self.mapped_edge_original_ids,
+            &self.mapped_edge_original_bases,
+        ) {
+            let (rel_table_id, csr_pos) = id::decode_edge_id(compact_id);
+            let base = *bases.get(rel_table_id as usize).unwrap_or(&0);
+            let idx = base.saturating_add(usize::try_from(csr_pos).unwrap_or(0));
+            let start = idx.saturating_mul(8);
+            if start + 8 <= bytes.len() {
+                let raw = u64::from_le_bytes([
+                    bytes[start],
+                    bytes[start + 1],
+                    bytes[start + 2],
+                    bytes[start + 3],
+                    bytes[start + 4],
+                    bytes[start + 5],
+                    bytes[start + 6],
+                    bytes[start + 7],
+                ]);
+                EdgeId::new(raw)
+            } else {
+                compact_id
+            }
         } else {
             compact_id
         }
+    }
+
+    /// Installs mapped ID indexes from a v5 payload (G-EM0.2).
+    pub(crate) fn set_mapped_id_indexes(
+        &mut self,
+        node_lookup: mapped::MappedNodeIdLookup,
+        edge_lookup: mapped::MappedEdgeIdLookup,
+        node_orig: Bytes,
+        edge_orig: Bytes,
+        meta_node_counts: &[usize],
+        meta_edge_counts: &[usize],
+    ) {
+        let mut node_bases = Vec::with_capacity(meta_node_counts.len());
+        let mut cursor = 0usize;
+        for &c in meta_node_counts {
+            node_bases.push(cursor);
+            cursor = cursor.saturating_add(c);
+        }
+        let mut edge_bases = Vec::with_capacity(meta_edge_counts.len());
+        cursor = 0;
+        for &c in meta_edge_counts {
+            edge_bases.push(cursor);
+            cursor = cursor.saturating_add(c);
+        }
+        self.mapped_node_id_lookup = Some(node_lookup);
+        self.mapped_edge_id_lookup = Some(edge_lookup);
+        self.mapped_node_original_ids = Some(node_orig);
+        self.mapped_node_original_bases = Some(node_bases);
+        self.mapped_edge_original_ids = Some(edge_orig);
+        self.mapped_edge_original_bases = Some(edge_bases);
+        // Clear heap maps so accounting sees zero proportional anonymous.
+        self.node_id_map = None;
+        self.edge_id_map = None;
+        self.node_offset_to_id = None;
+        self.edge_offset_to_id = None;
+    }
+
+    /// Records split memory accounting for this store.
+    pub(crate) fn set_memory_accounting(&mut self, accounting: mapped::CompactMemoryAccounting) {
+        self.memory_accounting = Some(accounting);
+    }
+
+    /// Returns split memory accounting when recorded (mapped v5 open).
+    #[must_use]
+    pub fn memory_accounting(&self) -> Option<&mapped::CompactMemoryAccounting> {
+        self.memory_accounting.as_ref()
+    }
+
+    /// Anonymous bytes from proportional structures (CSR heap, dict Arc, ID maps).
+    ///
+    /// Mapped-backed structures contribute zero. A successful v5 mapped open
+    /// must report zero.
+    #[must_use]
+    pub fn proportional_anonymous_bytes(&self) -> usize {
+        // Heap ID maps always count when present.
+        let mut total = self.id_map_memory_bytes();
+
+        // When opened from a retained container mapping, column codec bodies
+        // and CSR arrays are views into that mapping. Charge only residual
+        // heap dictionary Arc tables and inline CSR variants.
+        let mapped_open = self.mapped_backing.is_some();
+        for nt in &self.node_tables_by_id {
+            for codec in nt.columns().values() {
+                total = total.saturating_add(codec_proportional_heap(codec, mapped_open));
+            }
+        }
+        for rt in &self.rel_tables_by_id {
+            if !rt.fwd().is_mapped() {
+                total = total.saturating_add(rt.fwd().memory_bytes());
+            }
+            if let Some(bwd) = rt.bwd() {
+                if !bwd.is_mapped() {
+                    total = total.saturating_add(bwd.memory_bytes());
+                }
+            }
+            for codec in rt.properties().values() {
+                total = total.saturating_add(codec_proportional_heap(codec, mapped_open));
+            }
+        }
+        total
     }
 
     /// Approximate heap cost of the ID maps.

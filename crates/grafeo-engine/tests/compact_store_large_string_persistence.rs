@@ -124,7 +124,8 @@ fn large_documentation_json_survives_compact_explicit_close_and_reopen() {
         "reopen must reconstruct LayeredStore from CompactStore section"
     );
 
-    // Prove CompactStore section is present and payload header is v4.
+    // Prove CompactStore section is present and payload header is current
+    // (v5 mapped layout; still accepts large section-level / dict strings).
     let (payload, _dir_version) = read_compact_store_payload(&db);
     assert!(
         payload.len() >= 6,
@@ -133,8 +134,8 @@ fn large_documentation_json_survives_compact_explicit_close_and_reopen() {
     );
     assert_eq!(&payload[0..4], b"GCST", "magic must be GCST");
     assert_eq!(
-        payload[4], 4,
-        "CompactStore payload version must be 4 after E-0 writer"
+        payload[4], 5,
+        "CompactStore payload version must be 5 after G-EM0.2 writer"
     );
 
     // Retrieve via LayeredStore (GrafeoDB::get_node only sees the overlay
@@ -170,12 +171,12 @@ fn large_documentation_json_survives_compact_explicit_close_and_reopen() {
 }
 
 #[test]
-fn compact_store_payload_v4_is_present_for_modest_strings_too() {
-    // Smaller sanity check that the GCST v4 header is written even when no
+fn compact_store_payload_v5_is_present_for_modest_strings_too() {
+    // Smaller sanity check that the GCST v5 header is written even when no
     // section-level string exceeds the legacy u16 limit (guards against a
     // writer that only bumps version when forced by length overflow).
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let path = tmp.path().join("e0_modest.grafeo");
+    let path = tmp.path().join("em02_modest.grafeo");
 
     {
         let mut db = GrafeoDB::with_config(Config::persistent(&path)).expect("create");
@@ -188,6 +189,6 @@ fn compact_store_payload_v4_is_present_for_modest_strings_too() {
     let db = GrafeoDB::with_config(Config::persistent(&path)).expect("reopen");
     let (payload, _) = read_compact_store_payload(&db);
     assert_eq!(&payload[0..4], b"GCST");
-    assert_eq!(payload[4], 4);
+    assert_eq!(payload[4], 5);
     db.close().expect("close");
 }

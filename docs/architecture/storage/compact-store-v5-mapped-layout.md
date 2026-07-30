@@ -401,21 +401,16 @@ through `StringBytes`. Code→string remains O(1) via `StringOffsets[code]`.
 
 ## Compatibility and implementation contracts
 
-G-EM0.1 must add the v5 source codec and checked directory parser while
-preserving v1–v4 readers and existing error behavior for malformed legacy
-sections. Its owned paths are `crates/grafeo-core/src/graph/compact/section.rs`
-and `crates/grafeo-core/src/graph/compact/column.rs`; RED assertions must cover
-the header, enum/order, CRC domains, and all fail-closed cases above.
+G-EM0.1 landed direct container mmap ownership (`deserialize_from_mapped_bytes`
++ `CompactBacking::ContainerMmap`). G-EM0.2 implements the v5 source codec,
+checked directory parser, mapped proportional graph structures (CSR, string
+dict, ID lookups, column bodies), and split memory accounting. Owned paths
+include `crates/grafeo-core/src/graph/compact/{section,section_v5,mapped,csr,
+column,mod}.rs` and the integration targets
+`compact_store_readonly_graph_parity` / `mapped_graph_tests`.
 
-G-EM0.2 owns `crates/grafeo-engine/src/database/mod.rs`,
-`crates/grafeo-engine/src/database/section_consumer.rs`, and
-`crates/grafeo-storage/src/file/manager.rs`; it connects container open to the
-mapped owner and exposes lookup/graph-view operations without whole-payload
-copies. The writer lane (G-F0.1) emits the outer directory version required by
-v5; readers still dispatch historical outer versions to the payload parser.
-
-Current E-0 readers accept v1–v4. Version 5 is selected by this packet but is
-not emitted or read until G-EM0.1 lands.
+Current writers emit v5. Readers accept v1–v5; v1–v4 remain compatibility
+paths and may retain proportional heap.
 
 RED coverage required before implementation is accepted:
 

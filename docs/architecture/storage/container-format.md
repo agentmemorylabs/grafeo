@@ -211,25 +211,24 @@ CRC32: u32 LE over all preceding payload bytes
 | 1 | `u16` LE | Read-only compatibility |
 | 2 | `u16` LE | Read-only compatibility |
 | 3 | `u16` LE | Read-only compatibility |
-| **4** | **`u32` LE** | **Current writer** |
-| 5 | `u32` LE | Selected by G-EM0.R0; not emitted or read until G-EM0.1 |
+| 4 | `u32` LE | E-0 / pre-mapped streaming writer (compat) |
+| **5** | **mapped segments** | **Current writer (G-EM0.2); see v5 mapped layout** |
 
 “Section-level string” means labels, property keys, edge types, and zone-map
 `Value::String` min/max fields (the path that previously panicked above
 65,535 bytes). Column dictionary string bodies already used `u32` lengths
 and are unchanged in v4.
 
-- The E-0 writer emits payload version **4** (legacy/current on the accepted
-  base).
-- G-EM0.R0 selects payload version **5** for disk-native reopen. Version 5
-  keeps the outer `CompactStore` section type but adds a checked in-payload
-  range directory so readers can map metadata, columns, CSR arrays,
+- The G-EM0.2 writer emits payload version **5** (mapped segment directory).
+- Version 5 keeps the outer `CompactStore` section type and adds a checked
+  in-payload range directory so readers can map metadata, columns, CSR arrays,
   dictionaries, zone maps, and ID lookup ranges without copying the section.
   See [CompactStore v5 mapped layout](compact-store-v5-mapped-layout.md) for
-  the source inventory, exact header/directory contract, compatibility rules,
-  and RED verification list.
-- Current E-0 readers accept v1–v4. Version 5 is selected but not emitted or
-  read until G-EM0.1 lands; existing v1–v4 readers remain supported throughout.
+  the source inventory, exact header/directory contract, and compatibility
+  rules.
+- Current readers accept v1–v5. Explicit `serialize_with_version(4)` remains
+  available for the E-0 streaming layout. Existing v1–v4 readers remain
+  supported for compatibility fixtures.
 - Old binaries that only understand ≤v3 must **fail closed** on v4 (no silent
   misparse). Binaries that understand ≤v4 must fail closed on v5.
 - Overflow of the active length width returns `Error::Serialization`

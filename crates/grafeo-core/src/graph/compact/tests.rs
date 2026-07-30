@@ -1300,7 +1300,7 @@ fn test_csr_neighbors_out_of_bounds() {
     use super::csr::CsrAdjacency;
 
     let csr = CsrAdjacency::from_sorted_edges(2, &[(0, 1)]);
-    assert_eq!(csr.neighbors(0), &[1]);
+    assert_eq!(csr.neighbors(0), vec![1]);
     assert!(csr.neighbors(1).is_empty());
     // Node 99 is out of bounds: should return empty.
     assert!(csr.neighbors(99).is_empty());

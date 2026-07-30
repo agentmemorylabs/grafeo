@@ -80,7 +80,10 @@ fn readonly_reopen_owns_the_compact_container_mapping_and_preserves_graph_reads(
         panic!("read-only CompactStore reopen must use ContainerMmap");
     };
     assert!(artifact_id.starts_with("container:"));
-    assert_eq!(*payload_version, 4, "current direct compatibility payload");
+    assert_eq!(
+        *payload_version, 5,
+        "G-EM0.2 direct-mapped CompactStore payload is v5"
+    );
     assert_eq!(*mapped_bytes, expected_payload_bytes);
 
     let base = db
@@ -88,11 +91,14 @@ fn readonly_reopen_owns_the_compact_container_mapping_and_preserves_graph_reads(
         .expect("layered store after compact reopen")
         .base_store_arc();
     assert_eq!(base.mapped_backing_bytes(), Some(expected_payload_bytes));
-    // Mapped payload is file-backed; retained heap is tracked separately.
-    assert!(
-        base.memory_bytes() > 0,
-        "decoded metadata remains heap-accounted for G-EM0.2 budgeting"
-    );
+    // Proportional structures are file-backed; split accounting is the
+    // Milestone R evidence surface (not memory_bytes alone).
+    let acc = base
+        .memory_accounting()
+        .expect("v5 mapped open must record split accounting");
+    assert_eq!(acc.anonymous_proportional_structure_bytes, 0);
+    assert!(acc.mapped_payload_index_bytes > 0);
+    assert!(acc.is_disk_native_graph());
 
     // Deterministic pseudo-random order (fixed LCG) over node property reads.
     let mut state: u64 = 0xC0FFEE;
@@ -137,9 +143,14 @@ fn readonly_reopen_owns_the_compact_container_mapping_and_preserves_graph_reads(
     );
 
     // Writable reopen of the same artifact remains the explicit legacy path and
-    // must not claim Milestone R ContainerMmap evidence.
+    // must not claim Milestone R ContainerMmap evidence. v5 property strings
+    // are file-backed, so a concurrent writable open of the same path can
+    // invalidate an existing mapping; exercise LegacyEager on a byte-identical
+    // copy instead so the RO base Arc remains valid.
     {
-        let writable = GrafeoDB::open(&path).expect("writable reopen");
+        let writable_path = temp.path().join("direct-mapped-writable-copy.grafeo");
+        std::fs::copy(&path, &writable_path).expect("copy artifact");
+        let writable = GrafeoDB::open(&writable_path).expect("writable reopen");
         match writable.compact_backing() {
             Some(CompactBacking::LegacyEager { payload_bytes, .. }) => {
                 assert_eq!(*payload_bytes, expected_payload_bytes);

@@ -115,9 +115,9 @@ impl RelTable {
         let rel_id = self.schema.rel_table_id;
 
         neighbors
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(i, &target_offset)| {
+            .map(|(i, target_offset)| {
                 let node_id = encode_node_id(self.dst_table_id, u64::from(target_offset));
                 let edge_id = encode_edge_id(rel_id, start_pos + i as u64);
                 (node_id, edge_id)
@@ -138,9 +138,9 @@ impl RelTable {
         let rel_id = self.schema.rel_table_id;
 
         let results = source_offsets
-            .iter()
+            .into_iter()
             .enumerate()
-            .filter_map(|(i, &src_offset)| {
+            .filter_map(|(i, src_offset)| {
                 // O(1) lookup via edge_data stored on the backward CSR.
                 // Returns None if edge_data was not populated on backward CSR.
                 let fwd_pos = bwd.edge_data_at(bwd_start + i)?;
