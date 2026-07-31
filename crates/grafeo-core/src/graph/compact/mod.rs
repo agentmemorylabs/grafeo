@@ -34,6 +34,8 @@ mod tests;
 pub mod zone_map;
 /// Mapped CompactStore v5 views and accounting (G-EM0.2).
 pub mod mapped;
+/// Source-true CompactStore generation on bounded runs (G-EM0.W0-A2).
+pub mod generation;
 /// CompactStore payload version 5 codec.
 pub(crate) mod section_v5;
 

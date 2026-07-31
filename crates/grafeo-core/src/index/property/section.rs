@@ -173,6 +173,7 @@ pub fn materialize_heap_from_mapped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grafeo_common::types::{NodeId, PropertyKey, Value};
     use grafeo_common::utils::hash::FxHashMap;
 
     #[test]

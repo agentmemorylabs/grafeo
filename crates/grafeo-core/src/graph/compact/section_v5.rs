@@ -1,10 +1,8 @@
 //! CompactStore payload version 5: mapped segment directory codec (G-EM0.2).
 
-use std::sync::Arc;
-
 use arcstr::ArcStr;
 use bytes::Bytes;
-use grafeo_common::types::{EdgeId, NodeId, PropertyKey};
+use grafeo_common::types::PropertyKey;
 use grafeo_common::utils::hash::FxHashMap;
 
 use super::CompactStore;
@@ -27,12 +25,37 @@ use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 
 const MAGIC: [u8; 4] = *b"GCST";
 
+/// Global string code assignment policy for v5 serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StringCodeOrder {
+    /// First-seen insertion order (legacy heap serializer path).
+    #[default]
+    Insertion,
+    /// UTF-8 byte-lexicographic order (G-EM0.W0 generation contract).
+    Lexicographic,
+}
+
 /// Serializes a heap-built [`CompactStore`] into a v5 payload with trailing CRC.
+///
+/// Uses insertion-order string codes for backward-compatible writers.
 ///
 /// # Errors
 ///
 /// Returns an error when a collection length exceeds the wire encoding.
 pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
+    serialize_v5_with_string_order(store, StringCodeOrder::Insertion)
+}
+
+/// Serializes a heap-built [`CompactStore`] into a v5 payload with the given
+/// global string-code assignment policy.
+///
+/// # Errors
+///
+/// Returns an error when a collection length exceeds the wire encoding.
+pub fn serialize_v5_with_string_order(
+    store: &CompactStore,
+    string_order: StringCodeOrder,
+) -> Result<Vec<u8>, String> {
     let mut segments: Vec<(SegmentKind, u16, u16, u16, u32, Vec<u8>)> = Vec::new();
     // (kind, encoding_version, flags, alignment, element_width, bytes)
 
@@ -86,6 +109,23 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
                     }
                 }
             }
+        }
+    }
+
+    if string_order == StringCodeOrder::Lexicographic {
+        // Reassign codes in UTF-8 byte-lexicographic order; count must fit u32.
+        strings.sort();
+        strings.dedup();
+        if strings.len() > u32::MAX as usize {
+            return Err(format!(
+                "global string dictionary length {} exceeds u32::MAX",
+                strings.len()
+            ));
+        }
+        string_index.clear();
+        for (i, s) in strings.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            string_index.insert(s.clone(), i as u32);
         }
     }
 
@@ -358,7 +398,7 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
     let mut cursor = data_offset;
     let mut entries_meta = Vec::new();
 
-    for (kind, enc_ver, flags_u16, alignment, element_width, body) in &segments {
+    for (kind, _enc_ver, _flags_u16, alignment, element_width, body) in &segments {
         let align = u64::from(*alignment);
         let padded_off = align_up(cursor, align);
         // padding between segments
@@ -377,7 +417,7 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
         cursor = offset + length;
     }
 
-    for ((kind, enc_ver, flags_u16, alignment, element_width, _), meta) in
+    for ((_kind, enc_ver, flags_u16, alignment, element_width, _), meta) in
         segments.iter().zip(entries_meta.iter())
     {
         let (kind, offset, length, crc, element_count) = *meta;
