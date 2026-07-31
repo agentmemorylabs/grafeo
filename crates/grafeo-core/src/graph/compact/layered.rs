@@ -744,10 +744,12 @@ impl GraphStore for LayeredStore {
         let dirty = self.dirty_node_ids.read();
         let overlay = self.overlay.load();
 
-        // G-E1.RO: mapped PropertyIndex section captures base+overlay postings
-        // at checkpoint. Prefer it exclusively so we do not double-count base
-        // nodes that also appear in the overlay index.
-        if overlay.has_mapped_property_index(property) {
+        // G-E1.RO: after compact, create_property_index / mapped PropertyIndex
+        // restore store full base+overlay postings on the overlay. Merging a
+        // CompactStore base scan with those postings double-counts base nodes
+        // (planner WHERE / find_nodes_by_properties see 2× hits). Prefer the
+        // overlay index exclusively whenever one is registered.
+        if overlay.has_property_index(property) {
             return overlay
                 .find_nodes_by_property(property, value)
                 .into_iter()
@@ -773,6 +775,21 @@ impl GraphStore for LayeredStore {
         }
         let deleted = self.deleted_from_base_nodes.read();
         let dirty = self.dirty_node_ids.read();
+        let overlay = self.overlay.load();
+
+        // Same exclusive-overlay rule as find_nodes_by_property: the planner
+        // try_plan_filter_with_property_index path calls this multi-predicate
+        // API, so base∪overlay would inflate Cypher WHERE counts.
+        if conditions
+            .iter()
+            .any(|(prop, _)| overlay.has_property_index(prop))
+        {
+            return overlay
+                .find_nodes_by_properties(conditions)
+                .into_iter()
+                .filter(|id| !deleted.contains(id))
+                .collect();
+        }
 
         let mut results: Vec<NodeId> = self
             .base
@@ -782,7 +799,7 @@ impl GraphStore for LayeredStore {
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
 
-        results.extend(self.overlay.load().find_nodes_by_properties(conditions));
+        results.extend(overlay.find_nodes_by_properties(conditions));
         results
     }
 
