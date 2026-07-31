@@ -202,10 +202,11 @@ fn force_disk_checkpoint_reopen_exact_read_without_inline_property() {
         assert_eq!(got, expected);
         // Property-key probe via the store must also miss (same as get_node).
         let prop_key = PropertyKey::new("embedding");
-        assert!(db
-            .get_node(node)
-            .and_then(|n| n.properties.get(&prop_key).cloned())
-            .is_none());
+        assert!(
+            db.get_node(node)
+                .and_then(|n| n.properties.get(&prop_key).cloned())
+                .is_none()
+        );
         db.close().unwrap();
     }
 }

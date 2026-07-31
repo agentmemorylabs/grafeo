@@ -71,17 +71,25 @@ fn bench_generation_container_write(c: &mut Criterion) {
             let path = dir.path().join("bench.grafeo");
 
             let budget = GenerationBudget::for_tests();
-            let generated = generate_compact_store(black_box(&input_1k), &budget).unwrap();
+            let input = black_box(&input_1k);
+            let generated = generate_compact_store(
+                &mut input.node_source(),
+                &mut input.edge_source(),
+                &input.rel_schemas,
+                &budget,
+            )
+            .unwrap();
 
+            let node_count = generated.store.total_nodes();
+            let edge_count = generated.store.total_edges();
             let section =
-                CompactStoreSectionSource::new(&generated.store, &generated.global_strings)
-                    .unwrap();
+                CompactStoreSectionSource::new(generated.store, generated.global_strings).unwrap();
 
             let header = GenerationContainerHeader {
                 epoch: 1,
                 transaction_id: 1,
-                node_count: generated.store.total_nodes(),
-                edge_count: generated.store.total_edges(),
+                node_count,
+                edge_count,
             };
 
             let mut sections: Vec<
@@ -106,17 +114,25 @@ fn bench_generation_container_write(c: &mut Criterion) {
             let path = dir.path().join("bench.grafeo");
 
             let budget = GenerationBudget::for_tests();
-            let generated = generate_compact_store(black_box(&input_10k), &budget).unwrap();
+            let input = black_box(&input_10k);
+            let generated = generate_compact_store(
+                &mut input.node_source(),
+                &mut input.edge_source(),
+                &input.rel_schemas,
+                &budget,
+            )
+            .unwrap();
 
+            let node_count = generated.store.total_nodes();
+            let edge_count = generated.store.total_edges();
             let section =
-                CompactStoreSectionSource::new(&generated.store, &generated.global_strings)
-                    .unwrap();
+                CompactStoreSectionSource::new(generated.store, generated.global_strings).unwrap();
 
             let header = GenerationContainerHeader {
                 epoch: 1,
                 transaction_id: 1,
-                node_count: generated.store.total_nodes(),
-                edge_count: generated.store.total_edges(),
+                node_count,
+                edge_count,
             };
 
             let mut sections: Vec<

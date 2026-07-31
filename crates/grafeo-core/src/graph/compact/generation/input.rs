@@ -180,6 +180,60 @@ pub trait EdgeRecordSource {
     fn next_edge(&mut self) -> Result<Option<GenerationEdge>, GenerationError>;
 }
 
+/// Slice-backed node source adapter for test and fixture use.
+#[derive(Debug)]
+pub struct SliceNodeSource<'a> {
+    slice: &'a [GenerationNode],
+    cursor: usize,
+}
+
+impl<'a> SliceNodeSource<'a> {
+    /// Wraps a slice of generation nodes.
+    #[must_use]
+    pub fn new(slice: &'a [GenerationNode]) -> Self {
+        Self { slice, cursor: 0 }
+    }
+}
+
+impl NodeRecordSource for SliceNodeSource<'_> {
+    fn next_node(&mut self) -> Result<Option<GenerationNode>, GenerationError> {
+        if self.cursor < self.slice.len() {
+            let n = self.slice[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(n))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Slice-backed edge source adapter for test and fixture use.
+#[derive(Debug)]
+pub struct SliceEdgeSource<'a> {
+    slice: &'a [GenerationEdge],
+    cursor: usize,
+}
+
+impl<'a> SliceEdgeSource<'a> {
+    /// Wraps a slice of generation edges.
+    #[must_use]
+    pub fn new(slice: &'a [GenerationEdge]) -> Self {
+        Self { slice, cursor: 0 }
+    }
+}
+
+impl EdgeRecordSource for SliceEdgeSource<'_> {
+    fn next_edge(&mut self) -> Result<Option<GenerationEdge>, GenerationError> {
+        if self.cursor < self.slice.len() {
+            let e = self.slice[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(e))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 /// Full generation input graph.
 #[derive(Default)]
 pub struct GenerationInput {
@@ -189,6 +243,32 @@ pub struct GenerationInput {
     pub edges: Vec<GenerationEdge>,
     /// Optional relationship schema declarations for wrong-table checks.
     pub rel_schemas: Vec<RelSchemaDecl>,
+    node_cursor: usize,
+    edge_cursor: usize,
+}
+
+impl NodeRecordSource for GenerationInput {
+    fn next_node(&mut self) -> Result<Option<GenerationNode>, GenerationError> {
+        if self.node_cursor < self.nodes.len() {
+            let n = self.nodes[self.node_cursor].clone();
+            self.node_cursor += 1;
+            Ok(Some(n))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl EdgeRecordSource for GenerationInput {
+    fn next_edge(&mut self) -> Result<Option<GenerationEdge>, GenerationError> {
+        if self.edge_cursor < self.edges.len() {
+            let e = self.edges[self.edge_cursor].clone();
+            self.edge_cursor += 1;
+            Ok(Some(e))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl std::fmt::Debug for GenerationInput {
@@ -206,6 +286,18 @@ impl GenerationInput {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates node streaming source.
+    #[must_use]
+    pub fn node_source(&self) -> SliceNodeSource<'_> {
+        SliceNodeSource::new(&self.nodes)
+    }
+
+    /// Creates edge streaming source.
+    #[must_use]
+    pub fn edge_source(&self) -> SliceEdgeSource<'_> {
+        SliceEdgeSource::new(&self.edges)
     }
 
     /// Adds a node.

@@ -8,7 +8,10 @@
 use super::budget::{GenerationBudget, GenerationMetrics};
 use super::columns::{encode_column, push_zone_strings};
 use super::error::GenerationError;
-use super::input::{GenerationEdge, GenerationInput, GenerationNode, OriginalEdgeId};
+use super::input::{
+    EdgeRecordSource, GenerationEdge, GenerationNode, NodeRecordSource, OriginalEdgeId,
+    RelSchemaDecl,
+};
 use super::strings::{GlobalStringDictionary, collect_and_assign_global_codes};
 use crate::graph::compact::CompactStore;
 use crate::graph::compact::column::ColumnCodec;
@@ -40,7 +43,9 @@ pub struct GeneratedCompact {
 ///
 /// Fail-closed on duplicates, missing/wrong-table endpoints, and wire-width overflow.
 pub fn generate_compact_store(
-    input: &GenerationInput,
+    nodes: &mut dyn NodeRecordSource,
+    edges: &mut dyn EdgeRecordSource,
+    rel_schemas: &[RelSchemaDecl],
     budget: &GenerationBudget,
 ) -> Result<GeneratedCompact, GenerationError> {
     budget.validate()?;
@@ -48,12 +53,12 @@ pub fn generate_compact_store(
     let mut string_occ: Vec<String> = Vec::new();
 
     // Optional relationship schema declarations force endpoint table checks.
-    let rel_decls = &input.rel_schemas;
+    let rel_decls = rel_schemas;
 
     // ── Partition nodes by label, sort by original ID, assign dense offsets ──
-    let mut by_label: FxHashMap<String, Vec<&GenerationNode>> = FxHashMap::default();
+    let mut by_label: FxHashMap<String, Vec<GenerationNode>> = FxHashMap::default();
     let mut seen_nodes: FxHashSet<u64> = FxHashSet::default();
-    for n in &input.nodes {
+    while let Some(n) = nodes.next_node()? {
         if !seen_nodes.insert(n.id.as_u64()) {
             return Err(GenerationError::DuplicateNodeId(n.id.as_u64()));
         }
@@ -74,7 +79,7 @@ pub fn generate_compact_store(
     let mut table_id_to_label: Vec<ArcStr> = Vec::new();
     let mut node_id_map: FxHashMap<NodeId, (u16, u64)> = FxHashMap::default();
     let mut node_offset_to_id: Vec<Vec<NodeId>> = Vec::new();
-    let mut node_rows: Vec<Vec<&GenerationNode>> = Vec::new();
+    let mut node_rows: Vec<Vec<GenerationNode>> = Vec::new();
 
     for (tid_usize, label) in labels.iter().enumerate() {
         let tid = u16::try_from(tid_usize).map_err(|_| GenerationError::WireWidthOverflow {
@@ -181,12 +186,12 @@ pub fn generate_compact_store(
         string_occ.push(d.edge_type.clone());
     }
 
-    for e in &input.edges {
+    while let Some(e) = edges.next_edge()? {
         if !seen_edges.insert(e.id.as_u64()) {
             return Err(GenerationError::DuplicateEdgeId(e.id.as_u64()));
         }
-        let (src_tid, src_off) = resolve_endpoint(&node_id_map, e, true)?;
-        let (dst_tid, dst_off) = resolve_endpoint(&node_id_map, e, false)?;
+        let (src_tid, src_off) = resolve_endpoint(&node_id_map, &e, true)?;
+        let (dst_tid, dst_off) = resolve_endpoint(&node_id_map, &e, false)?;
 
         if let Some((exp_src, exp_dst)) = decl_by_type.get(&e.edge_type) {
             let actual_src = table_id_to_label[src_tid as usize].as_str();
@@ -235,7 +240,7 @@ pub fn generate_compact_store(
             original_id: e.id,
             src_off: src_off_u32,
             dst_off: dst_off_u32,
-            properties: e.properties.clone(),
+            properties: e.properties,
         });
     }
 
@@ -405,16 +410,19 @@ pub fn generate_compact_store(
     })
 }
 
-/// Emit a production v5 payload with lexicographic global string codes.
+/// Emit a production v5 payload with lexicographic global string codes (test helper).
 ///
 /// # Errors
 ///
 /// Codec or generation failures.
+#[cfg(test)]
 pub fn generate_v5_payload(
-    input: &GenerationInput,
+    nodes: &mut dyn NodeRecordSource,
+    edges: &mut dyn EdgeRecordSource,
+    rel_schemas: &[RelSchemaDecl],
     budget: &GenerationBudget,
 ) -> Result<(Vec<u8>, GeneratedCompact), GenerationError> {
-    let mut generated = generate_compact_store(input, budget)?;
+    let mut generated = generate_compact_store(nodes, edges, rel_schemas, budget)?;
     let mut source = super::segment_source::CompactV5SegmentSource::new(
         &generated.store,
         &generated.global_strings,

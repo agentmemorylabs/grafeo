@@ -308,36 +308,40 @@ mod adapter {
     use grafeo_common::utils::error::{Error, Result};
     use grafeo_core::graph::compact::CompactStore;
     use grafeo_core::graph::compact::generation::{
-        CompactV5SegmentSource, GlobalStringDictionary, assemble_v5_payload_from_source,
+        CompactV5SegmentSource, GlobalStringDictionary, V5SegmentSource,
     };
     use std::io::Write;
 
     /// Adapter that presents a core `V5SegmentSource` as a container
     /// [`ExactSectionSource`] with `SectionType::CompactStore`.
     ///
-    /// Assembles the v5 payload via core's production codecs (no codec
-    /// duplication in storage) and streams it through `copy_to`.
+    /// Streams the v5 payload directly from `CompactV5SegmentSource`
+    /// through `copy_to` without materializing the whole payload.
     pub struct CompactStoreSectionSource {
-        payload: Vec<u8>,
+        store: CompactStore,
+        global_strings: GlobalStringDictionary,
+        total_nodes: u64,
+        total_edges: u64,
+        preserves_ids: bool,
     }
 
     impl CompactStoreSectionSource {
-        /// Assembles the v5 payload from a heap-built `CompactStore`.
+        /// Constructs a streaming section source from a heap-built `CompactStore`.
         ///
         /// # Errors
         ///
-        /// Returns an error if segment emission or payload assembly fails.
-        pub fn new(store: &CompactStore, global_strings: &GlobalStringDictionary) -> Result<Self> {
-            let mut source = CompactV5SegmentSource::new(store, global_strings)
-                .map_err(|e| Error::Internal(format!("V5SegmentSource: {e}")))?;
-            let payload = assemble_v5_payload_from_source(
-                &mut source,
-                store.total_nodes(),
-                store.total_edges(),
-                store.preserves_ids(),
-            )
-            .map_err(|e| Error::Internal(format!("v5 assembly: {e}")))?;
-            Ok(Self { payload })
+        /// Returns an error if segment planning fails.
+        pub fn new(store: CompactStore, global_strings: GlobalStringDictionary) -> Result<Self> {
+            let total_nodes = store.total_nodes();
+            let total_edges = store.total_edges();
+            let preserves_ids = store.preserves_ids();
+            Ok(Self {
+                store,
+                global_strings,
+                total_nodes,
+                total_edges,
+                preserves_ids,
+            })
         }
     }
 
@@ -351,15 +355,142 @@ mod adapter {
         }
 
         fn exact_len(&self) -> u64 {
-            // reason: payload length fits u64 on all targets
-            #[allow(clippy::cast_possible_truncation)]
-            let len = self.payload.len() as u64;
-            len
+            CompactV5SegmentSource::new(&self.store, &self.global_strings)
+                .map_or(0, |s| s.payload_len())
         }
 
         fn copy_to(&mut self, sink: &mut dyn Write) -> Result<()> {
-            sink.write_all(&self.payload).map_err(Error::Io)
+            let mut source = CompactV5SegmentSource::new(&self.store, &self.global_strings)
+                .map_err(|e| Error::Internal(format!("V5SegmentSource: {e}")))?;
+            let plan = source.segment_plan().to_vec();
+            let segment_count = plan.len();
+            let segment_count_u16 = u16::try_from(segment_count)
+                .map_err(|_| Error::Internal(format!("too many segments: {segment_count}")))?;
+
+            let directory_length = u64::from(segment_count_u16) * 48; // DIRECTORY_ENTRY_LEN
+            let data_offset = align_up(64 + directory_length, 8); // HEADER_LEN = 64
+
+            // reason: directory_length fits usize on all supported targets
+            #[allow(clippy::cast_possible_truncation)]
+            let dir_cap = directory_length as usize;
+            let mut dir_bytes = Vec::with_capacity(dir_cap);
+            let mut cursor = data_offset;
+            let mut entries_meta = Vec::with_capacity(segment_count);
+
+            for entry in &plan {
+                let align = u64::from(entry.alignment);
+                let offset = align_up(cursor, align);
+                entries_meta.push((
+                    entry.kind,
+                    entry.encoding_version,
+                    entry.flags,
+                    entry.alignment,
+                    offset,
+                    entry.length,
+                    entry.element_width,
+                    entry.element_count,
+                    entry.crc,
+                ));
+                cursor = offset + entry.length;
+            }
+
+            for meta in &entries_meta {
+                let (kind, enc_ver, flags, alignment, offset, length, el_width, el_count, crc) =
+                    *meta;
+                write_u16(&mut dir_bytes, kind.as_u16());
+                write_u16(&mut dir_bytes, enc_ver);
+                write_u16(&mut dir_bytes, flags);
+                write_u16(&mut dir_bytes, alignment);
+                write_u64(&mut dir_bytes, offset);
+                write_u64(&mut dir_bytes, length);
+                write_u32(&mut dir_bytes, el_width);
+                write_u32(&mut dir_bytes, el_count);
+                write_u32(&mut dir_bytes, crc);
+                write_u32(&mut dir_bytes, 0); // reserved_a
+                write_u64(&mut dir_bytes, 0); // reserved_b
+            }
+
+            let directory_crc = crc32fast::hash(&dir_bytes);
+            let flags: u8 = u8::from(self.preserves_ids);
+
+            let mut header = Vec::with_capacity(64);
+            header.extend_from_slice(b"GCST");
+            header.push(5); // FORMAT_VERSION_V5
+            header.push(flags);
+            write_u16(&mut header, 64); // HEADER_LEN
+            write_u16(&mut header, segment_count_u16);
+            write_u16(&mut header, 48); // DIRECTORY_ENTRY_LEN
+            write_u32(&mut header, 0); // layout_flags
+            write_u64(&mut header, 64); // directory_offset
+            write_u64(&mut header, directory_length);
+            write_u64(&mut header, data_offset);
+            write_u64(&mut header, self.total_nodes);
+            write_u64(&mut header, self.total_edges);
+            write_u32(&mut header, directory_crc);
+            write_u32(&mut header, 0); // reserved
+            debug_assert_eq!(header.len(), 64);
+
+            let mut hasher = crc32fast::Hasher::new();
+
+            sink.write_all(&header).map_err(Error::Io)?;
+            hasher.update(&header);
+
+            sink.write_all(&dir_bytes).map_err(Error::Io)?;
+            hasher.update(&dir_bytes);
+
+            let mut written_so_far = 64 + directory_length;
+            while written_so_far < data_offset {
+                // reason: padding delta fits usize
+                #[allow(clippy::cast_possible_truncation)]
+                let pad_len = (data_offset - written_so_far) as usize;
+                let zeros = vec![0u8; pad_len];
+                sink.write_all(&zeros).map_err(Error::Io)?;
+                hasher.update(&zeros);
+                written_so_far = data_offset;
+            }
+
+            let mut current_offset = data_offset;
+            while let Some(seg) = source
+                .next_segment()
+                .map_err(|e| Error::Internal(format!("next_segment: {e}")))?
+            {
+                let target_offset = align_up(current_offset, u64::from(seg.alignment));
+                if target_offset > current_offset {
+                    // reason: alignment padding fits usize
+                    #[allow(clippy::cast_possible_truncation)]
+                    let pad = (target_offset - current_offset) as usize;
+                    let zeros = vec![0u8; pad];
+                    sink.write_all(&zeros).map_err(Error::Io)?;
+                    hasher.update(&zeros);
+                    current_offset = target_offset;
+                }
+                sink.write_all(&seg.bytes).map_err(Error::Io)?;
+                hasher.update(&seg.bytes);
+                current_offset += seg.bytes.len() as u64;
+            }
+
+            let crc = hasher.finalize();
+            sink.write_all(&crc.to_le_bytes()).map_err(Error::Io)?;
+
+            Ok(())
         }
+    }
+
+    fn align_up(val: u64, align: u64) -> u64 {
+        if align == 0 {
+            return val;
+        }
+        (val + align - 1) & !(align - 1)
+    }
+
+    fn write_u16(buf: &mut Vec<u8>, v: u16) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_u64(buf: &mut Vec<u8>, v: u64) {
+        buf.extend_from_slice(&v.to_le_bytes());
     }
 }
 

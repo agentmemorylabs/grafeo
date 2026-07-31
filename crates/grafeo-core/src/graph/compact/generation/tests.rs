@@ -34,8 +34,13 @@ fn sparse_huge_ids_map_to_dense_offsets_not_magnitude() {
             sparse_id(1),
             "KNOWS",
         ));
-    let generated =
-        generate_compact_store(&input, &GenerationBudget::for_tests()).expect("generate");
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .expect("generate");
     assert!(generated.store.preserves_ids());
     // Dense cardinality is 3, not ~2^40.
     assert_eq!(generated.store.node_table("Person").unwrap().len(), 3);
@@ -71,7 +76,13 @@ fn multiple_node_and_rel_tables_with_different_cardinalities() {
         .edge(GenerationEdge::new(200u64, 1u64, 10u64, "REV"))
         .rel_schema(RelSchemaDecl::new("LINKS", "A", "B"))
         .rel_schema(RelSchemaDecl::new("REV", "B", "A"));
-    let generated = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap();
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     assert_eq!(generated.store.node_table("A").unwrap().len(), 3);
     assert_eq!(generated.store.node_table("B").unwrap().len(), 2);
     assert_eq!(generated.store.rel_table("LINKS").unwrap().num_edges(), 2);
@@ -86,7 +97,13 @@ fn missing_endpoint_fails_closed() {
     let input = GenerationInput::new()
         .node(GenerationNode::new(1u64, "Person"))
         .edge(GenerationEdge::new(9u64, 1u64, 999u64, "KNOWS"));
-    let err = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap_err();
+    let err = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap_err();
     assert!(matches!(
         err,
         GenerationError::MissingEndpoint {
@@ -104,7 +121,13 @@ fn wrong_table_endpoint_fails_closed() {
         .node(GenerationNode::new(2u64, "City"))
         .edge(GenerationEdge::new(9u64, 2u64, 1u64, "KNOWS")) // City -> Person
         .rel_schema(RelSchemaDecl::new("KNOWS", "Person", "Person"));
-    let err = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap_err();
+    let err = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap_err();
     assert!(matches!(
         err,
         GenerationError::WrongTableEndpoint {
@@ -122,7 +145,13 @@ fn duplicate_src_dst_preserves_distinct_edge_ids_and_properties() {
         .edge(GenerationEdge::new(50u64, 1u64, 2u64, "KNOWS").with_prop("w", Value::Int64(1)))
         .edge(GenerationEdge::new(40u64, 1u64, 2u64, "KNOWS").with_prop("w", Value::Int64(2)))
         .edge(GenerationEdge::new(60u64, 1u64, 2u64, "KNOWS").with_prop("w", Value::Int64(3)));
-    let generated = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap();
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     let rt = generated.store.rel_table("KNOWS").unwrap();
     assert_eq!(rt.num_edges(), 3);
     // Forward order by (src,dst,edge_id): 40, 50, 60
@@ -150,7 +179,13 @@ fn reverse_forward_positions_map_to_exact_forward_edge() {
         .edge(GenerationEdge::new(11u64, 1u64, 2u64, "K").with_prop("tag", "b"))
         .edge(GenerationEdge::new(12u64, 3u64, 2u64, "K").with_prop("tag", "c"))
         .edge(GenerationEdge::new(13u64, 2u64, 1u64, "K").with_prop("tag", "d"));
-    let generated = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap();
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     let rt = generated.store.rel_table("K").unwrap();
     let bwd = rt.bwd().expect("reverse csr required");
     assert!(bwd.has_edge_data());
@@ -188,7 +223,13 @@ fn four_original_id_structures_round_trip() {
             sparse_id(3),
             "E",
         ));
-    let (payload, generated) = generate_v5_payload(&input, &GenerationBudget::for_tests()).unwrap();
+    let (payload, generated) = generate_v5_payload(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     let restored = section_v5::deserialize_v5(&Bytes::from(payload)).unwrap();
     assert!(restored.preserves_ids());
     assert!(restored.get_node(NodeId::new(sparse_id(5))).is_some());
@@ -215,7 +256,13 @@ fn global_string_dedupe_across_metadata_zone_and_dict_columns() {
                 .with_prop("other", Value::from("Z")),
         )
         .edge(GenerationEdge::new(3u64, 1u64, 2u64, "X").with_prop("X", Value::from("X")));
-    let (payload, generated) = generate_v5_payload(&input, &GenerationBudget::for_tests()).unwrap();
+    let (payload, generated) = generate_v5_payload(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     assert!(generated.global_strings.code("X").is_some());
     let code_x = generated.global_strings.code("X").unwrap();
     assert_eq!(
@@ -278,7 +325,13 @@ fn lexicographic_codes_stable_across_input_iteration_orders() {
                 .node(GenerationNode::new(1u64, "Apple").with_prop("k", "zebra"))
                 .node(GenerationNode::new(2u64, "Zebra").with_prop("k", "apple"));
         }
-        let (payload, _) = generate_v5_payload(&input, &GenerationBudget::for_tests()).unwrap();
+        let (payload, _) = generate_v5_payload(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &input.rel_schemas,
+            &GenerationBudget::for_tests(),
+        )
+        .unwrap();
         payload
     };
     let a = mk(false);
@@ -397,7 +450,13 @@ fn v5_payload_deserializes_with_preserve_ids_and_reverse() {
         .edge(
             GenerationEdge::new(10u64, 1u64, 2u64, "KNOWS").with_prop("since", Value::Int64(2020)),
         );
-    let (payload, _) = generate_v5_payload(&input, &GenerationBudget::for_tests()).unwrap();
+    let (payload, _) = generate_v5_payload(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     let store = section_v5::deserialize_v5(&Bytes::from(payload)).unwrap();
     assert!(store.preserves_ids());
     assert!(store.rel_table("KNOWS").unwrap().has_backward());
@@ -417,7 +476,13 @@ fn serialize_lex_vs_insertion_both_roundtrip() {
     let input = GenerationInput::new()
         .node(GenerationNode::new(1u64, "Z").with_prop("a", "m"))
         .node(GenerationNode::new(2u64, "A").with_prop("a", "b"));
-    let generated = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap();
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     let ins =
         section_v5::serialize_v5_with_string_order(&generated.store, StringCodeOrder::Insertion)
             .unwrap();
@@ -437,7 +502,13 @@ fn null_value_fails_closed_not_empty_string() {
     let input = GenerationInput::new()
         .node(GenerationNode::new(1u64, "Person").with_prop("name", "Ada"))
         .node(GenerationNode::new(2u64, "Person"));
-    let err = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap_err();
+    let err = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap_err();
     assert!(matches!(err, GenerationError::NullValue { .. }));
 }
 
@@ -449,7 +520,13 @@ fn v5_segment_source_yields_byte_identical_assembled_payload_parity() {
         .edge(
             GenerationEdge::new(10u64, 1u64, 2u64, "KNOWS").with_prop("since", Value::Int64(2020)),
         );
-    let generated = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap();
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     let expected_payload = section_v5::serialize_v5_with_string_order(
         &generated.store,
         StringCodeOrder::Lexicographic,
@@ -467,7 +544,6 @@ fn v5_segment_source_yields_byte_identical_assembled_payload_parity() {
         generated.store.preserves_ids(),
     )
     .unwrap();
-
     assert_eq!(
         assembled_payload, expected_payload,
         "assembled payload from V5SegmentSource must be byte-identical to serialize_v5_with_string_order(Lexicographic)"
@@ -497,7 +573,13 @@ fn v5_segment_source_segment_count_ascending_kinds_and_bounded_bytes() {
             sparse_id(20),
             "FOLLOWS",
         ));
-    let generated = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap();
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
     let mut source =
         CompactV5SegmentSource::new(&generated.store, &generated.global_strings).unwrap();
 
