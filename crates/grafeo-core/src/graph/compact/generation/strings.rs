@@ -30,6 +30,12 @@ impl GlobalStringDictionary {
     pub fn is_empty(&self) -> bool {
         self.strings.is_empty()
     }
+
+    /// Slice of strings in lexicographic order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.strings
+    }
 }
 
 /// Collect unique strings, sort UTF-8 lexicographically, assign dense codes.

@@ -253,7 +253,9 @@ impl VectorIndexKind {
     ) -> Vec<(NodeId, f32)> {
         match self {
             Self::Hnsw(idx) => idx.search_with_ef_and_filter(query, k, ef, allowlist, accessor),
-            Self::Quantized(idx) => idx.search_with_ef_and_filter(query, k, ef, allowlist, accessor),
+            Self::Quantized(idx) => {
+                idx.search_with_ef_and_filter(query, k, ef, allowlist, accessor)
+            }
         }
     }
 
@@ -315,7 +317,9 @@ impl VectorIndexKind {
             Self::Hnsw(idx) => {
                 idx.batch_search_with_ef_and_filter(queries, k, ef, allowlist, accessor)
             }
-            Self::Quantized(idx) => idx.batch_search_with_ef_and_filter(queries, k, ef, allowlist, accessor),
+            Self::Quantized(idx) => {
+                idx.batch_search_with_ef_and_filter(queries, k, ef, allowlist, accessor)
+            }
         }
     }
 

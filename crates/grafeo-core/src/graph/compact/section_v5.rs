@@ -1003,7 +1003,7 @@ fn column_body_slice(block_index: &Bytes, bodies: &Bytes, col_idx: usize) -> Res
     Ok(bodies.slice(byte_offset..end))
 }
 
-fn write_column_body(
+pub(crate) fn write_column_body(
     buf: &mut Vec<u8>,
     codec: &ColumnCodec,
     string_index: &FxHashMap<String, u32>,
@@ -1100,7 +1100,7 @@ fn slice_u32_range(bytes: &Bytes, start_elem: usize, count: usize) -> Result<Byt
     Ok(bytes.slice(start..end))
 }
 
-fn intern_zone_strings(zm: &ZoneMap, intern: &mut impl FnMut(&str) -> u32) {
+pub(crate) fn intern_zone_strings(zm: &ZoneMap, intern: &mut impl FnMut(&str) -> u32) {
     if let Some(grafeo_common::types::Value::String(s)) = &zm.min {
         let _ = intern(s.as_str());
     }
@@ -1109,7 +1109,7 @@ fn intern_zone_strings(zm: &ZoneMap, intern: &mut impl FnMut(&str) -> u32) {
     }
 }
 
-fn codec_disc(codec: &ColumnCodec) -> u16 {
+pub(crate) fn codec_disc(codec: &ColumnCodec) -> u16 {
     match codec {
         ColumnCodec::BitPacked(_) => 0,
         ColumnCodec::Dict(_) => 1,
@@ -1121,7 +1121,7 @@ fn codec_disc(codec: &ColumnCodec) -> u16 {
     }
 }
 
-fn value_type_code(codec: &ColumnCodec) -> u16 {
+pub(crate) fn value_type_code(codec: &ColumnCodec) -> u16 {
     codec_disc(codec)
 }
 
@@ -1135,7 +1135,7 @@ fn column_type_from_disc(disc: u16) -> ColumnType {
     }
 }
 
-fn append_u32_array(buf: &mut Vec<u8>, values: &[u32]) {
+pub(crate) fn append_u32_array(buf: &mut Vec<u8>, values: &[u32]) {
     for &v in values {
         write_u32(buf, v);
     }
@@ -1153,18 +1153,18 @@ fn estimate_schema_bytes(store: &CompactStore) -> usize {
     labels + types + tables + 4096
 }
 
-fn align_up(value: u64, align: u64) -> u64 {
+pub(crate) fn align_up(value: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
     (value + (align - 1)) & !(align - 1)
 }
 
-fn write_u16(buf: &mut Vec<u8>, v: u16) {
+pub(crate) fn write_u16(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
-fn write_u32(buf: &mut Vec<u8>, v: u32) {
+pub(crate) fn write_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
-fn write_u64(buf: &mut Vec<u8>, v: u64) {
+pub(crate) fn write_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16, String> {

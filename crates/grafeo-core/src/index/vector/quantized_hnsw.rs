@@ -35,9 +35,9 @@
 //! let results = index.search(&query, 10, &acc);
 //! ```
 
-use super::quantization::{BinaryQuantizer, ProductQuantizer, QuantizationType, ScalarQuantizer};
 use super::VectorAccessor;
-use super::{compute_distance, HnswConfig, HnswIndex};
+use super::quantization::{BinaryQuantizer, ProductQuantizer, QuantizationType, ScalarQuantizer};
+use super::{HnswConfig, HnswIndex, compute_distance};
 use grafeo_common::types::NodeId;
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;

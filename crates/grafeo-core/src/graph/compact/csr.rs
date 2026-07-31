@@ -407,7 +407,6 @@ impl CsrAdjacency {
     }
 }
 
-
 fn write_usize_as_u32(buf: &mut Vec<u8>, v: usize) {
     let n = u32::try_from(v).expect("value exceeds u32::MAX in CSR serialization");
     buf.extend_from_slice(&n.to_le_bytes());

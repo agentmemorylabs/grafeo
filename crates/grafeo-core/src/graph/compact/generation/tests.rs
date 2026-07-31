@@ -440,3 +440,88 @@ fn null_value_fails_closed_not_empty_string() {
     let err = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap_err();
     assert!(matches!(err, GenerationError::NullValue { .. }));
 }
+
+#[test]
+fn v5_segment_source_yields_byte_identical_assembled_payload_parity() {
+    let input = GenerationInput::new()
+        .node(GenerationNode::new(1u64, "Person").with_prop("name", "Ada"))
+        .node(GenerationNode::new(2u64, "Person").with_prop("name", "Bob"))
+        .edge(
+            GenerationEdge::new(10u64, 1u64, 2u64, "KNOWS").with_prop("since", Value::Int64(2020)),
+        );
+    let generated = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap();
+    let expected_payload = section_v5::serialize_v5_with_string_order(
+        &generated.store,
+        StringCodeOrder::Lexicographic,
+    )
+    .unwrap();
+
+    let mut source =
+        CompactV5SegmentSource::new(&generated.store, &generated.global_strings).unwrap();
+    assert_eq!(source.segment_count(), 20);
+
+    let assembled_payload = assemble_v5_payload_from_source(
+        &mut source,
+        generated.store.total_nodes(),
+        generated.store.total_edges(),
+        generated.store.preserves_ids(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        assembled_payload, expected_payload,
+        "assembled payload from V5SegmentSource must be byte-identical to serialize_v5_with_string_order(Lexicographic)"
+    );
+
+    let restored = section_v5::deserialize_v5(&Bytes::from(assembled_payload)).unwrap();
+    assert!(restored.preserves_ids());
+    assert_eq!(
+        restored
+            .get_node(NodeId::new(1))
+            .unwrap()
+            .properties
+            .get(&"name".into())
+            .unwrap(),
+        &Value::from("Ada")
+    );
+}
+
+#[test]
+fn v5_segment_source_segment_count_ascending_kinds_and_bounded_bytes() {
+    let input = GenerationInput::new()
+        .node(GenerationNode::new(sparse_id(10), "User").with_prop("email", "a@b.com"))
+        .node(GenerationNode::new(sparse_id(20), "User").with_prop("email", "c@d.com"))
+        .edge(GenerationEdge::new(
+            sparse_id(100),
+            sparse_id(10),
+            sparse_id(20),
+            "FOLLOWS",
+        ));
+    let generated = generate_compact_store(&input, &GenerationBudget::for_tests()).unwrap();
+    let mut source =
+        CompactV5SegmentSource::new(&generated.store, &generated.global_strings).unwrap();
+
+    let total = source.segment_count();
+    let mut count = 0;
+    let mut prev_kind: Option<u16> = None;
+    let mut _total_segment_bytes = 0usize;
+
+    while let Some(seg) = source.next_segment().unwrap() {
+        count += 1;
+        let kind_code = seg.kind.as_u16();
+        if let Some(prev) = prev_kind {
+            assert!(
+                kind_code > prev,
+                "segments must be strictly ascending: {kind_code} > {prev}"
+            );
+        }
+        prev_kind = Some(kind_code);
+        _total_segment_bytes += seg.bytes.len();
+        // Each segment is bounded (individual section bytes, not whole assembled payload)
+        assert!(
+            seg.bytes.len() < 4096,
+            "individual segment bytes must be bounded"
+        );
+    }
+    assert_eq!(count, total);
+}

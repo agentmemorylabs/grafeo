@@ -23,8 +23,8 @@
 //! On the next checkpoint after a v1→v2 read, the section serializes
 //! the in-memory topologies as v2, completing the migration.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::types::NodeId;
 use grafeo_common::utils::error::{Error, Result};
 
-use super::paged_topology::{deserialize_topology, serialize_topology, MmapTopology};
+use super::paged_topology::{MmapTopology, deserialize_topology, serialize_topology};
 use super::{DistanceMetric, VectorIndexKind};
 
 /// Current vector store section format version.

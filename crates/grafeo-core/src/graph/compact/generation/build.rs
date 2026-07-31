@@ -17,7 +17,6 @@ use crate::graph::compact::id::MAX_TABLE_ID;
 use crate::graph::compact::node_table::NodeTable;
 use crate::graph::compact::rel_table::RelTable;
 use crate::graph::compact::schema::{ColumnDef, EdgeSchema, TableSchema};
-use crate::graph::compact::section_v5::{self, StringCodeOrder};
 use crate::graph::compact::zone_map::{ZoneMap, compute_block_zone_maps};
 use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 use arcstr::ArcStr;
@@ -416,11 +415,16 @@ pub fn generate_v5_payload(
     budget: &GenerationBudget,
 ) -> Result<(Vec<u8>, GeneratedCompact), GenerationError> {
     let mut generated = generate_compact_store(input, budget)?;
-    let bytes = section_v5::serialize_v5_with_string_order(
+    let mut source = super::segment_source::CompactV5SegmentSource::new(
         &generated.store,
-        StringCodeOrder::Lexicographic,
-    )
-    .map_err(GenerationError::Codec)?;
+        &generated.global_strings,
+    )?;
+    let bytes = super::segment_source::assemble_v5_payload_from_source(
+        &mut source,
+        generated.store.total_nodes(),
+        generated.store.total_edges(),
+        generated.store.preserves_ids(),
+    )?;
 
     generated
         .metrics

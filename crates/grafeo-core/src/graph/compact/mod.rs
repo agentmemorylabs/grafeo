@@ -14,12 +14,16 @@ pub mod csr;
 /// Container section serialization for the layered overlay deletion log.
 #[cfg(feature = "lpg")]
 pub mod deletions_section;
+/// Source-true CompactStore generation on bounded runs (G-EM0.W0-A2).
+pub mod generation;
 mod graph_store_impl;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
 /// Two-layer store: columnar base + mutable LPG overlay.
 #[cfg(feature = "lpg")]
 pub mod layered;
+/// Mapped CompactStore v5 views and accounting (G-EM0.2).
+pub mod mapped;
 /// Per-label node tables with columnar property storage.
 pub mod node_table;
 /// Per-type relationship tables backed by forward/backward CSR.
@@ -28,16 +32,12 @@ pub mod rel_table;
 pub mod schema;
 /// Container section serialization for CompactStore.
 pub mod section;
+/// CompactStore payload version 5 codec.
+pub(crate) mod section_v5;
 #[cfg(test)]
 mod tests;
 /// Zone maps for skip-pruning predicate evaluation.
 pub mod zone_map;
-/// Mapped CompactStore v5 views and accounting (G-EM0.2).
-pub mod mapped;
-/// Source-true CompactStore generation on bounded runs (G-EM0.W0-A2).
-pub mod generation;
-/// CompactStore payload version 5 codec.
-pub(crate) mod section_v5;
 
 pub use builder::{CompactStoreBuilder, from_graph_store, from_graph_store_preserving_ids};
 
@@ -320,6 +320,24 @@ impl CompactStore {
         }
 
         results
+    }
+
+    /// Returns the total logical node count across all node tables.
+    #[must_use]
+    pub fn total_nodes(&self) -> u64 {
+        self.node_tables_by_id
+            .iter()
+            .map(NodeTable::len)
+            .sum::<usize>() as u64
+    }
+
+    /// Returns the total logical edge count across all rel tables.
+    #[must_use]
+    pub fn total_edges(&self) -> u64 {
+        self.rel_tables_by_id
+            .iter()
+            .map(RelTable::num_edges)
+            .sum::<usize>() as u64
     }
 
     /// Returns a rough estimate of heap memory used by the snapshot data

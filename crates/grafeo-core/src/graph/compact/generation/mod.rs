@@ -11,7 +11,9 @@ mod columns;
 mod error;
 mod input;
 mod runs;
+mod segment_source;
 mod strings;
+mod v5_emitter;
 
 #[cfg(test)]
 mod tests;
@@ -27,4 +29,8 @@ pub use runs::{
     CancelToken, ExternalRunHandle, ExternalRunMerger, ExternalRunSink, InMemoryRunMerger,
     InMemoryRunSink, SortRecord, default_merge_fan_in,
 };
+pub use segment_source::{
+    CompactV5SegmentSource, V5Segment, V5SegmentSource, assemble_v5_payload_from_source,
+};
 pub use strings::{GlobalStringDictionary, collect_and_assign_global_codes};
+pub use v5_emitter::emit_v5_segments;

@@ -146,10 +146,7 @@ impl CompactStoreSection {
         version: u8,
     ) -> grafeo_common::utils::error::Result<Vec<u8>> {
         match version {
-            FORMAT_VERSION_V1
-            | FORMAT_VERSION_V2
-            | FORMAT_VERSION_V3
-            | FORMAT_VERSION_V4
+            FORMAT_VERSION_V1 | FORMAT_VERSION_V2 | FORMAT_VERSION_V3 | FORMAT_VERSION_V4
             | FORMAT_VERSION => {}
             other => {
                 return Err(grafeo_common::utils::error::Error::Serialization(format!(
