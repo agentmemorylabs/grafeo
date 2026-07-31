@@ -255,9 +255,30 @@ Entries are emitted in ascending numeric kind order; empty kinds are omitted.
 | 15 | `EdgeIdLookup` | 24 | 1 | conditional | required when flags bit 0 set; fixed 24-byte records sorted ascending by `id`; see layout below |
 | 16 | `NodeOriginalIds` | 8 | 1 | conditional | required when flags bit 0 set; u64 LE per-table row-offset → original NodeId |
 | 17 | `EdgeOriginalIds` | 8 | 1 | conditional | required when flags bit 0 set; u64 LE per-rel-table CSR-position → original EdgeId |
-| 18 | `TableZoneMaps` | 0 (variable) | 1 | no | per-column zone-map records: `(column:u32, block:u32, min_offset:u64, max_offset:u64)` = 24 bytes; min/max are offsets into `StringBytes` for string values, inline for numeric |
-| 19 | `BlockZoneMaps` | 0 (variable) | 1 | no | per-block zone-map records, same record shape as kind 18 |
-| 20 | `DictionaryCodeIndex` | 16 | 1 | no | sorted records: `(string_offset:u64, string_len:u32, code:u32)` = 16 bytes; sorted lexicographically by UTF-8 bytes at `(string_offset, string_len)` within `StringBytes`; enables O(log D) string→code lookup |
+| 18 | `TableZoneMaps` | 40 | 1 | yes (when any table zone maps exist) | fixed 40-byte records (see below); `block_index = u32::MAX` sentinel for table-level |
+| 19 | `BlockZoneMaps` | 40 | 1 | yes (when any block zone maps exist) | same 40-byte record shape; dense `block_index` from 0 |
+| 20 | `DictionaryCodeIndex` | 16 | 1 | yes (when dictionary non-empty) | sorted records: `(string_offset:u64, string_len:u32, code:u32)` = 16 bytes; sorted lexicographically by UTF-8 content; enables O(log D) string→code lookup |
+
+#### Kinds 18–19 — zone-map record (40 bytes)
+
+| offset | field | width | notes |
+| ---: | --- | ---: | --- |
+| 0 | table_id | u16 | node table id |
+| 2 | reserved | u16 | must be zero |
+| 4 | column_key_code | u32 | global dictionary code for property key |
+| 8 | block_index | u32 | `u32::MAX` for table-level (kind 18); dense block index for kind 19 |
+| 12 | null_count | u32 | |
+| 16 | row_count | u32 | |
+| 20 | min_tag | u8 | 0=absent, 1=int64, 2=bool, 3=string_code, 4=float64 |
+| 21 | max_tag | u8 | same tags |
+| 22 | pad | u16 | must be zero |
+| 24 | min_payload | u64 | i64 bits / bool / string code / f64 bits |
+| 32 | max_payload | u64 | same |
+
+String min/max payloads are **dictionary codes** into `StringOffsets`/`StringBytes`
+(not raw offsets). G-EM0.2 writes kinds 18–20 whenever the corresponding
+data is non-empty and restores them on mapped reopen for prune + O(log D)
+`find_eq`.
 
 ### Fixed-width record layouts (kinds 3, 4, 14, 15)
 
@@ -401,21 +422,16 @@ through `StringBytes`. Code→string remains O(1) via `StringOffsets[code]`.
 
 ## Compatibility and implementation contracts
 
-G-EM0.1 must add the v5 source codec and checked directory parser while
-preserving v1–v4 readers and existing error behavior for malformed legacy
-sections. Its owned paths are `crates/grafeo-core/src/graph/compact/section.rs`
-and `crates/grafeo-core/src/graph/compact/column.rs`; RED assertions must cover
-the header, enum/order, CRC domains, and all fail-closed cases above.
+G-EM0.1 landed direct container mmap ownership (`deserialize_from_mapped_bytes`
++ `CompactBacking::ContainerMmap`). G-EM0.2 implements the v5 source codec,
+checked directory parser, mapped proportional graph structures (CSR, string
+dict, ID lookups, column bodies), and split memory accounting. Owned paths
+include `crates/grafeo-core/src/graph/compact/{section,section_v5,mapped,csr,
+column,mod}.rs` and the integration targets
+`compact_store_readonly_graph_parity` / `mapped_graph_tests`.
 
-G-EM0.2 owns `crates/grafeo-engine/src/database/mod.rs`,
-`crates/grafeo-engine/src/database/section_consumer.rs`, and
-`crates/grafeo-storage/src/file/manager.rs`; it connects container open to the
-mapped owner and exposes lookup/graph-view operations without whole-payload
-copies. The writer lane (G-F0.1) emits the outer directory version required by
-v5; readers still dispatch historical outer versions to the payload parser.
-
-Current E-0 readers accept v1–v4. Version 5 is selected by this packet but is
-not emitted or read until G-EM0.1 lands.
+Current writers emit v5. Readers accept v1–v5; v1–v4 remain compatibility
+paths and may retain proportional heap.
 
 RED coverage required before implementation is accepted:
 

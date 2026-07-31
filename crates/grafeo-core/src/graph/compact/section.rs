@@ -24,10 +24,14 @@ use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 /// Magic bytes identifying a CompactStore section.
 const MAGIC: [u8; 4] = *b"GCST";
 
-/// Current section format version. E-0 bumped this from 3 to 4 to encode
-/// section-level strings with `u32` lengths (production-sized property
-/// zone-map min/max values).
-const FORMAT_VERSION: u8 = 4;
+/// Current section format version. G-EM0.2 selects payload version 5 for
+/// the mapped segment-directory layout. v4 remains the last pre-mapped
+/// streaming codec.
+const FORMAT_VERSION: u8 = 5;
+
+/// v4 (E-0) layout: section-level strings with `u32` lengths; streaming
+/// tables without a mapped directory. Retained as a read/write compat path.
+const FORMAT_VERSION_V4: u8 = 4;
 
 /// v3 (Phase 2c) layout: per-block zone maps in the column index for
 /// skip pruning; section-level strings still use `u16` lengths.
@@ -142,10 +146,14 @@ impl CompactStoreSection {
         version: u8,
     ) -> grafeo_common::utils::error::Result<Vec<u8>> {
         match version {
-            FORMAT_VERSION_V1 | FORMAT_VERSION_V2 | FORMAT_VERSION_V3 | FORMAT_VERSION => {}
+            FORMAT_VERSION_V1
+            | FORMAT_VERSION_V2
+            | FORMAT_VERSION_V3
+            | FORMAT_VERSION_V4
+            | FORMAT_VERSION => {}
             other => {
                 return Err(grafeo_common::utils::error::Error::Serialization(format!(
-                    "unsupported CompactStore section version {other} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION})"
+                    "unsupported CompactStore section version {other} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION_V4}, {FORMAT_VERSION})"
                 )));
             }
         }
@@ -154,6 +162,15 @@ impl CompactStoreSection {
         let store = guard.as_ref().ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal("no CompactStore to serialize".into())
         })?;
+
+        if version == FORMAT_VERSION {
+            let bytes = super::section_v5::serialize_v5(store).map_err(|e| {
+                grafeo_common::utils::error::Error::Serialization(format!(
+                    "CompactStore v5 serialization failed: {e}"
+                ))
+            })?;
+            return Ok(bytes);
+        }
 
         let mut buf = Vec::with_capacity(store.memory_bytes());
 
@@ -268,7 +285,7 @@ fn write_codec(
     match version {
         FORMAT_VERSION_V1 => codec.write_to(buf),
         FORMAT_VERSION_V2 => codec.write_to_v2(buf),
-        FORMAT_VERSION_V3 | FORMAT_VERSION => codec.write_to_v3(buf, block_stats_hint),
+        FORMAT_VERSION_V3 | FORMAT_VERSION_V4 => codec.write_to_v3(buf, block_stats_hint),
         other => {
             return Err(grafeo_common::utils::error::Error::Serialization(format!(
                 "unsupported CompactStore section version {other} for column codec write"
@@ -334,7 +351,7 @@ fn read_codec(
         FORMAT_VERSION_V2 => ColumnCodec::read_from_v2(data, pos)
             .map(|c| (c, None))
             .map_err(|e| e.to_string()),
-        FORMAT_VERSION_V3 | FORMAT_VERSION => ColumnCodec::read_from_v3(data, pos)
+        FORMAT_VERSION_V3 | FORMAT_VERSION_V4 => ColumnCodec::read_from_v3(data, pos)
             .map(|(c, stats)| (c, Some(stats)))
             .map_err(|e| e.to_string()),
         _ => Err(format!("unsupported CompactStore version {version}")),
@@ -371,13 +388,16 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
     pos += 4;
     let version = data[pos];
     pos += 1;
-    if version != FORMAT_VERSION
+    if version == FORMAT_VERSION {
+        return super::section_v5::deserialize_v5(data_bytes);
+    }
+    if version != FORMAT_VERSION_V4
         && version != FORMAT_VERSION_V3
         && version != FORMAT_VERSION_V2
         && version != FORMAT_VERSION_V1
     {
         return Err(format!(
-            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION})"
+            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION_V4}, {FORMAT_VERSION})"
         ));
     }
     let flags = data[pos];
@@ -706,7 +726,7 @@ fn write_string_len(
             write_u16(buf, n);
             Ok(())
         }
-        FORMAT_VERSION => {
+        FORMAT_VERSION_V4 | FORMAT_VERSION => {
             let n = u32::try_from(len).map_err(|_| {
                 grafeo_common::utils::error::Error::Serialization(format!(
                     "string length {len} exceeds u32::MAX for CompactStore payload version {version}"
@@ -830,7 +850,7 @@ fn checked_count_for_alloc(
 /// label length prefix + `row_count` + `num_cols`.
 fn min_node_table_wire_bytes(version: u8) -> usize {
     let label_len_bytes = match version {
-        FORMAT_VERSION => 4,
+        FORMAT_VERSION_V4 | FORMAT_VERSION => 4,
         _ => 2,
     };
     label_len_bytes + 4 + 4
@@ -841,7 +861,7 @@ fn min_node_table_wire_bytes(version: u8) -> usize {
 /// (`offsets_len`, `targets_len`, no edge_data) + bwd flag + `num_props`.
 fn min_rel_table_wire_bytes(version: u8) -> usize {
     let edge_type_len_bytes = match version {
-        FORMAT_VERSION => 4,
+        FORMAT_VERSION_V4 | FORMAT_VERSION => 4,
         _ => 2,
     };
     // CSR empty: u32 offsets_len + u32 targets_len + u8 has_edge_data(=0).
@@ -853,7 +873,7 @@ fn min_rel_table_wire_bytes(version: u8) -> usize {
 /// key length prefix + zone-map flag (node columns) or codec tag alone.
 fn min_column_entry_wire_bytes(version: u8) -> usize {
     let key_len_bytes = match version {
-        FORMAT_VERSION => 4,
+        FORMAT_VERSION_V4 | FORMAT_VERSION => 4,
         _ => 2,
     };
     // Node columns: key + has_zm flag. Edge props omit the flag but still need
@@ -896,7 +916,7 @@ fn read_string(data: &[u8], pos: &mut usize, version: u8) -> Result<String, Stri
         FORMAT_VERSION_V1 | FORMAT_VERSION_V2 | FORMAT_VERSION_V3 => {
             usize::from(read_u16(data, pos)?)
         }
-        FORMAT_VERSION => read_u32(data, pos)? as usize,
+        FORMAT_VERSION_V4 | FORMAT_VERSION => read_u32(data, pos)? as usize,
         other => {
             return Err(format!(
                 "unsupported CompactStore section version {other} for string read"
@@ -1100,6 +1120,7 @@ mod tests {
         let section = CompactStoreSection::empty();
         assert_eq!(section.section_type(), SectionType::CompactStore);
         assert_eq!(section.version(), FORMAT_VERSION);
+        assert_eq!(FORMAT_VERSION, 5);
         assert!(!section.is_dirty());
         assert_eq!(section.memory_usage(), 0);
     }
@@ -1468,11 +1489,10 @@ mod tests {
         let (compact, node, body) = compact_with_documentation_json(65_536);
         let section = CompactStoreSection::new(compact);
         let bytes = section
-            .serialize()
+            .serialize_with_version(FORMAT_VERSION_V4)
             .expect("v4 writer must accept 65536-byte strings");
-        assert_eq!(bytes[4], FORMAT_VERSION);
-        assert_eq!(section.version(), FORMAT_VERSION);
-        assert_eq!(FORMAT_VERSION, 4);
+        assert_eq!(bytes[4], FORMAT_VERSION_V4);
+        assert_eq!(FORMAT_VERSION_V4, 4);
 
         let mut section2 = CompactStoreSection::empty();
         section2.deserialize(&bytes).unwrap();
@@ -1491,7 +1511,7 @@ mod tests {
         let len = 96 * 1024;
         let (compact, node, body) = compact_with_documentation_json(len);
         let section = CompactStoreSection::new(compact);
-        let bytes = section.serialize().unwrap();
+        let bytes = section.serialize_with_version(FORMAT_VERSION_V4).unwrap();
         assert_eq!(bytes[4], 4);
 
         let mut section2 = CompactStoreSection::empty();
@@ -1510,7 +1530,7 @@ mod tests {
         data.extend_from_slice(&10u32.to_le_bytes());
         data.extend_from_slice(b"ab");
         let mut pos = 0;
-        let err = read_string(&data, &mut pos, FORMAT_VERSION).expect_err("truncated");
+        let err = read_string(&data, &mut pos, FORMAT_VERSION_V4).expect_err("truncated");
         assert!(err.contains("truncated string"), "unexpected error: {err}");
     }
 
@@ -1520,7 +1540,7 @@ mod tests {
         let mut buf = Vec::new();
         let over = (u32::MAX as usize).saturating_add(1);
         assert!(over > u32::MAX as usize);
-        let err = write_string_len(&mut buf, over, FORMAT_VERSION).expect_err("over u32");
+        let err = write_string_len(&mut buf, over, FORMAT_VERSION_V4).expect_err("over u32");
         match err {
             grafeo_common::utils::error::Error::Serialization(msg) => {
                 assert!(
@@ -1615,8 +1635,9 @@ mod tests {
         let _ = store.create_node(&["Item"]);
         let compact = from_graph_store_preserving_ids(&store).unwrap();
         let section = CompactStoreSection::new(Arc::new(compact));
-        assert_eq!(section.version(), 4);
-        let bytes = section.serialize().unwrap();
+        // Default section version is v5 (mapped). Explicit v4 remains available.
+        assert_eq!(section.version(), 5);
+        let bytes = section.serialize_with_version(FORMAT_VERSION_V4).unwrap();
         assert_eq!(bytes[4], 4);
     }
 
@@ -1628,7 +1649,7 @@ mod tests {
     fn e0_malformed_v4_header_only_fails_closed_without_pathological_alloc() {
         let mut payload = Vec::new();
         payload.extend_from_slice(b"GCST");
-        payload.push(FORMAT_VERSION);
+        payload.push(FORMAT_VERSION_V4);
         payload.push(0);
         let crc = crc32fast::hash(&payload);
         payload.extend_from_slice(&crc.to_le_bytes());
@@ -1652,7 +1673,7 @@ mod tests {
     fn e0_malformed_v4_huge_node_table_count_fails_closed_without_pathological_alloc() {
         let mut payload = Vec::new();
         payload.extend_from_slice(b"GCST");
-        payload.push(FORMAT_VERSION);
+        payload.push(FORMAT_VERSION_V4);
         payload.push(0); // flags: no id maps
         payload.extend_from_slice(&u32::MAX.to_le_bytes()); // num_node_tables
         let crc = crc32fast::hash(&payload);
@@ -1690,8 +1711,8 @@ mod tests {
         assert_eq!(compact.node_tables_by_id.len(), 1);
         assert!(compact.preserves_ids());
         let section = CompactStoreSection::new(Arc::new(compact));
-        let mut bytes = section.serialize().unwrap();
-        assert_eq!(bytes[4], FORMAT_VERSION);
+        let mut bytes = section.serialize_with_version(FORMAT_VERSION_V4).unwrap();
+        assert_eq!(bytes[4], FORMAT_VERSION_V4);
         assert_ne!(bytes[5] & 0x01, 0, "preserves_ids flag must be set");
 
         // Trailing layout before CRC:
@@ -1736,8 +1757,8 @@ mod tests {
         assert_eq!(compact.rel_tables_by_id.len(), 1);
         assert!(compact.preserves_ids());
         let section = CompactStoreSection::new(Arc::new(compact));
-        let mut bytes = section.serialize().unwrap();
-        assert_eq!(bytes[4], FORMAT_VERSION);
+        let mut bytes = section.serialize_with_version(FORMAT_VERSION_V4).unwrap();
+        assert_eq!(bytes[4], FORMAT_VERSION_V4);
         assert_ne!(bytes[5] & 0x01, 0, "preserves_ids flag must be set");
 
         // Trailing layout before CRC ends with one edge_id_map entry:
