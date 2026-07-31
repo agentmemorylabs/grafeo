@@ -14,7 +14,7 @@
 //!   feature (pulls in `grafeo-core`).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,6 +101,72 @@ pub trait GenerationFileOps {
     fn remove(&self, path: &Path) -> Result<()>;
     /// Check if a path exists.
     fn path_exists(&self, path: &Path) -> bool;
+
+    // ── W0-B lifecycle additions (additive only) ─────────────────────
+    // These operations are needed by the writable generation lifecycle
+    // (publication, recovery, snapshot, fault injection). Existing method
+    // signatures are unchanged.
+
+    /// Open an existing file for reading and writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened.
+    fn open_existing(&self, path: &Path) -> Result<File>;
+
+    /// Read the full contents of a file into memory.
+    ///
+    /// Used only for small fixed-size control files (manifest slots).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
+    fn read_to_end(&self, path: &Path) -> Result<Vec<u8>>;
+
+    /// Create directories recursively.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory creation fails.
+    fn create_dir_all(&self, path: &Path) -> Result<()>;
+
+    /// List directory entry names (not full paths).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be read.
+    fn read_dir(&self, path: &Path) -> Result<Vec<String>>;
+
+    /// Compute SHA-256 of a file (streaming, bounded memory).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
+    fn sha256(&self, path: &Path) -> Result<[u8; 32]>;
+
+    /// Return the byte length of a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be stat'ed.
+    fn file_len(&self, path: &Path) -> Result<u64>;
+
+    /// Path-based fsync (for manifest and directory sync where the caller
+    /// does not hold a `File` handle).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sync fails.
+    fn sync_path(&self, path: &Path) -> Result<()>;
+
+    /// Bounded streaming copy from `src` to `dst`. Returns bytes copied.
+    /// Uses a fixed buffer — never loads the whole file into memory.
+    /// Fails if `dst` already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the copy fails.
+    fn copy_bounded(&self, src: &Path, dst: &Path, buf_size: usize) -> Result<u64>;
 }
 
 /// OS-backed file operations.
@@ -135,6 +201,78 @@ impl GenerationFileOps for OsGenerationFileOps {
 
     fn path_exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn open_existing(&self, path: &Path) -> Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(Error::Io)
+    }
+
+    fn read_to_end(&self, path: &Path) -> Result<Vec<u8>> {
+        fs::read(path).map_err(Error::Io)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<()> {
+        fs::create_dir_all(path).map_err(Error::Io)
+    }
+
+    fn read_dir(&self, path: &Path) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(path).map_err(Error::Io)? {
+            let entry = entry.map_err(Error::Io)?;
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        Ok(names)
+    }
+
+    fn sha256(&self, path: &Path) -> Result<[u8; 32]> {
+        use sha2::Digest;
+        let mut file = File::open(path).map_err(Error::Io)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf).map_err(Error::Io)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let digest = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        Ok(out)
+    }
+
+    fn file_len(&self, path: &Path) -> Result<u64> {
+        fs::metadata(path).map_err(Error::Io).map(|m| m.len())
+    }
+
+    fn sync_path(&self, path: &Path) -> Result<()> {
+        let f = File::open(path).map_err(Error::Io)?;
+        f.sync_all().map_err(Error::Io)
+    }
+
+    fn copy_bounded(&self, src: &Path, dst: &Path, buf_size: usize) -> Result<u64> {
+        let mut reader = File::open(src).map_err(Error::Io)?;
+        let mut writer = self.create_new(dst)?;
+        let mut buf = vec![0u8; buf_size.max(1)];
+        let mut total: u64 = 0;
+        loop {
+            let n = reader.read(&mut buf).map_err(Error::Io)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n]).map_err(Error::Io)?;
+            // reason: total byte count is bounded by file size, fits in u64
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                total += n as u64;
+            }
+        }
+        Ok(total)
     }
 }
 

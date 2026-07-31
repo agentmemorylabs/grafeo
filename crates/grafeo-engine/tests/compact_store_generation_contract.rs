@@ -459,3 +459,120 @@ fn fresh_child_mmap_and_rss_anon_check() {
         "RSS_ANON_KB must be <= 192 MiB (196608 KB), got {rss_anon_kb}"
     );
 }
+
+// ── W0-B lifecycle end-to-end (G-EM0.W0-B) ───────────────────────────
+//
+// Proves the full writable lifecycle through production readers: publish a
+// generation under the root lock, recover it in a fresh lock acquisition,
+// and publish an external snapshot — all opening through the real
+// `GrafeoFileManager` + CompactStore readers.
+
+use grafeo_storage::file::generation_writer::ExactSectionSource;
+use grafeo_storage::generation::lock::RootLock;
+use grafeo_storage::generation::publication::{PublicationInput, publish_generation};
+use grafeo_storage::generation::recovery::recover;
+use grafeo_storage::generation::snapshot::publish_snapshot;
+use grafeo_storage::wal::WalManager;
+
+/// Build a streaming section source + header for a fresh fixture graph.
+fn lifecycle_section() -> (
+    Box<dyn ExactSectionSource>,
+    grafeo_storage::file::generation_writer::GenerationContainerHeader,
+) {
+    let input = GenerationInput::new()
+        .node(GenerationNode::new(1u64, "Person").with_prop("name", "Ada"))
+        .node(GenerationNode::new(2u64, "Person").with_prop("name", "Bob"))
+        .node(GenerationNode::new(100u64, "Project").with_prop("title", "Grafeo"))
+        .edge(GenerationEdge::new(10u64, 1u64, 2u64, "KNOWS"))
+        .edge(GenerationEdge::new(11u64, 2u64, 100u64, "WORKS_ON"));
+
+    let budget = GenerationBudget::for_tests();
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &budget,
+    )
+    .expect("fixture generation");
+
+    let node_count = generated.store.total_nodes();
+    let edge_count = generated.store.total_edges();
+    let section = CompactStoreSectionSource::new(generated.store, generated.global_strings)
+        .expect("section source");
+    let header = GenerationContainerHeader {
+        epoch: 1,
+        transaction_id: 1,
+        node_count,
+        edge_count,
+    };
+    (Box::new(section), header)
+}
+
+#[test]
+fn lifecycle_publish_recover_snapshot_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Writable layout: root/wal + root lock.
+    let wal_dir = root.join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let wal = WalManager::open(&wal_dir).unwrap();
+
+    // 1. Publish a generation under the held root lock.
+    let lock = RootLock::try_acquire(root).expect("root lock");
+    let (section, header) = lifecycle_section();
+    let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![section];
+    let result = publish_generation(
+        &lock,
+        PublicationInput {
+            header,
+            sections: &mut sections,
+            generation_id: "g-e2e".to_string(),
+            parent_generation_id: None,
+            parent_publication_sequence: None,
+        },
+        &wal,
+        &OsGenerationFileOps,
+    )
+    .expect("publish");
+    assert_eq!(result.publication_sequence, 1);
+    drop(lock);
+
+    // 2. Recovery in a fresh lock acquisition selects the published slot.
+    let lock = RootLock::try_acquire(root).expect("re-lock");
+    let selected = recover(&lock).expect("recover");
+    assert_eq!(selected.slot.generation_id, "g-e2e");
+    assert_eq!(selected.slot.publication_sequence, 1);
+
+    // The selected generation opens through the production reader.
+    let manager = GrafeoFileManager::open_read_only(&selected.generation_abs_path).expect("open");
+    let section_dir = manager.read_section_directory().unwrap().unwrap();
+    let entry = section_dir
+        .find(grafeo_common::storage::SectionType::CompactStore)
+        .expect("CompactStore section");
+    assert!(entry.length > 0);
+
+    // 3. External snapshot with independent lifetime.
+    let snap_dir = TempDir::new().unwrap();
+    let provenance = publish_snapshot(
+        &lock,
+        &selected,
+        snap_dir.path(),
+        "snapshot-e2e.grafeo",
+        &OsGenerationFileOps,
+    )
+    .expect("snapshot");
+    assert_eq!(provenance.source_generation_id, "g-e2e");
+    assert_eq!(provenance.source_publication_sequence, 1);
+
+    // Snapshot bytes equal the source generation bytes.
+    let src = std::fs::read(&selected.generation_abs_path).unwrap();
+    let snap = std::fs::read(snap_dir.path().join("snapshot-e2e.grafeo")).unwrap();
+    assert_eq!(snap, src);
+
+    // Delete the live generation; the snapshot stays readable.
+    std::fs::remove_file(&selected.generation_abs_path).unwrap();
+    let manager = GrafeoFileManager::open_read_only(snap_dir.path().join("snapshot-e2e.grafeo"))
+        .expect("snapshot stays open");
+    assert!(manager.read_section_directory().unwrap().is_some());
+}

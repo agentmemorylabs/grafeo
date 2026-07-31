@@ -21,9 +21,15 @@
 
 pub mod budget;
 pub mod external_sort;
+pub mod lock;
+pub mod manifest;
 pub mod merge;
 pub mod metrics;
+pub mod publication;
 pub mod records;
+pub mod recovery;
+pub mod snapshot;
+pub mod wal_cursor;
 
 pub use budget::{ExternalSortBudget, GenerationBudget, GenerationBudgetError};
 pub use external_sort::{CancelToken, DiskRunMerger, DiskRunSink, RunHandle, merge_runs_recursive};
@@ -33,3 +39,14 @@ pub use records::{FramedRecord, FramedRecordError, MAX_RECORD_BODY_BYTES};
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+mod faults;
+
+#[cfg(test)]
+#[path = "tests/fresh_process_faults.rs"]
+mod fresh_process_faults;
+
+#[cfg(test)]
+#[path = "tests/root_lock_process.rs"]
+mod root_lock_process;
