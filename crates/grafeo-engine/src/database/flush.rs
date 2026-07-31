@@ -10,12 +10,48 @@
 //! | Explicit CHECKPOINT | All sections | Kept |
 //!
 //! Future phases will add memory pressure integration with BufferManager.
+//!
+//! ## Generation-root seam (G-EM0.3a)
+//!
+//! Legacy flush writes into a standalone mapped `.grafeo` container. Writable
+//! E-M0 generation builds use [`super::generation_build`] and publish into an
+//! explicit generation root. Flush must never transparently rewrite a
+//! generation root or convert a legacy standalone snapshot into the generation
+//! layout.
+
+use std::path::Path;
 
 use grafeo_common::storage::{Section, SectionType};
 use grafeo_common::utils::error::Result;
 
 #[cfg(feature = "grafeo-file")]
 use grafeo_storage::file::GrafeoFileManager;
+
+/// Returns true when `path` is (or already contains) an E-M0 generation root.
+///
+/// Used to keep the legacy single-file flush path fail-closed against
+/// accidental in-place conversion of generation layouts.
+#[cfg(feature = "generation")]
+#[must_use]
+pub(crate) fn is_generation_root(path: &Path) -> bool {
+    if path.join("root.lock").is_file() || path.join("manifest.bin").is_file() {
+        return true;
+    }
+    if path.join("generations").is_dir() {
+        return true;
+    }
+    // Conventional layout name: `<logical>.grafeo.d/`
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with(".grafeo.d"))
+}
+
+/// Placeholder when the generation feature is off — always false.
+#[cfg(not(feature = "generation"))]
+#[must_use]
+pub(crate) fn is_generation_root(_path: &Path) -> bool {
+    false
+}
 
 /// Reason for triggering a flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

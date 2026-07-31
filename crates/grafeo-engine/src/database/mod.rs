@@ -37,6 +37,8 @@ mod crud;
 mod embed;
 #[cfg(feature = "grafeo-file")]
 pub(crate) mod flush;
+#[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+pub mod generation_build;
 #[cfg(feature = "lpg")]
 mod import;
 #[cfg(feature = "lpg")]
