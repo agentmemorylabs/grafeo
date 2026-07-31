@@ -49,6 +49,7 @@ pub(crate) fn is_generation_root(path: &Path) -> bool {
 /// Placeholder when the generation feature is off — always false.
 #[cfg(not(feature = "generation"))]
 #[must_use]
+#[allow(dead_code)] // real implementation is cfg(feature = "generation"); stub keeps callers compiling
 pub(crate) fn is_generation_root(_path: &Path) -> bool {
     false
 }

@@ -369,6 +369,11 @@ impl BufferManager {
     ///
     /// Returns the number of matching consumers reloaded. The first reload
     /// failure is returned so snapshot callers can fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SpillError` if a matching on-disk consumer fails to reload
+    /// its data from the spill file.
     pub fn reload_consumer_by_name(&self, name: &str) -> Result<usize, SpillError> {
         let candidates: Vec<Arc<dyn MemoryConsumer>> = self
             .consumers

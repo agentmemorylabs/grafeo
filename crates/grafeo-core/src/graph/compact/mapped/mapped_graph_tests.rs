@@ -1,4 +1,6 @@
 //! Unit tests for mapped v5 graph views (G-EM0.2).
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
 
 use super::*;
 use bytes::Bytes;
@@ -346,8 +348,7 @@ fn adversarial_many_block_zone_maps_round_trip() {
     let compact = from_graph_store_preserving_ids(&store).unwrap();
     let pre_blocks = compact.node_tables_by_id[0]
         .block_zone_maps_for(&PropertyKey::new("rank"))
-        .map(|s| s.len())
-        .unwrap_or(0);
+        .map_or(0, |s| s.len());
     assert!(
         pre_blocks >= 3,
         "expected ≥3 block zone maps for {ROWS} rows, got {pre_blocks}"
@@ -362,8 +363,7 @@ fn adversarial_many_block_zone_maps_round_trip() {
     let restored = section2.store().unwrap();
     let post_blocks = restored.node_tables_by_id[0]
         .block_zone_maps_for(&PropertyKey::new("rank"))
-        .map(|s| s.len())
-        .unwrap_or(0);
+        .map_or(0, |s| s.len());
     assert_eq!(
         post_blocks, pre_blocks,
         "block zone maps must round-trip on v5 mapped open"

@@ -4,6 +4,13 @@
 //! global `StringOffsets`/`StringBytes` segments (no owned string payload
 //! in the zone-map segment itself). Numeric/bool min/max are inlined.
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_sign_loss)]
 use super::string_dict::MappedStringDictionary;
 use crate::graph::compact::zone_map::ZoneMap;
 use grafeo_common::types::{PropertyKey, Value};
@@ -58,6 +65,11 @@ const TAG_STRING_CODE: u8 = 3;
 const TAG_FLOAT64: u8 = 4;
 
 /// Writes one zone-map record into `buf`.
+///
+/// # Errors
+///
+/// Returns an error if the zone-map value encoding fails (e.g., unsupported
+/// value type or string code out of dictionary range).
 pub fn write_zone_map_record(
     buf: &mut Vec<u8>,
     table_id: u16,
@@ -183,6 +195,11 @@ fn parse_records(data: &[u8], dict: &MappedStringDictionary) -> Result<Vec<RawZo
 }
 
 /// Parses kind-18 table zone maps into per-table maps.
+///
+/// # Errors
+///
+/// Returns an error if the data length is not a multiple of the record size,
+/// a table_id is out of range, or a zone-map value fails to decode.
 pub fn parse_table_zone_maps(
     data: &[u8],
     dict: &MappedStringDictionary,
@@ -211,6 +228,11 @@ pub fn parse_table_zone_maps(
 }
 
 /// Parses kind-19 block zone maps into per-table column → Vec maps.
+///
+/// # Errors
+///
+/// Returns an error if the data is truncated, a table_id/column is out of
+/// range, block indices are non-contiguous, or a value fails to decode.
 pub fn parse_block_zone_maps(
     data: &[u8],
     dict: &MappedStringDictionary,
@@ -256,6 +278,11 @@ pub fn parse_block_zone_maps(
 }
 
 /// Builds TableZoneMaps + BlockZoneMaps segment bodies for all node tables.
+///
+/// # Errors
+///
+/// Returns an error if a zone-map value cannot be encoded or a required
+/// string code is missing from `string_index`.
 pub fn build_zone_map_segments(
     store: &crate::graph::compact::CompactStore,
     string_index: &FxHashMap<String, u32>,

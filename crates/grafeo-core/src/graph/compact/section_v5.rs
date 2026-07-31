@@ -1,4 +1,11 @@
 //! CompactStore payload version 5: mapped segment directory codec (G-EM0.2).
+//!
+//! All `usize as u16/u32` casts in this codec write graph-structure counts and
+//! offsets (table IDs, column counts, segment lengths) into fixed-width wire
+//! fields. These are bounded by the v5 format by construction — a section
+//! cannot exceed `u32::MAX` columns or `u16::MAX` tables — so truncation is
+//! impossible for any valid store.
+#![allow(clippy::cast_possible_truncation)]
 
 use arcstr::ArcStr;
 use bytes::Bytes;
@@ -1037,6 +1044,7 @@ pub(crate) fn write_column_body(
     Ok(())
 }
 
+#[allow(dead_code)] // reserved for the writable open path (Milestone W)
 fn read_column_body(
     body: &Bytes,
     expected_disc: u16,

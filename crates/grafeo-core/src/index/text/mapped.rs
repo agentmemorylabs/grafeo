@@ -17,6 +17,11 @@
 //! doc record: node_id u64 | doc_len u32 | pad u32       (16 bytes)
 //! ```
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
 use std::collections::HashMap;
 
 use bytes::Bytes;
@@ -249,6 +254,10 @@ pub struct TextIndexEncodeSnapshot {
 }
 
 /// Encode mapped TextIndex v2 payload.
+///
+/// # Errors
+///
+/// Returns an error if a term or posting fails to serialize.
 pub fn encode_text_index_section(indexes: &[TextIndexEncodeSnapshot]) -> Result<Vec<u8>> {
     let mut keys = Vec::new();
     let mut key_spans: Vec<(u32, u32)> = Vec::new();
@@ -364,6 +373,16 @@ struct IndexBody {
 }
 
 /// Parse mapped TextIndex v2 (or reject other versions).
+///
+/// # Errors
+///
+/// Returns an error if the header is truncated, the magic/version is wrong,
+/// a directory entry is out of bounds, or a term/posting blob fails to decode.
+///
+/// # Panics
+///
+/// Panics if internal slice arithmetic overflows (cannot occur with a
+/// bounds-validated section).
 pub fn parse_text_index_section(data: Bytes) -> Result<MappedTextIndexSet> {
     if data.len() < HEADER_LEN {
         return Err(Error::Serialization(

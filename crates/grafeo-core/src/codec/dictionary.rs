@@ -21,6 +21,11 @@
 //! assert_eq!(dict.dictionary_size(), 2);  // Only 2 unique strings stored
 //! ```
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -343,6 +348,16 @@ impl DictionaryEncoding {
 
     /// Like [`from_mapped_strings`](Self::from_mapped_strings) but attaches a
     /// sorted dictionary code index for O(log D) string→code lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dictionary offsets/string bytes are malformed,
+    /// the code index is truncated, or any string is not valid UTF-8.
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal offset arithmetic overflows (should not occur with
+    /// well-formed input).
     pub fn from_mapped_strings_with_index(
         offsets: Bytes,
         string_bytes: Bytes,

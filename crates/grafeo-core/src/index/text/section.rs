@@ -10,6 +10,11 @@
 //! - **v2**: mapped GTXT payload (G-E1.RO). New writes emit v2 so RO reopen
 //!   can keep postings file-backed without proportional anonymous HashMaps.
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

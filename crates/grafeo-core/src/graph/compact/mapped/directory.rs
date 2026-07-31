@@ -1,4 +1,9 @@
 //! CompactStore v5 header and checked segment directory.
+//!
+//! The `u64 as usize` casts below convert wire offsets/lengths into in-memory
+//! indices for a payload already fully resident in `Bytes`; they are bounded
+//! by the section's own length on the 64-bit targets this engine supports.
+#![allow(clippy::cast_possible_truncation)]
 
 use super::views::{read_u16_le, read_u32_le, read_u64_le};
 use bytes::Bytes;
@@ -19,26 +24,47 @@ pub const DIRECTORY_ENTRY_LEN: usize = 48;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum SegmentKind {
+    /// Store metadata (table/column descriptors).
     Metadata = 0,
+    /// String dictionary offset table.
     StringOffsets = 1,
+    /// String dictionary byte pool.
     StringBytes = 2,
+    /// Per-node-table directory entries.
     NodeTableDirectory = 3,
+    /// Per-rel-table directory entries.
     RelTableDirectory = 4,
+    /// Node-to-relationship adjacency directory.
     NodeRelationshipDirectory = 5,
+    /// Per-column directory entries.
     ColumnDirectory = 6,
+    /// Per-column block index.
     ColumnBlockIndex = 7,
+    /// Column body payloads.
     ColumnBodies = 8,
+    /// Forward CSR row offsets.
     ForwardCsrOffsets = 9,
+    /// Forward CSR edge targets.
     ForwardCsrTargets = 10,
+    /// Reverse CSR row offsets.
     ReverseCsrOffsets = 11,
+    /// Reverse CSR edge targets.
     ReverseCsrTargets = 12,
+    /// Forward edge position array.
     ForwardPositions = 13,
+    /// Node ID lookup index.
     NodeIdLookup = 14,
+    /// Edge ID lookup index.
     EdgeIdLookup = 15,
+    /// Node original-ID mapping.
     NodeOriginalIds = 16,
+    /// Edge original-ID mapping.
     EdgeOriginalIds = 17,
+    /// Table-level zone maps.
     TableZoneMaps = 18,
+    /// Per-block zone maps.
     BlockZoneMaps = 19,
+    /// Dictionary code index.
     DictionaryCodeIndex = 20,
 }
 
@@ -293,7 +319,7 @@ pub fn validate_segment_range(
             entry.kind
         ));
     }
-    if entry.offset % alignment != 0 {
+    if !entry.offset.is_multiple_of(alignment) {
         return Err(format!(
             "segment {:?} offset {} not aligned to {alignment}",
             entry.kind, entry.offset

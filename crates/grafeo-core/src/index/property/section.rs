@@ -3,6 +3,12 @@
 //! Serializes property hash-index postings so checkpoint → close → reopen
 //! restores exact-match lookups without rebuilding from a full node scan.
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -95,11 +101,11 @@ impl PropertyIndexSection {
         };
         let guard = heap.read();
         let mut out = Vec::with_capacity(guard.len());
-        for (key, map) in guard.iter() {
+        for (key, map) in &*guard {
             let mut entries = Vec::new();
-            for item in map.iter() {
+            for item in map {
                 let value = item.key().0.clone();
-                for node_id in item.value().iter() {
+                for node_id in item.value() {
                     entries.push((value.clone(), *node_id));
                 }
             }
@@ -144,8 +150,7 @@ impl Section for PropertyIndexSection {
     fn memory_usage(&self) -> usize {
         self.restored_mapped
             .as_ref()
-            .map(|m| m.accounting().mapped_payload_bytes as usize)
-            .unwrap_or(0)
+            .map_or(0, |m| m.accounting().mapped_payload_bytes as usize)
     }
 }
 
@@ -153,6 +158,7 @@ impl Section for PropertyIndexSection {
 ///
 /// RO reopen keeps the mapped set and does **not** call this — proportional
 /// postings stay file-backed.
+#[allow(dead_code)] // reserved for the writable open path (Milestone W)
 pub fn materialize_heap_from_mapped(
     mapped: &MappedPropertyIndexSet,
     heap: &HeapPropertyIndexes,

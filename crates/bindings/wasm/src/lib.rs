@@ -1002,7 +1002,10 @@ impl Database {
                         .collect()
                 })
                 .unwrap_or_default();
-            let id = self.inner.create_node_with_props(&labels, props);
+            let id = self
+                .inner
+                .create_node_with_props(&labels, props)
+                .map_err(|e| JsError::new(&e.to_string()))?;
             node_ids.push(id);
         }
 
@@ -2127,7 +2130,7 @@ mod tests {
                         .collect()
                 })
                 .unwrap_or_default();
-            let id = db.create_node_with_props(&labels, props);
+            let id = db.create_node_with_props(&labels, props).unwrap();
             node_ids.push(id);
         }
 

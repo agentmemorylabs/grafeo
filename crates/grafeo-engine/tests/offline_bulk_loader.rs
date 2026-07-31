@@ -1,3 +1,9 @@
+//! Offline bulk-loader integration tests.
+//!
+//! Gated to match `GrafeoDB::bulk_load_nodes_with_props_unindexed`, which is
+//! only available without `temporal`.
+#![cfg(not(feature = "temporal"))]
+
 use std::collections::HashMap;
 
 use grafeo_common::types::{PropertyKey, Value};

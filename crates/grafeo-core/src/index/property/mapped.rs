@@ -14,6 +14,11 @@
 //! Values are bincode-encoded [`Value`]s so equality matches the live
 //! [`HashableValue`] path for exact-match lookups.
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -122,6 +127,10 @@ impl MappedPropertyIndex {
     }
 
     /// Iterate all (Value, NodeId) postings by decoding value blobs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a stored value blob fails to deserialize.
     pub fn iter_entries(&self) -> Result<Vec<(Value, NodeId)>> {
         let mut out = Vec::with_capacity(self.entry_count as usize);
         for i in 0..self.entry_count {
@@ -173,6 +182,15 @@ pub struct PropertyIndexSnapshot {
 }
 
 /// Encode a PropertyIndex section from live heap snapshots.
+///
+/// # Errors
+///
+/// Returns an error if a property value fails to serialize.
+///
+/// # Panics
+///
+/// Panics if internal offset arithmetic overflows `u32` (cannot occur for
+/// sections within the format's size limits).
 pub fn encode_property_index_section(indexes: &[PropertyIndexSnapshot]) -> Result<Vec<u8>> {
     let mut names = Vec::new();
     let mut name_spans: Vec<(u32, u32)> = Vec::with_capacity(indexes.len());
@@ -247,6 +265,16 @@ pub fn encode_property_index_section(indexes: &[PropertyIndexSnapshot]) -> Resul
 }
 
 /// Parse a mapped PropertyIndex section from retained section bytes.
+///
+/// # Errors
+///
+/// Returns an error if the header is truncated, the magic/version is wrong,
+/// a directory entry is out of bounds, or a value blob fails to decode.
+///
+/// # Panics
+///
+/// Panics if internal slice arithmetic overflows (cannot occur with a
+/// bounds-validated section).
 pub fn parse_property_index_section(data: Bytes) -> Result<MappedPropertyIndexSet> {
     if data.len() < HEADER_LEN {
         return Err(Error::Serialization(
@@ -349,6 +377,7 @@ fn decode_value(bytes: &[u8]) -> Result<Value> {
 }
 
 /// Shared handle used by LpgStore for RO mapped property indexes.
+#[allow(dead_code)] // reserved for LpgStore RO index wiring (Milestone W)
 pub type SharedMappedPropertyIndex = Arc<MappedPropertyIndex>;
 
 #[cfg(test)]

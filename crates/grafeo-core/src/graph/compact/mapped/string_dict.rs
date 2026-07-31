@@ -1,5 +1,10 @@
 //! Mapped string dictionary: `StringOffsets` + `StringBytes`.
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
 use super::views::U64View;
 use bytes::Bytes;
 
@@ -24,7 +29,7 @@ impl MappedStringDictionary {
     /// out-of-range offsets, or invalid UTF-8 in any entry.
     pub fn new(offsets_bytes: Bytes, string_bytes: Bytes) -> Result<Self, String> {
         let offsets = U64View::new(offsets_bytes).map_err(str::to_string)?;
-        if offsets.len() < 1 {
+        if offsets.is_empty() {
             return Err("StringOffsets must contain at least a sentinel".into());
         }
         let dict_len = offsets.len() - 1;
@@ -57,6 +62,10 @@ impl MappedStringDictionary {
     }
 
     /// Empty dictionary (one sentinel at 0).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal offset vector allocation fails (out of memory).
     #[must_use]
     pub fn empty() -> Self {
         let mut offsets = Vec::new();

@@ -25,6 +25,7 @@ impl U32Store {
         }
     }
 
+    #[allow(dead_code)] // reserved for mapped CSR slice fast-paths (Milestone W)
     fn as_slice(&self) -> Option<&[u32]> {
         match self {
             Self::Inline(v) => Some(v.as_slice()),

@@ -17,6 +17,10 @@ impl LpgStore {
     /// This is deliberately an offline-loader primitive.  It is valid only
     /// before property, text, or vector indexes are installed and before the
     /// store becomes visible to concurrent readers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if node creation or bulk property assignment fails.
     #[cfg(not(any(feature = "tiered-storage", feature = "temporal")))]
     pub fn bulk_create_nodes_with_props_unindexed(
         &self,
@@ -76,7 +80,7 @@ impl LpgStore {
 
         self.node_properties.set_bulk_unindexed(property_rows);
         self.live_node_count
-            .fetch_add(count as i64, Ordering::Relaxed);
+            .fetch_add(i64::try_from(count).unwrap_or(i64::MAX), Ordering::Relaxed);
         Ok(ids)
     }
 

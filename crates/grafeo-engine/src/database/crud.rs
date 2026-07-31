@@ -23,6 +23,11 @@ impl super::GrafeoDB {
     /// let alix = db.create_node(&["Person"]);
     /// let company = db.create_node(&["Company", "Startup"]);
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL log (when enabled) fails to record the
+    /// creation.
     pub fn create_node(&self, labels: &[&str]) -> Result<grafeo_common::types::NodeId> {
         let id = self.lpg_store().create_node(labels);
 
@@ -49,6 +54,11 @@ impl super::GrafeoDB {
     /// Creates a new node with labels and properties.
     ///
     /// If WAL is enabled, the operation is logged for durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL log (when enabled) fails to record the
+    /// creation.
     pub fn create_node_with_props(
         &self,
         labels: &[&str],
@@ -252,6 +262,11 @@ impl super::GrafeoDB {
     /// Deletes a node and all its edges.
     ///
     /// If WAL is enabled, the operation is logged for durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL log (when enabled) fails to record the
+    /// deletion.
     pub fn delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {
         // Capture properties for CDC before deletion
         #[cfg(feature = "cdc")]
@@ -352,6 +367,11 @@ impl super::GrafeoDB {
     /// Sets a property on a node.
     ///
     /// If WAL is enabled, the operation is logged for durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL log (when enabled) fails to record the
+    /// property write.
     pub fn set_node_property(
         &self,
         id: grafeo_common::types::NodeId,
@@ -1147,6 +1167,12 @@ impl super::GrafeoDB {
     /// WAL/CDC/index work and holds the node and property-store locks once per
     /// chunk.  It is rejected once any secondary index exists; create indexes
     /// only after all rows have been loaded.
+    ///
+    /// Available only without `temporal`, matching the underlying
+    /// `LpgStore::bulk_create_nodes_with_props_unindexed` primitive (which is
+    /// also gated off under grafeo-core's `tiered-storage`, unreachable from
+    /// this crate).
+    #[cfg(not(feature = "temporal"))]
     pub fn bulk_load_nodes_with_props_unindexed(
         &self,
         label: &str,

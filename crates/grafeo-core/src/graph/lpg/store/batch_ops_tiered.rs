@@ -26,6 +26,11 @@ use std::sync::atomic::Ordering;
 impl LpgStore {
     /// Tiered-storage variant of
     /// [`create_nodes_batch_versioned`](LpgStore::create_nodes_batch_versioned).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal MVCC version index or property store encounters
+    /// an invariant violation (should not occur with valid batch input).
     pub fn create_nodes_batch_versioned(
         &self,
         nodes: &[BatchNodeCreate<'_>],
@@ -102,6 +107,11 @@ impl LpgStore {
 
     /// Tiered-storage variant of
     /// [`create_edges_batch_versioned`](LpgStore::create_edges_batch_versioned).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal MVCC version index or CSR adjacency encounters
+    /// an invariant violation (should not occur with valid batch input).
     pub fn create_edges_batch_versioned(
         &self,
         edges: &[BatchEdgeCreate<'_>],

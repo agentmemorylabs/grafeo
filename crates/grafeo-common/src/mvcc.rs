@@ -1145,7 +1145,7 @@ mod tests {
         assert_eq!(chain.visible_at(EpochId::new(3)), Some(&"committed"));
 
         chain.add_version("pending", EpochId::PENDING, tx);
-        assert!(chain.solely_created_by(tx) == false); // mixed committed + pending
+        assert!(!chain.solely_created_by(tx)); // mixed committed + pending
         // Only the PENDING create is discarded.
         chain.remove_versions_by(tx);
         assert_eq!(chain.version_count(), 1);

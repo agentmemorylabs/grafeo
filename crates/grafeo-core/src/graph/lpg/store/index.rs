@@ -95,7 +95,7 @@ impl LpgStore {
             return;
         }
         let mut indexes = self.property_indexes.write();
-        indexes.entry(key).or_insert_with(|| DashMap::new());
+        indexes.entry(key).or_default();
     }
 
     /// Installs a mapped property index restored from the PropertyIndex section.
@@ -157,9 +157,9 @@ impl LpgStore {
         let mut out = Vec::with_capacity(guard.len());
         for (key, map) in guard.iter() {
             let mut entries = Vec::new();
-            for item in map.iter() {
+            for item in map {
                 let value = item.key().0.clone();
-                for node_id in item.value().iter() {
+                for node_id in item.value() {
                     entries.push((value.clone(), *node_id));
                 }
             }

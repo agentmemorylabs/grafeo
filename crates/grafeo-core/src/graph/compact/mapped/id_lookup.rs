@@ -207,11 +207,16 @@ impl MappedEdgeIdLookup {
 }
 
 /// Reverse original-ID array view (O(1) internal→original).
+///
+/// Reserved for the Milestone W writable read path (G-EM0.4a ID preservation);
+/// the read-only reopen does not yet consume it.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MappedOriginalIds {
     view: U64View,
 }
 
+#[allow(dead_code)] // reserved for Milestone W writable read path
 impl MappedOriginalIds {
     /// Wraps a u64 array of original IDs.
     ///

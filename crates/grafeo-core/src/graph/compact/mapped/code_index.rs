@@ -1,5 +1,10 @@
 //! Sorted dictionary code index (v5 kind 20) for O(log D) string→code.
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
 use super::string_dict::MappedStringDictionary;
 use bytes::Bytes;
 

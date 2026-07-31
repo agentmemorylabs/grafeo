@@ -556,10 +556,10 @@ impl CompactStore {
             if !rt.fwd().is_mapped() {
                 total = total.saturating_add(rt.fwd().memory_bytes());
             }
-            if let Some(bwd) = rt.bwd() {
-                if !bwd.is_mapped() {
-                    total = total.saturating_add(bwd.memory_bytes());
-                }
+            if let Some(bwd) = rt.bwd()
+                && !bwd.is_mapped()
+            {
+                total = total.saturating_add(bwd.memory_bytes());
             }
             for codec in rt.properties().values() {
                 total = total.saturating_add(codec_proportional_heap(codec, mapped_open));
