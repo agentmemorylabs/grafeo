@@ -24,5 +24,8 @@ pub mod format;
 pub mod header;
 pub mod manager;
 
+#[cfg(feature = "grafeo-file")]
+pub mod generation_writer;
+
 pub use format::{DbHeader, FileHeader, MAGIC};
 pub use manager::GrafeoFileManager;

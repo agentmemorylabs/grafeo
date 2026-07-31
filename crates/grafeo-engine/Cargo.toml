@@ -91,6 +91,7 @@ algos = ["grafeo-adapters/algos"]  # Graph algorithm plugin (SSSP, PageRank, etc
 wal = ["dep:grafeo-storage", "grafeo-storage/wal"]  # Write-ahead log storage
 async-storage = ["dep:grafeo-storage", "grafeo-storage/async-storage", "dep:tokio"]  # Async WAL and storage backend
 grafeo-file = ["dep:grafeo-storage", "grafeo-storage/grafeo-file", "dep:crc32fast"]  # Single-file .grafeo format
+generation = ["grafeo-file", "grafeo-storage/generation"]  # Streaming generation container writer
 encryption = ["dep:grafeo-storage", "grafeo-common/encryption", "grafeo-storage/encryption"]  # AES-256-GCM encryption at rest
 spill = ["grafeo-core/spill"]  # Disk spilling for out-of-core execution
 mmap = ["grafeo-core/mmap", "dep:memmap2"]  # File-backed vector storage and compact-store spill
@@ -134,6 +135,11 @@ workspace = true
 name = "exact_vector_read"
 path = "tests/exact_vector_read/main.rs"
 required-features = ["vector-index", "mmap", "grafeo-file"]
+
+[[test]]
+name = "compact_store_generation_contract"
+path = "tests/compact_store_generation_contract.rs"
+required-features = ["generation", "compact-store"]
 
 [[bench]]
 name = "query_bench"

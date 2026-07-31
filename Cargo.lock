@@ -1630,6 +1630,7 @@ dependencies = [
  "crossbeam",
  "fs2",
  "grafeo-common",
+ "grafeo-core",
  "memmap2",
  "parking_lot",
  "serde",
