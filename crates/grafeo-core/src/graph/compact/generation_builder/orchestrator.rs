@@ -148,6 +148,11 @@ impl BoundedGenerationBuilder {
             &mut self.metrics,
         )?;
         let occ_lease = occ_sink.finish()?;
+        // ID-index records were emitted in per-table dense order (label, then
+        // id); the mapped index requires global ascending order by
+        // `original_id`. Sort the fixed-width records (the index is a resident
+        // binary-search structure by design — 18 bytes/row, no per-row map).
+        sort_id_index_records(&mut id_index_bytes)?;
         let id_index = MappedNodeIdIndex::new(bytes::Bytes::from(id_index_bytes))?;
         let node_schema = node_out.schema;
 
@@ -656,4 +661,42 @@ fn make_resident_desc(
             bytes::Bytes::from(bytes.to_vec()),
         ),
     }
+}
+
+/// Sorts fixed-width ID-index records by `original_id` (the first `u64` of
+/// each 18-byte record, little-endian), returning a new sorted buffer.
+///
+/// The node pass emits records in per-table dense order (sorted by label, then
+/// id within a table); the [`MappedNodeIdIndex`] requires a single global
+/// ascending run over `original_id`. The index is a resident binary-search
+/// structure by design (18 bytes/row), so sorting the record set is bounded by
+/// the index size, not the graph payload.
+///
+/// # Errors
+///
+/// [`GenerationError::Codec`] if the buffer is not a multiple of the record
+/// width.
+fn sort_id_index_records(buf: &mut Vec<u8>) -> Result<(), GenerationError> {
+    use crate::graph::compact::mapped::id_index::{ID_INDEX_RECORD_LEN, write_id_index_record};
+    if !buf.len().is_multiple_of(ID_INDEX_RECORD_LEN) {
+        return Err(GenerationError::Codec(format!(
+            "id index buffer len {} not multiple of {ID_INDEX_RECORD_LEN}",
+            buf.len()
+        )));
+    }
+    // Decode into (original_id, table_id, dense_offset) tuples, sort by id,
+    // and re-serialize. Schema-bounded (one tuple per node).
+    let mut records: Vec<(u64, u16, u64)> = Vec::with_capacity(buf.len() / ID_INDEX_RECORD_LEN);
+    for chunk in buf.chunks_exact(ID_INDEX_RECORD_LEN) {
+        let original_id = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let table_id = u16::from_le_bytes(chunk[8..10].try_into().unwrap());
+        let dense_offset = u64::from_le_bytes(chunk[10..18].try_into().unwrap());
+        records.push((original_id, table_id, dense_offset));
+    }
+    records.sort_unstable_by_key(|&(id, _, _)| id);
+    buf.clear();
+    for (original_id, table_id, dense_offset) in records {
+        write_id_index_record(buf, original_id, table_id, dense_offset);
+    }
+    Ok(())
 }

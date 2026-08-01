@@ -8,12 +8,15 @@
 //! (bounded pass outputs, not a heap `CompactStore`).
 
 /// Local LE writers (byte-exact with section_v5 helpers).
+/// Writes a little-endian `u16`.
 pub fn w16(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
+/// Writes a little-endian `u32`.
 pub fn w32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
+/// Writes a little-endian `u64`.
 pub fn w64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }

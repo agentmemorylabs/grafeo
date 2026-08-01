@@ -903,8 +903,8 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
             presence,
             null,
             data_bytes.clone(),
-            presence_bytes.map(bytes::Bytes::from),
-            null_bytes.map(bytes::Bytes::from),
+            presence_bytes,
+            null_bytes,
         );
     }
 

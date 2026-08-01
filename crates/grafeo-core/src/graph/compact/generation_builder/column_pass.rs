@@ -271,7 +271,7 @@ pub fn compute_column_geometries(
                     Some(d) if d != dims => {
                         return Err(GenerationError::MixedColumnTypes {
                             context: g.key.clone(),
-                            kinds: vec!["Vector(dims mismatch)".into()],
+                            kinds: vec!["Vector(dims mismatch)"],
                         });
                     }
                     _ => g.vector_dims = Some(dims),
@@ -303,7 +303,7 @@ fn check_family(g: &mut ColumnGeometry, fam: &'static str) -> Result<(), Generat
         Some(f) if f == fam => Ok(()),
         Some(f) => Err(GenerationError::MixedColumnTypes {
             context: g.key.clone(),
-            kinds: vec![f.into(), fam.into()],
+            kinds: vec![f, fam],
         }),
     }
 }

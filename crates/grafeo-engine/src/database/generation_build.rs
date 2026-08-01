@@ -279,13 +279,64 @@ impl GrafeoDB {
             cursor: 0,
         };
 
-        let generated = generate_compact_store(
-            &mut nodes,
-            &mut edges,
-            &request.rel_schemas,
-            &request.budget,
-        )
-        .map_err(map_generation_error)?;
+        // ── Generation build + section source ─────────────────────────────
+        // With `generation-streaming` the engine drives the bounded
+        // out-of-core orchestrator and streams a payload lease; otherwise it
+        // falls back to the eager heap `generate_compact_store` path. The
+        // accepted 3a commit/rollback/lease/publication state machine below
+        // is verbatim in both cases.
+        #[cfg(feature = "generation-streaming")]
+        let (section, node_count, edge_count) = {
+            use grafeo_core::graph::compact::generation_builder::orchestrator::{
+                BoundedBuildConfig, BoundedGenerationBuilder,
+            };
+            use grafeo_storage::file::generation_writer::StreamingPayloadSectionSource;
+            use grafeo_storage::generation::DiskRunStore;
+
+            // Job temp root: a scratch dir under the generation root, removed
+            // when the run-set leases and payload lease drop (success or
+            // failure). Correlation id = generation id for traceability.
+            let temp_dir = root.join("build-tmp");
+            let config = BoundedBuildConfig {
+                budget: request.budget,
+                temp_dir,
+                correlation_id: request.generation_id.clone(),
+                spool_buf_cap: usize::try_from(request.budget.io_buffer_bytes)
+                    .unwrap_or(1024 * 1024),
+            };
+            let mut run_store = DiskRunStore::new(
+                root.join("build-runs"),
+                request.budget,
+                request.generation_id.clone(),
+            )
+            .map_err(map_generation_error)?;
+            let mut builder = BoundedGenerationBuilder::new(config);
+            let lease = builder
+                .build(&mut nodes, &mut edges, &mut run_store)
+                .map_err(map_generation_error)?;
+            let node_count = lease.total_nodes();
+            let edge_count = lease.total_edges();
+            let section: Box<dyn ExactSectionSource> =
+                Box::new(StreamingPayloadSectionSource::new(lease));
+            (section, node_count, edge_count)
+        };
+
+        #[cfg(not(feature = "generation-streaming"))]
+        let (section, node_count, edge_count) = {
+            let generated = generate_compact_store(
+                &mut nodes,
+                &mut edges,
+                &request.rel_schemas,
+                &request.budget,
+            )
+            .map_err(map_generation_error)?;
+            let node_count = generated.store.total_nodes();
+            let edge_count = generated.store.total_edges();
+            let section: Box<dyn ExactSectionSource> =
+                Box::new(CompactStoreSectionSource::new(generated.store, generated.global_strings)
+                    .map_err(map_section_error)?);
+            (section, node_count, edge_count)
+        };
 
         // `#[doc(hidden)]` test-only fault seam (G-EM0.3c crash matrix): in
         // debug/test builds, `GRAFEO_3C_ABORT` hard-aborts the process at the
@@ -301,11 +352,7 @@ impl GrafeoDB {
             std::process::abort();
         }
 
-        let node_count = generated.store.total_nodes();
-        let edge_count = generated.store.total_edges();
         let overlay_epoch = self.transaction_manager.current_epoch().0;
-        let section = CompactStoreSectionSource::new(generated.store, generated.global_strings)
-            .map_err(map_section_error)?;
         let header = GenerationContainerHeader {
             epoch: overlay_epoch,
             transaction_id: self
@@ -320,7 +367,7 @@ impl GrafeoDB {
         let parent_publication_sequence = request.parent_publication_sequence;
         let generation_id = request.generation_id.clone();
 
-        let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![Box::new(section)];
+        let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![section];
         let result = publish_generation(
             &lock,
             PublicationInput {
