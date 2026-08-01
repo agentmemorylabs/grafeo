@@ -66,6 +66,21 @@ pub enum SegmentKind {
     BlockZoneMaps = 19,
     /// Dictionary code index.
     DictionaryCodeIndex = 20,
+    /// Node logical-label membership records (G-EM0.5b D0.8.0).
+    ///
+    /// Companion segment emitted only when a node carries more than one
+    /// logical label. See [`crate::graph::compact::mapped::label_membership`].
+    NodeLabelMembership = 21,
+    /// Per-column row-presence bitmap (G-EM0.5b D0.8.0).
+    ///
+    /// Companion segment emitted only when some row lacks the property.
+    /// See [`crate::graph::compact::mapped::presence`].
+    ColumnRowPresence = 22,
+    /// Per-column row-null bitmap (G-EM0.5b D0.8.0).
+    ///
+    /// Companion segment emitted only when some present row stores
+    /// `Value::Null`. See [`crate::graph::compact::mapped::presence`].
+    ColumnRowNull = 23,
 }
 
 impl SegmentKind {
@@ -97,6 +112,9 @@ impl SegmentKind {
             18 => Self::TableZoneMaps,
             19 => Self::BlockZoneMaps,
             20 => Self::DictionaryCodeIndex,
+            21 => Self::NodeLabelMembership,
+            22 => Self::ColumnRowPresence,
+            23 => Self::ColumnRowNull,
             other => return Err(format!("unknown CompactStore v5 segment kind {other}")),
         })
     }

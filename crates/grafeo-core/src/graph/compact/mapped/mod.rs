@@ -9,6 +9,8 @@ pub(crate) mod accounting;
 pub(crate) mod code_index;
 pub(crate) mod directory;
 pub(crate) mod id_lookup;
+pub(crate) mod label_membership;
+pub(crate) mod presence;
 pub(crate) mod string_dict;
 pub(crate) mod views;
 pub(crate) mod zone_maps;
@@ -24,6 +26,14 @@ pub use directory::{
 };
 pub use id_lookup::{
     MappedEdgeIdLookup, MappedNodeIdLookup, write_edge_id_record, write_node_id_record,
+};
+pub use label_membership::{
+    LabelMembership, LabelMembershipView, MEMBERSHIP_HEADER_LEN, MEMBERSHIP_RECORD_LEN,
+    write_membership_segment,
+};
+pub use presence::{
+    PRESENCE_RECORD_HEADER_LEN, RowBitmapView, bitmap_bytes, pack_bits, unpack_bits,
+    write_null_segment, write_presence_segment,
 };
 pub use string_dict::{MappedStringDictionary, build_string_segments};
 pub use views::{U32View, U64View, read_u16_le, read_u32_le, read_u64_le};
