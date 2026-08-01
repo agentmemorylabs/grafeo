@@ -15,12 +15,16 @@ use grafeo_common::utils::error::{Error, Result};
 use grafeo_common::utils::hash::FxHashMap;
 use grafeo_core::graph::Direction;
 use grafeo_core::graph::GraphStore;
+#[cfg(not(feature = "generation-streaming"))]
+use grafeo_core::graph::compact::generation::generate_compact_store;
 use grafeo_core::graph::compact::generation::{
     EdgeRecordSource, GenerationBudget, GenerationEdge, GenerationError, GenerationNode,
-    NodeRecordSource, OriginalEdgeId, OriginalNodeId, RelSchemaDecl, generate_compact_store,
+    NodeRecordSource, OriginalEdgeId, OriginalNodeId, RelSchemaDecl,
 };
+#[cfg(not(feature = "generation-streaming"))]
+use grafeo_storage::file::generation_writer::CompactStoreSectionSource;
 use grafeo_storage::file::generation_writer::{
-    CompactStoreSectionSource, ExactSectionSource, GenerationContainerHeader, OsGenerationFileOps,
+    ExactSectionSource, GenerationContainerHeader, OsGenerationFileOps,
 };
 use grafeo_storage::generation::lock::RootLock;
 use grafeo_storage::generation::publication::{
@@ -178,6 +182,7 @@ fn map_publication_error(err: PublicationError) -> Error {
     PublicationPhaseError::from_publication(err).into()
 }
 
+#[cfg(not(feature = "generation-streaming"))]
 fn map_section_error(err: Error) -> Error {
     Error::Internal(format!("generation section source: {err}"))
 }
@@ -333,9 +338,10 @@ impl GrafeoDB {
             .map_err(map_generation_error)?;
             let node_count = generated.store.total_nodes();
             let edge_count = generated.store.total_edges();
-            let section: Box<dyn ExactSectionSource> =
-                Box::new(CompactStoreSectionSource::new(generated.store, generated.global_strings)
-                    .map_err(map_section_error)?);
+            let section: Box<dyn ExactSectionSource> = Box::new(
+                CompactStoreSectionSource::new(generated.store, generated.global_strings)
+                    .map_err(map_section_error)?,
+            );
             (section, node_count, edge_count)
         };
 
