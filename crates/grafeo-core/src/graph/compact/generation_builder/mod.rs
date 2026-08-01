@@ -9,7 +9,10 @@
 //! and the final payload is streamed through [`V5PayloadAssembler::stream_to`].
 
 pub mod builder;
+pub mod column_pass;
+pub mod edge_pass;
 pub mod freeze;
+pub mod node_pass;
 pub mod staging;
 
 pub use builder::{StreamingBuildConfig, StreamingGenerationBuilder, StreamingGenerationOutput};
@@ -18,5 +21,7 @@ pub use freeze::{
     MergedEdgeSource, MergedNodeSource,
 };
 
+#[cfg(test)]
+mod pipeline_tests;
 #[cfg(test)]
 mod tests;
