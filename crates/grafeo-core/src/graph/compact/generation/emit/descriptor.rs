@@ -82,6 +82,20 @@ impl SegmentBody {
     }
 }
 
+impl Drop for SegmentBody {
+    fn drop(&mut self) {
+        if let Self::Spilled(path) = self {
+            // Best-effort cleanup: delete the spool file. Ignore errors
+            // (file may already be gone, or path may be on a tmpfs that
+            // was cleaned). This is the RAII cleanup for spilled segment
+            // bodies — the spool file is deleted when the descriptor is
+            // dropped, whether on success (after assembly) or failure
+            // (unwind, error return, or panic).
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Cheap metadata plus a readable body for one finished v5 segment.
 ///
 /// Produced by [`SegmentSink::finish`]. The assembler consumes ordered

@@ -204,6 +204,64 @@ fn write_golden_fixtures() {
     eprintln!("wrote {} bytes to {}", eager.len(), path.display());
 }
 
+/// RAII: spool files and temp dir are cleaned up when the lease is dropped
+/// after a successful build+stream (D0.8.10 #10: zero leftover artifacts).
+#[test]
+fn raii_cleanup_on_success() {
+    let tmp = TempDir::new().unwrap();
+    let build_tmp = tmp.path().join("build-tmp");
+    let input = gem0_5b_parity_input();
+    let mut store = InMemoryRunStore::new();
+    let config = BoundedBuildConfig {
+        budget: budget(),
+        temp_dir: build_tmp.clone(),
+        correlation_id: "raii-success".into(),
+        spool_buf_cap: 64 * 1024,
+    };
+    let mut builder = BoundedGenerationBuilder::new(config);
+    let mut lease = builder
+        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .expect("build");
+
+    // Stream the payload (consumes spool files).
+    let mut payload = Vec::new();
+    lease.stream_to(&mut payload).expect("stream_to");
+
+    // Drop the lease → should clean up temp dir + spool files.
+    drop(lease);
+
+    // Verify the build-tmp directory is gone.
+    assert!(
+        !build_tmp.exists(),
+        "build-tmp directory should be removed after lease drop"
+    );
+}
+
+/// RAII: spool files and temp dir are cleaned up even when the lease is
+/// dropped WITHOUT streaming (simulating a build error after lease creation).
+#[test]
+fn raii_cleanup_on_drop_without_stream() {
+    let tmp = TempDir::new().unwrap();
+    let build_tmp = tmp.path().join("build-tmp");
+    let input = gem0_5b_parity_input();
+    let mut store = InMemoryRunStore::new();
+    let config = BoundedBuildConfig {
+        budget: budget(),
+        temp_dir: build_tmp.clone(),
+        correlation_id: "raii-nostream".into(),
+        spool_buf_cap: 64 * 1024,
+    };
+    let mut builder = BoundedGenerationBuilder::new(config);
+    let lease = builder
+        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .expect("build");
+    drop(lease);
+    assert!(
+        !build_tmp.exists(),
+        "build-tmp directory should be removed even without streaming"
+    );
+}
+
 /// Diagnostic: dump the segment directory of a v5 payload (kind, length).
 fn dump_plan(payload: &[u8]) -> Vec<(u16, u64)> {
     let seg_count = u16::from_le_bytes([payload[8], payload[9]]) as usize;

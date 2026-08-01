@@ -16,6 +16,7 @@ use crate::graph::compact::generation::GenerationMetrics;
 use crate::graph::compact::generation::emit::assembler::V5PayloadAssembler;
 use crate::graph::compact::generation::emit::descriptor::SegmentDescriptor;
 use crate::graph::compact::generation::error::GenerationError;
+use std::path::PathBuf;
 
 /// A spool-owning streaming v5 payload lease.
 pub struct V5PayloadLease {
@@ -25,6 +26,8 @@ pub struct V5PayloadLease {
     total_edges: u64,
     preserves_ids: bool,
     metrics: GenerationMetrics,
+    /// Job temp directory (spools, build-tmp). Cleaned on Drop.
+    temp_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for V5PayloadLease {
@@ -49,6 +52,24 @@ impl V5PayloadLease {
         preserves_ids: bool,
         metrics: GenerationMetrics,
     ) -> Self {
+        Self::with_temp_dir(descriptors, total_nodes, total_edges, preserves_ids, metrics, None)
+    }
+
+    /// Creates a lease that owns the job temp directory for RAII cleanup.
+    ///
+    /// When `temp_dir` is `Some`, the directory is removed recursively
+    /// when the lease is dropped (after assembly on success, or on
+    /// error/cancel/unwind). Spilled segment body files are cleaned by
+    /// [`SegmentBody`]'s `Drop`.
+    #[must_use]
+    pub fn with_temp_dir(
+        descriptors: Vec<SegmentDescriptor>,
+        total_nodes: u64,
+        total_edges: u64,
+        preserves_ids: bool,
+        metrics: GenerationMetrics,
+        temp_dir: Option<PathBuf>,
+    ) -> Self {
         let assembler = V5PayloadAssembler::new(total_nodes, total_edges, preserves_ids);
         Self {
             assembler,
@@ -57,6 +78,7 @@ impl V5PayloadLease {
             total_edges,
             preserves_ids,
             metrics,
+            temp_dir,
         }
     }
 
@@ -104,5 +126,17 @@ impl V5PayloadLease {
     /// [`GenerationError`] on body read or sink write failure.
     pub fn stream_to(&mut self, sink: &mut dyn std::io::Write) -> Result<(), GenerationError> {
         self.assembler.stream_to(&self.descriptors, sink)
+    }
+}
+
+impl Drop for V5PayloadLease {
+    fn drop(&mut self) {
+        // 1. SegmentBody::Drop deletes each spilled spool file.
+        //    This happens automatically when descriptors drop.
+        // 2. Clean up the job temp directory (spools, build-tmp, any
+        //    other artifacts). Best-effort: ignore errors.
+        if let Some(ref dir) = self.temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

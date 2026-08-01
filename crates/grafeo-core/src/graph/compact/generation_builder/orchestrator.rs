@@ -529,12 +529,13 @@ impl BoundedGenerationBuilder {
         // Sort by kind ascending.
         descriptors.sort_by_key(|d| d.kind.as_u16());
 
-        Ok(V5PayloadLease::new(
+        Ok(V5PayloadLease::with_temp_dir(
             descriptors,
             node_schema.total_nodes,
             total_edges,
             true,
             self.metrics.clone(),
+            Some(self.config.temp_dir.clone()),
         ))
     }
 }

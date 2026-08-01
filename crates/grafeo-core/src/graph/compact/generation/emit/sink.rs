@@ -147,10 +147,12 @@ impl SegmentSink for SpoolSegmentSink {
         } else {
             SegmentBody::Resident(Bytes::from(std::mem::take(&mut self.buf)))
         };
-        let crc = self.crc.finalize();
+        // Take the hasher out via replace since Drop now exists on this type.
+        let crc = std::mem::replace(&mut self.crc, crc32fast::Hasher::new()).finalize();
+        let length = self.length;
         let element_count = if self.element_width > 0 {
             #[allow(clippy::cast_possible_truncation)]
-            let count = (self.length / u64::from(self.element_width)) as u32;
+            let count = (length / u64::from(self.element_width)) as u32;
             count
         } else {
             0
@@ -161,11 +163,23 @@ impl SegmentSink for SpoolSegmentSink {
             flags: self.flags,
             alignment: self.alignment,
             element_width: self.element_width,
-            length: self.length,
+            length,
             crc,
             element_count,
             body,
         })
+    }
+}
+
+impl Drop for SpoolSegmentSink {
+    fn drop(&mut self) {
+        // RAII cleanup: if the sink was spilled but never finished (error,
+        // cancel, panic), delete the temp file. If finish() was called,
+        // the file was transferred to SegmentBody::Spilled and the sink's
+        // file/path are None, so this is a no-op.
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
