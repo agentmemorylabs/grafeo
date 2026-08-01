@@ -19,6 +19,8 @@ pub struct GenerationBudget {
     pub max_record_bytes: u64,
     /// Max retained schema metadata bytes.
     pub max_schema_bytes: u64,
+    /// Max memory-mapped bytes (mmap'd files, separate from anonymous).
+    pub max_mapped_bytes: u64,
 }
 
 impl GenerationBudget {
@@ -33,6 +35,7 @@ impl GenerationBudget {
             merge_fan_in: 4,
             max_record_bytes: 8 * 1024 * 1024,
             max_schema_bytes: 16 * 1024 * 1024,
+            max_mapped_bytes: 256 * 1024 * 1024,
         }
     }
 
@@ -47,6 +50,7 @@ impl GenerationBudget {
             merge_fan_in: 32,
             max_record_bytes: 8 * 1024 * 1024,
             max_schema_bytes: 16 * 1024 * 1024,
+            max_mapped_bytes: 4 * 1024 * 1024 * 1024,
         }
     }
 
@@ -86,6 +90,10 @@ pub struct GenerationMetrics {
     pub schema_bytes_peak: u64,
     /// Current retained schema-metadata charge.
     pub schema_bytes_current: u64,
+    /// Peak memory-mapped bytes charged (mmap'd files, not anonymous).
+    pub mapped_bytes_peak: u64,
+    /// Current memory-mapped charge.
+    pub mapped_bytes_current: u64,
     /// Number of sorted runs formed.
     pub run_count: u64,
     /// Max simultaneously open run files during merge.
@@ -189,5 +197,36 @@ impl GenerationMetrics {
     /// Releases previously reserved schema bytes.
     pub fn release_schema(&mut self, bytes: u64) {
         self.schema_bytes_current = self.schema_bytes_current.saturating_sub(bytes);
+    }
+
+    /// Reserves `bytes` against the memory-mapped budget.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::BudgetExceeded`] when the reservation would cross the limit.
+    pub fn reserve_mapped(&mut self, bytes: u64, limit: u64) -> Result<(), GenerationError> {
+        let next = self
+            .mapped_bytes_current
+            .checked_add(bytes)
+            .ok_or(GenerationError::BudgetExceeded {
+                counter: "mapped_bytes",
+                requested: bytes,
+                limit,
+            })?;
+        if next > limit {
+            return Err(GenerationError::BudgetExceeded {
+                counter: "mapped_bytes",
+                requested: next,
+                limit,
+            });
+        }
+        self.mapped_bytes_current = next;
+        self.mapped_bytes_peak = self.mapped_bytes_peak.max(next);
+        Ok(())
+    }
+
+    /// Releases previously reserved mapped bytes.
+    pub fn release_mapped(&mut self, bytes: u64) {
+        self.mapped_bytes_current = self.mapped_bytes_current.saturating_sub(bytes);
     }
 }
