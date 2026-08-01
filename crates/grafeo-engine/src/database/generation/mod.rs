@@ -29,8 +29,10 @@
 #[cfg(feature = "mmap")]
 pub mod lease;
 pub mod manifest;
+pub mod ownership;
 pub mod publication;
 pub mod recovery;
+pub mod retirement;
 
 #[cfg(feature = "mmap")]
 pub use lease::{
@@ -40,6 +42,7 @@ pub use lease::{
 pub use manifest::{
     ManifestSelection, ManifestState, ManifestStateError, WalBoundary, read_manifest_state,
 };
+pub use ownership::{OpenMode, OwnershipError, RootLockOwnerState, RootOwnership};
 pub use publication::{
     BuildPublication, PublicationPhase, PublicationPhaseError, PublishedGeneration,
 };
@@ -47,3 +50,27 @@ pub use recovery::{
     ExpectedSelection, OrphanClassification, PublicationCrashPoint, RecoveryViewError,
     RootRecovery, recover_generation_root,
 };
+pub use retirement::{
+    BACKUP_MANIFEST_NAME, BackedUpWalFile, BackupPin, BackupPinGuard, ClassifiedGeneration,
+    GenerationBackupManifest, GenerationBackupReceipt, RetentionClass, RetirementAuthority,
+    RetirementError, RetirementPlan, RootLifecycleReport, backup_generation_root,
+    collect_retirement, plan_retirement, restore_generation_root,
+};
+
+/// Wall-clock milliseconds since the UNIX epoch, for observability
+/// timestamps (ownership hold-since, backup-pin start, backup creation).
+///
+/// Kept in this module rather than reusing [`crate::database::backup::now_ms`]
+/// so the generation-lifecycle surface does not depend on the legacy backup
+/// module (which is gated behind the `wal` feature). Saturates to 0 before
+/// the epoch.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| {
+            // reason: millis since the UNIX epoch fits u64 for centuries
+            #[allow(clippy::cast_possible_truncation)]
+            let ms = d.as_millis() as u64;
+            ms
+        })
+}
