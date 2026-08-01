@@ -1,0 +1,118 @@
+//! One immutable generation's in-process base (G-EM0.4a).
+//!
+//! A [`BaseGeneration`] owns the CompactStore **section** mapping of one
+//! immutable generation container plus the zero-copy store deserialized from
+//! it, tagged with the generation's durable identity. See [`super`] (the
+//! `lease` module) for the full lease/transition contract.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use grafeo_common::storage::SectionType;
+use grafeo_common::utils::error::{Error, Result};
+use grafeo_core::graph::compact::CompactStore;
+use grafeo_core::graph::compact::section::CompactStoreSection;
+use grafeo_storage::file::GrafeoFileManager;
+
+/// One immutable generation's in-process base: identity + the owned section mapping.
+///
+/// The base owns the CompactStore section's mmap-backed `Bytes` (via
+/// [`GrafeoFileManager::mmap_section`], which CRC-validates the mapped region)
+/// and the `Arc<CompactStore>` deserialized from it; the codec columns hold
+/// zero-copy `Bytes::slice` views into the mapping, so the mapping is released
+/// only when both the store and this owner drop. This struct tags the mapping
+/// with the generation's durable identity so a reader can prove which
+/// immutable base a snapshot serves. `BaseGeneration` is reference-counted;
+/// the OS mapping it wraps is released only when the *last* strong reference
+/// (owner, registry, or read snapshot) drops — that is the "final mapping
+/// release" the tests prove via weak refs.
+pub struct BaseGeneration {
+    /// Manifest publication sequence of the selected generation (identity).
+    publication_sequence: u64,
+    /// Caller-supplied generation identifier.
+    generation_id: String,
+    /// Absolute path of the immutable generation container.
+    generation_abs_path: PathBuf,
+    /// The owned CompactStore-section mapping. The store's columns hold
+    /// zero-copy `Bytes::slice` views that share this same allocation, so the
+    /// mapping stays live as long as the store does; the OS mapping is released
+    /// once both this field and the store's slices are dropped.
+    _section_bytes: Bytes,
+    /// The base store, deserialized from the mapped section bytes.
+    store: Arc<CompactStore>,
+}
+
+impl std::fmt::Debug for BaseGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseGeneration")
+            .field("publication_sequence", &self.publication_sequence)
+            .field("generation_id", &self.generation_id)
+            .field("generation_abs_path", &self.generation_abs_path)
+            .field("node_count", &self.store.total_nodes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BaseGeneration {
+    /// Open a generation container as an in-process base.
+    ///
+    /// Maps the CompactStore **section** of the generation `.grafeo` container
+    /// (not the whole file) via [`GrafeoFileManager::mmap_section`] and
+    /// deserializes a zero-copy store from the mapped, CRC-validated bytes.
+    /// Fails closed on any open/map/decode error (never serves a torn
+    /// generation).
+    pub(super) fn open(
+        publication_sequence: u64,
+        generation_id: String,
+        generation_abs_path: PathBuf,
+    ) -> Result<Self> {
+        let manager = GrafeoFileManager::open_read_only(&generation_abs_path)?;
+        let directory = manager
+            .read_section_directory()?
+            .ok_or_else(|| Error::Internal("generation has no section directory".into()))?;
+        let entry = directory
+            .find(SectionType::CompactStore)
+            .ok_or_else(|| Error::Internal("generation has no CompactStore section".into()))?;
+        let section = manager.mmap_section(entry)?;
+        let section_bytes = Arc::new(section).into_bytes();
+
+        let mut cs_section = CompactStoreSection::empty();
+        cs_section.deserialize_from_bytes(section_bytes.clone())?;
+        let store = cs_section.store().ok_or_else(|| {
+            Error::Internal("empty CompactStoreSection after generation open".into())
+        })?;
+
+        Ok(Self {
+            publication_sequence,
+            generation_id,
+            generation_abs_path,
+            _section_bytes: section_bytes,
+            store,
+        })
+    }
+
+    /// Manifest publication sequence of this base.
+    #[must_use]
+    pub fn publication_sequence(&self) -> u64 {
+        self.publication_sequence
+    }
+
+    /// The generation identifier.
+    #[must_use]
+    pub fn generation_id(&self) -> &str {
+        &self.generation_id
+    }
+
+    /// Absolute path of the immutable generation container.
+    #[must_use]
+    pub fn generation_abs_path(&self) -> &Path {
+        &self.generation_abs_path
+    }
+
+    /// The base store, served from the owned mmap-backed bytes.
+    #[must_use]
+    pub fn store(&self) -> Arc<CompactStore> {
+        Arc::clone(&self.store)
+    }
+}

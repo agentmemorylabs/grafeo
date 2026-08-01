@@ -61,6 +61,9 @@ crc32fast = { workspace = true, optional = true }
 # Memory-mapped files (optional, for compact-store mmap spill)
 memmap2 = { workspace = true, optional = true }
 
+# Atomic Arc swap for generation-lease base redirect (G-EM0.4a)
+arc-swap = { workspace = true, optional = true }
+
 # Refcounted byte slices for mmap-backed column storage (Phase 3c)
 bytes.workspace = true
 
@@ -95,7 +98,7 @@ grafeo-file = ["dep:grafeo-storage", "grafeo-storage/grafeo-file", "dep:crc32fas
 generation = ["grafeo-file", "grafeo-storage/generation"]  # Streaming generation container writer
 encryption = ["dep:grafeo-storage", "grafeo-common/encryption", "grafeo-storage/encryption"]  # AES-256-GCM encryption at rest
 spill = ["grafeo-core/spill"]  # Disk spilling for out-of-core execution
-mmap = ["grafeo-core/mmap", "dep:memmap2"]  # File-backed vector storage and compact-store spill
+mmap = ["grafeo-core/mmap", "dep:memmap2", "dep:arc-swap"]  # File-backed vector storage and compact-store spill
 temporal = ["grafeo-core/temporal"]  # Append-only versioned properties
 compact-store = ["grafeo-core/compact-store"]  # CompactStore — columnar graph for read-only workloads
 # Convenience groups
@@ -156,6 +159,11 @@ required-features = ["generation", "compact-store", "lpg"]
 name = "compact_store_manifest_recovery"
 path = "tests/compact_store_manifest_recovery.rs"
 required-features = ["generation", "compact-store", "lpg"]
+
+[[test]]
+name = "compact_store_generation_leases"
+path = "tests/compact_store_generation_leases.rs"
+required-features = ["generation", "compact-store", "lpg", "mmap"]
 
 [[bench]]
 name = "query_bench"

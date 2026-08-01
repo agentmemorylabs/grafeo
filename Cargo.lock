@@ -1540,6 +1540,7 @@ dependencies = [
 name = "grafeo-engine"
 version = "0.5.42"
 dependencies = [
+ "arc-swap",
  "arcstr",
  "arrow-array",
  "arrow-ipc",

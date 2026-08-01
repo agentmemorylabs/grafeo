@@ -56,6 +56,16 @@ pub use database::CompactBacking;
 pub use database::GrafeoDB;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use database::IndexedVectorRead;
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "mmap"
+))]
+pub use database::generation::{
+    BaseGeneration, GenerationLease, GenerationLeaseRegistry, GenerationLeaseStats,
+    GenerationTransitionError, TransitionReport,
+};
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation::{
     BuildPublication, ExpectedSelection, ManifestSelection, ManifestState, ManifestStateError,
