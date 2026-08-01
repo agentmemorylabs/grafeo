@@ -29,8 +29,11 @@ use grafeo_storage::file::GrafeoFileManager;
 
 /// Returns true when `path` is (or already contains) an E-M0 generation root.
 ///
-/// Used to keep the legacy single-file flush path fail-closed against
-/// accidental in-place conversion of generation layouts.
+/// Today this is a detection helper only: it backs the generation-build debug
+/// assertion in `super::generation_build::build_immutable_generation` and is
+/// re-exported publicly as `super::generation_build::path_is_generation_root`.
+/// Wiring it in as a fail-closed guard on the legacy single-file flush path is
+/// future work; no flush-path caller invokes it yet.
 #[cfg(feature = "generation")]
 #[must_use]
 pub(crate) fn is_generation_root(path: &Path) -> bool {

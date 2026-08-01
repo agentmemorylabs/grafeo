@@ -12,8 +12,10 @@
 use std::fs;
 use std::path::Path;
 
+use bytes::Bytes;
 use grafeo_common::storage::SectionType;
-use grafeo_common::types::Value;
+use grafeo_common::types::{PropertyKey, Value};
+use grafeo_core::graph::compact::section::CompactStoreSection;
 use grafeo_engine::GrafeoDB;
 use grafeo_engine::database::generation_build::{
     generation_build_request, path_is_generation_root,
@@ -41,6 +43,69 @@ fn write_legacy_standalone(path: &Path) {
     let db = GrafeoDB::new_in_memory();
     populate_live_graph(&db);
     db.save(path).expect("save standalone .grafeo");
+}
+
+/// Open a published generation container through the production read path and
+/// verify the deserialized CompactStore contents (R1 review repair).
+///
+/// Reuses the exact mechanism of the W0 contract test
+/// `compact_store_generation_contract`: `GrafeoFileManager::open_read_only` +
+/// `CompactStoreSection::deserialize_from_bytes` via the public API — no second
+/// reader implementation. Assertions are non-zero-count and real-data presence
+/// checks, so a generation with zero records (e.g. a broken record source) or
+/// missing overlay data fails here.
+fn assert_published_generation_contents(
+    path: &Path,
+    expected_nodes: u64,
+    expected_edges: u64,
+    expected_person_names: &[&str],
+    expected_edge_types: &[&str],
+) {
+    let manager = GrafeoFileManager::open_read_only(path).expect("open published generation");
+    let section_dir = manager.read_section_directory().unwrap().unwrap();
+    let entry = section_dir
+        .find(SectionType::CompactStore)
+        .expect("CompactStore section present");
+    assert!(entry.length > 0);
+
+    let data = manager
+        .read_section_data(entry)
+        .expect("read CompactStore section");
+    let mut cs_section = CompactStoreSection::empty();
+    cs_section
+        .deserialize_from_bytes(Bytes::from(data))
+        .expect("published v5 payload must deserialize through the public API");
+    let store = cs_section.store().expect("store must be present");
+
+    assert_eq!(store.total_nodes(), expected_nodes, "published node count");
+    assert_eq!(store.total_edges(), expected_edges, "published edge count");
+
+    let mut person_names: Vec<String> = Vec::new();
+    if let Some(person) = store.node_table("Person") {
+        for offset in 0..person.len() {
+            if let Some(Value::String(name)) =
+                person.get_property(offset, &PropertyKey::new("name"))
+            {
+                person_names.push(name.as_str().to_string());
+            }
+        }
+    }
+    for expected in expected_person_names {
+        assert!(
+            person_names.iter().any(|n| n.as_str() == *expected),
+            "Person table must contain node named {expected:?}, got {person_names:?}"
+        );
+    }
+
+    for edge_type in expected_edge_types {
+        let table = store
+            .rel_table(edge_type)
+            .unwrap_or_else(|| panic!("rel table {edge_type:?} must exist in published store"));
+        assert!(
+            table.num_edges() > 0,
+            "rel table {edge_type:?} must have edges"
+        );
+    }
 }
 
 #[test]
@@ -72,13 +137,10 @@ fn live_engine_publishes_immutable_generation_via_w0() {
     assert_eq!(selected.slot.generation_id, "g-live-3a");
     assert_eq!(selected.slot.publication_sequence, 1);
 
-    let manager = GrafeoFileManager::open_read_only(&selected.generation_abs_path)
-        .expect("open published generation");
-    let section_dir = manager.read_section_directory().unwrap().unwrap();
-    let entry = section_dir
-        .find(SectionType::CompactStore)
-        .expect("CompactStore section present");
-    assert!(entry.length > 0);
+    // Deserialize the published generation through the production read path
+    // (same mechanism as the W0 contract test) and verify actual graph
+    // contents: 3 nodes, 2 edges, and the known data ("Ada", "KNOWS").
+    assert_published_generation_contents(&selected.generation_abs_path, 3, 2, &["Ada"], &["KNOWS"]);
 }
 
 #[test]
@@ -101,14 +163,16 @@ fn layered_live_graph_streams_base_plus_overlay() {
 
     let lock = RootLock::try_acquire(&gen_root).unwrap();
     let selected = recover(&lock).unwrap();
-    let manager = GrafeoFileManager::open_read_only(&selected.generation_abs_path).unwrap();
-    let section_dir = manager.read_section_directory().unwrap().unwrap();
-    assert!(
-        section_dir
-            .find(SectionType::CompactStore)
-            .expect("section")
-            .length
-            > 0
+
+    // Clause-2 layered proof: the published generation must contain the base
+    // nodes AND the overlay node created after `db.compact()` (Carol) —
+    // 4 nodes / 2 edges total.
+    assert_published_generation_contents(
+        &selected.generation_abs_path,
+        4,
+        2,
+        &["Ada", "Carol"],
+        &["KNOWS", "WORKS_ON"],
     );
 }
 

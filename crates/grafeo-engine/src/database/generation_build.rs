@@ -183,6 +183,16 @@ impl GrafeoDB {
     /// a standalone `.grafeo` snapshot or renames over a mapped active container.
     /// Returns a validated descriptor; does **not** select the generation.
     ///
+    /// # Single-writer assumption
+    ///
+    /// The freeze captures identity keys only; node/edge payloads (labels, edge
+    /// types, properties) are read live from the graph while the build streams.
+    /// Callers must ensure **no concurrent writes** mutate the graph during the
+    /// build (single-writer assumption). A mid-build node or edge deletion
+    /// fails closed (the record is skipped and endpoint validation rejects
+    /// dangling edges), but a concurrent property mutation does **not** fail
+    /// closed — the published payload reflects whatever the stream read live.
+    ///
     /// # Errors
     ///
     /// Returns an error when the root lock cannot be acquired, the live graph
@@ -290,7 +300,14 @@ impl GrafeoDB {
     }
 }
 
-/// Convenience constructor for test and operator call sites.
+/// TEST-ONLY convenience constructor: builds a request with the test-scale
+/// [`GenerationBudget::for_tests`] budget so integration tests keep one-line
+/// call sites.
+///
+/// This is not a production entry point. Operator/production call sites must
+/// construct [`GenerationBuildRequest`] directly with an explicit production
+/// budget (`GenerationBuildRequest::budget` is non-optional); do not route
+/// production builds through this helper.
 #[must_use]
 pub fn generation_build_request(
     generation_root: impl Into<PathBuf>,
