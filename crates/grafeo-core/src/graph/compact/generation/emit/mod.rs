@@ -15,14 +15,14 @@ pub mod assembler;
 pub mod column;
 pub mod descriptor;
 pub mod dictionary;
+pub mod segments;
 pub mod sink;
 
 pub use assembler::V5PayloadAssembler;
 pub use column::ColumnEncoder;
 pub use descriptor::{SegmentBody, SegmentDescriptor};
-pub use dictionary::{
-    BoundedDictionary, DictionaryPassDriver, StringOccurrence, StringUseKind,
-};
+pub use dictionary::{BoundedDictionary, DictionaryPassDriver, StringOccurrence, StringUseKind};
+pub use segments::emit_canonical_descriptors;
 pub use sink::{MemorySegmentSink, SegmentSink, SpoolSegmentSink};
 
 #[cfg(test)]

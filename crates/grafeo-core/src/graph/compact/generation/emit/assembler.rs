@@ -49,13 +49,12 @@ impl V5PayloadAssembler {
     /// exceeds `u16::MAX`, or [`GenerationError::Io`] when a spilled body
     /// cannot be read.
     pub fn assemble(&self, descriptors: &[SegmentDescriptor]) -> Result<Vec<u8>, GenerationError> {
-        let segment_count = u16::try_from(descriptors.len()).map_err(|_| {
-            GenerationError::WireWidthOverflow {
+        let segment_count =
+            u16::try_from(descriptors.len()).map_err(|_| GenerationError::WireWidthOverflow {
                 what: "segment_count",
                 count: descriptors.len() as u64,
                 max: u64::from(u16::MAX),
-            }
-        })?;
+            })?;
 
         #[allow(clippy::cast_possible_truncation)]
         let directory_length = u64::from(segment_count) * (DIRECTORY_ENTRY_LEN as u64);

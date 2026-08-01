@@ -234,7 +234,9 @@ impl DictionaryPassDriver {
             let is_dup = prev_string.is_some_and(|p| p == string_bytes);
             if !is_dup {
                 let s = std::str::from_utf8(string_bytes)
-                    .map_err(|_| GenerationError::Codec("invalid UTF-8 in dictionary string".into()))?
+                    .map_err(|_| {
+                        GenerationError::Codec("invalid UTF-8 in dictionary string".into())
+                    })?
                     .to_string();
                 unique_strings.push(s);
                 prev_string = Some(string_bytes);

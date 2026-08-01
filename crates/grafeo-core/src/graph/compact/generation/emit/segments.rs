@@ -1,9 +1,18 @@
-//! Production v5 segment emission for core V5SegmentSource (G-EM0.W0-A3).
+//! Canonical v5 segment emitter (G-EM0.5b Phase 1).
+//!
+//! One implementation of CompactStore → ordered `SegmentDescriptor`s. Both
+//! `serialize_v5_with_string_order` (feature ON) and `emit_v5_segments`
+//! (feature ON) delegate here; the eager paths remain for feature OFF.
+//!
+//! Phase 1 uses `MemorySegmentSink` (compatibility). Phase 2's streaming
+//! builder will drive the same logic through `SpoolSegmentSink`.
 
-use super::error::GenerationError;
-use super::segment_source::V5Segment;
-use super::strings::GlobalStringDictionary;
+#![allow(clippy::cast_possible_truncation)]
+
+use super::descriptor::SegmentDescriptor;
+use super::sink::{MemorySegmentSink, SegmentSink};
 use crate::graph::compact::CompactStore;
+use crate::graph::compact::generation::error::GenerationError;
 use crate::graph::compact::mapped::{
     SegmentKind, ZONE_MAP_RECORD_LEN, build_dictionary_code_index, build_string_segments,
     build_zone_map_segments, write_edge_id_record, write_node_id_record,
@@ -16,165 +25,50 @@ use crate::graph::compact::section_v5::{
 };
 use grafeo_common::utils::hash::FxHashMap;
 
-/// Lightweight segment plan entry holding metadata without payload bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentPlanEntry {
-    /// Segment kind code.
-    pub kind: SegmentKind,
-    /// Per-kind encoding version (usually 1).
-    pub encoding_version: u16,
-    /// Flags (bit 0 = required).
-    pub flags: u16,
-    /// Required alignment in bytes.
-    pub alignment: u16,
-    /// Fixed element width, or 0 for variable length.
-    pub element_width: u32,
-    /// Segment payload length in bytes.
-    pub length: u64,
-    /// Segment payload CRC-32.
-    pub crc: u32,
-    /// Element count for directory entry.
-    pub element_count: u32,
-}
-
-/// Builds string index map for global string lookups.
+/// Emits all v5 segments from a `CompactStore` and pre-built string index as
+/// ordered `SegmentDescriptor`s (ascending `SegmentKind`).
+///
+/// This is the single canonical segment-building implementation. Callers:
+/// - `serialize_v5_with_string_order` (feature ON) → descriptors → assembler
+/// - `emit_v5_segments` (feature ON) → descriptors → `V5Segment` conversion
 ///
 /// # Errors
 ///
-/// Returns `GenerationError::WireWidthOverflow` if global string count exceeds `u32::MAX`.
-pub fn build_string_index(
-    global_strings: &GlobalStringDictionary,
-) -> Result<FxHashMap<String, u32>, GenerationError> {
-    let str_slice = global_strings.as_slice();
-    let mut string_index: FxHashMap<String, u32> = FxHashMap::default();
-    for (idx, s) in str_slice.iter().enumerate() {
-        let code = u32::try_from(idx).map_err(|_| GenerationError::WireWidthOverflow {
-            what: "global_string_index",
-            count: idx as u64,
-            max: u64::from(u32::MAX),
-        })?;
-        string_index.insert(s.clone(), code);
-    }
-    Ok(string_index)
-}
-
-/// Builds lightweight segment execution plan (kinds, alignments, lengths, CRCs) without holding all payloads.
-///
-/// # Errors
-///
-/// Returns `GenerationError` if string lookup or wire width validation fails.
-pub fn build_segment_plan(
-    store: &CompactStore,
-    global_strings: &GlobalStringDictionary,
-) -> Result<(FxHashMap<String, u32>, Vec<SegmentPlanEntry>), GenerationError> {
-    let string_index = build_string_index(global_strings)?;
-    let all_segments = emit_v5_segments(store, global_strings)?;
-    let mut plan = Vec::with_capacity(all_segments.len());
-    for seg in all_segments {
-        // reason: segment bytes length fits u64 on all supported platforms
-        #[allow(clippy::cast_possible_truncation)]
-        let length = seg.bytes.len() as u64;
-        let crc = crc32fast::hash(&seg.bytes);
-        let element_count = if seg.element_width > 0 {
-            // reason: element count calculation bounded by length / element_width
-            #[allow(clippy::cast_possible_truncation)]
-            let count = (length / u64::from(seg.element_width)) as u32;
-            count
-        } else {
-            0
-        };
-        plan.push(SegmentPlanEntry {
-            kind: seg.kind,
-            encoding_version: seg.encoding_version,
-            flags: seg.flags,
-            alignment: seg.alignment,
-            element_width: seg.element_width,
-            length,
-            crc,
-            element_count,
-        });
-    }
-    Ok((string_index, plan))
-}
-
-/// Emits a single `V5Segment` object on demand for a plan entry.
-///
-/// # Errors
-///
-/// Returns `GenerationError` if segment codec emission fails.
-pub fn emit_single_segment(
-    store: &CompactStore,
-    global_strings: &GlobalStringDictionary,
-    _string_index: &FxHashMap<String, u32>,
-    plan: &SegmentPlanEntry,
-) -> Result<V5Segment, GenerationError> {
-    let all_segments = emit_v5_segments(store, global_strings)?;
-    for seg in all_segments {
-        if seg.kind == plan.kind {
-            return Ok(seg);
-        }
-    }
-    Err(GenerationError::Codec(format!(
-        "missing segment kind: {:?}",
-        plan.kind
-    )))
-}
-
-/// Emits all individual `V5Segment` objects for a `CompactStore` and `GlobalStringDictionary`
-/// in strictly ascending `SegmentKind` order.
-///
-/// # Errors
-///
-/// Returns `GenerationError` if string lookup or wire width validation fails.
+/// Returns `GenerationError` on wire-width overflow, codec failure, or
+/// missing string index entries.
 ///
 /// # Panics
 ///
-/// Panics if a property key exists in a column map but is missing from the
-/// string index (internal invariant violation — all keys are interned during
-/// plan construction).
-#[cfg_attr(
-    feature = "generation-streaming",
-    allow(unreachable_code, unused_variables, unused_mut)
-)]
-pub fn emit_v5_segments(
+/// Panics if a column key present in a table's column map is missing from
+/// that map on re-lookup (internal invariant violation — keys are iterated
+/// from the same map).
+pub fn emit_canonical_descriptors(
     store: &CompactStore,
-    global_strings: &GlobalStringDictionary,
-) -> Result<Vec<V5Segment>, GenerationError> {
-    let string_index = build_string_index(global_strings)?;
-    let str_slice = global_strings.as_slice();
+    string_index: &FxHashMap<String, u32>,
+    str_refs: &[&str],
+) -> Result<Vec<SegmentDescriptor>, GenerationError> {
+    let mut descriptors: Vec<SegmentDescriptor> = Vec::new();
 
-    // ── Canonical bounded emission (G-EM0.5b Phase 1) ──────────────────
-    // Feature ON: delegate to the canonical emitter and convert descriptors
-    // back to V5Segment. The eager path below is held harmless for OFF.
-    #[cfg(feature = "generation-streaming")]
-    {
-        use super::emit::emit_canonical_descriptors;
-        let str_refs: Vec<&str> = str_slice.iter().map(String::as_str).collect();
-        let descriptors = emit_canonical_descriptors(store, &string_index, &str_refs)?;
-        let mut segments = Vec::with_capacity(descriptors.len());
-        for desc in descriptors {
-            let mut bytes = Vec::new();
-            desc.body.stream(&mut |chunk| {
-                bytes.extend_from_slice(chunk);
-                Ok(())
-            })?;
-            segments.push(V5Segment {
-                kind: desc.kind,
-                encoding_version: desc.encoding_version,
-                flags: desc.flags,
-                alignment: desc.alignment,
-                element_width: desc.element_width,
-                bytes,
-            });
-        }
-        return Ok(segments);
-    }
+    // Helper: build a MemorySegmentSink, write bytes, finish → descriptor.
+    let emit = |kind: SegmentKind,
+                encoding_version: u16,
+                flags: u16,
+                alignment: u16,
+                element_width: u32,
+                bytes: &[u8]|
+     -> Result<SegmentDescriptor, GenerationError> {
+        let mut sink = Box::new(MemorySegmentSink::new(
+            kind,
+            encoding_version,
+            flags,
+            alignment,
+            element_width,
+        ));
+        sink.write(bytes)?;
+        sink.finish()
+    };
 
-    // ── Eager path (feature OFF) ────────────────────────────────────────
-    #[allow(unused_variables)]
-    let mut segments: Vec<V5Segment> = Vec::new();
-
-    // ── 0. Metadata ────────────────────────────────────────────────────────
+    // ── Metadata ────────────────────────────────────────────────────────
     let mut meta = Vec::new();
     let node_table_count = u32::try_from(store.node_tables_by_id.len()).map_err(|_| {
         GenerationError::WireWidthOverflow {
@@ -274,16 +168,11 @@ pub fn emit_v5_segments(
         }
     }
 
-    // reason: total node count fits u64
-    #[allow(clippy::cast_possible_truncation)]
     let total_nodes = store
         .node_tables_by_id
         .iter()
         .map(NodeTable::len)
         .sum::<usize>() as u64;
-
-    // reason: total edge count fits u64
-    #[allow(clippy::cast_possible_truncation)]
     let total_edges = store
         .rel_tables_by_id
         .iter()
@@ -292,36 +181,21 @@ pub fn emit_v5_segments(
     write_u64(&mut meta, total_nodes);
     write_u64(&mut meta, total_edges);
 
-    segments.push(V5Segment {
-        kind: SegmentKind::Metadata,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 1,
-        element_width: 0,
-        bytes: meta,
-    });
+    descriptors.push(emit(SegmentKind::Metadata, 1, 0x0001, 1, 0, &meta)?);
 
-    // ── 1 & 2. StringOffsets & StringBytes ─────────────────────────────────
-    let str_refs: Vec<&str> = str_slice.iter().map(String::as_str).collect();
-    let (off_bytes, str_bytes) = build_string_segments(&str_refs);
-    segments.push(V5Segment {
-        kind: SegmentKind::StringOffsets,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 8,
-        element_width: 8,
-        bytes: off_bytes,
-    });
-    segments.push(V5Segment {
-        kind: SegmentKind::StringBytes,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 1,
-        element_width: 1,
-        bytes: str_bytes,
-    });
+    // ── StringOffsets & StringBytes ─────────────────────────────────────
+    let (off_bytes, str_bytes) = build_string_segments(str_refs);
+    descriptors.push(emit(
+        SegmentKind::StringOffsets,
+        1,
+        0x0001,
+        8,
+        8,
+        &off_bytes,
+    )?);
+    descriptors.push(emit(SegmentKind::StringBytes, 1, 0x0001, 1, 1, &str_bytes)?);
 
-    // ── 3..8. Directories, Columns, CSR ───────────────────────────────────
+    // ── Directories, Columns, CSR ───────────────────────────────────────
     let mut node_dir = Vec::new();
     let mut rel_dir = Vec::new();
     let mut col_dir = Vec::new();
@@ -353,7 +227,7 @@ pub fn emit_v5_segments(
                     max: u64::from(u32::MAX),
                 }
             })?;
-            write_column_body(&mut col_bodies, codec, &string_index)
+            write_column_body(&mut col_bodies, codec, string_index)
                 .map_err(GenerationError::Codec)?;
             let body_len = (u32::try_from(col_bodies.len()).map_err(|_| {
                 GenerationError::WireWidthOverflow {
@@ -369,7 +243,6 @@ pub fn emit_v5_segments(
             write_u32(&mut col_dir, 1);
             write_u64(&mut col_dir, codec.len() as u64);
             write_u32(&mut col_dir, 0);
-
             write_u32(&mut col_block_index, body_start);
             write_u32(&mut col_block_index, body_len);
             let codec_len =
@@ -413,7 +286,7 @@ pub fn emit_v5_segments(
                     max: u64::from(u32::MAX),
                 }
             })?;
-            write_column_body(&mut col_bodies, codec, &string_index)
+            write_column_body(&mut col_bodies, codec, string_index)
                 .map_err(GenerationError::Codec)?;
             let body_len = (u32::try_from(col_bodies.len()).map_err(|_| {
                 GenerationError::WireWidthOverflow {
@@ -472,91 +345,91 @@ pub fn emit_v5_segments(
         }
     }
 
-    segments.push(V5Segment {
-        kind: SegmentKind::NodeTableDirectory,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 8,
-        element_width: 24,
-        bytes: node_dir,
-    });
-    segments.push(V5Segment {
-        kind: SegmentKind::RelTableDirectory,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 8,
-        element_width: 24,
-        bytes: rel_dir,
-    });
-    segments.push(V5Segment {
-        kind: SegmentKind::ColumnDirectory,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 8,
-        element_width: 24,
-        bytes: col_dir,
-    });
-    segments.push(V5Segment {
-        kind: SegmentKind::ColumnBlockIndex,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 4,
-        element_width: 12,
-        bytes: col_block_index,
-    });
-    segments.push(V5Segment {
-        kind: SegmentKind::ColumnBodies,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 1,
-        element_width: 0,
-        bytes: col_bodies,
-    });
-    segments.push(V5Segment {
-        kind: SegmentKind::ForwardCsrOffsets,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 4,
-        element_width: 4,
-        bytes: fwd_offsets,
-    });
-    segments.push(V5Segment {
-        kind: SegmentKind::ForwardCsrTargets,
-        encoding_version: 1,
-        flags: 0x0001,
-        alignment: 4,
-        element_width: 4,
-        bytes: fwd_targets,
-    });
+    descriptors.push(emit(
+        SegmentKind::NodeTableDirectory,
+        1,
+        0x0001,
+        8,
+        24,
+        &node_dir,
+    )?);
+    descriptors.push(emit(
+        SegmentKind::RelTableDirectory,
+        1,
+        0x0001,
+        8,
+        24,
+        &rel_dir,
+    )?);
+    descriptors.push(emit(
+        SegmentKind::ColumnDirectory,
+        1,
+        0x0001,
+        8,
+        24,
+        &col_dir,
+    )?);
+    descriptors.push(emit(
+        SegmentKind::ColumnBlockIndex,
+        1,
+        0x0001,
+        4,
+        12,
+        &col_block_index,
+    )?);
+    descriptors.push(emit(
+        SegmentKind::ColumnBodies,
+        1,
+        0x0001,
+        1,
+        0,
+        &col_bodies,
+    )?);
+    descriptors.push(emit(
+        SegmentKind::ForwardCsrOffsets,
+        1,
+        0x0001,
+        4,
+        4,
+        &fwd_offsets,
+    )?);
+    descriptors.push(emit(
+        SegmentKind::ForwardCsrTargets,
+        1,
+        0x0001,
+        4,
+        4,
+        &fwd_targets,
+    )?);
 
     if has_reverse {
-        segments.push(V5Segment {
-            kind: SegmentKind::ReverseCsrOffsets,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 4,
-            element_width: 4,
-            bytes: rev_offsets,
-        });
-        segments.push(V5Segment {
-            kind: SegmentKind::ReverseCsrTargets,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 4,
-            element_width: 4,
-            bytes: rev_targets,
-        });
-        segments.push(V5Segment {
-            kind: SegmentKind::ForwardPositions,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 4,
-            element_width: 4,
-            bytes: fwd_positions,
-        });
+        descriptors.push(emit(
+            SegmentKind::ReverseCsrOffsets,
+            1,
+            0x0001,
+            4,
+            4,
+            &rev_offsets,
+        )?);
+        descriptors.push(emit(
+            SegmentKind::ReverseCsrTargets,
+            1,
+            0x0001,
+            4,
+            4,
+            &rev_targets,
+        )?);
+        descriptors.push(emit(
+            SegmentKind::ForwardPositions,
+            1,
+            0x0001,
+            4,
+            4,
+            &fwd_positions,
+        )?);
     }
 
-    // ── ID lookups ─────────────────────────────────────────────────────────
+    // ── ID lookups ──────────────────────────────────────────────────────
     if store.preserves_ids() {
         let mut node_lookup = Vec::new();
         let mut edge_lookup = Vec::new();
@@ -591,43 +464,43 @@ pub fn emit_v5_segments(
                 }
             }
         }
-        segments.push(V5Segment {
-            kind: SegmentKind::NodeIdLookup,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 8,
-            element_width: 24,
-            bytes: node_lookup,
-        });
-        segments.push(V5Segment {
-            kind: SegmentKind::EdgeIdLookup,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 8,
-            element_width: 24,
-            bytes: edge_lookup,
-        });
-        segments.push(V5Segment {
-            kind: SegmentKind::NodeOriginalIds,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 8,
-            element_width: 8,
-            bytes: node_orig,
-        });
-        segments.push(V5Segment {
-            kind: SegmentKind::EdgeOriginalIds,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 8,
-            element_width: 8,
-            bytes: edge_orig,
-        });
+        descriptors.push(emit(
+            SegmentKind::NodeIdLookup,
+            1,
+            0x0001,
+            8,
+            24,
+            &node_lookup,
+        )?);
+        descriptors.push(emit(
+            SegmentKind::EdgeIdLookup,
+            1,
+            0x0001,
+            8,
+            24,
+            &edge_lookup,
+        )?);
+        descriptors.push(emit(
+            SegmentKind::NodeOriginalIds,
+            1,
+            0x0001,
+            8,
+            8,
+            &node_orig,
+        )?);
+        descriptors.push(emit(
+            SegmentKind::EdgeOriginalIds,
+            1,
+            0x0001,
+            8,
+            8,
+            &edge_orig,
+        )?);
     }
 
-    // ── Zone maps & dictionary code index ─────────────────────────────────
+    // ── Zone maps & dictionary code index ───────────────────────────────
     let (table_zm, block_zm) =
-        build_zone_map_segments(store, &string_index).map_err(GenerationError::Codec)?;
+        build_zone_map_segments(store, string_index).map_err(GenerationError::Codec)?;
     if !table_zm.is_empty() {
         let rec_len =
             u32::try_from(ZONE_MAP_RECORD_LEN).map_err(|_| GenerationError::WireWidthOverflow {
@@ -635,14 +508,14 @@ pub fn emit_v5_segments(
                 count: ZONE_MAP_RECORD_LEN as u64,
                 max: u64::from(u32::MAX),
             })?;
-        segments.push(V5Segment {
-            kind: SegmentKind::TableZoneMaps,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 8,
-            element_width: rec_len,
-            bytes: table_zm,
-        });
+        descriptors.push(emit(
+            SegmentKind::TableZoneMaps,
+            1,
+            0x0001,
+            8,
+            rec_len,
+            &table_zm,
+        )?);
     }
     if !block_zm.is_empty() {
         let rec_len =
@@ -651,29 +524,29 @@ pub fn emit_v5_segments(
                 count: ZONE_MAP_RECORD_LEN as u64,
                 max: u64::from(u32::MAX),
             })?;
-        segments.push(V5Segment {
-            kind: SegmentKind::BlockZoneMaps,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 8,
-            element_width: rec_len,
-            bytes: block_zm,
-        });
+        descriptors.push(emit(
+            SegmentKind::BlockZoneMaps,
+            1,
+            0x0001,
+            8,
+            rec_len,
+            &block_zm,
+        )?);
     }
 
-    let code_index_body = build_dictionary_code_index(&str_refs);
+    let code_index_body = build_dictionary_code_index(str_refs);
     if !code_index_body.is_empty() {
-        segments.push(V5Segment {
-            kind: SegmentKind::DictionaryCodeIndex,
-            encoding_version: 1,
-            flags: 0x0001,
-            alignment: 8,
-            element_width: 16,
-            bytes: code_index_body,
-        });
+        descriptors.push(emit(
+            SegmentKind::DictionaryCodeIndex,
+            1,
+            0x0001,
+            8,
+            16,
+            &code_index_body,
+        )?);
     }
 
-    // Sort strictly by segment kind ascending
-    segments.sort_by_key(|s| s.kind.as_u16());
-    Ok(segments)
+    // Sort strictly by segment kind ascending.
+    descriptors.sort_by_key(|d| d.kind.as_u16());
+    Ok(descriptors)
 }

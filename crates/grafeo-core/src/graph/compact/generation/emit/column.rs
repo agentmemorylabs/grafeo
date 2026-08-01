@@ -224,8 +224,7 @@ impl ColumnEncoder {
             }
             Some(Family::Vector) => {
                 let dims = self.vector_dims.unwrap_or(0);
-                let mut flat: Vec<f32> =
-                    Vec::with_capacity(self.values.len() * usize::from(dims));
+                let mut flat: Vec<f32> = Vec::with_capacity(self.values.len() * usize::from(dims));
                 for v in &self.values {
                     if let Some(Value::Vector(vec)) = v {
                         flat.extend_from_slice(vec);

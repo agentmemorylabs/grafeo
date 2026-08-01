@@ -59,6 +59,10 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
 /// # Errors
 ///
 /// Returns an error when a collection length exceeds the wire encoding.
+#[cfg_attr(
+    feature = "generation-streaming",
+    allow(unreachable_code, unused_variables, unused_mut)
+)]
 pub fn serialize_v5_with_string_order(
     store: &CompactStore,
     string_order: StringCodeOrder,
@@ -137,6 +141,32 @@ pub fn serialize_v5_with_string_order(
     }
 
     let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+
+    // ── Canonical bounded emission (G-EM0.5b Phase 1) ──────────────────
+    // Feature ON: delegate to the canonical emitter + assembler. The eager
+    // path below is held harmless for feature OFF (Milestone R unchanged).
+    #[cfg(feature = "generation-streaming")]
+    {
+        use super::generation::emit::{V5PayloadAssembler, emit_canonical_descriptors};
+        let total_nodes = store
+            .node_tables_by_id
+            .iter()
+            .map(NodeTable::len)
+            .sum::<usize>() as u64;
+        let total_edges = store
+            .rel_tables_by_id
+            .iter()
+            .map(RelTable::num_edges)
+            .sum::<usize>() as u64;
+        let descriptors = emit_canonical_descriptors(store, &string_index, &str_refs)
+            .map_err(|e| e.to_string())?;
+        let assembler = V5PayloadAssembler::new(total_nodes, total_edges, store.preserves_ids());
+        return assembler.assemble(&descriptors).map_err(|e| e.to_string());
+    }
+
+    // ── Eager path (feature OFF; Milestone R held harmless) ─────────────
+    // With generation-streaming ON this code is unreachable (canonical path
+    // returns above). It is intentionally retained for feature OFF.
     let (off_bytes, str_bytes) = build_string_segments(&str_refs);
     segments.push((SegmentKind::StringOffsets, 1, 0x0001, 8, 8, off_bytes));
     segments.push((SegmentKind::StringBytes, 1, 0x0001, 1, 1, str_bytes));
