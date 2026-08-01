@@ -170,6 +170,11 @@ name = "compact_store_overlay_admission"
 path = "tests/compact_store_overlay_admission.rs"
 required-features = ["compact-store", "lpg"]
 
+[[test]]
+name = "compact_store_generation_retirement"
+path = "tests/compact_store_generation_retirement.rs"
+required-features = ["generation", "compact-store", "lpg", "mmap"]
+
 [[bench]]
 name = "query_bench"
 harness = false
