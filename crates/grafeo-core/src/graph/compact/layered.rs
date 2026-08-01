@@ -17,6 +17,8 @@ use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 
 use super::CompactStore;
+use super::overlay_budget::{OverlayAdmissionController, RetainedCategory};
+use super::overlay_cost;
 use crate::graph::Direction;
 use crate::graph::lpg::{CompareOp, Edge, LpgStore, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
@@ -73,6 +75,19 @@ pub struct LayeredStore {
     /// this lock — they use `ArcSwap` snapshot semantics on base and
     /// overlay separately, which already provides a consistent view.
     merge_guard: RwLock<()>,
+    /// Optional overlay admission controller (G-EM0.5a, W-mode).
+    ///
+    /// When present, every overlay mutation charges its retained capacity
+    /// to the controller so aggregate overlay bytes stay within the
+    /// calibrated soft/hard limits. The engine installs this for writable
+    /// (W-mode) roots; read-only and legacy stores leave it `None` and
+    /// behave exactly as before. The controller also carries the W-mode
+    /// flag that disables the eager `merge_overlay_in_place` pressure path
+    /// until `G-EM0.5b` installs the bounded streaming builder.
+    ///
+    /// Wrapped in an `RwLock` so the engine can install it through `&self`
+    /// after construction (the store is shared via `Arc`).
+    admission_slot: RwLock<Option<Arc<OverlayAdmissionController>>>,
 }
 
 impl std::fmt::Debug for LayeredStore {
@@ -159,6 +174,7 @@ impl LayeredStore {
             deleted_from_base_edges: RwLock::new(FxHashSet::default()),
             deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
+            admission_slot: RwLock::new(None),
         }
     }
 
@@ -172,6 +188,7 @@ impl LayeredStore {
             deleted_from_base_edges: RwLock::new(FxHashSet::default()),
             deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
+            admission_slot: RwLock::new(None),
         }
     }
 
@@ -228,6 +245,42 @@ impl LayeredStore {
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         self.base.load().memory_bytes() + self.overlay_memory_bytes()
+    }
+
+    /// Installs the overlay admission controller (G-EM0.5a, W-mode seam).
+    ///
+    /// The engine calls this once when opening a writable generation root.
+    /// After installation, every overlay mutation charges its retained
+    /// capacity to the controller, and the eager `merge_overlay_in_place`
+    /// pressure path is disabled (see [`Self::writable_mode`]). Installing
+    /// twice replaces the previous controller; callers should install once.
+    pub fn install_admission_controller(&self, controller: Arc<OverlayAdmissionController>) {
+        *self.admission_slot.write() = Some(controller);
+    }
+
+    /// Returns the installed admission controller, if any.
+    #[must_use]
+    pub fn admission_controller(&self) -> Option<Arc<OverlayAdmissionController>> {
+        self.admission_slot.read().clone()
+    }
+
+    /// Whether this store runs in writable (W-mode) admission.
+    ///
+    /// `true` exactly when an admission controller is installed. In W-mode
+    /// the eager full-base `merge_overlay_in_place` pressure path is
+    /// disabled until `G-EM0.5b` installs the bounded streaming builder;
+    /// hard pressure must fail/backpressure instead (packet §3).
+    #[must_use]
+    pub fn writable_mode(&self) -> bool {
+        self.admission_slot.read().is_some()
+    }
+
+    /// Charges retained capacity for an overlay mutation, if a controller is
+    /// installed. No-op for read-only/legacy stores.
+    fn charge_retained(&self, category: RetainedCategory, bytes: usize) {
+        if let Some(ctl) = self.admission_slot.read().as_ref() {
+            ctl.try_reserve(category, bytes as u64);
+        }
     }
 
     /// Replaces the overlay with a fresh empty `LpgStore` and clears
@@ -356,6 +409,15 @@ impl LayeredStore {
 
         // Reset the overlay (already seeds id allocators from the new base).
         self.reset_overlay();
+
+        // G-EM0.5a: the overlay is now empty, so release all retained
+        // accounting. In W-mode this path is disabled under pressure
+        // (OverlayConsumer refuses to call it until G-EM0.5b), but an
+        // explicit compact() may still reach here; draining keeps the
+        // controller's counters truthful either way.
+        if let Some(ctl) = self.admission_slot.read().as_ref() {
+            ctl.drain_all_retained();
+        }
         Ok(())
     }
 
@@ -1163,6 +1225,10 @@ impl GraphStoreMut for LayeredStore {
         let _guard = self.merge_guard.read();
         let id = self.overlay.load().create_node(labels);
         self.dirty_node_ids.write().insert(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::node_creation_retained_bytes(labels),
+        );
         id
     }
 
@@ -1178,6 +1244,10 @@ impl GraphStoreMut for LayeredStore {
             .load()
             .create_node_versioned(labels, epoch, transaction_id);
         self.dirty_node_ids.write().insert(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::node_creation_retained_bytes(labels),
+        );
         id
     }
 
@@ -1188,6 +1258,10 @@ impl GraphStoreMut for LayeredStore {
         self.ensure_in_overlay(dst);
         let id = self.overlay.load().create_edge(src, dst, edge_type);
         self.dirty_edge_ids.write().insert(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::edge_creation_retained_bytes(edge_type),
+        );
         id
     }
 
@@ -1207,6 +1281,10 @@ impl GraphStoreMut for LayeredStore {
                 .load()
                 .create_edge_versioned(src, dst, edge_type, epoch, transaction_id);
         self.dirty_edge_ids.write().insert(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::edge_creation_retained_bytes(edge_type),
+        );
         id
     }
 
@@ -1221,6 +1299,13 @@ impl GraphStoreMut for LayeredStore {
         for &id in &ids {
             dirty.insert(id);
         }
+        drop(dirty);
+        for &(_, _, edge_type) in edges {
+            self.charge_retained(
+                RetainedCategory::MutationPayload,
+                overlay_cost::edge_creation_retained_bytes(edge_type),
+            );
+        }
         ids
     }
 
@@ -1233,6 +1318,10 @@ impl GraphStoreMut for LayeredStore {
         if self.base.load().get_node(id).is_some() {
             if self.deleted_from_base_nodes.write().insert(id) {
                 self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
             }
             return true;
         }
@@ -1255,6 +1344,10 @@ impl GraphStoreMut for LayeredStore {
         if self.base.load().get_node(id).is_some() {
             if self.deleted_from_base_nodes.write().insert(id) {
                 self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
             }
             return true;
         }
@@ -1268,16 +1361,20 @@ impl GraphStoreMut for LayeredStore {
             self.overlay.load().delete_node_edges(node_id);
         }
         // Mark base edges as deleted.
-        let mut deleted_any = false;
+        let mut newly_deleted = 0usize;
         let mut edges = self.deleted_from_base_edges.write();
         for (_, eid) in self.base.load().edges_from(node_id, Direction::Both) {
             if edges.insert(eid) {
-                deleted_any = true;
+                newly_deleted += 1;
             }
         }
         drop(edges);
-        if deleted_any {
+        if newly_deleted > 0 {
             self.deletions_dirty.store(true, Ordering::Release);
+            self.charge_retained(
+                RetainedCategory::DeletionSets,
+                newly_deleted * overlay_cost::deletion_entry_retained_bytes(),
+            );
         }
     }
 
@@ -1289,6 +1386,10 @@ impl GraphStoreMut for LayeredStore {
         if self.base.load().get_edge(id).is_some() {
             if self.deleted_from_base_edges.write().insert(id) {
                 self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
             }
             return true;
         }
@@ -1311,6 +1412,10 @@ impl GraphStoreMut for LayeredStore {
         if self.base.load().get_edge(id).is_some() {
             if self.deleted_from_base_edges.write().insert(id) {
                 self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
             }
             return true;
         }
@@ -1319,8 +1424,10 @@ impl GraphStoreMut for LayeredStore {
 
     fn set_node_property(&self, id: NodeId, key: &str, value: Value) {
         let _guard = self.merge_guard.read();
+        let cost = overlay_cost::property_retained_bytes(key, &value);
         self.ensure_in_overlay(id);
         self.overlay.load().set_node_property(id, key, value);
+        self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
 
     fn set_node_property_versioned(
@@ -1331,16 +1438,20 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) {
         let _guard = self.merge_guard.read();
+        let cost = overlay_cost::property_retained_bytes(key, &value);
         self.ensure_in_overlay(id);
         self.overlay
             .load()
             .set_node_property_versioned(id, key, value, transaction_id);
+        self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
 
     fn set_edge_property(&self, id: EdgeId, key: &str, value: Value) {
         let _guard = self.merge_guard.read();
+        let cost = overlay_cost::property_retained_bytes(key, &value);
         self.ensure_edge_in_overlay(id);
         self.overlay.load().set_edge_property(id, key, value);
+        self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
 
     fn set_edge_property_versioned(
@@ -1351,10 +1462,12 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) {
         let _guard = self.merge_guard.read();
+        let cost = overlay_cost::property_retained_bytes(key, &value);
         self.ensure_edge_in_overlay(id);
         self.overlay
             .load()
             .set_edge_property_versioned(id, key, value, transaction_id);
+        self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
 
     fn remove_node_property(&self, id: NodeId, key: &str) -> Option<Value> {

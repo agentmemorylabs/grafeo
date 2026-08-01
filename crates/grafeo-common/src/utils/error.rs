@@ -68,6 +68,10 @@ pub enum ErrorCode {
     StorageRecoveryFailed,
     /// Requested direct memory mapping is unavailable for this storage layout.
     StorageDirectMmapUnavailable,
+    /// Overlay admission backpressure: retryable (G-EM0.5a).
+    AdmissionRetryable,
+    /// Overlay admission rejected: terminal (G-EM0.5a).
+    AdmissionRejected,
 
     // Validation errors (V)
     /// Request validation failed.
@@ -115,6 +119,8 @@ impl ErrorCode {
             Self::StorageCorrupted => "GRAFEO-S002",
             Self::StorageRecoveryFailed => "GRAFEO-S003",
             Self::StorageDirectMmapUnavailable => "GRAFEO-S004",
+            Self::AdmissionRetryable => "GRAFEO-S005",
+            Self::AdmissionRejected => "GRAFEO-S006",
 
             Self::InvalidInput => "GRAFEO-V001",
             Self::NodeNotFound => "GRAFEO-V002",
@@ -138,6 +144,7 @@ impl ErrorCode {
                 | Self::TransactionTimeout
                 | Self::TransactionDeadlock
                 | Self::QueryTimeout
+                | Self::AdmissionRetryable
         )
     }
 }
@@ -193,6 +200,15 @@ pub enum Error {
     /// I/O error.
     Io(std::io::Error),
 
+    /// Overlay admission backpressure (G-EM0.5a): the writable overlay is at
+    /// hard pressure and the bounded block timed out. The caller should retry
+    /// the mutation later.
+    AdmissionRetryable(String),
+
+    /// Overlay admission rejected (G-EM0.5a): the request is terminal
+    /// (oversized, shutdown, or cancelled) and will not succeed on retry.
+    AdmissionRejected(String),
+
     /// Internal error (should not happen in normal operation).
     Internal(String),
 }
@@ -213,6 +229,8 @@ impl Error {
             Error::Query(e) => e.error_code(),
             Error::Serialization(_) => ErrorCode::SerializationError,
             Error::Io(_) => ErrorCode::IoError,
+            Error::AdmissionRetryable(_) => ErrorCode::AdmissionRetryable,
+            Error::AdmissionRejected(_) => ErrorCode::AdmissionRejected,
             Error::Internal(_) => ErrorCode::Internal,
         }
     }
@@ -238,6 +256,8 @@ impl fmt::Display for Error {
             Error::Query(e) => write!(f, "{e}"),
             Error::Serialization(msg) => write!(f, "{code}: Serialization error: {msg}"),
             Error::Io(e) => write!(f, "{code}: I/O error: {e}"),
+            Error::AdmissionRetryable(msg) => write!(f, "{code}: Admission retryable: {msg}"),
+            Error::AdmissionRejected(msg) => write!(f, "{code}: Admission rejected: {msg}"),
             Error::Internal(msg) => write!(f, "{code}: Internal error: {msg}"),
         }
     }

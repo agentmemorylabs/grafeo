@@ -20,6 +20,17 @@ pub enum SpillError {
     /// Insufficient disk space.
     #[error("insufficient disk space for spill")]
     InsufficientDiskSpace,
+    /// Backpressure: the consumer refuses to free memory via its eager path
+    /// because the writable overlay is under admission control (G-EM0.5a).
+    ///
+    /// In W-mode the overlay must not be drained by the eager full-base
+    /// `merge_overlay_in_place` rebuild (which allocates O(total base bytes)
+    /// anonymous memory). Until the bounded streaming builder (G-EM0.5b) is
+    /// installed, hard pressure fails closed / backpressures instead. The
+    /// caller should block boundedly or return a typed retryable error to the
+    /// writer rather than treating this as a fatal spill failure.
+    #[error("overlay backpressure: eager merge disabled in writable mode")]
+    Backpressure,
 }
 
 /// Trait for subsystems that consume managed memory.

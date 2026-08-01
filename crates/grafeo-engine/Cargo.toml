@@ -165,6 +165,11 @@ name = "compact_store_generation_leases"
 path = "tests/compact_store_generation_leases.rs"
 required-features = ["generation", "compact-store", "lpg", "mmap"]
 
+[[test]]
+name = "compact_store_overlay_admission"
+path = "tests/compact_store_overlay_admission.rs"
+required-features = ["compact-store", "lpg"]
+
 [[bench]]
 name = "query_bench"
 harness = false

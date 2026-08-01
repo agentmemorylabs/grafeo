@@ -758,6 +758,13 @@ impl MemoryConsumer for OverlayConsumer {
         let Some(layered) = self.layered.upgrade() else {
             return false;
         };
+        // G-EM0.5a (req #3): in writable mode the eager full-base
+        // `merge_overlay_in_place` pressure path is disabled until G-EM0.5b
+        // installs the bounded streaming builder. Hard pressure must
+        // fail/backpressure rather than silently invoke it.
+        if layered.writable_mode() {
+            return false;
+        }
         // Only worth spilling if the overlay actually has mutations.
         layered.overlay_mutation_count() > 0
     }
@@ -766,6 +773,13 @@ impl MemoryConsumer for OverlayConsumer {
         let Some(layered) = self.layered.upgrade() else {
             return Err(SpillError::IoError("layered store dropped".to_string()));
         };
+
+        // G-EM0.5a (req #3): refuse the eager merge under W-mode admission.
+        // The buffer manager treats this as "could not free" and the writer
+        // path backpressures via the admission controller instead.
+        if layered.writable_mode() {
+            return Err(SpillError::Backpressure);
+        }
 
         if layered.overlay_mutation_count() == 0 {
             return Ok(0);
