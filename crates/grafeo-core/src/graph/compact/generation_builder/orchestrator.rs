@@ -162,6 +162,12 @@ impl BoundedGenerationBuilder {
         let id_index = MappedNodeIdIndex::new(bytes::Bytes::from(id_index_bytes))?;
         let node_schema = node_out.schema;
 
+        // Charge schema: node_schema (labels + label_to_table_id + table_row_counts)
+        let schema_charge = node_schema.labels.iter().map(|s| s.len() as u64 + 8).sum::<u64>()
+            + (node_schema.label_to_table_id.len() as u64 * 40) // FxHashMap overhead estimate
+            + (node_schema.table_row_counts.len() as u64 * 8);
+        self.metrics.reserve_schema(schema_charge, budget.max_schema_bytes)?;
+
         // ── 2. Edge pass ─────────────────────────────────────────────
         let epass = edge_pass::EdgePass::new(&budget, self.cancel.as_ref());
         let (edge_rows, _rel_keys, total_edges) = epass.stage(edges, run_store)?;
@@ -173,6 +179,12 @@ impl BoundedGenerationBuilder {
             &mut self.metrics,
             self.cancel.as_ref(),
         )?;
+        
+        // Charge schema: rel_keys + rel_id_map (edge type schema)
+        let rel_schema_charge = rel_keys.iter().map(|k| k.edge_type.len() as u64 + 16).sum::<u64>()
+            + (rel_id_map.len() as u64 * 48); // FxHashMap<RelTableKey, u16> overhead
+        self.metrics.reserve_schema(rel_schema_charge, budget.max_schema_bytes)?;
+        
         let rel_id_of = |k: &RelTableKey| rel_id_map.get(k).copied();
         let mut fwd_sink = run_store.sink("fwd-csr", &budget)?;
         epass.resolve_and_stage_forward(
@@ -242,6 +254,12 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
             &chunks_path,
         )?;
+        
+        // Charge schema: schema_strings (labels, prop keys, edge types — schema-bounded)
+        let schema_strings_charge = schema_strings.iter().map(|(s, _)| s.len() as u64 + 8).sum::<u64>()
+            + (schema_strings.len() as u64 * 40); // FxHashMap overhead
+        self.metrics.reserve_schema(schema_strings_charge, budget.max_schema_bytes)?;
+        
         drop(remap_lease);
 
         // ── 5. Column geometry + bodies ──────────────────────────────
@@ -254,6 +272,13 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
             &table_row_count,
         )?;
+        
+        // Charge schema: column geometries (schema-bounded metadata)
+        let geo_charge = geometries.iter().map(|g| {
+            g.key.len() as u64 + 64 // key string + ColumnGeometry struct overhead
+        }).sum::<u64>();
+        self.metrics.reserve_schema(geo_charge, budget.max_schema_bytes)?;
+        
         let mut bodies_sink =
             Box::new(self.make_sink(SegmentKind::ColumnBodies, 1, 0, "colbodies"));
         let mut chunk_file = std::fs::File::open(&chunks_path).map_err(|e| {
