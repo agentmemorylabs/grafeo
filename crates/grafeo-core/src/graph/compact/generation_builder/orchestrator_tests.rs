@@ -128,10 +128,36 @@ fn bounded_payload(input: &GenerationInput, temp: &std::path::Path) -> Vec<u8> {
 /// D0.8.10 core acceptance: the bounded orchestrator emits a v5 payload
 /// **byte-identical** to the eager lexicographic reference for the dense
 /// single-label domain (the reference's supported semantic domain).
+///
+/// The golden fixtures are frozen at SHA ca0d6069 (D0.8.10 #2: no
+/// regenerating the oracle at test time). The test loads the committed
+/// binary fixtures and compares against the bounded output.
 #[test]
 fn bounded_byte_parity_with_eager_lexicographic() {
     let tmp = TempDir::new().unwrap();
-    let input = GenerationInput::new()
+    let input = gem0_5b_parity_input();
+
+    let bounded = bounded_payload(&input, tmp.path());
+    let golden = golden_fixture("parity_dense");
+
+    assert_eq!(
+        golden.len(),
+        bounded.len(),
+        "payload length mismatch: golden {} vs bounded {}",
+        golden.len(),
+        bounded.len()
+    );
+    assert_eq!(
+        golden, bounded,
+        "bounded payload not byte-identical to frozen golden fixture (SHA ca0d6069)"
+    );
+}
+
+/// The shared parity test input (3 Person nodes, 2 KNOWS edges, all with
+/// properties). Matches the golden fixture generated at SHA ca0d6069.
+#[allow(clippy::needless_pass_by_value)]
+fn gem0_5b_parity_input() -> GenerationInput {
+    GenerationInput::new()
         .node(
             GenerationNode::new(1u64, "Person")
                 .with_prop("name", "Alice")
@@ -148,22 +174,34 @@ fn bounded_byte_parity_with_eager_lexicographic() {
                 .with_prop("age", Value::Int64(40)),
         )
         .edge(GenerationEdge::new(10u64, 1u64, 2u64, "KNOWS"))
-        .edge(GenerationEdge::new(11u64, 2u64, 3u64, "KNOWS"));
+        .edge(GenerationEdge::new(11u64, 2u64, 3u64, "KNOWS"))
+}
 
+/// Loads a committed golden fixture from `tests/golden/gem0_5b/`.
+fn golden_fixture(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/gem0_5b")
+        .join(format!("{name}.v5"));
+    std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("read golden fixture {}: {e}", path.display()))
+}
+
+/// One-time fixture generator: writes the golden payloads to
+/// `tests/golden/gem0_5b/`. Run with `cargo test write_golden_fixtures
+/// -- --ignored --nocapture` then commit the output. This test is
+/// `#[ignore]` so it does NOT run in normal CI (D0.8.10 #2 forbids
+/// regenerating the oracle at test time).
+#[test]
+#[ignore = "fixture generator: run manually, commit output (D0.8.10 #2)"]
+fn write_golden_fixtures() {
+    let input = gem0_5b_parity_input();
     let eager = eager_lexicographic_payload(&input);
-    let bounded = bounded_payload(&input, tmp.path());
-
-    assert_eq!(
-        eager.len(),
-        bounded.len(),
-        "payload length mismatch: eager {} vs bounded {}",
-        eager.len(),
-        bounded.len()
-    );
-    assert_eq!(
-        eager, bounded,
-        "bounded payload not byte-identical to eager lexicographic reference"
-    );
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/gem0_5b");
+    std::fs::create_dir_all(&out_dir).expect("create golden dir");
+    let path = out_dir.join("parity_dense.v5");
+    std::fs::write(&path, &eager).expect("write golden fixture");
+    eprintln!("wrote {} bytes to {}", eager.len(), path.display());
 }
 
 /// Diagnostic: dump the segment directory of a v5 payload (kind, length).
