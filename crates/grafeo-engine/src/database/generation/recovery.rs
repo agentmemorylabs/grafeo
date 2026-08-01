@@ -126,9 +126,11 @@ pub fn recover_generation_root(root: &Path) -> Result<RootRecovery, RecoveryView
     let wal_boundary = WalBoundary::from_cursor(&selected.wal_cursor);
 
     let canonical = lock.canonical_root().to_path_buf();
-    let orphans = classify_root_artifacts(&canonical, &selected)?;
-
+    // Read the retained previous slot once; shared by the descriptor field
+    // and orphan classification (a torn/absent previous slot yields None).
     let previous_generation_path = previous_slot_path(&canonical, &selected);
+    let orphans =
+        classify_root_artifacts(&canonical, &selected, previous_generation_path.as_deref())?;
 
     Ok(RootRecovery {
         lock,
@@ -139,9 +141,9 @@ pub fn recover_generation_root(root: &Path) -> Result<RootRecovery, RecoveryView
     })
 }
 
-/// Read the retained previous slot's generation path when it decodes and
-/// differs from the selected slot. Best-effort: a non-decoding previous slot
-/// simply yields `None` (W0 recovery already validated the selected slot).
+/// Read the retained previous slot's generation path when it decodes.
+/// Best-effort: a non-decoding previous slot simply yields `None` (W0
+/// recovery already validated the selected slot).
 fn previous_slot_path(root: &Path, selected: &SelectedGeneration) -> Option<String> {
     let [slot0, slot1] =
         grafeo_storage::generation::manifest::read_both_slots(&root.join("manifest.bin")).ok()?;
@@ -157,15 +159,17 @@ fn previous_slot_path(root: &Path, selected: &SelectedGeneration) -> Option<Stri
 fn classify_root_artifacts(
     root: &Path,
     selected: &SelectedGeneration,
+    previous_path: Option<&str>,
 ) -> Result<Vec<OrphanClassification>, std::io::Error> {
     let mut out = vec![OrphanClassification::SelectedGeneration {
         path: selected.slot.generation_path.clone(),
     }];
 
-    // Retained previous generation (explicit fallback): read the other slot
-    // directly; a torn/absent previous slot contributes nothing.
-    if let Some(prev_path) = previous_slot_path(root, selected) {
-        out.push(OrphanClassification::PreviousGeneration { path: prev_path });
+    // Retained previous generation (explicit W0 fallback slot).
+    if let Some(prev_path) = previous_path {
+        out.push(OrphanClassification::PreviousGeneration {
+            path: prev_path.to_string(),
+        });
     }
 
     // Unpublished build directories at the root level.

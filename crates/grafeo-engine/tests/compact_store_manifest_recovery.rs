@@ -192,11 +192,15 @@ fn recover_genesis_root_fails_closed() {
     .unwrap();
 
     let err = recover_generation_root(&gen_root).expect_err("genesis must fail closed");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("no valid generation") || msg.contains("manifest"),
-        "typed genesis failure, got: {msg}"
+    // Typed identity: the W0 NoValidGeneration variant is preserved through
+    // the engine error surface (never flattened to an opaque I/O error).
+    let is_no_valid = matches!(
+        &err,
+        grafeo_engine::RecoveryViewError::Recovery(
+            grafeo_storage::generation::recovery::RecoveryError::NoValidGeneration(_)
+        )
     );
+    assert!(is_no_valid, "expected NoValidGeneration, got: {err}");
 }
 
 // ---------------------------------------------------------------------------
