@@ -109,14 +109,24 @@ impl NodeRecordSource for LiveNodeRecordSource {
             let Some(node) = self.graph.store.get_node(id) else {
                 continue;
             };
-            let label = primary_label(&node.labels)?;
+            // D0.8.0 item 1: carry the node's complete canonical label set.
+            // Never select one primary label and discard the rest.
+            let mut labels: Vec<String> = node.labels.iter().map(|l| l.to_string()).collect();
+            labels.sort();
+            labels.dedup();
+            if labels.is_empty() {
+                return Err(GenerationError::InvalidInput(format!(
+                    "node {} has no labels",
+                    node.id.as_u64()
+                )));
+            }
             let mut properties = FxHashMap::default();
             for (key, value) in node.properties.iter() {
                 properties.insert(key.clone(), value.clone());
             }
             return Ok(Some(GenerationNode {
                 id: OriginalNodeId::new(node.id.as_u64()),
-                label,
+                labels,
                 properties,
             }));
         }
@@ -152,15 +162,6 @@ impl EdgeRecordSource for LiveEdgeRecordSource {
         }
         Ok(None)
     }
-}
-
-fn primary_label(labels: &[arcstr::ArcStr]) -> std::result::Result<String, GenerationError> {
-    let mut names: Vec<&str> = labels.iter().map(|l| l.as_str()).collect();
-    names.sort_unstable();
-    names
-        .first()
-        .map(|s| (*s).to_string())
-        .ok_or_else(|| GenerationError::InvalidInput("node has no labels".into()))
 }
 
 fn map_generation_error(err: GenerationError) -> Error {

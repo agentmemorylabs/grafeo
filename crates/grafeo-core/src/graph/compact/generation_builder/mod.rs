@@ -12,9 +12,7 @@ pub mod builder;
 pub mod freeze;
 pub mod staging;
 
-pub use builder::{
-    StreamingBuildConfig, StreamingGenerationBuilder, StreamingGenerationOutput,
-};
+pub use builder::{StreamingBuildConfig, StreamingGenerationBuilder, StreamingGenerationOutput};
 pub use freeze::{
     BaseEdgeCursor, BaseNodeCursor, EmptyEdgeSource, EmptyNodeSource, FrozenOverlayEpoch,
     MergedEdgeSource, MergedNodeSource,

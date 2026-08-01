@@ -1,5 +1,9 @@
 //! Frozen overlay epoch + merged base/overlay record sources
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 //! (G-EM0.5b Phase 2).
 //!
 //! A generation build must freeze **one** accepted overlay epoch before it
@@ -161,7 +165,7 @@ impl NodeRecordSource for BaseNodeCursor {
             let properties = nt.get_all_properties(off);
             return Ok(Some(GenerationNode {
                 id: OriginalNodeId::new(original_id),
-                label: nt.label().to_string(),
+                labels: vec![nt.label().to_string()],
                 properties,
             }));
         }
@@ -269,10 +273,14 @@ impl EdgeRecordSource for BaseEdgeCursor {
                 GenerationError::Codec(format!("rel {rel_table_id} pos {pos} missing dst"))
             })?;
             let src = self.original_node_id(src_compact).ok_or_else(|| {
-                GenerationError::Codec(format!("rel {rel_table_id} pos {pos} src has no original id"))
+                GenerationError::Codec(format!(
+                    "rel {rel_table_id} pos {pos} src has no original id"
+                ))
             })?;
             let dst = self.original_node_id(dst_compact).ok_or_else(|| {
-                GenerationError::Codec(format!("rel {rel_table_id} pos {pos} dst has no original id"))
+                GenerationError::Codec(format!(
+                    "rel {rel_table_id} pos {pos} dst has no original id"
+                ))
             })?;
             let properties = rt.get_all_edge_properties(pos);
             return Ok(Some(GenerationEdge {

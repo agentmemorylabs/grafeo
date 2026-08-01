@@ -7,13 +7,11 @@
 #![cfg(feature = "generation-streaming")]
 
 use crate::graph::compact::generation::{
-    generate_compact_store, GenerationBudget, GenerationEdge, GenerationInput, GenerationNode,
-    InMemoryRunStore,
+    GenerationBudget, GenerationEdge, GenerationInput, GenerationNode, InMemoryRunStore,
+    generate_compact_store,
 };
-use crate::graph::compact::generation_builder::{
-    StreamingBuildConfig, StreamingGenerationBuilder,
-};
-use crate::graph::compact::section_v5::{serialize_v5_with_string_order, StringCodeOrder};
+use crate::graph::compact::generation_builder::{StreamingBuildConfig, StreamingGenerationBuilder};
+use crate::graph::compact::section_v5::{StringCodeOrder, serialize_v5_with_string_order};
 use grafeo_common::types::Value;
 
 /// Build the eager reference payload for a given input.

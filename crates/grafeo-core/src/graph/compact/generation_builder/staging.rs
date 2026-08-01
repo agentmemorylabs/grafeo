@@ -37,7 +37,9 @@ use grafeo_common::utils::hash::FxHashMap;
 /// # Errors
 ///
 /// Returns [`GenerationError::Codec`] on an unsupported value kind.
-pub fn encode_properties(props: &FxHashMap<PropertyKey, Value>) -> Result<Vec<u8>, GenerationError> {
+pub fn encode_properties(
+    props: &FxHashMap<PropertyKey, Value>,
+) -> Result<Vec<u8>, GenerationError> {
     let mut keys: Vec<&PropertyKey> = props.keys().collect();
     keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     let mut out = Vec::new();
@@ -130,9 +132,7 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value, GenerationError>
             Value::Vector(std::sync::Arc::from(vec))
         }
         other => {
-            return Err(GenerationError::Codec(format!(
-                "unknown value tag {other}"
-            )));
+            return Err(GenerationError::Codec(format!("unknown value tag {other}")));
         }
     })
 }
@@ -232,7 +232,12 @@ pub fn split_edge_row_payload(payload: &[u8]) -> Result<(u64, u64, &[u8]), Gener
 /// Build a forward-CSR sort key:
 /// `rel_table_id u16 || src_off u32 BE || dst_off u32 BE || original_edge_id u64 BE`.
 #[must_use]
-pub fn fwd_csr_key(rel_table_id: u16, src_off: u32, dst_off: u32, original_edge_id: u64) -> Vec<u8> {
+pub fn fwd_csr_key(
+    rel_table_id: u16,
+    src_off: u32,
+    dst_off: u32,
+    original_edge_id: u64,
+) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + 4 + 4 + 8);
     key.extend_from_slice(&rel_table_id.to_be_bytes());
     key.extend_from_slice(&src_off.to_be_bytes());

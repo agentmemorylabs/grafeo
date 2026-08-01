@@ -160,7 +160,8 @@ pub trait RunStore {
 /// Shared run-body registry connecting in-memory sinks to in-memory mergers
 /// (G-EM0.5b Phase 2 core tests). Handle ids map to their run bodies so a
 /// merger can resolve handles produced by any sink sharing the registry.
-pub type InMemoryRegistry = std::rc::Rc<std::cell::RefCell<grafeo_common::utils::hash::FxHashMap<String, Vec<SortRecord>>>>;
+pub type InMemoryRegistry =
+    std::rc::Rc<std::cell::RefCell<grafeo_common::utils::hash::FxHashMap<String, Vec<SortRecord>>>>;
 
 /// In-memory sink used by core unit tests and small fixtures.
 #[derive(Debug)]
@@ -406,10 +407,8 @@ impl Default for InMemoryRunStore {
 
 impl RunStore for InMemoryRunStore {
     fn sink(&mut self, domain: &str, budget: &GenerationBudget) -> Box<dyn ExternalRunSink> {
-        let mut sink = InMemoryRunSink::new(*budget).with_registry(
-            std::rc::Rc::clone(&self.registry),
-            domain,
-        );
+        let mut sink =
+            InMemoryRunSink::new(*budget).with_registry(std::rc::Rc::clone(&self.registry), domain);
         if let Some(c) = &self.cancel {
             sink = sink.with_cancel(c.clone());
         }
@@ -417,9 +416,7 @@ impl RunStore for InMemoryRunStore {
     }
 
     fn merger(&mut self, _domain: &str) -> Box<dyn ExternalRunMerger> {
-        Box::new(
-            InMemoryRunMerger::new().with_registry(std::rc::Rc::clone(&self.registry)),
-        )
+        Box::new(InMemoryRunMerger::new().with_registry(std::rc::Rc::clone(&self.registry)))
     }
 }
 

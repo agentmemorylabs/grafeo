@@ -9,15 +9,19 @@
 //! (or the caller-supplied [`SegmentSink`] factory), and the final payload is
 //! streamed through [`V5PayloadAssembler::stream_to`].
 
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 use super::freeze::FrozenOverlayEpoch;
 use super::staging;
+use crate::graph::compact::generation::emit::{
+    SegmentDescriptor, SegmentSink, SpoolSegmentSink, V5PayloadAssembler,
+};
 use crate::graph::compact::generation::{
     CancelToken, EdgeRecordSource, ExternalRunHandle, GenerationBudget, GenerationError,
     GenerationMetrics, NodeRecordSource, RelSchemaDecl, RunStore, SortRecord,
-};
-use crate::graph::compact::generation::emit::{
-    SegmentDescriptor, SegmentSink, SpoolSegmentSink, V5PayloadAssembler,
 };
 use crate::graph::compact::mapped::SegmentKind;
 use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
@@ -176,9 +180,11 @@ impl StreamingGenerationBuilder {
 
         while let Some(node) = nodes.next_node()? {
             self.check_cancel()?;
-            labels.insert(node.label.clone());
+            node.validate_labels()?;
+            let physical = node.physical_label().to_string();
+            labels.insert(physical.clone());
             let props_bytes = staging::encode_properties(&node.properties)?;
-            let key = staging::node_row_key(&node.label, node.id.as_u64());
+            let key = staging::node_row_key(&physical, node.id.as_u64());
             sink.push(SortRecord::new(key, props_bytes))?;
             count += 1;
         }
@@ -209,7 +215,8 @@ impl StreamingGenerationBuilder {
             edge_types.insert(edge.edge_type.clone());
             let props_bytes = staging::encode_properties(&edge.properties)?;
             let key = staging::edge_row_key(&edge.edge_type, edge.id.as_u64());
-            let payload = staging::edge_row_payload(edge.src.as_u64(), edge.dst.as_u64(), &props_bytes);
+            let payload =
+                staging::edge_row_payload(edge.src.as_u64(), edge.dst.as_u64(), &props_bytes);
             sink.push(SortRecord::new(key, payload))?;
             count += 1;
         }
@@ -350,22 +357,20 @@ impl StreamingGenerationBuilder {
         for edge_type in &schema.edge_types {
             if let Some(edges) = edges_by_type.get(edge_type) {
                 for edge in edges {
-                    let (src_tid, _) = node_result
-                        .node_id_map
-                        .get(&edge.src)
-                        .ok_or(GenerationError::MissingEndpoint {
+                    let (src_tid, _) = node_result.node_id_map.get(&edge.src).ok_or(
+                        GenerationError::MissingEndpoint {
                             edge_id: edge.original_id,
                             node_id: edge.src,
                             is_source: true,
-                        })?;
-                    let (dst_tid, _) = node_result
-                        .node_id_map
-                        .get(&edge.dst)
-                        .ok_or(GenerationError::MissingEndpoint {
+                        },
+                    )?;
+                    let (dst_tid, _) = node_result.node_id_map.get(&edge.dst).ok_or(
+                        GenerationError::MissingEndpoint {
                             edge_id: edge.original_id,
                             node_id: edge.dst,
                             is_source: false,
-                        })?;
+                        },
+                    )?;
                     let key = (edge_type.clone(), *src_tid, *dst_tid);
                     if !rel_keys.contains(&key) {
                         rel_keys.push(key);
@@ -619,11 +624,25 @@ impl StreamingGenerationBuilder {
 
         // ── StringOffsets & StringBytes ──────────────────────────────
         let (off_bytes, str_bytes) = build_string_segments(&dict_result.strings);
-        let mut off_sink = Box::new(make_sink(SegmentKind::StringOffsets, 1, 0x0001, 8, 8, "stroff"));
+        let mut off_sink = Box::new(make_sink(
+            SegmentKind::StringOffsets,
+            1,
+            0x0001,
+            8,
+            8,
+            "stroff",
+        ));
         off_sink.write(&off_bytes)?;
         descriptors.push(off_sink.finish()?);
 
-        let mut str_sink = Box::new(make_sink(SegmentKind::StringBytes, 1, 0x0001, 1, 1, "strbytes"));
+        let mut str_sink = Box::new(make_sink(
+            SegmentKind::StringBytes,
+            1,
+            0x0001,
+            1,
+            1,
+            "strbytes",
+        ));
         str_sink.write(&str_bytes)?;
         descriptors.push(str_sink.finish()?);
 
@@ -631,23 +650,58 @@ impl StreamingGenerationBuilder {
         let (node_dir, rel_dir, col_dir, col_block_index, col_bodies) =
             self.build_column_segments(node_result, edge_result, dict_result)?;
 
-        let mut nd_sink = Box::new(make_sink(SegmentKind::NodeTableDirectory, 1, 0x0001, 8, 24, "ndir"));
+        let mut nd_sink = Box::new(make_sink(
+            SegmentKind::NodeTableDirectory,
+            1,
+            0x0001,
+            8,
+            24,
+            "ndir",
+        ));
         nd_sink.write(&node_dir)?;
         descriptors.push(nd_sink.finish()?);
 
-        let mut rd_sink = Box::new(make_sink(SegmentKind::RelTableDirectory, 1, 0x0001, 8, 24, "rdir"));
+        let mut rd_sink = Box::new(make_sink(
+            SegmentKind::RelTableDirectory,
+            1,
+            0x0001,
+            8,
+            24,
+            "rdir",
+        ));
         rd_sink.write(&rel_dir)?;
         descriptors.push(rd_sink.finish()?);
 
-        let mut cd_sink = Box::new(make_sink(SegmentKind::ColumnDirectory, 1, 0x0001, 8, 24, "cdir"));
+        let mut cd_sink = Box::new(make_sink(
+            SegmentKind::ColumnDirectory,
+            1,
+            0x0001,
+            8,
+            24,
+            "cdir",
+        ));
         cd_sink.write(&col_dir)?;
         descriptors.push(cd_sink.finish()?);
 
-        let mut cbi_sink = Box::new(make_sink(SegmentKind::ColumnBlockIndex, 1, 0x0001, 4, 12, "cbi"));
+        let mut cbi_sink = Box::new(make_sink(
+            SegmentKind::ColumnBlockIndex,
+            1,
+            0x0001,
+            4,
+            12,
+            "cbi",
+        ));
         cbi_sink.write(&col_block_index)?;
         descriptors.push(cbi_sink.finish()?);
 
-        let mut cb_sink = Box::new(make_sink(SegmentKind::ColumnBodies, 1, 0x0001, 1, 0, "cbodies"));
+        let mut cb_sink = Box::new(make_sink(
+            SegmentKind::ColumnBodies,
+            1,
+            0x0001,
+            1,
+            0,
+            "cbodies",
+        ));
         cb_sink.write(&col_bodies)?;
         descriptors.push(cb_sink.finish()?);
 
@@ -655,24 +709,59 @@ impl StreamingGenerationBuilder {
         let (fwd_off, fwd_tgt, rev_off, rev_tgt, fwd_pos, has_reverse) =
             self.build_csr_segments(edge_result);
 
-        let mut fo_sink = Box::new(make_sink(SegmentKind::ForwardCsrOffsets, 1, 0x0001, 4, 4, "fwdoff"));
+        let mut fo_sink = Box::new(make_sink(
+            SegmentKind::ForwardCsrOffsets,
+            1,
+            0x0001,
+            4,
+            4,
+            "fwdoff",
+        ));
         fo_sink.write(&fwd_off)?;
         descriptors.push(fo_sink.finish()?);
 
-        let mut ft_sink = Box::new(make_sink(SegmentKind::ForwardCsrTargets, 1, 0x0001, 4, 4, "fwdtgt"));
+        let mut ft_sink = Box::new(make_sink(
+            SegmentKind::ForwardCsrTargets,
+            1,
+            0x0001,
+            4,
+            4,
+            "fwdtgt",
+        ));
         ft_sink.write(&fwd_tgt)?;
         descriptors.push(ft_sink.finish()?);
 
         if has_reverse {
-            let mut ro_sink = Box::new(make_sink(SegmentKind::ReverseCsrOffsets, 1, 0x0001, 4, 4, "revoff"));
+            let mut ro_sink = Box::new(make_sink(
+                SegmentKind::ReverseCsrOffsets,
+                1,
+                0x0001,
+                4,
+                4,
+                "revoff",
+            ));
             ro_sink.write(&rev_off)?;
             descriptors.push(ro_sink.finish()?);
 
-            let mut rt_sink = Box::new(make_sink(SegmentKind::ReverseCsrTargets, 1, 0x0001, 4, 4, "revtgt"));
+            let mut rt_sink = Box::new(make_sink(
+                SegmentKind::ReverseCsrTargets,
+                1,
+                0x0001,
+                4,
+                4,
+                "revtgt",
+            ));
             rt_sink.write(&rev_tgt)?;
             descriptors.push(rt_sink.finish()?);
 
-            let mut fp_sink = Box::new(make_sink(SegmentKind::ForwardPositions, 1, 0x0001, 4, 4, "fwdpos"));
+            let mut fp_sink = Box::new(make_sink(
+                SegmentKind::ForwardPositions,
+                1,
+                0x0001,
+                4,
+                4,
+                "fwdpos",
+            ));
             fp_sink.write(&fwd_pos)?;
             descriptors.push(fp_sink.finish()?);
         }
@@ -681,31 +770,73 @@ impl StreamingGenerationBuilder {
         let (node_lookup, edge_lookup, node_orig, edge_orig) =
             self.build_id_segments(node_result, edge_result);
 
-        let mut nl_sink = Box::new(make_sink(SegmentKind::NodeIdLookup, 1, 0x0001, 8, 24, "nlookup"));
+        let mut nl_sink = Box::new(make_sink(
+            SegmentKind::NodeIdLookup,
+            1,
+            0x0001,
+            8,
+            24,
+            "nlookup",
+        ));
         nl_sink.write(&node_lookup)?;
         descriptors.push(nl_sink.finish()?);
 
-        let mut el_sink = Box::new(make_sink(SegmentKind::EdgeIdLookup, 1, 0x0001, 8, 24, "elookup"));
+        let mut el_sink = Box::new(make_sink(
+            SegmentKind::EdgeIdLookup,
+            1,
+            0x0001,
+            8,
+            24,
+            "elookup",
+        ));
         el_sink.write(&edge_lookup)?;
         descriptors.push(el_sink.finish()?);
 
-        let mut no_sink = Box::new(make_sink(SegmentKind::NodeOriginalIds, 1, 0x0001, 8, 8, "norig"));
+        let mut no_sink = Box::new(make_sink(
+            SegmentKind::NodeOriginalIds,
+            1,
+            0x0001,
+            8,
+            8,
+            "norig",
+        ));
         no_sink.write(&node_orig)?;
         descriptors.push(no_sink.finish()?);
 
-        let mut eo_sink = Box::new(make_sink(SegmentKind::EdgeOriginalIds, 1, 0x0001, 8, 8, "eorig"));
+        let mut eo_sink = Box::new(make_sink(
+            SegmentKind::EdgeOriginalIds,
+            1,
+            0x0001,
+            8,
+            8,
+            "eorig",
+        ));
         eo_sink.write(&edge_orig)?;
         descriptors.push(eo_sink.finish()?);
 
         // ── Zone maps ────────────────────────────────────────────────
         let (table_zm, block_zm) = self.build_zone_map_segments(node_result, dict_result)?;
         if !table_zm.is_empty() {
-            let mut tz_sink = Box::new(make_sink(SegmentKind::TableZoneMaps, 1, 0x0001, 8, 40, "tablezm"));
+            let mut tz_sink = Box::new(make_sink(
+                SegmentKind::TableZoneMaps,
+                1,
+                0x0001,
+                8,
+                40,
+                "tablezm",
+            ));
             tz_sink.write(&table_zm)?;
             descriptors.push(tz_sink.finish()?);
         }
         if !block_zm.is_empty() {
-            let mut bz_sink = Box::new(make_sink(SegmentKind::BlockZoneMaps, 1, 0x0001, 8, 40, "blockzm"));
+            let mut bz_sink = Box::new(make_sink(
+                SegmentKind::BlockZoneMaps,
+                1,
+                0x0001,
+                8,
+                40,
+                "blockzm",
+            ));
             bz_sink.write(&block_zm)?;
             descriptors.push(bz_sink.finish()?);
         }
@@ -713,7 +844,14 @@ impl StreamingGenerationBuilder {
         // ── Dictionary code index ────────────────────────────────────
         let code_index = build_dictionary_code_index(&dict_result.strings);
         if !code_index.is_empty() {
-            let mut ci_sink = Box::new(make_sink(SegmentKind::DictionaryCodeIndex, 1, 0x0001, 8, 16, "codeidx"));
+            let mut ci_sink = Box::new(make_sink(
+                SegmentKind::DictionaryCodeIndex,
+                1,
+                0x0001,
+                8,
+                16,
+                "codeidx",
+            ));
             ci_sink.write(&code_index)?;
             descriptors.push(ci_sink.finish()?);
         }
@@ -732,13 +870,14 @@ impl StreamingGenerationBuilder {
         use crate::graph::compact::section_v5::{write_u16, write_u32, write_u64};
         let mut meta = Vec::new();
 
-        let node_table_count = u32::try_from(node_result.table_id_to_label.len()).map_err(|_| {
-            GenerationError::WireWidthOverflow {
-                what: "node_table_count",
-                count: node_result.table_id_to_label.len() as u64,
-                max: u64::from(u32::MAX),
-            }
-        })?;
+        let node_table_count =
+            u32::try_from(node_result.table_id_to_label.len()).map_err(|_| {
+                GenerationError::WireWidthOverflow {
+                    what: "node_table_count",
+                    count: node_result.table_id_to_label.len() as u64,
+                    max: u64::from(u32::MAX),
+                }
+            })?;
         write_u32(&mut meta, node_table_count);
 
         for (tid_usize, label) in node_result.table_id_to_label.iter().enumerate() {
@@ -754,11 +893,12 @@ impl StreamingGenerationBuilder {
             write_u32(&mut meta, label_code);
 
             let rows = &node_result.node_rows_by_table[tid_usize];
-            let row_count = u32::try_from(rows.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "node_table_row_count",
-                count: rows.len() as u64,
-                max: u64::from(u32::MAX),
-            })?;
+            let row_count =
+                u32::try_from(rows.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                    what: "node_table_row_count",
+                    count: rows.len() as u64,
+                    max: u64::from(u32::MAX),
+                })?;
             write_u32(&mut meta, row_count);
 
             // Collect property keys for this table.
@@ -771,11 +911,12 @@ impl StreamingGenerationBuilder {
             let mut key_list: Vec<String> = keys.into_iter().collect();
             key_list.sort();
 
-            let col_count = u32::try_from(key_list.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "node_table_col_count",
-                count: key_list.len() as u64,
-                max: u64::from(u32::MAX),
-            })?;
+            let col_count =
+                u32::try_from(key_list.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                    what: "node_table_col_count",
+                    count: key_list.len() as u64,
+                    max: u64::from(u32::MAX),
+                })?;
             write_u32(&mut meta, col_count);
 
             for key in &key_list {
@@ -807,11 +948,12 @@ impl StreamingGenerationBuilder {
                 GenerationError::Codec(format!("edge type not interned: {}", rt.edge_type))
             })?;
             write_u32(&mut meta, type_code);
-            let edge_count = u32::try_from(rt.edge_count).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "rel_table_edge_count",
-                count: rt.edge_count as u64,
-                max: u64::from(u32::MAX),
-            })?;
+            let edge_count =
+                u32::try_from(rt.edge_count).map_err(|_| GenerationError::WireWidthOverflow {
+                    what: "rel_table_edge_count",
+                    count: rt.edge_count as u64,
+                    max: u64::from(u32::MAX),
+                })?;
             write_u32(&mut meta, edge_count);
 
             // Collect property keys for this rel table.
@@ -824,11 +966,12 @@ impl StreamingGenerationBuilder {
             let mut key_list: Vec<String> = keys.into_iter().collect();
             key_list.sort();
 
-            let prop_count = u32::try_from(key_list.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "rel_table_prop_count",
-                count: key_list.len() as u64,
-                max: u64::from(u32::MAX),
-            })?;
+            let prop_count =
+                u32::try_from(key_list.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                    what: "rel_table_prop_count",
+                    count: key_list.len() as u64,
+                    max: u64::from(u32::MAX),
+                })?;
             write_u32(&mut meta, prop_count);
 
             for key in &key_list {
@@ -854,8 +997,10 @@ impl StreamingGenerationBuilder {
         edge_result: &EdgeMergeResult,
         dict_result: &DictionaryResult,
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), GenerationError> {
-        use crate::graph::compact::section_v5::{write_u16, write_u32, write_u64, write_column_body, codec_disc, value_type_code};
         use crate::graph::compact::generation::encode_column;
+        use crate::graph::compact::section_v5::{
+            codec_disc, value_type_code, write_column_body, write_u16, write_u32, write_u64,
+        };
 
         let mut node_dir = Vec::new();
         let mut rel_dir = Vec::new();
@@ -885,25 +1030,36 @@ impl StreamingGenerationBuilder {
             for key in &key_list {
                 let values: Vec<Option<grafeo_common::types::Value>> = rows
                     .iter()
-                    .map(|r| r.properties.get(&grafeo_common::types::PropertyKey::new(key)).cloned())
+                    .map(|r| {
+                        r.properties
+                            .get(&grafeo_common::types::PropertyKey::new(key))
+                            .cloned()
+                    })
                     .collect();
                 let value_refs: Vec<Option<&grafeo_common::types::Value>> =
                     values.iter().map(|v| v.as_ref()).collect();
-                let ctx = format!("node table {} column {}", node_result.table_id_to_label[tid_usize], key);
+                let ctx = format!(
+                    "node table {} column {}",
+                    node_result.table_id_to_label[tid_usize], key
+                );
                 let mut string_occ = Vec::new();
                 let (codec, _col_type, _zm) = encode_column(&value_refs, &ctx, &mut string_occ)?;
 
-                let body_start = u32::try_from(col_bodies.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                    what: "col_body_offset",
-                    count: col_bodies.len() as u64,
-                    max: u64::from(u32::MAX),
+                let body_start = u32::try_from(col_bodies.len()).map_err(|_| {
+                    GenerationError::WireWidthOverflow {
+                        what: "col_body_offset",
+                        count: col_bodies.len() as u64,
+                        max: u64::from(u32::MAX),
+                    }
                 })?;
                 write_column_body(&mut col_bodies, &codec, &dict_result.string_index)
                     .map_err(GenerationError::Codec)?;
-                let body_len = (u32::try_from(col_bodies.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                    what: "col_body_offset",
-                    count: col_bodies.len() as u64,
-                    max: u64::from(u32::MAX),
+                let body_len = (u32::try_from(col_bodies.len()).map_err(|_| {
+                    GenerationError::WireWidthOverflow {
+                        what: "col_body_offset",
+                        count: col_bodies.len() as u64,
+                        max: u64::from(u32::MAX),
+                    }
                 })?)
                 .saturating_sub(body_start);
 
@@ -915,11 +1071,12 @@ impl StreamingGenerationBuilder {
                 write_u32(&mut col_dir, 0);
                 write_u32(&mut col_block_index, body_start);
                 write_u32(&mut col_block_index, body_len);
-                let codec_len = u32::try_from(codec.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                    what: "codec_len",
-                    count: codec.len() as u64,
-                    max: u64::from(u32::MAX),
-                })?;
+                let codec_len =
+                    u32::try_from(codec.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                        what: "codec_len",
+                        count: codec.len() as u64,
+                        max: u64::from(u32::MAX),
+                    })?;
                 write_u32(&mut col_block_index, codec_len);
                 column_index += 1;
             }
@@ -927,11 +1084,12 @@ impl StreamingGenerationBuilder {
             write_u16(&mut node_dir, tid);
             write_u16(&mut node_dir, 0);
             write_u32(&mut node_dir, col_start);
-            let key_count = u32::try_from(key_list.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "node_table_key_count",
-                count: key_list.len() as u64,
-                max: u64::from(u32::MAX),
-            })?;
+            let key_count =
+                u32::try_from(key_list.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                    what: "node_table_key_count",
+                    count: key_list.len() as u64,
+                    max: u64::from(u32::MAX),
+                })?;
             write_u32(&mut node_dir, key_count);
             write_u64(&mut node_dir, rows.len() as u64);
             write_u32(&mut node_dir, 0);
@@ -962,17 +1120,21 @@ impl StreamingGenerationBuilder {
                 let mut string_occ = Vec::new();
                 let (codec, _col_type, _zm) = encode_column(&value_refs, &ctx, &mut string_occ)?;
 
-                let body_start = u32::try_from(col_bodies.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                    what: "col_body_offset",
-                    count: col_bodies.len() as u64,
-                    max: u64::from(u32::MAX),
+                let body_start = u32::try_from(col_bodies.len()).map_err(|_| {
+                    GenerationError::WireWidthOverflow {
+                        what: "col_body_offset",
+                        count: col_bodies.len() as u64,
+                        max: u64::from(u32::MAX),
+                    }
                 })?;
                 write_column_body(&mut col_bodies, &codec, &dict_result.string_index)
                     .map_err(GenerationError::Codec)?;
-                let body_len = (u32::try_from(col_bodies.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                    what: "col_body_offset",
-                    count: col_bodies.len() as u64,
-                    max: u64::from(u32::MAX),
+                let body_len = (u32::try_from(col_bodies.len()).map_err(|_| {
+                    GenerationError::WireWidthOverflow {
+                        what: "col_body_offset",
+                        count: col_bodies.len() as u64,
+                        max: u64::from(u32::MAX),
+                    }
                 })?)
                 .saturating_sub(body_start);
 
@@ -984,11 +1146,12 @@ impl StreamingGenerationBuilder {
                 write_u32(&mut col_dir, 0);
                 write_u32(&mut col_block_index, body_start);
                 write_u32(&mut col_block_index, body_len);
-                let codec_len = u32::try_from(codec.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                    what: "codec_len",
-                    count: codec.len() as u64,
-                    max: u64::from(u32::MAX),
-                })?;
+                let codec_len =
+                    u32::try_from(codec.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                        what: "codec_len",
+                        count: codec.len() as u64,
+                        max: u64::from(u32::MAX),
+                    })?;
                 write_u32(&mut col_block_index, codec_len);
                 column_index += 1;
             }
@@ -998,11 +1161,12 @@ impl StreamingGenerationBuilder {
             write_u16(&mut rel_dir, rt.dst_table_id);
             write_u16(&mut rel_dir, 0);
             write_u32(&mut rel_dir, col_start);
-            let key_count = u32::try_from(key_list.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "rel_table_key_count",
-                count: key_list.len() as u64,
-                max: u64::from(u32::MAX),
-            })?;
+            let key_count =
+                u32::try_from(key_list.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                    what: "rel_table_key_count",
+                    count: key_list.len() as u64,
+                    max: u64::from(u32::MAX),
+                })?;
             write_u32(&mut rel_dir, key_count);
             write_u64(&mut rel_dir, rt.edge_count as u64);
         }
@@ -1033,7 +1197,14 @@ impl StreamingGenerationBuilder {
             }
         }
 
-        (fwd_offsets, fwd_targets, rev_offsets, rev_targets, fwd_positions, has_reverse)
+        (
+            fwd_offsets,
+            fwd_targets,
+            rev_offsets,
+            rev_targets,
+            fwd_positions,
+            has_reverse,
+        )
     }
 
     fn build_id_segments(
@@ -1041,8 +1212,8 @@ impl StreamingGenerationBuilder {
         node_result: &NodeMergeResult,
         edge_result: &EdgeMergeResult,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        use crate::graph::compact::mapped::{write_edge_id_record, write_node_id_record};
         use crate::graph::compact::section_v5::write_u64;
-        use crate::graph::compact::mapped::{write_node_id_record, write_edge_id_record};
 
         let mut node_lookup = Vec::new();
         let mut edge_lookup = Vec::new();
@@ -1115,11 +1286,18 @@ impl StreamingGenerationBuilder {
             for key in &key_list {
                 let values: Vec<Option<grafeo_common::types::Value>> = rows
                     .iter()
-                    .map(|r| r.properties.get(&grafeo_common::types::PropertyKey::new(key)).cloned())
+                    .map(|r| {
+                        r.properties
+                            .get(&grafeo_common::types::PropertyKey::new(key))
+                            .cloned()
+                    })
                     .collect();
                 let value_refs: Vec<Option<&grafeo_common::types::Value>> =
                     values.iter().map(|v| v.as_ref()).collect();
-                let ctx = format!("node table {} column {}", node_result.table_id_to_label[tid_usize], key);
+                let ctx = format!(
+                    "node table {} column {}",
+                    node_result.table_id_to_label[tid_usize], key
+                );
                 let mut string_occ = Vec::new();
                 let (codec, _col_type, zm) = encode_column(&value_refs, &ctx, &mut string_occ)?;
 
@@ -1143,13 +1321,22 @@ impl StreamingGenerationBuilder {
                 // Block-level zone maps.
                 let block_zms = compute_block_zone_maps(&codec);
                 for (block_idx, bzm) in block_zms.iter().enumerate() {
-                    let bi = u32::try_from(block_idx).map_err(|_| GenerationError::WireWidthOverflow {
-                        what: "block_index",
-                        count: block_idx as u64,
-                        max: u64::from(u32::MAX),
+                    let bi = u32::try_from(block_idx).map_err(|_| {
+                        GenerationError::WireWidthOverflow {
+                            what: "block_index",
+                            count: block_idx as u64,
+                            max: u64::from(u32::MAX),
+                        }
                     })?;
-                    write_zone_map_record(&mut block_seg, table_id, code, bi, bzm, &dict_result.string_index)
-                        .map_err(GenerationError::Codec)?;
+                    write_zone_map_record(
+                        &mut block_seg,
+                        table_id,
+                        code,
+                        bi,
+                        bzm,
+                        &dict_result.string_index,
+                    )
+                    .map_err(GenerationError::Codec)?;
                 }
             }
         }
@@ -1239,10 +1426,7 @@ struct DictionaryResult {
 
 // ── Helper functions ───────────────────────────────────────────────
 
-fn infer_column_codec(
-    rows: &[StagedNodeRow],
-    key: &str,
-) -> (u16, u16) {
+fn infer_column_codec(rows: &[StagedNodeRow], key: &str) -> (u16, u16) {
     use grafeo_common::types::Value;
     let pk = grafeo_common::types::PropertyKey::new(key);
     for row in rows {

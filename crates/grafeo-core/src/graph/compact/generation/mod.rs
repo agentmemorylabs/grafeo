@@ -23,6 +23,7 @@ pub use budget::{GenerationBudget, GenerationMetrics};
 #[cfg(test)]
 pub use build::generate_v5_payload;
 pub use build::{GeneratedCompact, generate_compact_store};
+pub(crate) use columns::encode_column;
 pub use error::GenerationError;
 pub use input::{
     EdgeRecordSource, GenerationEdge, GenerationInput, GenerationNode, NodeRecordSource,
@@ -32,7 +33,6 @@ pub use runs::{
     CancelToken, ExternalRunHandle, ExternalRunMerger, ExternalRunSink, InMemoryRunMerger,
     InMemoryRunSink, InMemoryRunStore, RunStore, SortRecord, default_merge_fan_in,
 };
-pub(crate) use columns::encode_column;
 #[cfg(test)]
 pub use segment_source::assemble_v5_payload_from_source;
 pub use segment_source::{CompactV5SegmentSource, V5Segment, V5SegmentSource};

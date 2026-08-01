@@ -56,13 +56,20 @@ pub fn generate_compact_store(
     let rel_decls = rel_schemas;
 
     // ── Partition nodes by label, sort by original ID, assign dense offsets ──
+    // Physical grouping uses the first canonical label (D0.8.0 item 2); the
+    // full logical label vector is preserved on the row for membership
+    // emission. Multi-label nodes are stored once under `physical_label()`.
     let mut by_label: FxHashMap<String, Vec<GenerationNode>> = FxHashMap::default();
     let mut seen_nodes: FxHashSet<u64> = FxHashSet::default();
     while let Some(n) = nodes.next_node()? {
+        n.validate_labels()?;
         if !seen_nodes.insert(n.id.as_u64()) {
             return Err(GenerationError::DuplicateNodeId(n.id.as_u64()));
         }
-        by_label.entry(n.label.clone()).or_default().push(n);
+        by_label
+            .entry(n.physical_label().to_string())
+            .or_default()
+            .push(n);
     }
 
     let mut labels: Vec<String> = by_label.keys().cloned().collect();
