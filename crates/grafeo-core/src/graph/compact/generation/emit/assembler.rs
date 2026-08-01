@@ -50,7 +50,12 @@ impl V5PayloadAssembler {
     /// cannot be read.
     pub fn assemble(&self, descriptors: &[SegmentDescriptor]) -> Result<Vec<u8>, GenerationError> {
         let len = self.payload_len(descriptors)?;
-        let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(usize::MAX));
+        let cap = usize::try_from(len).map_err(|_| GenerationError::WireWidthOverflow {
+            what: "payload_len",
+            count: len,
+            max: u64::MAX,
+        })?;
+        let mut out = Vec::with_capacity(cap);
         self.stream_to(descriptors, &mut out)?;
         Ok(out)
     }

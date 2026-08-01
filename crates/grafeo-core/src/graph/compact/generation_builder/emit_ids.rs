@@ -299,3 +299,79 @@ pub fn build_table_zone_maps(
     }
     Ok(out)
 }
+
+/// Builds the BlockZoneMaps segment from per-column per-block zone maps.
+///
+/// Each `EmittedColumn` carries `block_zone_maps` computed from its codec.
+/// Layout per record (40 bytes): same as table zone maps but with a real
+/// `block_index` (0, 1, 2, …) instead of the sentinel.
+pub fn build_block_zone_maps(
+    columns: &[crate::graph::compact::generation_builder::emit_columns::EmittedColumn],
+    geometries: &[ColumnGeometry],
+    string_index: &FxHashMap<String, u32>,
+) -> Result<Vec<u8>, GenerationError> {
+    use crate::graph::compact::mapped::ZONE_MAP_RECORD_LEN;
+    const TAG_ABSENT: u8 = 0;
+    const TAG_INT64: u8 = 1;
+    const TAG_BOOL: u8 = 2;
+    const TAG_STRING_CODE: u8 = 3;
+    const TAG_FLOAT64: u8 = 4;
+
+    let mut out = Vec::new();
+    for (i, col) in columns.iter().enumerate() {
+        let g = &geometries[i];
+        let key_code = *string_index
+            .get(&g.key)
+            .ok_or_else(|| GenerationError::Codec(format!("block zone key not interned: {}", g.key)))?;
+        for (block_idx, zm) in col.block_zone_maps.iter().enumerate() {
+            let bi = u32::try_from(block_idx).map_err(|_| {
+                GenerationError::WireWidthOverflow {
+                    what: "block_index",
+                    count: block_idx as u64,
+                    max: u64::from(u32::MAX),
+                }
+            })?;
+            let (min_tag, min_payload) = encode_zone_value(&zm.min, string_index)?;
+            let (max_tag, max_payload) = encode_zone_value(&zm.max, string_index)?;
+            let mut rec = [0u8; ZONE_MAP_RECORD_LEN];
+            rec[0..2].copy_from_slice(&g.table_id.to_le_bytes());
+            rec[2..4].copy_from_slice(&0u16.to_le_bytes()); // reserved
+            rec[4..8].copy_from_slice(&key_code.to_le_bytes());
+            rec[8..12].copy_from_slice(&bi.to_le_bytes());
+            rec[12..16].copy_from_slice(&(zm.null_count as u32).to_le_bytes());
+            rec[16..20].copy_from_slice(&(zm.row_count as u32).to_le_bytes());
+            rec[20] = min_tag;
+            rec[21] = max_tag;
+            rec[22..24].copy_from_slice(&0u16.to_le_bytes()); // pad
+            rec[24..32].copy_from_slice(&min_payload.to_le_bytes());
+            rec[32..40].copy_from_slice(&max_payload.to_le_bytes());
+            out.extend_from_slice(&rec);
+        }
+    }
+    Ok(out)
+}
+
+/// Encodes an optional zone-map value to (tag, payload).
+fn encode_zone_value(
+    v: &Option<grafeo_common::types::Value>,
+    string_index: &FxHashMap<String, u32>,
+) -> Result<(u8, u64), GenerationError> {
+    const TAG_ABSENT: u8 = 0;
+    const TAG_INT64: u8 = 1;
+    const TAG_BOOL: u8 = 2;
+    const TAG_STRING_CODE: u8 = 3;
+    const TAG_FLOAT64: u8 = 4;
+    match v {
+        None => Ok((TAG_ABSENT, 0)),
+        Some(grafeo_common::types::Value::Int64(n)) => Ok((TAG_INT64, *n as u64)),
+        Some(grafeo_common::types::Value::Bool(b)) => Ok((TAG_BOOL, u64::from(*b))),
+        Some(grafeo_common::types::Value::String(s)) => {
+            let code = *string_index
+                .get(s.as_str())
+                .ok_or_else(|| GenerationError::Codec(format!("zone string not interned: {s}")))?;
+            Ok((TAG_STRING_CODE, u64::from(code)))
+        }
+        Some(grafeo_common::types::Value::Float64(f)) => Ok((TAG_FLOAT64, f.to_bits())),
+        Some(_) => Ok((TAG_ABSENT, 0)),
+    }
+}

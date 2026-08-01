@@ -15,6 +15,7 @@
 //! `ColumnRowNull` companion segments (D0.8.0), written here from the same
 //! stream.
 
+use crate::graph::compact::column::ColumnCodec;
 use crate::graph::compact::generation::emit::column::ColumnEncoder;
 use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::{
@@ -24,6 +25,7 @@ use crate::graph::compact::generation::{
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
 use crate::graph::compact::generation_builder::emit_meta::{CodecKind, w16, w32, w64};
 use crate::graph::compact::mapped::SegmentKind;
+use crate::graph::compact::zone_map::ZoneMap;
 use grafeo_common::types::Value;
 
 /// Decodes one occurrence payload (mirrors column_pass::decode_occ_value).
@@ -130,6 +132,9 @@ pub struct EmittedColumn {
     pub body_start: u32,
     /// Codec logical row count.
     pub codec_len: u32,
+    /// Per-block zone maps computed from the emitted codec.
+    /// Empty when the column has no zone maps (e.g. Vector columns).
+    pub block_zone_maps: Vec<ZoneMap>,
 }
 
 /// Result of the column body pass.
@@ -191,6 +196,8 @@ pub fn emit_column_bodies(
         let column_index = result.columns.len() as u32;
         let mut string_occ = Vec::new();
         let (codec, _col_type, _zm) = enc.finish(&mut string_occ)?;
+        // Compute per-block zone maps from the emitted codec (byte-exact with eager).
+        let block_zms = crate::graph::compact::zone_map::compute_block_zone_maps(&codec);
         // Serialize the body via production write_column_body.
         let mut body = Vec::new();
         crate::graph::compact::section_v5::write_column_body(&mut body, &codec, string_index)
@@ -210,6 +217,7 @@ pub fn emit_column_bodies(
                 }
             })?,
             codec_len: codec.len() as u32,
+            block_zone_maps: block_zms,
         });
         if g.needs_presence() {
             result
@@ -358,25 +366,33 @@ pub fn write_directory_segments(
         w32(col_block_index, col.codec_len);
     }
     // NodeTableDirectory.
+    let mut running_col = 0u32;
     for (tid, row_count, col_indices) in node_tables {
         w16(node_dir, *tid);
         w16(node_dir, 0);
-        let col_start = col_indices.first().copied().unwrap_or(0);
+        let col_start = col_indices.first().copied().unwrap_or(running_col);
         w32(node_dir, col_start);
         w32(node_dir, col_indices.len() as u32);
         w64(node_dir, *row_count);
         w32(node_dir, 0);
+        running_col = col_start + col_indices.len() as u32;
     }
     // RelTableDirectory.
+    let mut next_col = running_col;
     for (rid, src, dst, edge_count, col_indices) in rel_tables {
         w16(rel_dir, *rid);
         w16(rel_dir, *src);
         w16(rel_dir, *dst);
         w16(rel_dir, 0);
-        let col_start = col_indices.first().copied().unwrap_or(0);
+        // col_start = first column index for this rel table, or the
+        // running next column index when the rel table has no columns
+        // (matching the eager path's `column_index` snapshot before
+        // iterating keys, even when keys is empty).
+        let col_start = col_indices.first().copied().unwrap_or(next_col);
         w32(rel_dir, col_start);
         w32(rel_dir, col_indices.len() as u32);
         w64(rel_dir, *edge_count);
+        next_col = col_start + col_indices.len() as u32;
     }
     Ok(())
 }

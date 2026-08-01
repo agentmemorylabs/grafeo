@@ -41,8 +41,9 @@ use crate::graph::compact::generation_builder::emit_columns::{
     emit_column_bodies, write_directory_segments,
 };
 use crate::graph::compact::generation_builder::emit_ids::{
-    build_edge_id_lookup, build_edge_original_ids, build_metadata, build_node_id_lookup,
-    build_node_original_ids, build_table_zone_maps, count_edges_per_rel_table,
+    build_block_zone_maps, build_edge_id_lookup, build_edge_original_ids, build_metadata,
+    build_node_id_lookup, build_node_original_ids, build_table_zone_maps,
+    count_edges_per_rel_table,
 };
 use crate::graph::compact::generation_builder::emit_meta::CodecKind;
 use crate::graph::compact::generation_builder::node_pass::{self, NodeSchema};
@@ -437,6 +438,7 @@ impl BoundedGenerationBuilder {
 
         // Build zone maps.
         let table_zm = build_table_zone_maps(geometries, string_index)?;
+        let block_zm = build_block_zone_maps(&col_result.columns, geometries, string_index)?;
 
         // Finish all sinks → descriptors.
         let mut descriptors = vec![
@@ -477,6 +479,7 @@ impl BoundedGenerationBuilder {
         let edge_lookup_desc = make_resident_desc(SegmentKind::EdgeIdLookup, 8, 24, &edge_lookup);
         let edge_orig_desc = make_resident_desc(SegmentKind::EdgeOriginalIds, 8, 8, &edge_orig);
         let table_zm_desc = make_resident_desc(SegmentKind::TableZoneMaps, 8, 40, &table_zm);
+        let block_zm_desc = make_resident_desc(SegmentKind::BlockZoneMaps, 8, 40, &block_zm);
 
         descriptors.push(node_dir_desc);
         descriptors.push(rel_dir_desc);
@@ -488,6 +491,9 @@ impl BoundedGenerationBuilder {
         descriptors.push(edge_orig_desc);
         if !table_zm.is_empty() {
             descriptors.push(table_zm_desc);
+        }
+        if !block_zm.is_empty() {
+            descriptors.push(block_zm_desc);
         }
 
         // Add presence/null companions.
