@@ -3,12 +3,20 @@
 //! Builds the Metadata, NodeIdLookup, EdgeIdLookup, NodeOriginalIds,
 //! EdgeOriginalIds, TableZoneMaps, and BlockZoneMaps segments from bounded
 //! pass outputs. Layout is byte-exact with `emit_canonical_descriptors`.
+//!
+//! Boundedness: the four ID segments are **streamed** into spool sinks.
+//! NodeIdLookup follows the (already sorted) mapped index; the other three
+//! re-sort fixed-width records through the external-run machinery and never
+//! retain a graph-proportional vector. Zone-map string bounds resolve
+//! through the per-column DictValue chunk file, one column's map at a time.
 
+use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::{
-    CancelToken, GenerationBudget, GenerationError, GenerationMetrics, RunSetLease,
+    CancelToken, ExternalRunMerger, GenerationBudget, GenerationError, GenerationMetrics,
+    RunSetLease, RunStore, SortRecord,
 };
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
-use crate::graph::compact::generation_builder::emit_columns::codec_kind_of;
+use crate::graph::compact::generation_builder::emit_columns::{codec_kind_of, DictChunkReader};
 use crate::graph::compact::generation_builder::emit_meta::{w16, w32, w64};
 use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
 use grafeo_common::utils::hash::FxHashMap;
@@ -95,113 +103,203 @@ pub fn build_metadata(
     Ok(meta)
 }
 
-/// Builds the NodeIdLookup segment from a mapped ID index.
+/// Streams the NodeIdLookup segment into `sink`.
 ///
-/// Records are sorted by original_id (the index is already sorted).
+/// Records are sorted by original_id (the mapped index is already sorted).
 /// Layout per record (24 bytes): original_id u64 LE, table_id u16 LE,
-/// pad u16, pad u32, offset u64 LE.
-pub fn build_node_id_lookup(id_index: &MappedNodeIdIndex) -> Vec<u8> {
-    let mut out = Vec::with_capacity(id_index.len() * 24);
+/// pad u16, pad u32, offset u64 LE. No graph-proportional resident buffer.
+///
+/// # Errors
+///
+/// Sink write failure.
+pub fn build_node_id_lookup(
+    id_index: &MappedNodeIdIndex,
+    sink: &mut dyn SegmentSink,
+) -> Result<(), GenerationError> {
+    let mut rec = [0u8; 24];
     for i in 0..id_index.len() {
         if let Some((tid, off)) = id_index.lookup_at(i) {
             let id = id_index.original_id_at(i);
-            out.extend_from_slice(&id.to_le_bytes());
-            out.extend_from_slice(&tid.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes()); // pad
-            out.extend_from_slice(&0u32.to_le_bytes()); // pad
-            out.extend_from_slice(&off.to_le_bytes());
+            rec[0..8].copy_from_slice(&id.to_le_bytes());
+            rec[8..10].copy_from_slice(&tid.to_le_bytes());
+            rec[10..12].copy_from_slice(&0u16.to_le_bytes()); // pad
+            rec[12..16].copy_from_slice(&0u32.to_le_bytes()); // pad
+            rec[16..24].copy_from_slice(&off.to_le_bytes());
+            sink.write(&rec)?;
         }
     }
-    out
+    Ok(())
 }
 
-/// Builds the NodeOriginalIds segment (per-table, per-offset original IDs).
+/// Streams the NodeOriginalIds segment (per-table, per-offset original IDs)
+/// into `sink`.
 ///
-/// Layout: concatenated u64 LE original IDs, grouped by table in table order.
-pub fn build_node_original_ids(id_index: &MappedNodeIdIndex, table_counts: &[u64]) -> Vec<u8> {
-    // Collect (tid, off, id) and sort by (tid, off).
-    let mut entries: Vec<(u16, u64, u64)> = Vec::with_capacity(id_index.len());
+/// Layout: concatenated u64 LE original IDs, grouped by table in table
+/// order. The index is not in `(table_id, dense_offset)` order, so records
+/// are re-sorted externally (key = `table_id u16 BE || dense_offset u64 BE`,
+/// payload = original_id u64 LE); the merged stream is written straight to
+/// the spool sink.
+///
+/// # Errors
+///
+/// Codec, budget, or I/O failure.
+pub fn build_node_original_ids(
+    id_index: &MappedNodeIdIndex,
+    run_store: &mut dyn RunStore,
+    budget: &GenerationBudget,
+    metrics: &mut GenerationMetrics,
+    cancel: Option<&CancelToken>,
+    sink: &mut dyn SegmentSink,
+) -> Result<(), GenerationError> {
+    let mut run_sink = run_store.sink("node-orig", budget)?;
     for i in 0..id_index.len() {
         if let Some((tid, off)) = id_index.lookup_at(i) {
-            entries.push((tid, off, id_index.original_id_at(i)));
+            let mut key = Vec::with_capacity(10);
+            key.extend_from_slice(&tid.to_be_bytes());
+            key.extend_from_slice(&off.to_be_bytes());
+            run_sink.push(SortRecord::new(
+                key,
+                id_index.original_id_at(i).to_le_bytes().to_vec(),
+            ))?;
         }
     }
-    entries.sort_by_key(|&(tid, off, _)| (tid, off));
-    let mut out = Vec::with_capacity(entries.len() * 8);
-    for (_, _, id) in &entries {
-        out.extend_from_slice(&id.to_le_bytes());
-    }
-    let _ = table_counts; // used for validation in full impl
-    out
+    let lease = run_sink.finish()?;
+    let mut merger = run_store.merger("node-orig")?;
+    merger.merge_all(&lease.handles, budget, metrics, cancel, &mut |rec| {
+        if rec.payload.len() != 8 {
+            return Err(GenerationError::Codec(
+                "node original id payload width".into(),
+            ));
+        }
+        sink.write(&rec.payload)
+    })?;
+    Ok(())
 }
 
-/// Builds the EdgeIdLookup segment from forward CSR records.
+/// Extracts the original edge id from a forward CSR record key.
 ///
-/// Records are sorted by original edge ID.
-/// Layout per record (24 bytes): edge_id u64 LE, rel_table_id u16 LE,
-/// pad u16, pad u32, csr_position u64 LE.
+/// Key layout: `rel_table_id u16 BE, src_off u64 BE, dst_off u64 BE,
+/// edge_id u64 BE`.
+///
+/// # Errors
+///
+/// [`GenerationError::Codec`] when the key is too short.
+fn forward_csr_edge_id(rec: &SortRecord) -> Result<u64, GenerationError> {
+    if rec.key.len() < 26 {
+        return Err(GenerationError::Codec("forward CSR key too short".into()));
+    }
+    Ok(u64::from_be_bytes(
+        rec.key[18..26]
+            .try_into()
+            .map_err(|_| GenerationError::Codec("forward CSR key width".into()))?,
+    ))
+}
+
+/// Streams the EdgeIdLookup segment from forward CSR records into `sink`.
+///
+/// Records are sorted by original edge ID. Layout per record (24 bytes):
+/// edge_id u64 LE, rel_table_id u16 LE, pad u16, pad u32, csr_position u64
+/// LE. The CSR stream yields records in forward-CSR order, so each record's
+/// `csr_position` is its running index; the fixed-width records are then
+/// re-sorted externally by `edge_id` (key = `edge_id u64 BE || rel_table_id
+/// u16 BE || position u64 BE`) and merged straight into the spool sink.
+///
+/// # Errors
+///
+/// Codec, budget, or I/O failure.
 pub fn build_edge_id_lookup(
     fwd_lease: &RunSetLease,
-    merger: &mut dyn crate::graph::compact::generation::ExternalRunMerger,
+    merger: &mut dyn ExternalRunMerger,
     budget: &GenerationBudget,
     metrics: &mut GenerationMetrics,
     cancel: Option<&CancelToken>,
-) -> Result<Vec<u8>, GenerationError> {
-    // Collect (edge_id, rel_table_id, csr_position) from forward CSR records.
-    let mut entries: Vec<(u64, u16, u64)> = Vec::new();
+    run_store: &mut dyn RunStore,
+    sink: &mut dyn SegmentSink,
+) -> Result<(), GenerationError> {
+    let mut run_sink = run_store.sink("edge-lookup", budget)?;
+    let mut pos: u64 = 0;
     merger.merge_all(&fwd_lease.handles, budget, metrics, cancel, &mut |rec| {
         // Forward CSR key: rel_table_id u16 BE, src_off u64 BE, dst_off u64 BE, edge_id u64 BE.
-        if rec.key.len() < 26 {
-            return Err(GenerationError::Codec("forward CSR key too short".into()));
-        }
+        let edge_id = forward_csr_edge_id(rec)?;
         let rel_table_id = u16::from_be_bytes([rec.key[0], rec.key[1]]);
-        let edge_id = u64::from_be_bytes(rec.key[18..26].try_into().unwrap());
-        let csr_position = entries.len() as u64; // position in forward CSR order
-        entries.push((edge_id, rel_table_id, csr_position));
+        let mut key = Vec::with_capacity(26);
+        key.extend_from_slice(&edge_id.to_be_bytes());
+        key.extend_from_slice(&rel_table_id.to_be_bytes());
+        key.extend_from_slice(&pos.to_be_bytes());
+        let mut payload = Vec::with_capacity(18);
+        payload.extend_from_slice(&rel_table_id.to_le_bytes());
+        payload.extend_from_slice(&pos.to_le_bytes());
+        run_sink.push(SortRecord::new(key, payload))?;
+        pos += 1;
         Ok(())
     })?;
-    // Sort by edge_id.
-    entries.sort_by_key(|&(id, _, _)| id);
-    let mut out = Vec::with_capacity(entries.len() * 24);
-    for (id, rel_table_id, csr_pos) in &entries {
-        out.extend_from_slice(&id.to_le_bytes());
-        out.extend_from_slice(&rel_table_id.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // pad
-        out.extend_from_slice(&0u32.to_le_bytes()); // pad
-        out.extend_from_slice(&csr_pos.to_le_bytes());
-    }
-    Ok(out)
+    let lease = run_sink.finish()?;
+    let mut merger2 = run_store.merger("edge-lookup")?;
+    merger2.merge_all(&lease.handles, budget, metrics, cancel, &mut |rec| {
+        if rec.payload.len() != 10 {
+            return Err(GenerationError::Codec("edge lookup payload width".into()));
+        }
+        let edge_id = u64::from_be_bytes(
+            rec.key
+                .get(0..8)
+                .ok_or_else(|| GenerationError::Codec("edge lookup key short".into()))?
+                .try_into()
+                .map_err(|_| GenerationError::Codec("edge lookup key width".into()))?,
+        );
+        let mut out = [0u8; 24];
+        out[0..8].copy_from_slice(&edge_id.to_le_bytes());
+        out[8..10].copy_from_slice(&rec.payload[0..2]); // rel_table_id LE
+        out[10..12].copy_from_slice(&0u16.to_le_bytes()); // pad
+        out[12..16].copy_from_slice(&0u32.to_le_bytes()); // pad
+        out[16..24].copy_from_slice(&rec.payload[2..10]); // csr_position LE
+        sink.write(&out)
+    })?;
+    Ok(())
 }
 
-/// Builds the EdgeOriginalIds segment (per-rel-table, per-csr-position edge IDs).
+/// Streams the EdgeOriginalIds segment (per-rel-table, per-csr-position edge
+/// IDs) into `sink`.
 ///
-/// Layout: concatenated u64 LE edge IDs, grouped by rel_table in rel_table order.
+/// Layout: concatenated u64 LE edge IDs, grouped by rel_table in rel_table
+/// order. Records are re-sorted externally (key = `rel_table_id u16 BE ||
+/// csr_position u64 BE`, payload = edge_id u64 LE) and the merged stream is
+/// written straight to the spool sink.
+///
+/// # Errors
+///
+/// Codec, budget, or I/O failure.
 pub fn build_edge_original_ids(
     fwd_lease: &RunSetLease,
-    merger: &mut dyn crate::graph::compact::generation::ExternalRunMerger,
+    merger: &mut dyn ExternalRunMerger,
     budget: &GenerationBudget,
     metrics: &mut GenerationMetrics,
     cancel: Option<&CancelToken>,
-) -> Result<Vec<u8>, GenerationError> {
-    // Collect (rel_table_id, csr_position, edge_id) from forward CSR records.
-    let mut entries: Vec<(u16, u64, u64)> = Vec::new();
+    run_store: &mut dyn RunStore,
+    sink: &mut dyn SegmentSink,
+) -> Result<(), GenerationError> {
+    let mut run_sink = run_store.sink("edge-orig", budget)?;
+    let mut pos: u64 = 0;
     merger.merge_all(&fwd_lease.handles, budget, metrics, cancel, &mut |rec| {
-        if rec.key.len() < 26 {
-            return Err(GenerationError::Codec("forward CSR key too short".into()));
-        }
         let rel_table_id = u16::from_be_bytes([rec.key[0], rec.key[1]]);
-        let edge_id = u64::from_be_bytes(rec.key[18..26].try_into().unwrap());
-        let csr_position = entries.len() as u64;
-        entries.push((rel_table_id, csr_position, edge_id));
+        let edge_id = forward_csr_edge_id(rec)?;
+        let mut key = Vec::with_capacity(10);
+        key.extend_from_slice(&rel_table_id.to_be_bytes());
+        key.extend_from_slice(&pos.to_be_bytes());
+        run_sink.push(SortRecord::new(key, edge_id.to_le_bytes().to_vec()))?;
+        pos += 1;
         Ok(())
     })?;
-    // Sort by (rel_table_id, csr_position).
-    entries.sort_by_key(|&(rel, pos, _)| (rel, pos));
-    let mut out = Vec::with_capacity(entries.len() * 8);
-    for (_, _, id) in &entries {
-        out.extend_from_slice(&id.to_le_bytes());
-    }
-    Ok(out)
+    let lease = run_sink.finish()?;
+    let mut merger2 = run_store.merger("edge-orig")?;
+    merger2.merge_all(&lease.handles, budget, metrics, cancel, &mut |rec| {
+        if rec.payload.len() != 8 {
+            return Err(GenerationError::Codec(
+                "edge original id payload width".into(),
+            ));
+        }
+        sink.write(&rec.payload)
+    })?;
+    Ok(())
 }
 
 /// Counts edges per rel_table from the forward CSR records.
@@ -235,9 +333,10 @@ pub fn count_edges_per_rel_table(
 /// table_id u16, reserved u16, col_key_code u32, block_index u32,
 /// null_count u32, row_count u32, min_tag u8, max_tag u8, pad u16,
 /// min_payload u64, max_payload u64.
-pub fn build_table_zone_maps(
+pub(crate) fn build_table_zone_maps(
     geometries: &[ColumnGeometry],
     string_index: &FxHashMap<String, u32>,
+    chunks: &mut DictChunkReader,
 ) -> Result<Vec<u8>, GenerationError> {
     use crate::graph::compact::mapped::ZONE_MAP_RECORD_LEN;
     const TAG_ABSENT: u8 = 0;
@@ -253,11 +352,16 @@ pub fn build_table_zone_maps(
             .get(&g.key)
             .ok_or_else(|| GenerationError::Codec(format!("zone key not interned: {}", g.key)))?;
 
+        // String bounds resolve through this column's DictValue chunk map
+        // (loaded only when the column has string bounds, discarded after).
+        let mut str_map: Option<FxHashMap<String, u32>> = None;
+        if g.min_str.is_some() || g.max_str.is_some() {
+            str_map = Some(chunks.map_for(g.table_id, &g.key)?);
+        }
+
         // Determine min/max tags and payloads from geometry.
         let (min_tag, min_payload) = if let Some(s) = &g.min_str {
-            let code = *string_index
-                .get(s)
-                .ok_or_else(|| GenerationError::Codec(format!("zone min not interned: {s}")))?;
+            let code = lookup_zone_str(str_map.as_ref(), s)?;
             (TAG_STRING_CODE, u64::from(code))
         } else if let Some(n) = g.min_int {
             (TAG_INT64, n as u64)
@@ -269,9 +373,7 @@ pub fn build_table_zone_maps(
             (TAG_ABSENT, 0)
         };
         let (max_tag, max_payload) = if let Some(s) = &g.max_str {
-            let code = *string_index
-                .get(s)
-                .ok_or_else(|| GenerationError::Codec(format!("zone max not interned: {s}")))?;
+            let code = lookup_zone_str(str_map.as_ref(), s)?;
             (TAG_STRING_CODE, u64::from(code))
         } else if let Some(n) = g.max_int {
             (TAG_INT64, n as u64)
@@ -305,34 +407,37 @@ pub fn build_table_zone_maps(
 /// Each `EmittedColumn` carries `block_zone_maps` computed from its codec.
 /// Layout per record (40 bytes): same as table zone maps but with a real
 /// `block_index` (0, 1, 2, …) instead of the sentinel.
-pub fn build_block_zone_maps(
+pub(crate) fn build_block_zone_maps(
     columns: &[crate::graph::compact::generation_builder::emit_columns::EmittedColumn],
     geometries: &[ColumnGeometry],
     string_index: &FxHashMap<String, u32>,
+    chunks: &mut DictChunkReader,
 ) -> Result<Vec<u8>, GenerationError> {
     use crate::graph::compact::mapped::ZONE_MAP_RECORD_LEN;
-    const TAG_ABSENT: u8 = 0;
-    const TAG_INT64: u8 = 1;
-    const TAG_BOOL: u8 = 2;
-    const TAG_STRING_CODE: u8 = 3;
-    const TAG_FLOAT64: u8 = 4;
 
     let mut out = Vec::new();
     for (i, col) in columns.iter().enumerate() {
         let g = &geometries[i];
-        let key_code = *string_index
-            .get(&g.key)
-            .ok_or_else(|| GenerationError::Codec(format!("block zone key not interned: {}", g.key)))?;
+        let key_code = *string_index.get(&g.key).ok_or_else(|| {
+            GenerationError::Codec(format!("block zone key not interned: {}", g.key))
+        })?;
+        // Load this column's DictValue chunk map only when some block bound
+        // is a string; discarded after the column.
+        let mut str_map: Option<FxHashMap<String, u32>> = None;
+        if col.block_zone_maps.iter().any(|zm| {
+            matches!(zm.min, Some(grafeo_common::types::Value::String(_)))
+                || matches!(zm.max, Some(grafeo_common::types::Value::String(_)))
+        }) {
+            str_map = Some(chunks.map_for(g.table_id, &g.key)?);
+        }
         for (block_idx, zm) in col.block_zone_maps.iter().enumerate() {
-            let bi = u32::try_from(block_idx).map_err(|_| {
-                GenerationError::WireWidthOverflow {
-                    what: "block_index",
-                    count: block_idx as u64,
-                    max: u64::from(u32::MAX),
-                }
+            let bi = u32::try_from(block_idx).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "block_index",
+                count: block_idx as u64,
+                max: u64::from(u32::MAX),
             })?;
-            let (min_tag, min_payload) = encode_zone_value(&zm.min, string_index)?;
-            let (max_tag, max_payload) = encode_zone_value(&zm.max, string_index)?;
+            let (min_tag, min_payload) = encode_zone_value(&zm.min, str_map.as_ref())?;
+            let (max_tag, max_payload) = encode_zone_value(&zm.max, str_map.as_ref())?;
             let mut rec = [0u8; ZONE_MAP_RECORD_LEN];
             rec[0..2].copy_from_slice(&g.table_id.to_le_bytes());
             rec[2..4].copy_from_slice(&0u16.to_le_bytes()); // reserved
@@ -351,10 +456,29 @@ pub fn build_block_zone_maps(
     Ok(out)
 }
 
+/// Resolves a zone-map string bound through the column's chunk map.
+///
+/// # Errors
+///
+/// [`GenerationError::Codec`] when the string is not interned or the map is
+/// missing (fail closed: the bound must be a value of this column).
+fn lookup_zone_str(
+    str_map: Option<&FxHashMap<String, u32>>,
+    s: &str,
+) -> Result<u32, GenerationError> {
+    let map = str_map.ok_or_else(|| GenerationError::Codec("zone string map not loaded".into()))?;
+    map.get(s)
+        .copied()
+        .ok_or_else(|| GenerationError::Codec(format!("zone string not interned: {s}")))
+}
+
 /// Encodes an optional zone-map value to (tag, payload).
+///
+/// `str_map` is the current column's DictValue chunk map (`None` when the
+/// column has no string bounds).
 fn encode_zone_value(
     v: &Option<grafeo_common::types::Value>,
-    string_index: &FxHashMap<String, u32>,
+    str_map: Option<&FxHashMap<String, u32>>,
 ) -> Result<(u8, u64), GenerationError> {
     const TAG_ABSENT: u8 = 0;
     const TAG_INT64: u8 = 1;
@@ -366,9 +490,7 @@ fn encode_zone_value(
         Some(grafeo_common::types::Value::Int64(n)) => Ok((TAG_INT64, *n as u64)),
         Some(grafeo_common::types::Value::Bool(b)) => Ok((TAG_BOOL, u64::from(*b))),
         Some(grafeo_common::types::Value::String(s)) => {
-            let code = *string_index
-                .get(s.as_str())
-                .ok_or_else(|| GenerationError::Codec(format!("zone string not interned: {s}")))?;
+            let code = lookup_zone_str(str_map, s.as_str())?;
             Ok((TAG_STRING_CODE, u64::from(code)))
         }
         Some(grafeo_common::types::Value::Float64(f)) => Ok((TAG_FLOAT64, f.to_bits())),

@@ -15,7 +15,6 @@
 //! `ColumnRowNull` companion segments (D0.8.0), written here from the same
 //! stream.
 
-use crate::graph::compact::column::ColumnCodec;
 use crate::graph::compact::generation::emit::column::ColumnEncoder;
 use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::{
@@ -27,6 +26,153 @@ use crate::graph::compact::generation_builder::emit_meta::{CodecKind, w16, w32, 
 use crate::graph::compact::mapped::SegmentKind;
 use crate::graph::compact::zone_map::ZoneMap;
 use grafeo_common::types::Value;
+use grafeo_common::utils::hash::FxHashMap;
+
+/// Sequential reader over the per-column DictValue chunk file.
+///
+/// The orchestrator's remap pre-pass writes one chunk per Dict column (in
+/// `(table_id, prop_key)` ascending order), each chunk holding that column's
+/// distinct `string → global_code` pairs. Chunk layout (LE):
+/// `[tid u16][prop_len u16][prop][count u32]` then
+/// `count × [str_len u32][string][code u32]`; clean EOF (0 bytes) ends the
+/// file.
+///
+/// Only the **current** column's map is ever resident; `map_for` advances
+/// the underlying reader in lockstep with the column-ordered consumer and
+/// fails closed on any order mismatch.
+pub(crate) struct DictChunkReader<'a> {
+    reader: &'a mut dyn std::io::Read,
+    /// Next unconsumed chunk (column + map).
+    pending: Option<(u16, Vec<u8>, FxHashMap<String, u32>)>,
+}
+
+impl<'a> DictChunkReader<'a> {
+    /// Wraps a byte reader positioned at the start of a chunk file.
+    #[must_use]
+    pub(crate) fn new(reader: &'a mut dyn std::io::Read) -> Self {
+        Self {
+            reader,
+            pending: None,
+        }
+    }
+
+    /// Loads the string→code map for `(tid, prop)`, or an empty map when
+    /// that column has no DictValue chunk. Fails closed on chunk/consumer
+    /// order mismatches.
+    ///
+    /// # Errors
+    ///
+    /// Codec or I/O failure.
+    pub(crate) fn map_for(
+        &mut self,
+        tid: u16,
+        prop: &str,
+    ) -> Result<FxHashMap<String, u32>, GenerationError> {
+        let target: (u16, &[u8]) = (tid, prop.as_bytes());
+        if self.pending.is_none() {
+            match self.read_chunk()? {
+                None => return Ok(FxHashMap::default()),
+                Some(chunk) => self.pending = Some(chunk),
+            }
+        }
+        let (ptid, pprop, _) = self.pending.as_ref().expect("just set");
+        match (*ptid, pprop.as_slice()).cmp(&target) {
+            std::cmp::Ordering::Equal => {
+                let (_, _, map) = self.pending.take().expect("checked");
+                Ok(map)
+            }
+            std::cmp::Ordering::Greater => {
+                // The consumer's column has no chunk; keep pending for a
+                // later column.
+                Ok(FxHashMap::default())
+            }
+            std::cmp::Ordering::Less => Err(GenerationError::Codec(format!(
+                "dict chunk order mismatch: chunk for table {ptid} column {} before table {tid} column {prop}",
+                String::from_utf8_lossy(pprop)
+            ))),
+        }
+    }
+
+    /// Fails closed unless every chunk has been consumed (used at the end of
+    /// the column-body pass, which visits every column).
+    ///
+    /// # Errors
+    ///
+    /// Codec or I/O failure.
+    pub(crate) fn verify_drained(&mut self) -> Result<(), GenerationError> {
+        if self.pending.is_some() {
+            return Err(GenerationError::Codec(
+                "dict chunk left unconsumed after column pass".into(),
+            ));
+        }
+        match self.read_chunk()? {
+            None => Ok(()),
+            Some(_) => Err(GenerationError::Codec(
+                "dict chunk left unconsumed after column pass".into(),
+            )),
+        }
+    }
+
+    fn read_chunk(
+        &mut self,
+    ) -> Result<Option<(u16, Vec<u8>, FxHashMap<String, u32>)>, GenerationError> {
+        let mut hdr = [0u8; 4];
+        if !read_full(self.reader, &mut hdr)? {
+            return Ok(None);
+        }
+        let tid = u16::from_le_bytes([hdr[0], hdr[1]]);
+        let prop_len = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+        let mut prop = vec![0u8; prop_len];
+        if !read_full(self.reader, &mut prop)? {
+            return Err(GenerationError::Codec("dict chunk prop truncated".into()));
+        }
+        let mut cnt = [0u8; 4];
+        if !read_full(self.reader, &mut cnt)? {
+            return Err(GenerationError::Codec("dict chunk count truncated".into()));
+        }
+        let count = u32::from_le_bytes(cnt) as usize;
+        let mut map = FxHashMap::default();
+        map.reserve(count.min(1 << 16));
+        for _ in 0..count {
+            let mut slen = [0u8; 4];
+            if !read_full(self.reader, &mut slen)? {
+                return Err(GenerationError::Codec("dict chunk entry truncated".into()));
+            }
+            let sl = u32::from_le_bytes(slen) as usize;
+            let mut s = vec![0u8; sl];
+            if !read_full(self.reader, &mut s)? {
+                return Err(GenerationError::Codec("dict chunk string truncated".into()));
+            }
+            let mut code = [0u8; 4];
+            if !read_full(self.reader, &mut code)? {
+                return Err(GenerationError::Codec("dict chunk code truncated".into()));
+            }
+            let text = std::str::from_utf8(&s)
+                .map_err(|_| GenerationError::Codec("dict chunk string not UTF-8".into()))?;
+            map.insert(text.to_string(), u32::from_le_bytes(code));
+        }
+        Ok(Some((tid, prop, map)))
+    }
+}
+
+/// Reads `buf.len()` bytes, returning `Ok(false)` on a clean EOF at the
+/// start of the buffer and failing closed on a torn read.
+fn read_full(r: &mut dyn std::io::Read, buf: &mut [u8]) -> Result<bool, GenerationError> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => {
+                if filled == 0 {
+                    return Ok(false);
+                }
+                return Err(GenerationError::Codec("dict chunk truncated".into()));
+            }
+            Ok(n) => filled += n,
+            Err(e) => return Err(GenerationError::Io(e.to_string())),
+        }
+    }
+    Ok(true)
+}
 
 /// Decodes one occurrence payload (mirrors column_pass::decode_occ_value).
 fn decode_occ(payload: &[u8]) -> Result<Value, GenerationError> {
@@ -152,18 +298,19 @@ pub struct ColumnEmissionResult {
 /// returning per-column directory data + presence/null records.
 ///
 /// `geometries` must be in the same order the occurrence run yields columns
-/// (`(table_id, prop_key)` ascending). `string_index` resolves Dict global
-/// codes (from the global dictionary pass).
+/// (`(table_id, prop_key)` ascending). `dict_chunks` resolves Dict global
+/// codes per column from the remap-run chunk file (one column's map at a
+/// time, discarded after the column flush).
 ///
 /// # Errors
 ///
 /// Codec, budget, or I/O failure.
 #[allow(clippy::too_many_arguments)]
-pub fn emit_column_bodies(
+pub(crate) fn emit_column_bodies(
     occ_lease: &RunSetLease,
     merger: &mut dyn ExternalRunMerger,
     geometries: &[ColumnGeometry],
-    string_index: &grafeo_common::utils::hash::FxHashMap<String, u32>,
+    dict_chunks: &mut DictChunkReader,
     bodies_sink: &mut dyn SegmentSink,
     budget: &GenerationBudget,
     metrics: &mut GenerationMetrics,
@@ -187,7 +334,8 @@ pub fn emit_column_bodies(
                      row_count: u64,
                      presence: &mut Vec<bool>,
                      null: &mut Vec<bool>,
-                     body_cursor: &mut u64|
+                     body_cursor: &mut u64,
+                     chunks: &mut DictChunkReader|
      -> Result<(), GenerationError> {
         let (Some(g), Some(enc)) = (geo, encoder) else {
             return Ok(());
@@ -196,11 +344,14 @@ pub fn emit_column_bodies(
         let column_index = result.columns.len() as u32;
         let mut string_occ = Vec::new();
         let (codec, _col_type, _zm) = enc.finish(&mut string_occ)?;
+        // Resolve this column's Dict strings from the per-column chunk map
+        // (bounded by the column's distinct strings; discarded after flush).
+        let dict_map = chunks.map_for(g.table_id, &g.key)?;
         // Compute per-block zone maps from the emitted codec (byte-exact with eager).
         let block_zms = crate::graph::compact::zone_map::compute_block_zone_maps(&codec);
         // Serialize the body via production write_column_body.
         let mut body = Vec::new();
-        crate::graph::compact::section_v5::write_column_body(&mut body, &codec, string_index)
+        crate::graph::compact::section_v5::write_column_body(&mut body, &codec, &dict_map)
             .map_err(GenerationError::Codec)?;
         let body_start = *body_cursor;
         bodies_sink.write(&body)?;
@@ -261,6 +412,7 @@ pub fn emit_column_bodies(
                 &mut presence_bits,
                 &mut null_bits,
                 &mut body_cursor,
+                dict_chunks,
             )?;
             current_geo = geo_iter.next();
             let g = current_geo.ok_or_else(|| {
@@ -320,7 +472,10 @@ pub fn emit_column_bodies(
         &mut presence_bits,
         &mut null_bits,
         &mut body_cursor,
+        dict_chunks,
     )?;
+    // Every Dict column's chunk must have been consumed by the flushes.
+    dict_chunks.verify_drained()?;
     Ok(result)
 }
 

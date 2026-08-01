@@ -38,7 +38,7 @@ use crate::graph::compact::generation_builder::column_pass::{
 use crate::graph::compact::generation_builder::csr_pass::{self, RelTableGeometry};
 use crate::graph::compact::generation_builder::edge_pass::{self, RelTableKey};
 use crate::graph::compact::generation_builder::emit_columns::{
-    emit_column_bodies, write_directory_segments,
+    DictChunkReader, emit_column_bodies, write_directory_segments,
 };
 use crate::graph::compact::generation_builder::emit_ids::{
     build_block_zone_maps, build_edge_id_lookup, build_edge_original_ids, build_metadata,
@@ -201,7 +201,7 @@ impl BoundedGenerationBuilder {
             Box::new(self.make_sink(SegmentKind::DictionaryCodeIndex, 8, 16, "codeidx"));
         let mut remap_sink = run_store.sink("remap", &budget)?;
         let mut dict = StreamingDictionary::new(&budget, &mut self.metrics);
-        let (_dict_count, dict_strings) = dict.run(
+        dict.run(
             &str_occ_lease,
             run_store.merger("str-occ")?.as_mut(),
             offsets_sink.as_mut(),
@@ -210,12 +210,32 @@ impl BoundedGenerationBuilder {
             remap_sink.as_mut(),
             self.cancel.as_ref(),
         )?;
-        let _remap_lease = remap_sink.finish()?;
-        let string_index: FxHashMap<String, u32> = dict_strings
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.clone(), i as u32))
-            .collect();
+        let remap_lease = remap_sink.finish()?;
+
+        // ── 4b. Consume the remap run (bounded) ───────────────────────
+        // The dictionary pass re-emitted every string occurrence as a remap
+        // record: key = use_kind || owner_key, payload = (string, code).
+        // One streaming merge builds:
+        //  - the schema-scoped string→code map (labels, prop keys, edge
+        //    types — bounded by schema, NOT by dict values), and
+        //  - a disk-backed per-column chunk file for DictValue strings
+        //    (one chunk per Dict column, read one column at a time by the
+        //    column-body and zone-map passes and discarded).
+        // This replaces the graph-proportional `FxHashMap<String, u32>` over
+        // ALL unique strings (D0.8.3: consume the remap run, never retain it).
+        let chunks_path = self
+            .config
+            .temp_dir
+            .join(format!("{}-dictchunks.bin", self.config.correlation_id));
+        let schema_strings = consume_remap_run(
+            &remap_lease,
+            run_store.merger("remap")?.as_mut(),
+            &budget,
+            &mut self.metrics,
+            self.cancel.as_ref(),
+            &chunks_path,
+        )?;
+        drop(remap_lease);
 
         // ── 5. Column geometry + bodies ──────────────────────────────
         let table_row_count = |tid: u16| table_counts[tid as usize];
@@ -229,11 +249,15 @@ impl BoundedGenerationBuilder {
         )?;
         let mut bodies_sink =
             Box::new(self.make_sink(SegmentKind::ColumnBodies, 1, 0, "colbodies"));
+        let mut chunk_file = std::fs::File::open(&chunks_path).map_err(|e| {
+            GenerationError::Io(format!("open dict chunks {}: {e}", chunks_path.display()))
+        })?;
+        let mut chunk_reader = DictChunkReader::new(&mut chunk_file);
         let col_result = emit_column_bodies(
             &occ_lease,
             run_store.merger("occ")?.as_mut(),
             &geometries,
-            &string_index,
+            &mut chunk_reader,
             bodies_sink.as_mut(),
             &budget,
             &mut self.metrics,
@@ -296,11 +320,12 @@ impl BoundedGenerationBuilder {
             &rel_keys,
             &geometries,
             &col_result,
-            &string_index,
+            &schema_strings,
             &id_index,
             &table_counts,
             &fwd_lease,
             run_store,
+            &chunks_path,
             offsets_sink,
             bytes_sink,
             code_index_sink,
@@ -322,11 +347,12 @@ impl BoundedGenerationBuilder {
         rel_keys: &[RelTableKey],
         geometries: &[ColumnGeometry],
         col_result: &crate::graph::compact::generation_builder::emit_columns::ColumnEmissionResult,
-        string_index: &FxHashMap<String, u32>,
+        schema_strings: &FxHashMap<String, u32>,
         id_index: &MappedNodeIdIndex,
         table_counts: &[u64],
         fwd_lease: &RunSetLease,
         run_store: &mut dyn RunStore,
+        chunks_path: &std::path::Path,
         offsets_sink: Box<dyn SegmentSink>,
         bytes_sink: Box<dyn SegmentSink>,
         code_index_sink: Box<dyn SegmentSink>,
@@ -360,7 +386,7 @@ impl BoundedGenerationBuilder {
             &rel_keys_flat,
             &rel_edge_counts,
             &rel_col_keys,
-            string_index,
+            schema_strings,
             geometries,
             node_schema.total_nodes,
             total_edges,
@@ -405,7 +431,13 @@ impl BoundedGenerationBuilder {
                     })
                     .map(|c| c.column_index)
                     .collect();
-                (rid as u16, k.src_table_id, k.dst_table_id, rel_edge_counts[rid], col_indices)
+                (
+                    rid as u16,
+                    k.src_table_id,
+                    k.dst_table_id,
+                    rel_edge_counts[rid],
+                    col_indices,
+                )
             })
             .collect();
         write_directory_segments(
@@ -418,27 +450,70 @@ impl BoundedGenerationBuilder {
             &mut col_block_index,
         )?;
 
-        // Build ID lookups.
-        let node_lookup = build_node_id_lookup(id_index);
-        let node_orig = build_node_original_ids(id_index, table_counts);
-        let edge_lookup = build_edge_id_lookup(
-            fwd_lease,
-            run_store.merger("fwd-csr")?.as_mut(),
+        // Build ID lookups — streamed into spool sinks (no graph-proportional
+        // resident vectors). Node lookup is index-order (already sorted by
+        // original_id); the other three go through external sorts keyed by
+        // their output order.
+        let mut node_lookup_sink =
+            Box::new(self.make_sink(SegmentKind::NodeIdLookup, 8, 24, "nodeidlk"));
+        build_node_id_lookup(id_index, node_lookup_sink.as_mut())?;
+        let mut node_orig_sink =
+            Box::new(self.make_sink(SegmentKind::NodeOriginalIds, 8, 8, "nodeorig"));
+        build_node_original_ids(
+            id_index,
+            run_store,
             &self.config.budget,
             &mut self.metrics,
             self.cancel.as_ref(),
+            node_orig_sink.as_mut(),
         )?;
-        let edge_orig = build_edge_original_ids(
+        let mut edge_lookup_sink =
+            Box::new(self.make_sink(SegmentKind::EdgeIdLookup, 8, 24, "edgeidlk"));
+        build_edge_id_lookup(
             fwd_lease,
             run_store.merger("fwd-csr")?.as_mut(),
             &self.config.budget,
             &mut self.metrics,
             self.cancel.as_ref(),
+            run_store,
+            edge_lookup_sink.as_mut(),
+        )?;
+        let mut edge_orig_sink =
+            Box::new(self.make_sink(SegmentKind::EdgeOriginalIds, 8, 8, "edgeorig"));
+        build_edge_original_ids(
+            fwd_lease,
+            run_store.merger("fwd-csr")?.as_mut(),
+            &self.config.budget,
+            &mut self.metrics,
+            self.cancel.as_ref(),
+            run_store,
+            edge_orig_sink.as_mut(),
         )?;
 
-        // Build zone maps.
-        let table_zm = build_table_zone_maps(geometries, string_index)?;
-        let block_zm = build_block_zone_maps(&col_result.columns, geometries, string_index)?;
+        // Build zone maps. String bounds resolve through the per-column
+        // DictValue chunk file (schema-scoped key codes come from
+        // `schema_strings`); each builder reads the file sequentially in
+        // column order, one column's map at a time.
+        let table_zm = {
+            let file = std::fs::File::open(chunks_path).map_err(|e| {
+                GenerationError::Io(format!("open dict chunks {}: {e}", chunks_path.display()))
+            })?;
+            let mut buf = std::io::BufReader::new(file);
+            let mut reader = DictChunkReader::new(&mut buf);
+            build_table_zone_maps(geometries, schema_strings, &mut reader)?
+        };
+        let block_zm = {
+            let file = std::fs::File::open(chunks_path).map_err(|e| {
+                GenerationError::Io(format!("open dict chunks {}: {e}", chunks_path.display()))
+            })?;
+            let mut buf = std::io::BufReader::new(file);
+            let mut reader = DictChunkReader::new(&mut buf);
+            build_block_zone_maps(&col_result.columns, geometries, schema_strings, &mut reader)?
+        };
+        // The chunk file is an intermediate; drop it now that every consumer
+        // has finished. Best-effort: the lease's temp-dir cleanup covers
+        // error paths.
+        let _ = std::fs::remove_file(chunks_path);
 
         // Finish all sinks → descriptors.
         let mut descriptors = vec![
@@ -453,7 +528,7 @@ impl BoundedGenerationBuilder {
             pos_sink.finish()?,
         ];
 
-        // Add metadata, directories, ID lookups, zone maps as resident descriptors.
+        // Add metadata, directories, ID lookups, zone maps as descriptors.
         let meta_desc = crate::graph::compact::generation::emit::descriptor::SegmentDescriptor {
             kind: SegmentKind::Metadata,
             encoding_version: 1,
@@ -474,10 +549,6 @@ impl BoundedGenerationBuilder {
         let col_dir_desc = make_resident_desc(SegmentKind::ColumnDirectory, 8, 24, &col_dir);
         let col_block_desc =
             make_resident_desc(SegmentKind::ColumnBlockIndex, 4, 12, &col_block_index);
-        let node_lookup_desc = make_resident_desc(SegmentKind::NodeIdLookup, 8, 24, &node_lookup);
-        let node_orig_desc = make_resident_desc(SegmentKind::NodeOriginalIds, 8, 8, &node_orig);
-        let edge_lookup_desc = make_resident_desc(SegmentKind::EdgeIdLookup, 8, 24, &edge_lookup);
-        let edge_orig_desc = make_resident_desc(SegmentKind::EdgeOriginalIds, 8, 8, &edge_orig);
         let table_zm_desc = make_resident_desc(SegmentKind::TableZoneMaps, 8, 40, &table_zm);
         let block_zm_desc = make_resident_desc(SegmentKind::BlockZoneMaps, 8, 40, &block_zm);
 
@@ -485,10 +556,11 @@ impl BoundedGenerationBuilder {
         descriptors.push(rel_dir_desc);
         descriptors.push(col_dir_desc);
         descriptors.push(col_block_desc);
-        descriptors.push(node_lookup_desc);
-        descriptors.push(node_orig_desc);
-        descriptors.push(edge_lookup_desc);
-        descriptors.push(edge_orig_desc);
+        // ID-lookup segments stream from spool sinks (disk-backed bodies).
+        descriptors.push(node_lookup_sink.finish()?);
+        descriptors.push(node_orig_sink.finish()?);
+        descriptors.push(edge_lookup_sink.finish()?);
+        descriptors.push(edge_orig_sink.finish()?);
         if !table_zm.is_empty() {
             descriptors.push(table_zm_desc);
         }
@@ -570,13 +642,16 @@ fn collect_string_occurrences(
     }
     // Prop keys + string values from the occurrence run.
     merger.merge_all(&occ_lease.handles, budget, metrics, cancel, &mut |rec| {
-        let (_tid, prop, _off) = split_occ_key(&rec.key)?;
+        let (tid, prop, _off) = split_occ_key(&rec.key)?;
         str_occ_sink.push(occurrence_record(
             prop.as_bytes(),
             StringUseKind::PropertyKey,
             &[],
         ))?;
-        // String values.
+        // String values. The DictValue owner_key carries the column
+        // identity (`table_id u16 BE || prop_key`), so the dictionary
+        // pass's remap stream groups each column's strings together for
+        // the per-column chunk map (D0.8.3).
         if !rec.payload.is_empty() && rec.payload[0] == 3 {
             let b = rec
                 .payload
@@ -585,12 +660,179 @@ fn collect_string_occurrences(
             if b.len() >= 4 {
                 let len = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
                 if let Some(s) = b.get(4..4 + len) {
-                    str_occ_sink.push(occurrence_record(s, StringUseKind::DictValue, &[]))?;
+                    let mut owner = Vec::with_capacity(2 + prop.len());
+                    owner.extend_from_slice(&tid.to_be_bytes());
+                    owner.extend_from_slice(prop.as_bytes());
+                    str_occ_sink.push(occurrence_record(s, StringUseKind::DictValue, &owner))?;
                 }
             }
         }
         Ok(())
     })?;
+    Ok(())
+}
+
+/// Consumes the global-dictionary remap run (bounded, D0.8.3).
+///
+/// The dictionary pass re-emitted every string occurrence as a remap record:
+/// key = `use_kind u8 || owner_key`, payload = `str_len u32 LE || string ||
+/// code u32 LE`. One streaming merge produces:
+///
+/// 1. The **schema-scoped** string→code map — labels, property keys, edge
+///    types (and zone strings). Bounded by schema (column count), never by
+///    the number of dictionary values.
+/// 2. A disk-backed **per-column chunk file** for `DictValue` records: one
+///    chunk per column (in `(table_id, prop_key)` order), each chunk holding
+///    that column's distinct `(string, code)` pairs sorted by string. The
+///    column-body and zone-map passes read one chunk at a time in lockstep
+///    with the occurrence run and discard it, so no graph-proportional
+///    string map is ever resident.
+///
+/// Chunk file layout (LE): `[tid u16][prop_len u16][prop][count u32]` then
+/// `count × [str_len u32][string][code u32]`. Clean EOF (0 bytes) terminates.
+///
+/// # Errors
+///
+/// Codec, I/O, or budget failure.
+#[allow(clippy::too_many_arguments)]
+fn consume_remap_run(
+    remap_lease: &RunSetLease,
+    merger: &mut dyn crate::graph::compact::generation::ExternalRunMerger,
+    budget: &GenerationBudget,
+    metrics: &mut GenerationMetrics,
+    cancel: Option<&CancelToken>,
+    chunks_path: &std::path::Path,
+) -> Result<FxHashMap<String, u32>, GenerationError> {
+    use crate::graph::compact::generation::emit::global_dict::StringUseKind;
+    use std::io::Write;
+
+    let mut schema: FxHashMap<String, u32> = FxHashMap::default();
+    let file = std::fs::File::create(chunks_path).map_err(|e| {
+        GenerationError::Io(format!("create dict chunks {}: {e}", chunks_path.display()))
+    })?;
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+
+    // Current chunk accumulation: one column's distinct (string, code) pairs.
+    let mut current_col: Option<(u16, Vec<u8>)> = None;
+    let mut entries: Vec<(Vec<u8>, u32)> = Vec::new();
+
+    merger.merge_all(&remap_lease.handles, budget, metrics, cancel, &mut |rec| {
+        let Some(&kind) = rec.key.first() else {
+            return Err(GenerationError::Codec("empty remap key".into()));
+        };
+        if rec.payload.len() < 8 {
+            return Err(GenerationError::Codec("remap payload too short".into()));
+        }
+        let slen = u32::from_le_bytes(rec.payload[0..4].try_into().unwrap()) as usize;
+        let string = rec
+            .payload
+            .get(4..4 + slen)
+            .ok_or_else(|| GenerationError::Codec("remap string truncated".into()))?;
+        let code_end = 4 + slen;
+        if code_end + 4 != rec.payload.len() {
+            return Err(GenerationError::Codec(
+                "remap payload trailing bytes".into(),
+            ));
+        }
+        let code = u32::from_le_bytes(rec.payload[code_end..code_end + 4].try_into().unwrap());
+
+        match kind {
+            k if k == StringUseKind::DictValue as u8 => {
+                // Column-scoped: owner_key = table_id u16 BE || prop_key.
+                if rec.key.len() < 3 {
+                    return Err(GenerationError::Codec(
+                        "dict remap owner key too short".into(),
+                    ));
+                }
+                let tid = u16::from_be_bytes([rec.key[1], rec.key[2]]);
+                let prop = &rec.key[3..];
+                let is_new_col = current_col
+                    .as_ref()
+                    .is_none_or(|(t, p)| *t != tid || p.as_slice() != prop);
+                if is_new_col {
+                    write_dict_chunk(&mut writer, current_col.as_ref(), &mut entries)?;
+                    current_col = Some((tid, prop.to_vec()));
+                }
+                // Dedup: identical strings are adjacent within a column.
+                if entries.last().map(|(s, _)| s.as_slice()) != Some(string) {
+                    entries.push((string.to_vec(), code));
+                }
+                Ok(())
+            }
+            k if k == StringUseKind::Label as u8
+                || k == StringUseKind::PropertyKey as u8
+                || k == StringUseKind::EdgeType as u8
+                || k == StringUseKind::ZoneString as u8 =>
+            {
+                // Schema-scoped strings only.
+                let s = std::str::from_utf8(string)
+                    .map_err(|_| GenerationError::Codec("remap string not UTF-8".into()))?;
+                schema.insert(s.to_string(), code);
+                Ok(())
+            }
+            other => Err(GenerationError::Codec(format!(
+                "bad remap use_kind {other}"
+            ))),
+        }
+    })?;
+    write_dict_chunk(&mut writer, current_col.as_ref(), &mut entries)?;
+    writer
+        .flush()
+        .map_err(|e| GenerationError::Io(format!("flush dict chunks: {e}")))?;
+    Ok(schema)
+}
+
+/// Serializes one accumulated per-column chunk to the chunk file.
+///
+/// # Errors
+///
+/// I/O or width-overflow failure.
+fn write_dict_chunk(
+    writer: &mut std::io::BufWriter<std::fs::File>,
+    col: Option<&(u16, Vec<u8>)>,
+    entries: &mut Vec<(Vec<u8>, u32)>,
+) -> Result<(), GenerationError> {
+    use std::io::Write;
+    let Some((tid, prop)) = col else {
+        if !entries.is_empty() {
+            return Err(GenerationError::Codec(
+                "dict chunk entries without column".into(),
+            ));
+        }
+        return Ok(());
+    };
+    let prop_len = u16::try_from(prop.len()).map_err(|_| GenerationError::WireWidthOverflow {
+        what: "dict_chunk_prop_len",
+        count: prop.len() as u64,
+        max: u64::from(u16::MAX),
+    })?;
+    let count = u32::try_from(entries.len()).map_err(|_| GenerationError::WireWidthOverflow {
+        what: "dict_chunk_entry_count",
+        count: entries.len() as u64,
+        max: u64::from(u32::MAX),
+    })?;
+    let mut hdr = Vec::with_capacity(4 + prop.len());
+    hdr.extend_from_slice(&tid.to_le_bytes());
+    hdr.extend_from_slice(&prop_len.to_le_bytes());
+    hdr.extend_from_slice(prop);
+    hdr.extend_from_slice(&count.to_le_bytes());
+    writer
+        .write_all(&hdr)
+        .map_err(|e| GenerationError::Io(format!("write dict chunk header: {e}")))?;
+    for (s, code) in entries.drain(..) {
+        let slen = u32::try_from(s.len()).map_err(|_| GenerationError::WireWidthOverflow {
+            what: "dict_chunk_str_len",
+            count: s.len() as u64,
+            max: u64::from(u32::MAX),
+        })?;
+        let mut rec = Vec::with_capacity(4 + s.len() + 4);
+        rec.extend_from_slice(&slen.to_le_bytes());
+        rec.extend_from_slice(&s);
+        rec.extend_from_slice(&code.to_le_bytes());
+        writer
+            .write_all(&rec)
+            .map_err(|e| GenerationError::Io(format!("write dict chunk entry: {e}")))?;
+    }
     Ok(())
 }
 

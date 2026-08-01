@@ -26,9 +26,14 @@
 //!   byte-lexicographic order, matching `serialize_v5` Lexicographic);
 //! - streams `StringOffsets` (with trailing sentinel), `StringBytes`, and one
 //!   `DictionaryCodeIndex` record per code into their sinks;
-//! - re-emits each occurrence as a **remap record** keyed by
-//!   `(use_kind, owner_key, string)` with payload = `global_code u32`, for
-//!   pass-2 column/metadata resolution.
+//! - re-emits each occurrence as a **remap record** with key
+//!   `use_kind || owner_key` and payload `str_len u32 LE || string || code
+//!   u32 LE`, for pass-2 column/metadata resolution.
+//!
+//! For `DictValue` occurrences the owner_key is the column identity
+//! (`table_id u16 BE || prop_key`), so the remap stream is grouped by column
+//! and the column-body pass can resolve each column's strings from a
+//! per-column chunk without any global string map.
 //!
 //! No `Vec<String>`, no complete merged-key vector, no graph-sized string map.
 
@@ -40,7 +45,6 @@ use crate::graph::compact::generation::runs::{
     CancelToken, ExternalRunMerger, RunSetLease, SortRecord,
 };
 use crate::graph::compact::mapped::{CODE_INDEX_RECORD_LEN, SegmentKind};
-
 /// String occurrence use kinds (mirrors emit/dictionary.rs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -123,9 +127,9 @@ impl<'a> StreamingDictionary<'a> {
     ///
     /// `occ_lease` owns the external-sorted occurrence runs. `merger` merges
     /// them. Segment bytes are streamed into the three sinks. Occurrences are
-    /// re-emitted to `remap_sink` as `(use_kind, owner_key, string)→code`
+    /// re-emitted to `remap_sink` as `(use_kind || owner_key) → (string, code)`
     /// records (the caller finishes that sink and owns the remap lease in the
-    /// returned result).
+    /// returned result). Returns the number of unique strings (== next code).
     ///
     /// # Errors
     ///
@@ -139,7 +143,7 @@ impl<'a> StreamingDictionary<'a> {
         code_index_sink: &mut dyn SegmentSink,
         remap_sink: &mut dyn crate::graph::compact::generation::runs::ExternalRunSink,
         cancel: Option<&CancelToken>,
-    ) -> Result<(u64, Vec<String>), GenerationError> {
+    ) -> Result<u64, GenerationError> {
         let mut byte_pos: u64 = 0;
         let mut prev_string: Option<Vec<u8>> = None;
 
@@ -149,50 +153,70 @@ impl<'a> StreamingDictionary<'a> {
             let (use_kind, owner_key) = decode_payload(&rec.payload)?;
 
             // Assign a code on first sight of a new string.
-            let code = if prev_string.as_deref() == Some(string.as_slice()) {
-                dict.current_code
+            let code32 = if prev_string.as_deref() == Some(string.as_slice()) {
+                u32::try_from(dict.current_code).map_err(|_| {
+                    GenerationError::WireWidthOverflow {
+                        what: "global_string_dictionary",
+                        count: dict.current_code,
+                        max: u64::from(u32::MAX),
+                    }
+                })?
             } else {
                 // New unique string: assign next code, stream segments.
                 let code = dict.next_code;
-                u32::try_from(code).map_err(|_| GenerationError::WireWidthOverflow {
-                    what: "global_string_dictionary",
-                    count: code,
-                    max: u64::from(u32::MAX),
+                let code32 =
+                    u32::try_from(code).map_err(|_| GenerationError::WireWidthOverflow {
+                        what: "global_string_dictionary",
+                        count: code,
+                        max: u64::from(u32::MAX),
+                    })?;
+                let slen = u32::try_from(string.len()).map_err(|_| {
+                    GenerationError::WireWidthOverflow {
+                        what: "global_dict_string_len",
+                        count: string.len() as u64,
+                        max: u64::from(u32::MAX),
+                    }
                 })?;
                 offsets_sink.write(&byte_pos.to_le_bytes())?;
                 bytes_sink.write(string)?;
                 // DictionaryCodeIndex record: (offset u64, len u32, code u32).
                 let mut ci = [0u8; CODE_INDEX_RECORD_LEN];
                 ci[0..8].copy_from_slice(&byte_pos.to_le_bytes());
-                ci[8..12].copy_from_slice(&(string.len() as u32).to_le_bytes());
-                ci[12..16].copy_from_slice(&(code as u32).to_le_bytes());
+                ci[8..12].copy_from_slice(&slen.to_le_bytes());
+                ci[12..16].copy_from_slice(&code32.to_le_bytes());
                 code_index_sink.write(&ci)?;
                 byte_pos += string.len() as u64;
                 dict.next_code += 1;
-                dict.current_code = code;
-                dict.strings.push(
-                    std::str::from_utf8(string)
-                        .map_err(|_| GenerationError::Codec("dict string not UTF-8".into()))?
-                        .to_string(),
-                );
+                dict.current_code = u64::from(code32);
                 prev_string = Some(string.clone());
-                code
+                code32
             };
 
-            // Re-emit remap record: key = use_kind || owner_key || string,
-            // payload = code. Sorted later by the caller's remap sink.
-            let mut rkey = Vec::with_capacity(1 + owner_key.len() + string.len());
+            // Re-emit remap record: key = use_kind || owner_key (the
+            // DictValue owner_key carries the column identity, so the
+            // remap stream is grouped by column), payload =
+            // str_len u32 LE || string || code u32 LE. Sorted later by the
+            // caller's remap sink.
+            let slen =
+                u32::try_from(string.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                    what: "remap_string_len",
+                    count: string.len() as u64,
+                    max: u64::from(u32::MAX),
+                })?;
+            let mut rkey = Vec::with_capacity(1 + owner_key.len());
             rkey.push(use_kind as u8);
             rkey.extend_from_slice(owner_key);
-            rkey.extend_from_slice(string);
-            remap_sink.push(SortRecord::new(rkey, (code as u32).to_le_bytes().to_vec()))?;
+            let mut rpayload = Vec::with_capacity(4 + string.len() + 4);
+            rpayload.extend_from_slice(&slen.to_le_bytes());
+            rpayload.extend_from_slice(string);
+            rpayload.extend_from_slice(&code32.to_le_bytes());
+            remap_sink.push(SortRecord::new(rkey, rpayload))?;
             Ok(())
         };
 
         let mut state = DictState {
             next_code: 0,
             current_code: 0,
-            strings: Vec::new(),
         };
         merger.merge_all(
             &occ_lease.handles,
@@ -206,15 +230,13 @@ impl<'a> StreamingDictionary<'a> {
         // StringOffsets trailing sentinel.
         offsets_sink.write(&byte_pos.to_le_bytes())?;
         self.metrics.global_string_count = next_code;
-        Ok((next_code, state.strings))
+        Ok(next_code)
     }
 }
 
 struct DictState {
     next_code: u64,
     current_code: u64,
-    /// Unique strings in lexicographic (code) order.
-    strings: Vec<String>,
 }
 
 /// Finalizes the three dictionary segment sinks into descriptors.
