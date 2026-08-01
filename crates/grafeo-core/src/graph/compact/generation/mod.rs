@@ -30,8 +30,9 @@ pub use input::{
 };
 pub use runs::{
     CancelToken, ExternalRunHandle, ExternalRunMerger, ExternalRunSink, InMemoryRunMerger,
-    InMemoryRunSink, SortRecord, default_merge_fan_in,
+    InMemoryRunSink, InMemoryRunStore, RunStore, SortRecord, default_merge_fan_in,
 };
+pub(crate) use columns::encode_column;
 #[cfg(test)]
 pub use segment_source::assemble_v5_payload_from_source;
 pub use segment_source::{CompactV5SegmentSource, V5Segment, V5SegmentSource};

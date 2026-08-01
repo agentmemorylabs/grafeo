@@ -143,6 +143,25 @@ pub trait ExternalRunMerger {
     fn cleanup(&mut self);
 }
 
+/// Factory for per-sort-domain sinks and mergers (G-EM0.5b Phase 2).
+///
+/// The streaming builder drives every external-sort domain through this seam:
+/// production wires the storage-backed disk implementation; core unit tests
+/// wire [`InMemoryRunStore`]. A fresh sink/merger pair is requested per
+/// domain so concurrent domains hold independent arenas.
+pub trait RunStore {
+    /// Create a sink for one sort domain under the (possibly projected) budget.
+    fn sink(&mut self, domain: &str, budget: &GenerationBudget) -> Box<dyn ExternalRunSink>;
+
+    /// Create a merger for one sort domain.
+    fn merger(&mut self, domain: &str) -> Box<dyn ExternalRunMerger>;
+}
+
+/// Shared run-body registry connecting in-memory sinks to in-memory mergers
+/// (G-EM0.5b Phase 2 core tests). Handle ids map to their run bodies so a
+/// merger can resolve handles produced by any sink sharing the registry.
+pub type InMemoryRegistry = std::rc::Rc<std::cell::RefCell<grafeo_common::utils::hash::FxHashMap<String, Vec<SortRecord>>>>;
+
 /// In-memory sink used by core unit tests and small fixtures.
 #[derive(Debug)]
 pub struct InMemoryRunSink {
@@ -155,6 +174,8 @@ pub struct InMemoryRunSink {
     run_handles: Vec<ExternalRunHandle>,
     next_id: u64,
     finished: bool,
+    domain: Option<String>,
+    registry: Option<InMemoryRegistry>,
 }
 
 impl InMemoryRunSink {
@@ -171,6 +192,8 @@ impl InMemoryRunSink {
             run_handles: Vec::new(),
             next_id: 0,
             finished: false,
+            domain: None,
+            registry: None,
         }
     }
 
@@ -178,6 +201,18 @@ impl InMemoryRunSink {
     #[must_use]
     pub fn with_cancel(mut self, token: CancelToken) -> Self {
         self.cancel = Some(token);
+        self
+    }
+
+    /// Attaches a shared registry and domain prefix (test wiring).
+    ///
+    /// Run handles are named `{domain}-run-{n}` and their bodies are
+    /// registered on flush so an [`InMemoryRunMerger`] sharing the registry
+    /// can resolve them in [`ExternalRunMerger::merge_all`].
+    #[must_use]
+    pub fn with_registry(mut self, registry: InMemoryRegistry, domain: &str) -> Self {
+        self.domain = Some(domain.to_string());
+        self.registry = Some(registry);
         self
     }
 
@@ -204,7 +239,10 @@ impl InMemoryRunSink {
         let byte_len: u64 = run.iter().map(SortRecord::encoded_len).sum();
         self.metrics
             .reserve_temp(byte_len, self.budget.max_temp_bytes)?;
-        let id = format!("mem-run-{}", self.next_id);
+        let id = match &self.domain {
+            Some(d) => format!("{d}-run-{}", self.next_id),
+            None => format!("mem-run-{}", self.next_id),
+        };
         self.next_id += 1;
         let handle = ExternalRunHandle {
             id: id.clone(),
@@ -212,6 +250,9 @@ impl InMemoryRunSink {
             byte_len,
         };
         self.metrics.run_count += 1;
+        if let Some(reg) = &self.registry {
+            reg.borrow_mut().insert(id, run.clone());
+        }
         self.runs.push(run);
         self.run_handles.push(handle);
         self.arena_bytes = 0;
@@ -255,6 +296,9 @@ impl ExternalRunSink for InMemoryRunSink {
     fn cleanup(&mut self) {
         for h in &self.run_handles {
             self.metrics.release_temp(h.byte_len);
+            if let Some(reg) = &self.registry {
+                reg.borrow_mut().remove(&h.id);
+            }
         }
         self.runs.clear();
         self.run_handles.clear();
@@ -268,6 +312,8 @@ impl ExternalRunSink for InMemoryRunSink {
 pub struct InMemoryRunMerger {
     /// Owned intermediate merge outputs pending cleanup.
     intermediate: Vec<Vec<SortRecord>>,
+    /// Shared run-body registry (test wiring).
+    registry: Option<InMemoryRegistry>,
 }
 
 impl InMemoryRunMerger {
@@ -275,6 +321,14 @@ impl InMemoryRunMerger {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attaches a shared run-body registry so [`Self::merge_all`] can resolve
+    /// handles produced by registry-attached [`InMemoryRunSink`]s.
+    #[must_use]
+    pub fn with_registry(mut self, registry: InMemoryRegistry) -> Self {
+        self.registry = Some(registry);
+        self
     }
 }
 
@@ -287,14 +341,85 @@ impl ExternalRunMerger for InMemoryRunMerger {
         cancel: Option<&CancelToken>,
         emit: &mut dyn FnMut(&SortRecord) -> Result<(), GenerationError>,
     ) -> Result<(), GenerationError> {
-        let _ = (runs, budget, metrics, cancel, emit);
-        Err(GenerationError::InvalidInput(
-            "InMemoryRunMerger::merge_all requires merge_records with concrete run bodies".into(),
-        ))
+        let Some(reg) = &self.registry else {
+            let _ = (runs, budget, metrics, cancel, emit);
+            return Err(GenerationError::InvalidInput(
+                "InMemoryRunMerger::merge_all requires merge_records with concrete run bodies"
+                    .into(),
+            ));
+        };
+        let store = reg.borrow();
+        let mut bodies: Vec<Vec<SortRecord>> = Vec::with_capacity(runs.len());
+        for h in runs {
+            let body = store.get(&h.id).ok_or_else(|| {
+                GenerationError::InvalidInput(format!(
+                    "run handle {} not found in shared registry",
+                    h.id
+                ))
+            })?;
+            bodies.push(body.clone());
+        }
+        drop(store);
+        self.merge_records(&bodies, budget, metrics, cancel, emit)
     }
 
     fn cleanup(&mut self) {
         self.intermediate.clear();
+    }
+}
+
+/// In-memory [`RunStore`] for core unit tests and small fixtures.
+///
+/// Sinks and mergers created here share one registry, so the streaming
+/// builder's trait-object pipeline runs end to end without disk I/O.
+#[derive(Debug)]
+pub struct InMemoryRunStore {
+    registry: InMemoryRegistry,
+    cancel: Option<CancelToken>,
+}
+
+impl InMemoryRunStore {
+    /// Fresh store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            registry: std::rc::Rc::new(std::cell::RefCell::new(
+                grafeo_common::utils::hash::FxHashMap::default(),
+            )),
+            cancel: None,
+        }
+    }
+
+    /// Attaches a cancel token propagated to every created sink.
+    #[must_use]
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+}
+
+impl Default for InMemoryRunStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RunStore for InMemoryRunStore {
+    fn sink(&mut self, domain: &str, budget: &GenerationBudget) -> Box<dyn ExternalRunSink> {
+        let mut sink = InMemoryRunSink::new(*budget).with_registry(
+            std::rc::Rc::clone(&self.registry),
+            domain,
+        );
+        if let Some(c) = &self.cancel {
+            sink = sink.with_cancel(c.clone());
+        }
+        Box::new(sink)
+    }
+
+    fn merger(&mut self, _domain: &str) -> Box<dyn ExternalRunMerger> {
+        Box::new(
+            InMemoryRunMerger::new().with_registry(std::rc::Rc::clone(&self.registry)),
+        )
     }
 }
 

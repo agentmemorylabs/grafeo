@@ -49,6 +49,54 @@ impl V5PayloadAssembler {
     /// exceeds `u16::MAX`, or [`GenerationError::Io`] when a spilled body
     /// cannot be read.
     pub fn assemble(&self, descriptors: &[SegmentDescriptor]) -> Result<Vec<u8>, GenerationError> {
+        let len = self.payload_len(descriptors)?;
+        let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(usize::MAX));
+        self.stream_to(descriptors, &mut out)?;
+        Ok(out)
+    }
+
+    /// Computes the exact total payload byte length without materializing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::WireWidthOverflow`] when segment count
+    /// exceeds `u16::MAX`, or [`GenerationError::Io`] when a spilled body
+    /// length cannot be stat'd.
+    pub fn payload_len(&self, descriptors: &[SegmentDescriptor]) -> Result<u64, GenerationError> {
+        if descriptors.len() > usize::from(u16::MAX) {
+            return Err(GenerationError::WireWidthOverflow {
+                what: "segment_count",
+                count: descriptors.len() as u64,
+                max: u64::from(u16::MAX),
+            });
+        }
+        let directory_length = descriptors.len() as u64 * (DIRECTORY_ENTRY_LEN as u64);
+        let data_offset = align_up((HEADER_LEN as u64) + directory_length, 8);
+        let mut cursor = data_offset;
+        for desc in descriptors {
+            let align = u64::from(desc.alignment);
+            let padded_off = align_up(cursor, align);
+            cursor = padded_off + desc.length;
+        }
+        Ok(cursor + 4) // trailing CRC-32
+    }
+
+    /// Streams the assembled payload to `sink` in bounded chunks.
+    ///
+    /// Segment bodies are read through [`SegmentBody::stream`], so spilled
+    /// bodies never become fully resident. The output is byte-identical to
+    /// [`Self::assemble`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::WireWidthOverflow`] when segment count
+    /// exceeds `u16::MAX`, or [`GenerationError::Io`] on body read / sink
+    /// write failure.
+    pub fn stream_to(
+        &self,
+        descriptors: &[SegmentDescriptor],
+        sink: &mut dyn std::io::Write,
+    ) -> Result<(), GenerationError> {
         let segment_count =
             u16::try_from(descriptors.len()).map_err(|_| GenerationError::WireWidthOverflow {
                 what: "segment_count",
@@ -63,13 +111,22 @@ impl V5PayloadAssembler {
 
         // ── Pass 1: compute offsets from descriptor metadata ──────────
         let mut cursor = data_offset;
-        let mut entries: Vec<(u64, u64)> = Vec::with_capacity(descriptors.len()); // (offset, length)
+        let mut entries: Vec<(u64, u64)> = Vec::with_capacity(descriptors.len());
         for desc in descriptors {
             let align = u64::from(desc.alignment);
             let padded_off = align_up(cursor, align);
             entries.push((padded_off, desc.length));
             cursor = padded_off + desc.length;
         }
+
+        // Everything written flows through a CRC hasher so the trailing CRC
+        // covers header + directory + padding + bodies exactly as `assemble`.
+        let mut hasher = crc32fast::Hasher::new();
+        let mut write = |buf: &[u8]| -> Result<(), GenerationError> {
+            hasher.update(buf);
+            sink.write_all(buf)
+                .map_err(|e| GenerationError::Io(format!("assemble stream: {e}")))
+        };
 
         // ── Directory bytes ───────────────────────────────────────────
         let mut dir_bytes = Vec::with_capacity(directory_length as usize);
@@ -90,50 +147,59 @@ impl V5PayloadAssembler {
 
         // ── Header ────────────────────────────────────────────────────
         let flags: u8 = u8::from(self.preserves_ids);
-        let mut out = Vec::new();
-        out.extend_from_slice(&MAGIC);
-        out.push(FORMAT_VERSION_V5);
-        out.push(flags);
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(&MAGIC);
+        header.push(FORMAT_VERSION_V5);
+        header.push(flags);
         #[allow(clippy::cast_possible_truncation)]
-        write_u16(&mut out, HEADER_LEN as u16);
-        write_u16(&mut out, segment_count);
+        write_u16(&mut header, HEADER_LEN as u16);
+        write_u16(&mut header, segment_count);
         #[allow(clippy::cast_possible_truncation)]
-        write_u16(&mut out, DIRECTORY_ENTRY_LEN as u16);
-        write_u32(&mut out, 0); // layout_flags
+        write_u16(&mut header, DIRECTORY_ENTRY_LEN as u16);
+        write_u32(&mut header, 0); // layout_flags
         #[allow(clippy::cast_possible_truncation)]
-        write_u64(&mut out, HEADER_LEN as u64); // directory_offset
-        write_u64(&mut out, directory_length);
-        write_u64(&mut out, data_offset);
-        write_u64(&mut out, self.total_nodes);
-        write_u64(&mut out, self.total_edges);
-        write_u32(&mut out, directory_crc);
-        write_u32(&mut out, 0); // reserved
-        debug_assert_eq!(out.len(), HEADER_LEN);
+        write_u64(&mut header, HEADER_LEN as u64); // directory_offset
+        write_u64(&mut header, directory_length);
+        write_u64(&mut header, data_offset);
+        write_u64(&mut header, self.total_nodes);
+        write_u64(&mut header, self.total_edges);
+        write_u32(&mut header, directory_crc);
+        write_u32(&mut header, 0); // reserved
+        debug_assert_eq!(header.len(), HEADER_LEN);
+        write(&header)?;
 
         // ── Directory + padding ───────────────────────────────────────
-        out.extend_from_slice(&dir_bytes);
+        write(&dir_bytes)?;
         #[allow(clippy::cast_possible_truncation)]
         let target = data_offset as usize;
-        while out.len() < target {
-            out.push(0);
+        let written = HEADER_LEN + dir_bytes.len();
+        if written < target {
+            let zeros = vec![0u8; target - written];
+            write(&zeros)?;
         }
 
         // ── Segment bodies (streamed from resident or spool) ──────────
+        let mut out_len = target;
         for (desc, &(offset, _length)) in descriptors.iter().zip(entries.iter()) {
-            // Alignment padding between segments.
             #[allow(clippy::cast_possible_truncation)]
-            let pad = (offset as usize).saturating_sub(out.len());
-            out.resize(out.len() + pad, 0);
+            let pad = (offset as usize).saturating_sub(out_len);
+            if pad > 0 {
+                let zeros = vec![0u8; pad];
+                write(&zeros)?;
+                out_len += pad;
+            }
             desc.body.stream(&mut |chunk| {
-                out.extend_from_slice(chunk);
+                write(chunk)?;
+                out_len += chunk.len();
                 Ok(())
             })?;
         }
 
-        // ── Trailing CRC ──────────────────────────────────────────────
-        let crc = crc32fast::hash(&out);
-        out.extend_from_slice(&crc.to_le_bytes());
-        Ok(out)
+        // ── Trailing CRC (not covered by the hasher) ──────────────────
+        let crc = hasher.finalize();
+        sink.write_all(&crc.to_le_bytes())
+            .map_err(|e| GenerationError::Io(format!("assemble trailer: {e}")))?;
+        Ok(())
     }
 }
 

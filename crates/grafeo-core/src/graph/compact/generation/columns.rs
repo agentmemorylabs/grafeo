@@ -28,7 +28,7 @@ use grafeo_common::types::Value;
 ///
 /// [`GenerationError::NullValue`], [`GenerationError::UnsupportedValue`], or
 /// [`GenerationError::MixedColumnTypes`].
-pub(super) fn encode_column(
+pub(crate) fn encode_column(
     values: &[Option<&Value>],
     context: &str,
     string_occ: &mut Vec<String>,

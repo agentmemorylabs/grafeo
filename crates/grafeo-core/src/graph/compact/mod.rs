@@ -16,6 +16,9 @@ pub mod csr;
 pub mod deletions_section;
 /// Source-true CompactStore generation on bounded runs (G-EM0.W0-A2).
 pub mod generation;
+/// Streaming bounded generation builder (G-EM0.5b Phase 2).
+#[cfg(feature = "generation-streaming")]
+pub mod generation_builder;
 mod graph_store_impl;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
