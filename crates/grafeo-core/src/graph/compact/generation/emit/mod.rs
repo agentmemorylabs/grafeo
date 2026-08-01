@@ -26,7 +26,16 @@ pub use descriptor::{SegmentBody, SegmentDescriptor};
 pub use dictionary::{BoundedDictionary, DictionaryPassDriver, StringOccurrence, StringUseKind};
 pub use payload_lease::V5PayloadLease;
 pub use segments::emit_canonical_descriptors;
-pub use sink::{MemorySegmentSink, SegmentSink, SpoolSegmentSink};
+pub use sink::{SegmentSink, SpoolSegmentSink};
+// MemorySegmentSink is the legacy/test-only in-memory sink. When
+// `generation-streaming` is on, it is NOT re-exported from the emit
+// module — the bounded builder path must use SpoolSegmentSink. This
+// is the B8 module-visibility seal.
+#[cfg(not(feature = "generation-streaming"))]
+pub use sink::MemorySegmentSink;
+#[cfg(feature = "generation-streaming")]
+#[allow(unused_imports)]
+pub(crate) use sink::MemorySegmentSink;
 
 #[cfg(test)]
 mod tests;

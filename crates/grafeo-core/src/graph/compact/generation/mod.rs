@@ -22,7 +22,16 @@ mod tests;
 pub use budget::{GenerationBudget, GenerationMetrics};
 #[cfg(test)]
 pub use build::generate_v5_payload;
-pub use build::{GeneratedCompact, generate_compact_store};
+// When `generation-streaming` is on, the eager `generate_compact_store` path
+// is sealed: it is not re-exported from the generation module, so external
+// crates (e.g. the engine) cannot reach it. The engine cutover uses the
+// bounded orchestrator instead. The eager path remains available internally
+// for test helpers (golden fixture generation) and when the feature is off.
+#[cfg(not(feature = "generation-streaming"))]
+pub use build::{generate_compact_store, GeneratedCompact};
+#[cfg(feature = "generation-streaming")]
+#[allow(unused_imports)]
+pub(crate) use build::{generate_compact_store, GeneratedCompact};
 pub(crate) use columns::encode_column;
 pub use error::GenerationError;
 pub use input::{
