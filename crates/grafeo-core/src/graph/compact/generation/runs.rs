@@ -248,6 +248,21 @@ pub trait RunStore {
     /// # Errors
     /// Returns [`GenerationError`] when the merger cannot be constructed.
     fn merger(&mut self, domain: &str) -> Result<Box<dyn ExternalRunMerger>, GenerationError>;
+
+    /// Open a completed fixed-width node-ID index file as a checked mapped view
+    /// (D0.8.4).
+    ///
+    /// Production (`DiskRunStore`) must mmap the file and wrap it in
+    /// `Bytes::from_owner` — never copy the index into a resident `Vec`.
+    /// The in-memory test store may load small fixtures via `fs::read`.
+    ///
+    /// # Errors
+    ///
+    /// I/O or index-validation failure.
+    fn map_id_index_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<crate::graph::compact::mapped::MappedNodeIdIndex, GenerationError>;
 }
 
 /// Shared run-body registry connecting in-memory sinks to in-memory mergers
@@ -516,6 +531,17 @@ impl RunStore for InMemoryRunStore {
         Ok(Box::new(
             InMemoryRunMerger::new().with_registry(std::rc::Rc::clone(&self.registry)),
         ))
+    }
+
+    fn map_id_index_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<crate::graph::compact::mapped::MappedNodeIdIndex, GenerationError> {
+        // Test-only path: small fixtures may load the completed file into
+        // heap `Bytes`. Production must use DiskRunStore's mmap path.
+        let bytes = std::fs::read(path)
+            .map_err(|e| GenerationError::Io(format!("read ID index {}: {e}", path.display())))?;
+        crate::graph::compact::mapped::MappedNodeIdIndex::new(bytes::Bytes::from(bytes))
     }
 }
 

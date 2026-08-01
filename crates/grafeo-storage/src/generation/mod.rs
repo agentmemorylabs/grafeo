@@ -39,6 +39,8 @@ pub use metrics::{ExternalSortMetrics, ExternalSortMetricsError, RssAnonSample, 
 pub use records::{FramedRecord, FramedRecordError, MAX_RECORD_BODY_BYTES};
 #[cfg(feature = "generation")]
 pub use run_adapter::DiskRunStore;
+#[cfg(all(feature = "generation", unix))]
+pub use run_adapter::map_node_id_index;
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]

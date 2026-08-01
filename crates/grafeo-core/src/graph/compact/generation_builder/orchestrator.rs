@@ -48,8 +48,8 @@ use crate::graph::compact::generation_builder::emit_ids::{
 use crate::graph::compact::generation_builder::emit_meta::CodecKind;
 use crate::graph::compact::generation_builder::node_pass::{self, NodeSchema};
 use crate::graph::compact::generation_builder::staging;
-use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
 use crate::graph::compact::mapped::SegmentKind;
+use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
 use grafeo_common::utils::hash::FxHashMap;
 use std::path::PathBuf;
 
@@ -146,21 +146,20 @@ impl BoundedGenerationBuilder {
             &mut self.metrics,
         )?;
         let mut occ_sink = run_store.sink("occ", &budget)?;
-        let mut id_index_bytes: Vec<u8> = Vec::new();
+        let mut id_index_sink = run_store.sink("id-index", &budget)?;
         let table_counts = npass.explode_occurrences(
             &mut node_out,
             run_store.merger("node-rows")?.as_mut(),
             occ_sink.as_mut(),
-            &mut id_index_bytes,
+            id_index_sink.as_mut(),
             &mut self.metrics,
         )?;
         let occ_lease = occ_sink.finish()?;
-        // ID-index records were emitted in per-table dense order (label, then
-        // id); the mapped index requires global ascending order by
-        // `original_id`. Sort the fixed-width records (the index is a resident
-        // binary-search structure by design — 18 bytes/row, no per-row map).
-        sort_id_index_records(&mut id_index_bytes)?;
-        let id_index = MappedNodeIdIndex::new(bytes::Bytes::from(id_index_bytes))?;
+        let id_index_lease = id_index_sink.finish()?;
+        // D0.8.4: external-sort ID-index records by original_id, stream the
+        // fixed-width file, then open a read-only mapped view. Never retain a
+        // resident Vec of the index.
+        let id_index = self.materialize_mapped_id_index(run_store, &id_index_lease, &budget)?;
         let node_schema = node_out.schema;
         let membership_runs = node_out.membership_runs.take();
 
@@ -168,7 +167,8 @@ impl BoundedGenerationBuilder {
         let schema_charge = node_schema.labels.iter().map(|s| s.len() as u64 + 8).sum::<u64>()
             + (node_schema.label_to_table_id.len() as u64 * 40) // FxHashMap overhead estimate
             + (node_schema.table_row_counts.len() as u64 * 8);
-        self.metrics.reserve_schema(schema_charge, budget.max_schema_bytes)?;
+        self.metrics
+            .reserve_schema(schema_charge, budget.max_schema_bytes)?;
 
         // ── 2. Edge pass ─────────────────────────────────────────────
         let epass = edge_pass::EdgePass::new(&budget, self.cancel.as_ref());
@@ -181,12 +181,16 @@ impl BoundedGenerationBuilder {
             &mut self.metrics,
             self.cancel.as_ref(),
         )?;
-        
+
         // Charge schema: rel_keys + rel_id_map (edge type schema)
-        let rel_schema_charge = rel_keys.iter().map(|k| k.edge_type.len() as u64 + 16).sum::<u64>()
+        let rel_schema_charge = rel_keys
+            .iter()
+            .map(|k| k.edge_type.len() as u64 + 16)
+            .sum::<u64>()
             + (rel_id_map.len() as u64 * 48); // FxHashMap<RelTableKey, u16> overhead
-        self.metrics.reserve_schema(rel_schema_charge, budget.max_schema_bytes)?;
-        
+        self.metrics
+            .reserve_schema(rel_schema_charge, budget.max_schema_bytes)?;
+
         let rel_id_of = |k: &RelTableKey| rel_id_map.get(k).copied();
         let mut fwd_sink = run_store.sink("fwd-csr", &budget)?;
         epass.resolve_and_stage_forward(
@@ -257,12 +261,16 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
             &chunks_path,
         )?;
-        
+
         // Charge schema: schema_strings (labels, prop keys, edge types — schema-bounded)
-        let schema_strings_charge = schema_strings.iter().map(|(s, _)| s.len() as u64 + 8).sum::<u64>()
+        let schema_strings_charge = schema_strings
+            .iter()
+            .map(|(s, _)| s.len() as u64 + 8)
+            .sum::<u64>()
             + (schema_strings.len() as u64 * 40); // FxHashMap overhead
-        self.metrics.reserve_schema(schema_strings_charge, budget.max_schema_bytes)?;
-        
+        self.metrics
+            .reserve_schema(schema_strings_charge, budget.max_schema_bytes)?;
+
         drop(remap_lease);
 
         // ── 5. Column geometry + bodies ──────────────────────────────
@@ -275,13 +283,17 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
             &table_row_count,
         )?;
-        
+
         // Charge schema: column geometries (schema-bounded metadata)
-        let geo_charge = geometries.iter().map(|g| {
-            g.key.len() as u64 + 64 // key string + ColumnGeometry struct overhead
-        }).sum::<u64>();
-        self.metrics.reserve_schema(geo_charge, budget.max_schema_bytes)?;
-        
+        let geo_charge = geometries
+            .iter()
+            .map(|g| {
+                g.key.len() as u64 + 64 // key string + ColumnGeometry struct overhead
+            })
+            .sum::<u64>();
+        self.metrics
+            .reserve_schema(geo_charge, budget.max_schema_bytes)?;
+
         let mut bodies_sink =
             Box::new(self.make_sink(SegmentKind::ColumnBodies, 1, 0, "colbodies"));
         let mut chunk_file = std::fs::File::open(&chunks_path).map_err(|e| {
@@ -373,6 +385,72 @@ impl BoundedGenerationBuilder {
             pos_sink,
             total_edges,
         )
+    }
+
+    /// External-sort ID-index runs, stream a fixed-width file, mmap/open it
+    /// via [`RunStore::map_id_index_file`], and charge temp + mapped counters.
+    fn materialize_mapped_id_index(
+        &mut self,
+        run_store: &mut dyn RunStore,
+        id_index_lease: &RunSetLease,
+        budget: &GenerationBudget,
+    ) -> Result<MappedNodeIdIndex, GenerationError> {
+        use crate::graph::compact::mapped::id_index::{ID_INDEX_RECORD_LEN, id_index_record_bytes};
+        use std::io::Write;
+
+        let id_index_path = self
+            .config
+            .temp_dir
+            .join(format!("{}-id-index.bin", self.config.correlation_id));
+        let mut file = std::fs::File::create(&id_index_path).map_err(|e| {
+            GenerationError::Io(format!("create ID index {}: {e}", id_index_path.display()))
+        })?;
+        let mut file_len = 0u64;
+        let mut merger = run_store.merger("id-index")?;
+        merger.merge_all(
+            &id_index_lease.handles,
+            budget,
+            &mut self.metrics,
+            self.cancel.as_ref(),
+            &mut |rec| {
+                if rec.key.len() != 8 || rec.payload.len() != 10 {
+                    return Err(GenerationError::Codec(format!(
+                        "id-index record width: key={} payload={}",
+                        rec.key.len(),
+                        rec.payload.len()
+                    )));
+                }
+                let original_id = u64::from_be_bytes(
+                    rec.key[0..8]
+                        .try_into()
+                        .map_err(|_| GenerationError::Codec("id-index key width".into()))?,
+                );
+                let table_id = u16::from_le_bytes(
+                    rec.payload[0..2]
+                        .try_into()
+                        .map_err(|_| GenerationError::Codec("id-index tid width".into()))?,
+                );
+                let dense_offset = u64::from_le_bytes(
+                    rec.payload[2..10]
+                        .try_into()
+                        .map_err(|_| GenerationError::Codec("id-index offset width".into()))?,
+                );
+                let bytes = id_index_record_bytes(original_id, table_id, dense_offset);
+                file.write_all(&bytes)
+                    .map_err(|e| GenerationError::Io(format!("write ID index record: {e}")))?;
+                file_len = file_len.saturating_add(ID_INDEX_RECORD_LEN as u64);
+                Ok(())
+            },
+        )?;
+        file.sync_all()
+            .map_err(|e| GenerationError::Io(format!("sync ID index: {e}")))?;
+        drop(file);
+
+        self.metrics.reserve_temp(file_len, budget.max_temp_bytes)?;
+        let id_index = run_store.map_id_index_file(&id_index_path)?;
+        self.metrics
+            .reserve_mapped(id_index.byte_len() as u64, budget.max_mapped_bytes)?;
+        Ok(id_index)
     }
 
     /// Emission stage: metadata, directories, ID lookups, zone maps, assemble.
@@ -702,17 +780,23 @@ fn collect_string_occurrences(
     }
     // Membership labels (logical labels from multi-label nodes).
     if let Some(membership_lease) = membership_runs {
-        merger.merge_all(&membership_lease.handles, budget, metrics, cancel, &mut |rec| {
-            let labels = staging::decode_labels(&rec.payload)?;
-            for label in labels {
-                str_occ_sink.push(occurrence_record(
-                    label.as_bytes(),
-                    StringUseKind::Label,
-                    &[],
-                ))?;
-            }
-            Ok(())
-        })?;
+        merger.merge_all(
+            &membership_lease.handles,
+            budget,
+            metrics,
+            cancel,
+            &mut |rec| {
+                let labels = staging::decode_labels(&rec.payload)?;
+                for label in labels {
+                    str_occ_sink.push(occurrence_record(
+                        label.as_bytes(),
+                        StringUseKind::Label,
+                        &[],
+                    ))?;
+                }
+                Ok(())
+            },
+        )?;
     }
     // Prop keys + string values from the occurrence run.
     merger.merge_all(&occ_lease.handles, budget, metrics, cancel, &mut |rec| {
@@ -984,42 +1068,4 @@ fn make_resident_desc(
             bytes::Bytes::from(bytes.to_vec()),
         ),
     }
-}
-
-/// Sorts fixed-width ID-index records by `original_id` (the first `u64` of
-/// each 18-byte record, little-endian), returning a new sorted buffer.
-///
-/// The node pass emits records in per-table dense order (sorted by label, then
-/// id within a table); the [`MappedNodeIdIndex`] requires a single global
-/// ascending run over `original_id`. The index is a resident binary-search
-/// structure by design (18 bytes/row), so sorting the record set is bounded by
-/// the index size, not the graph payload.
-///
-/// # Errors
-///
-/// [`GenerationError::Codec`] if the buffer is not a multiple of the record
-/// width.
-fn sort_id_index_records(buf: &mut Vec<u8>) -> Result<(), GenerationError> {
-    use crate::graph::compact::mapped::id_index::{ID_INDEX_RECORD_LEN, write_id_index_record};
-    if !buf.len().is_multiple_of(ID_INDEX_RECORD_LEN) {
-        return Err(GenerationError::Codec(format!(
-            "id index buffer len {} not multiple of {ID_INDEX_RECORD_LEN}",
-            buf.len()
-        )));
-    }
-    // Decode into (original_id, table_id, dense_offset) tuples, sort by id,
-    // and re-serialize. Schema-bounded (one tuple per node).
-    let mut records: Vec<(u64, u16, u64)> = Vec::with_capacity(buf.len() / ID_INDEX_RECORD_LEN);
-    for chunk in buf.chunks_exact(ID_INDEX_RECORD_LEN) {
-        let original_id = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let table_id = u16::from_le_bytes(chunk[8..10].try_into().unwrap());
-        let dense_offset = u64::from_le_bytes(chunk[10..18].try_into().unwrap());
-        records.push((original_id, table_id, dense_offset));
-    }
-    records.sort_unstable_by_key(|&(id, _, _)| id);
-    buf.clear();
-    for (original_id, table_id, dense_offset) in records {
-        write_id_index_record(buf, original_id, table_id, dense_offset);
-    }
-    Ok(())
 }

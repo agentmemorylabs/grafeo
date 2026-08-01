@@ -48,27 +48,49 @@ fn bounded_node_pass_schema_and_geometry() {
     pass.reject_duplicate_ids(&out, id_merger.as_mut(), &mut metrics)
         .expect("no duplicates");
 
-    // Explode occurrences.
+    // Explode occurrences + sortable ID-index runs (D0.8.4).
     let mut occ_sink = store.sink("occ", &b).unwrap();
-    let mut id_index_bytes = Vec::new();
+    let mut id_index_sink = store.sink("id-index", &b).unwrap();
     let mut node_row_merger = store.merger("node-rows").unwrap();
     let counts = pass
         .explode_occurrences(
             &mut out,
             node_row_merger.as_mut(),
             occ_sink.as_mut(),
-            &mut id_index_bytes,
+            id_index_sink.as_mut(),
             &mut metrics,
         )
         .expect("explode");
     assert_eq!(counts, vec![2, 1], "Person has 2 rows, Project 1");
     let occ_lease = occ_sink.finish().expect("occ lease");
+    let id_index_lease = id_index_sink.finish().expect("id-index lease");
 
-    // ID index: resolves original → (table, offset).
-    let id_index = crate::graph::compact::mapped::id_index::MappedNodeIdIndex::new(
-        bytes::Bytes::from(id_index_bytes),
-    )
-    .expect("id index");
+    // Materialize sorted fixed-width file and open via RunStore mapper.
+    use crate::graph::compact::mapped::id_index::{ID_INDEX_RECORD_LEN, id_index_record_bytes};
+    use std::io::Write;
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let id_path = tmp.path().join("id-index.bin");
+    let mut file = std::fs::File::create(&id_path).expect("create");
+    let mut merger = store.merger("id-index").unwrap();
+    merger
+        .merge_all(
+            &id_index_lease.handles,
+            &b,
+            &mut metrics,
+            None,
+            &mut |rec| {
+                let original_id = u64::from_be_bytes(rec.key[0..8].try_into().unwrap());
+                let table_id = u16::from_le_bytes(rec.payload[0..2].try_into().unwrap());
+                let dense_offset = u64::from_le_bytes(rec.payload[2..10].try_into().unwrap());
+                let bytes = id_index_record_bytes(original_id, table_id, dense_offset);
+                file.write_all(&bytes).unwrap();
+                assert_eq!(bytes.len(), ID_INDEX_RECORD_LEN);
+                Ok(())
+            },
+        )
+        .expect("merge id-index");
+    drop(file);
+    let id_index = store.map_id_index_file(&id_path).expect("id index");
     assert_eq!(id_index.lookup(1), Some((0, 0)));
     assert_eq!(id_index.lookup(2), Some((0, 1)));
     assert_eq!(id_index.lookup(100), Some((1, 0)));

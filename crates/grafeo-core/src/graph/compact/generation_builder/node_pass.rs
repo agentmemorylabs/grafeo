@@ -102,7 +102,7 @@ impl<'a> NodePass<'a> {
                 node.id.as_u64().to_be_bytes().to_vec(),
                 Vec::new(),
             ))?;
-            
+
             // Emit membership record for multi-label nodes
             if node.labels.len() > 1 {
                 has_multi_label = true;
@@ -112,7 +112,7 @@ impl<'a> NodePass<'a> {
                     payload,
                 ))?;
             }
-            
+
             count += 1;
         }
 
@@ -202,11 +202,9 @@ impl<'a> NodePass<'a> {
         out: &mut NodePassOutput,
         node_row_merger: &mut dyn ExternalRunMerger,
         occ_sink: &mut dyn ExternalRunSink,
-        id_index_out: &mut Vec<u8>,
+        id_index_sink: &mut dyn ExternalRunSink,
         metrics: &mut GenerationMetrics,
     ) -> Result<Vec<u64>, GenerationError> {
-        use crate::graph::compact::mapped::id_index::write_id_index_record;
-
         let ntables = out.schema.labels.len();
         let mut table_counts = vec![0u64; ntables];
         let label_to_tid = &out.schema.label_to_table_id;
@@ -223,7 +221,15 @@ impl<'a> NodePass<'a> {
                     .ok_or_else(|| GenerationError::Codec(format!("unknown label {label}")))?;
                 let off = table_counts[tid as usize];
                 table_counts[tid as usize] += 1;
-                write_id_index_record(id_index_out, original_id, tid, off);
+                // D0.8.4: emit sortable ID-index records — key = original_id BE
+                // for external sort; payload = table_id LE || dense_offset LE.
+                // Never accumulate into a resident Vec.
+                let mut id_key = Vec::with_capacity(8);
+                id_key.extend_from_slice(&original_id.to_be_bytes());
+                let mut id_payload = Vec::with_capacity(10);
+                id_payload.extend_from_slice(&tid.to_le_bytes());
+                id_payload.extend_from_slice(&off.to_le_bytes());
+                id_index_sink.push(SortRecord::new(id_key, id_payload))?;
 
                 // Explode each property into an occurrence record.
                 let props = staging::decode_properties(&rec.payload)?;

@@ -137,6 +137,23 @@ impl RunStore for DiskRunStore {
             budget: self.budget,
         }))
     }
+
+    fn map_id_index_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<grafeo_core::graph::compact::mapped::MappedNodeIdIndex, GenerationError> {
+        #[cfg(unix)]
+        {
+            map_node_id_index(path)
+        }
+        #[cfg(not(unix))]
+        {
+            let bytes = std::fs::read(path).map_err(|e| {
+                GenerationError::Io(format!("read ID index {}: {e}", path.display()))
+            })?;
+            grafeo_core::graph::compact::mapped::MappedNodeIdIndex::new(bytes::Bytes::from(bytes))
+        }
+    }
 }
 
 /// Adapter sink: pushes core records into a [`DiskRunSink`], then transfers
