@@ -8,6 +8,7 @@
 mod budget;
 mod build;
 mod columns;
+pub mod emit;
 mod error;
 mod input;
 mod runs;
