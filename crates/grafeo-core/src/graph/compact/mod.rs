@@ -598,7 +598,9 @@ impl CompactStore {
     /// payload).
     #[must_use]
     pub(crate) fn has_label_membership(&self) -> bool {
-        self.label_membership.as_ref().is_some_and(|v| !v.is_empty())
+        self.label_membership
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
     }
 
     /// Borrows the installed label-membership view, if any.

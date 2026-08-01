@@ -885,11 +885,18 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
             .transpose()?;
         let presence = presence_bytes
             .as_ref()
-            .map(|b| crate::graph::compact::mapped::RowBitmapView::parse(b, SegmentKind::ColumnRowPresence))
+            .map(|b| {
+                crate::graph::compact::mapped::RowBitmapView::parse(
+                    b,
+                    SegmentKind::ColumnRowPresence,
+                )
+            })
             .transpose()?;
         let null = null_bytes
             .as_ref()
-            .map(|b| crate::graph::compact::mapped::RowBitmapView::parse(b, SegmentKind::ColumnRowNull))
+            .map(|b| {
+                crate::graph::compact::mapped::RowBitmapView::parse(b, SegmentKind::ColumnRowNull)
+            })
             .transpose()?;
         store.set_source_true_companions(membership, presence, null, data_bytes.clone());
     }

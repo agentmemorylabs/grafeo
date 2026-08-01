@@ -28,6 +28,8 @@ pub mod metrics;
 pub mod publication;
 pub mod records;
 pub mod recovery;
+#[cfg(feature = "generation")]
+pub mod run_adapter;
 pub mod snapshot;
 pub mod wal_cursor;
 
@@ -35,6 +37,8 @@ pub use budget::{ExternalSortBudget, GenerationBudget, GenerationBudgetError};
 pub use external_sort::{CancelToken, DiskRunMerger, DiskRunSink, RunHandle, merge_runs_recursive};
 pub use metrics::{ExternalSortMetrics, ExternalSortMetricsError, RssAnonSample, RssAnonSampler};
 pub use records::{FramedRecord, FramedRecordError, MAX_RECORD_BODY_BYTES};
+#[cfg(feature = "generation")]
+pub use run_adapter::DiskRunStore;
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]

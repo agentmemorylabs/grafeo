@@ -21,7 +21,7 @@ use crate::graph::compact::generation::emit::{
 };
 use crate::graph::compact::generation::{
     CancelToken, EdgeRecordSource, ExternalRunHandle, GenerationBudget, GenerationError,
-    GenerationMetrics, NodeRecordSource, RelSchemaDecl, RunStore, SortRecord,
+    GenerationMetrics, NodeRecordSource, RelSchemaDecl, RunSetLease, RunStore, SortRecord,
 };
 use crate::graph::compact::mapped::SegmentKind;
 use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
@@ -131,15 +131,16 @@ impl StreamingGenerationBuilder {
         std::fs::create_dir_all(&self.config.temp_dir)
             .map_err(|e| GenerationError::Io(format!("create temp dir: {e}")))?;
 
-        // Phase A: stage nodes and edges into external runs.
-        let (node_runs, node_schema) = self.stage_nodes(nodes)?;
-        let (edge_runs, edge_schema) = self.stage_edges(edges)?;
+        // Phase A: stage nodes and edges into external runs (RAII leases own
+        // the run storage until consumed; D0.8.1).
+        let (mut node_runs, node_schema) = self.stage_nodes(nodes)?;
+        let (mut edge_runs, edge_schema) = self.stage_edges(edges)?;
 
         // Phase B: merge node runs → assign table ids, dense offsets, build idmap.
-        let node_result = self.merge_nodes(&node_runs, &node_schema)?;
+        let node_result = self.merge_nodes(&node_runs.handles, &node_schema)?;
 
         // Phase C: merge edge runs → resolve endpoints, build CSR.
-        let edge_result = self.merge_edges(&edge_runs, &edge_schema, &node_result)?;
+        let edge_result = self.merge_edges(&edge_runs.handles, &edge_schema, &node_result)?;
 
         // Phase D: external dictionary pass.
         let dict_result = self.build_dictionary(&node_result, &edge_result)?;
@@ -155,9 +156,11 @@ impl StreamingGenerationBuilder {
         );
         let payload = assembler.assemble(&descriptors)?;
 
-        // Cleanup temp files.
-        self.cleanup_runs(&node_runs);
-        self.cleanup_runs(&edge_runs);
+        // Runs fully consumed; disarm lease cleanup (success path) and drop.
+        node_runs.disarm();
+        edge_runs.disarm();
+        drop(node_runs);
+        drop(edge_runs);
 
         Ok(StreamingGenerationOutput {
             payload,
@@ -173,8 +176,8 @@ impl StreamingGenerationBuilder {
     fn stage_nodes(
         &mut self,
         nodes: &mut dyn NodeRecordSource,
-    ) -> Result<(Vec<ExternalRunHandle>, NodeSchema), GenerationError> {
-        let mut sink = self.run_store.sink("nodes", &self.config.budget);
+    ) -> Result<(RunSetLease, NodeSchema), GenerationError> {
+        let mut sink = self.run_store.sink("nodes", &self.config.budget)?;
         let mut labels: FxHashSet<String> = FxHashSet::default();
         let mut count = 0u64;
 
@@ -189,12 +192,12 @@ impl StreamingGenerationBuilder {
             count += 1;
         }
 
-        let runs = sink.finish()?;
+        let lease = sink.finish()?;
         let mut label_vec: Vec<String> = labels.into_iter().collect();
         label_vec.sort();
 
         Ok((
-            runs,
+            lease,
             NodeSchema {
                 labels: label_vec,
                 node_count: count,
@@ -205,8 +208,8 @@ impl StreamingGenerationBuilder {
     fn stage_edges(
         &mut self,
         edges: &mut dyn EdgeRecordSource,
-    ) -> Result<(Vec<ExternalRunHandle>, EdgeSchema), GenerationError> {
-        let mut sink = self.run_store.sink("edges", &self.config.budget);
+    ) -> Result<(RunSetLease, EdgeSchema), GenerationError> {
+        let mut sink = self.run_store.sink("edges", &self.config.budget)?;
         let mut edge_types: FxHashSet<String> = FxHashSet::default();
         let mut count = 0u64;
 
@@ -221,12 +224,12 @@ impl StreamingGenerationBuilder {
             count += 1;
         }
 
-        let runs = sink.finish()?;
+        let lease = sink.finish()?;
         let mut type_vec: Vec<String> = edge_types.into_iter().collect();
         type_vec.sort();
 
         Ok((
-            runs,
+            lease,
             EdgeSchema {
                 edge_types: type_vec,
                 edge_count: count,
@@ -241,7 +244,7 @@ impl StreamingGenerationBuilder {
         runs: &[ExternalRunHandle],
         schema: &NodeSchema,
     ) -> Result<NodeMergeResult, GenerationError> {
-        let mut merger = self.run_store.merger("nodes");
+        let mut merger = self.run_store.merger("nodes")?;
         let mut nodes_by_label: FxHashMap<String, Vec<StagedNodeRow>> = FxHashMap::default();
         let mut seen_ids: FxHashSet<u64> = FxHashSet::default();
 
@@ -315,7 +318,7 @@ impl StreamingGenerationBuilder {
         schema: &EdgeSchema,
         node_result: &NodeMergeResult,
     ) -> Result<EdgeMergeResult, GenerationError> {
-        let mut merger = self.run_store.merger("edges");
+        let mut merger = self.run_store.merger("edges")?;
         let mut edges_by_type: FxHashMap<String, Vec<StagedEdgeRow>> = FxHashMap::default();
         let mut seen_ids: FxHashSet<u64> = FxHashSet::default();
 
@@ -1342,12 +1345,6 @@ impl StreamingGenerationBuilder {
         }
 
         Ok((table_seg, block_seg))
-    }
-
-    fn cleanup_runs(&mut self, runs: &[ExternalRunHandle]) {
-        // In-memory runs are cleaned up by the run store.
-        // Disk runs would be cleaned up here.
-        let _ = runs;
     }
 }
 

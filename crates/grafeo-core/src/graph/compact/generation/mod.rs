@@ -31,7 +31,7 @@ pub use input::{
 };
 pub use runs::{
     CancelToken, ExternalRunHandle, ExternalRunMerger, ExternalRunSink, InMemoryRunMerger,
-    InMemoryRunSink, InMemoryRunStore, RunStore, SortRecord, default_merge_fan_in,
+    InMemoryRunSink, InMemoryRunStore, RunSetLease, RunStore, SortRecord, default_merge_fan_in,
 };
 #[cfg(test)]
 pub use segment_source::assemble_v5_payload_from_source;

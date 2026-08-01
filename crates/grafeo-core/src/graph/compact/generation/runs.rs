@@ -108,19 +108,98 @@ pub trait ExternalRunSink {
     /// Append one record into the current sort arena.
     ///
     /// # Errors
-    ///
     /// Budget, cancel, or I/O failures.
     fn push(&mut self, record: SortRecord) -> Result<(), GenerationError>;
 
-    /// Flush remaining arena as a final run (if non-empty).
+    /// Flush remaining arena as a final run (if non-empty) and return the
+    /// RAII run-set lease owning every flushed run's storage.
+    ///
+    /// The lease keeps the runs alive (disk files are not deleted) until the
+    /// caller explicitly consumes them via the merger and drops the lease.
+    /// This is the D0.8.1 repair: a disk-backed sink deletes its files on
+    /// `Drop`, so `finish` must transfer ownership into a lease rather than
+    /// returning bare handles whose storage vanishes with the sink.
     ///
     /// # Errors
-    ///
     /// Budget, cancel, or I/O failures.
-    fn finish(&mut self) -> Result<Vec<ExternalRunHandle>, GenerationError>;
+    fn finish(&mut self) -> Result<RunSetLease, GenerationError>;
 
     /// Drop all unpublished runs for this sink (idempotent).
     fn cleanup(&mut self);
+}
+
+/// RAII ownership over one sort domain's flushed runs (G-EM0.5b D0.8.1).
+///
+/// Owns the run storage (files or buffers) until the runs are fully consumed
+/// by a merger and the lease is dropped. On drop it cleans up every run it
+/// still owns — on success, error, cancellation, unwind, or abandon.
+///
+/// The in-memory implementation is a no-op guard (run bodies live in the
+/// shared registry). The storage implementation owns the live `DiskRunSink`
+/// and deletes files on drop.
+pub struct RunSetLease {
+    /// Opaque handles to the runs in creation order.
+    pub handles: Vec<ExternalRunHandle>,
+    /// Cleanup closure invoked once on drop. `None` after explicit disarm.
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for RunSetLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunSetLease")
+            .field("handles", &self.handles)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunSetLease {
+    /// A lease with no cleanup responsibility (in-memory runs).
+    #[must_use]
+    pub fn in_memory(handles: Vec<ExternalRunHandle>) -> Self {
+        Self {
+            handles,
+            on_drop: None,
+        }
+    }
+
+    /// A lease that runs `cleanup` on drop.
+    #[must_use]
+    pub fn with_cleanup(
+        handles: Vec<ExternalRunHandle>,
+        cleanup: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            handles,
+            on_drop: Some(Box::new(cleanup)),
+        }
+    }
+
+    /// Number of runs owned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// True when no runs are owned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    /// Disarm the drop cleanup, transferring responsibility to the caller.
+    /// Used on the success path after the runs are fully consumed and the
+    /// caller has taken over their lifecycle.
+    pub fn disarm(&mut self) {
+        self.on_drop = None;
+    }
+}
+
+impl Drop for RunSetLease {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.on_drop.take() {
+            cleanup();
+        }
+    }
 }
 
 /// Merger that performs recursive fan-in k-way merge.
@@ -128,7 +207,6 @@ pub trait ExternalRunMerger {
     /// Merge `runs` into a single sorted stream invoking `emit` per record.
     ///
     /// # Errors
-    ///
     /// Budget, cancel, I/O, or emit failures.
     fn merge_all(
         &mut self,
@@ -149,12 +227,27 @@ pub trait ExternalRunMerger {
 /// production wires the storage-backed disk implementation; core unit tests
 /// wire [`InMemoryRunStore`]. A fresh sink/merger pair is requested per
 /// domain so concurrent domains hold independent arenas.
+///
+/// D0.8.1: both factories are **fallible** — a disk-backed store can fail to
+/// create its job directory or validate its budget before any record is
+/// pushed, and that failure must surface as a typed error, not a panic.
 pub trait RunStore {
     /// Create a sink for one sort domain under the (possibly projected) budget.
-    fn sink(&mut self, domain: &str, budget: &GenerationBudget) -> Box<dyn ExternalRunSink>;
+    ///
+    /// # Errors
+    /// Returns [`GenerationError`] when the sink cannot be constructed (I/O,
+    /// budget validation).
+    fn sink(
+        &mut self,
+        domain: &str,
+        budget: &GenerationBudget,
+    ) -> Result<Box<dyn ExternalRunSink>, GenerationError>;
 
     /// Create a merger for one sort domain.
-    fn merger(&mut self, domain: &str) -> Box<dyn ExternalRunMerger>;
+    ///
+    /// # Errors
+    /// Returns [`GenerationError`] when the merger cannot be constructed.
+    fn merger(&mut self, domain: &str) -> Result<Box<dyn ExternalRunMerger>, GenerationError>;
 }
 
 /// Shared run-body registry connecting in-memory sinks to in-memory mergers
@@ -287,11 +380,11 @@ impl ExternalRunSink for InMemoryRunSink {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<ExternalRunHandle>, GenerationError> {
+    fn finish(&mut self) -> Result<RunSetLease, GenerationError> {
         self.check_cancel()?;
         self.flush_run()?;
         self.finished = true;
-        Ok(self.run_handles.clone())
+        Ok(RunSetLease::in_memory(self.run_handles.clone()))
     }
 
     fn cleanup(&mut self) {
@@ -406,17 +499,23 @@ impl Default for InMemoryRunStore {
 }
 
 impl RunStore for InMemoryRunStore {
-    fn sink(&mut self, domain: &str, budget: &GenerationBudget) -> Box<dyn ExternalRunSink> {
+    fn sink(
+        &mut self,
+        domain: &str,
+        budget: &GenerationBudget,
+    ) -> Result<Box<dyn ExternalRunSink>, GenerationError> {
         let mut sink =
             InMemoryRunSink::new(*budget).with_registry(std::rc::Rc::clone(&self.registry), domain);
         if let Some(c) = &self.cancel {
             sink = sink.with_cancel(c.clone());
         }
-        Box::new(sink)
+        Ok(Box::new(sink))
     }
 
-    fn merger(&mut self, _domain: &str) -> Box<dyn ExternalRunMerger> {
-        Box::new(InMemoryRunMerger::new().with_registry(std::rc::Rc::clone(&self.registry)))
+    fn merger(&mut self, _domain: &str) -> Result<Box<dyn ExternalRunMerger>, GenerationError> {
+        Ok(Box::new(
+            InMemoryRunMerger::new().with_registry(std::rc::Rc::clone(&self.registry)),
+        ))
     }
 }
 

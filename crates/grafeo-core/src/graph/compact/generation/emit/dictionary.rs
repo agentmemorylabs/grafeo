@@ -208,12 +208,12 @@ impl DictionaryPassDriver {
             }
             sink.push(occ.to_sort_record())?;
         }
-        let runs = sink.finish()?;
+        let mut lease = sink.finish()?;
 
         // ── Pass 1: merge, dedup, assign codes ────────────────────────
         let mut sorted_keys: Vec<Vec<u8>> = Vec::new();
         merger.merge_all(
-            &runs,
+            &lease.handles,
             &self.budget,
             &mut self.metrics,
             self.cancel.as_ref(),
@@ -253,7 +253,9 @@ impl DictionaryPassDriver {
 
         self.metrics.global_string_count = unique_strings.len() as u64;
 
-        // Cleanup sink temp data.
+        // Runs fully consumed; disarm the lease (in-memory runs are no-ops)
+        // and clean up sink/merger temp state.
+        lease.disarm();
         sink.cleanup();
         merger.cleanup();
 
