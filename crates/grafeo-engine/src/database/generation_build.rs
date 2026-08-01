@@ -17,9 +17,13 @@ use grafeo_core::graph::Direction;
 use grafeo_core::graph::GraphStore;
 #[cfg(not(feature = "generation-streaming"))]
 use grafeo_core::graph::compact::generation::generate_compact_store;
+#[cfg(not(feature = "generation-streaming"))]
 use grafeo_core::graph::compact::generation::{
-    EdgeRecordSource, GenerationBudget, GenerationEdge, GenerationError, GenerationNode,
-    NodeRecordSource, OriginalEdgeId, OriginalNodeId, RelSchemaDecl,
+    EdgeRecordSource, NodeRecordSource,
+};
+use grafeo_core::graph::compact::generation::{
+    GenerationBudget, GenerationEdge, GenerationError, GenerationNode,
+    OriginalEdgeId, OriginalNodeId, RelSchemaDecl,
 };
 #[cfg(not(feature = "generation-streaming"))]
 use grafeo_storage::file::generation_writer::CompactStoreSectionSource;
@@ -70,16 +74,18 @@ pub struct PublishedGenerationDescriptor {
     pub generation_id: String,
 }
 
-/// Frozen ID snapshot used by streaming live record sources.
+/// Frozen ID snapshot used by streaming live record sources (feature-off path).
 ///
 /// Holds only identity keys (not `GenerationNode` / `GenerationEdge` payloads).
 /// Payloads are loaded one-at-a-time in `next_*`.
+#[cfg(not(feature = "generation-streaming"))]
 struct FrozenLiveGraph {
     store: Arc<dyn GraphStore>,
     node_ids: Vec<NodeId>,
     edge_ids: Vec<EdgeId>,
 }
 
+#[cfg(not(feature = "generation-streaming"))]
 impl FrozenLiveGraph {
     fn freeze(store: Arc<dyn GraphStore>) -> Self {
         let node_ids = store.node_ids();
@@ -99,12 +105,14 @@ impl FrozenLiveGraph {
     }
 }
 
-/// Streams nodes from a frozen live-graph snapshot.
+/// Streams nodes from a frozen live-graph snapshot (feature-off path).
+#[cfg(not(feature = "generation-streaming"))]
 struct LiveNodeRecordSource {
     graph: Arc<FrozenLiveGraph>,
     cursor: usize,
 }
 
+#[cfg(not(feature = "generation-streaming"))]
 impl NodeRecordSource for LiveNodeRecordSource {
     fn next_node(&mut self) -> std::result::Result<Option<GenerationNode>, GenerationError> {
         while self.cursor < self.graph.node_ids.len() {
@@ -138,12 +146,14 @@ impl NodeRecordSource for LiveNodeRecordSource {
     }
 }
 
-/// Streams edges from a frozen live-graph snapshot.
+/// Streams edges from a frozen live-graph snapshot (feature-off path).
+#[cfg(not(feature = "generation-streaming"))]
 struct LiveEdgeRecordSource {
     graph: Arc<FrozenLiveGraph>,
     cursor: usize,
 }
 
+#[cfg(not(feature = "generation-streaming"))]
 impl EdgeRecordSource for LiveEdgeRecordSource {
     fn next_edge(&mut self) -> std::result::Result<Option<GenerationEdge>, GenerationError> {
         while self.cursor < self.graph.edge_ids.len() {
@@ -274,11 +284,19 @@ impl GrafeoDB {
         let wal = WalManager::open(&wal_dir)?;
 
         let store = self.live_graph_store()?;
+        #[cfg(feature = "generation-streaming")]
+        let mut live_sources =
+            grafeo_core::graph::compact::generation_builder::live_graph_sources(Arc::clone(
+                &store,
+            ));
+        #[cfg(not(feature = "generation-streaming"))]
         let frozen = Arc::new(FrozenLiveGraph::freeze(store));
+        #[cfg(not(feature = "generation-streaming"))]
         let mut nodes = LiveNodeRecordSource {
             graph: Arc::clone(&frozen),
             cursor: 0,
         };
+        #[cfg(not(feature = "generation-streaming"))]
         let mut edges = LiveEdgeRecordSource {
             graph: Arc::clone(&frozen),
             cursor: 0,
@@ -318,7 +336,11 @@ impl GrafeoDB {
             .map_err(map_generation_error)?;
             let mut builder = BoundedGenerationBuilder::new(config);
             let lease = builder
-                .build(&mut nodes, &mut edges, &mut run_store)
+                .build(
+                    live_sources.nodes.as_mut(),
+                    live_sources.edges.as_mut(),
+                    &mut run_store,
+                )
                 .map_err(map_generation_error)?;
             let node_count = lease.total_nodes();
             let edge_count = lease.total_edges();
