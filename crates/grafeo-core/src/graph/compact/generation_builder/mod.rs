@@ -10,6 +10,7 @@
 
 pub mod builder;
 pub mod column_pass;
+pub mod csr_pass;
 pub mod edge_pass;
 pub mod freeze;
 pub mod node_pass;
@@ -21,6 +22,8 @@ pub use freeze::{
     MergedEdgeSource, MergedNodeSource,
 };
 
+#[cfg(test)]
+mod csr_tests;
 #[cfg(test)]
 mod pipeline_tests;
 #[cfg(test)]
