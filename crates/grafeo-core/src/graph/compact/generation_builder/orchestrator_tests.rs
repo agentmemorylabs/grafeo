@@ -23,6 +23,7 @@ fn config(temp: &std::path::Path) -> BoundedBuildConfig {
         temp_dir: temp.to_path_buf(),
         correlation_id: "test".into(),
         spool_buf_cap: 64 * 1024,
+        rel_schemas: Vec::new(),
     }
 }
 
@@ -217,6 +218,7 @@ fn raii_cleanup_on_success() {
         temp_dir: build_tmp.clone(),
         correlation_id: "raii-success".into(),
         spool_buf_cap: 64 * 1024,
+        rel_schemas: Vec::new(),
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder
@@ -250,6 +252,7 @@ fn raii_cleanup_on_drop_without_stream() {
         temp_dir: build_tmp.clone(),
         correlation_id: "raii-nostream".into(),
         spool_buf_cap: 64 * 1024,
+        rel_schemas: Vec::new(),
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let lease = builder

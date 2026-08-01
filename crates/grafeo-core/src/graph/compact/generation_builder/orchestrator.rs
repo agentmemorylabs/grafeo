@@ -30,7 +30,7 @@ use crate::graph::compact::generation::emit::payload_lease::V5PayloadLease;
 use crate::graph::compact::generation::emit::sink::{SegmentSink, SpoolSegmentSink};
 use crate::graph::compact::generation::{
     CancelToken, EdgeRecordSource, GenerationBudget, GenerationError, GenerationMetrics,
-    NodeRecordSource, RunSetLease, RunStore,
+    NodeRecordSource, RelSchemaDecl, RunSetLease, RunStore,
 };
 use crate::graph::compact::generation_builder::column_pass::{
     ColumnGeometry, compute_column_geometries,
@@ -63,6 +63,11 @@ pub struct BoundedBuildConfig {
     pub correlation_id: String,
     /// In-memory cap per spool sink before spilling.
     pub spool_buf_cap: usize,
+    /// Optional relationship schema declarations for endpoint table validation
+    /// (B9). When non-empty, each edge's src/dst table labels are checked
+    /// against the declared src_label/dst_label. Schema-bounded (not
+    /// graph-proportional).
+    pub rel_schemas: Vec<RelSchemaDecl>,
 }
 
 /// The bounded orchestrator. Drives one full build.
@@ -177,6 +182,8 @@ impl BoundedGenerationBuilder {
             &rel_id_of,
             fwd_sink.as_mut(),
             &mut self.metrics,
+            &node_schema.labels,
+            &self.config.rel_schemas,
         )?;
         let fwd_lease = fwd_sink.finish()?;
 

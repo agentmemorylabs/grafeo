@@ -303,6 +303,7 @@ impl GrafeoDB {
                 correlation_id: request.generation_id.clone(),
                 spool_buf_cap: usize::try_from(request.budget.io_buffer_bytes)
                     .unwrap_or(1024 * 1024),
+                rel_schemas: request.rel_schemas.clone(),
             };
             let mut run_store = DiskRunStore::new(
                 root.join("build-runs"),

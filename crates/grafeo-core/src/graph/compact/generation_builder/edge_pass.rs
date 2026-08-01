@@ -98,9 +98,13 @@ impl<'a> EdgePass<'a> {
     /// `rel_id_of` maps a [`RelTableKey`] to its assigned rel table id
     /// (schema-bounded, built from the rel-key run).
     ///
+    /// When `rel_decls` is non-empty, each edge's src/dst table labels are
+    /// validated against the declared `src_label`/`dst_label` (B9).
+    ///
     /// # Errors
     ///
-    /// [`GenerationError::MissingEndpoint`], schema, budget, or I/O failure.
+    /// [`GenerationError::MissingEndpoint`], [`GenerationError::WrongTableEndpoint`],
+    /// schema, budget, or I/O failure.
     pub fn resolve_and_stage_forward(
         &self,
         edge_rows: &RunSetLease,
@@ -109,7 +113,15 @@ impl<'a> EdgePass<'a> {
         rel_id_of: &dyn Fn(&RelTableKey) -> Option<u16>,
         fwd_sink: &mut dyn ExternalRunSink,
         metrics: &mut GenerationMetrics,
+        labels: &[String],
+        rel_decls: &[crate::graph::compact::generation::RelSchemaDecl],
     ) -> Result<u64, GenerationError> {
+        // Build schema-bounded edge_type → (src_label, dst_label) map.
+        use grafeo_common::utils::hash::FxHashMap;
+        let decl_map: FxHashMap<String, (String, String)> = rel_decls
+            .iter()
+            .map(|d| (d.edge_type.clone(), (d.src_label.clone(), d.dst_label.clone())))
+            .collect();
         let mut total = 0u64;
         edge_merger.merge_all(
             &edge_rows.handles,
@@ -135,6 +147,29 @@ impl<'a> EdgePass<'a> {
                             node_id: dst,
                             is_source: false,
                         })?;
+                // B9: validate endpoints against RelSchemaDecl if declared.
+                if let Some((exp_src, exp_dst)) = decl_map.get(edge_type) {
+                    let actual_src = labels.get(src_tid as usize).map(String::as_str).unwrap_or("");
+                    let actual_dst = labels.get(dst_tid as usize).map(String::as_str).unwrap_or("");
+                    if actual_src != exp_src.as_str() {
+                        return Err(GenerationError::WrongTableEndpoint {
+                            edge_id: original_id,
+                            node_id: src,
+                            expected_table: src_tid,
+                            actual_table: src_tid,
+                            is_source: true,
+                        });
+                    }
+                    if actual_dst != exp_dst.as_str() {
+                        return Err(GenerationError::WrongTableEndpoint {
+                            edge_id: original_id,
+                            node_id: dst,
+                            expected_table: dst_tid,
+                            actual_table: dst_tid,
+                            is_source: false,
+                        });
+                    }
+                }
                 let key = RelTableKey {
                     edge_type: edge_type.to_string(),
                     src_table_id: src_tid,
