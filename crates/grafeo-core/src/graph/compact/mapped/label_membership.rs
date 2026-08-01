@@ -118,9 +118,13 @@ pub fn write_membership_segment(
 }
 
 /// A checked read view over the membership segment body.
+///
+/// Retains the mapped [`Bytes`] and yields per-node label codes via binary
+/// search over the fixed-width records — no `Vec<LabelMembership>` copy.
 #[derive(Debug, Clone)]
 pub struct LabelMembershipView {
-    records: Vec<LabelMembership>,
+    bytes: Bytes,
+    count: usize,
 }
 
 impl LabelMembershipView {
@@ -139,19 +143,19 @@ impl LabelMembershipView {
             ));
         }
         let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        let body = &bytes[MEMBERSHIP_HEADER_LEN..];
-        if body.len() != count * MEMBERSHIP_RECORD_LEN {
+        let body_len = bytes.len() - MEMBERSHIP_HEADER_LEN;
+        if body_len != count * MEMBERSHIP_RECORD_LEN {
             return Err(format!(
-                "{:?} body length {} != record_count {count} x {MEMBERSHIP_RECORD_LEN}",
+                "{:?} body length {body_len} != record_count {count} x {MEMBERSHIP_RECORD_LEN}",
                 SegmentKind::NodeLabelMembership,
-                body.len()
             ));
         }
-        let mut records = Vec::with_capacity(count);
+        // Validate ascending order without copying.
         let mut prev: Option<LabelMembership> = None;
         for i in 0..count {
+            let start = MEMBERSHIP_HEADER_LEN + i * MEMBERSHIP_RECORD_LEN;
             let rec = LabelMembership::from_bytes(
-                &body[i * MEMBERSHIP_RECORD_LEN..(i + 1) * MEMBERSHIP_RECORD_LEN],
+                &bytes[start..start + MEMBERSHIP_RECORD_LEN],
             )
             .ok_or_else(|| {
                 format!(
@@ -168,42 +172,86 @@ impl LabelMembershipView {
                 }
             }
             prev = Some(rec);
-            records.push(rec);
         }
-        Ok(Self { records })
+        Ok(Self {
+            bytes: bytes.clone(),
+            count,
+        })
     }
 
     /// Returns `true` when there are no extra memberships.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.count == 0
     }
 
     /// Returns all logical label codes for one physical node row, ascending.
     #[must_use]
     pub fn labels_of(&self, node_table_id: u16, node_offset: u32) -> Vec<u32> {
-        self.records
-            .iter()
-            .filter(|m| m.node_table_id == node_table_id && m.node_offset == node_offset)
-            .map(|m| m.label_code)
-            .collect()
+        // Binary search for the first record matching (node_table_id, node_offset).
+        // Records are sorted by (node_table_id, node_offset, label_code).
+        let mut out = Vec::new();
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let rec = self.record_at(mid);
+            let cmp = (rec.node_table_id, rec.node_offset).cmp(&(node_table_id, node_offset));
+            match cmp {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    // Found a match; scan left to find the first, then collect right.
+                    let mut start = mid;
+                    while start > 0 {
+                        let prev = self.record_at(start - 1);
+                        if (prev.node_table_id, prev.node_offset) == (node_table_id, node_offset) {
+                            start -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let mut i = start;
+                    while i < self.count {
+                        let rec = self.record_at(i);
+                        if (rec.node_table_id, rec.node_offset) != (node_table_id, node_offset) {
+                            break;
+                        }
+                        out.push(rec.label_code);
+                        i += 1;
+                    }
+                    return out;
+                }
+            }
+        }
+        out
     }
 
     /// Returns all physical `(node_table_id, node_offset)` rows carrying the
-    /// given label code, ascending.
+    /// given label code, ascending. Scans the fixed-width records (no heap index).
     #[must_use]
     pub fn nodes_with(&self, label_code: u32) -> Vec<(u16, u32)> {
-        self.records
-            .iter()
-            .filter(|m| m.label_code == label_code)
-            .map(|m| (m.node_table_id, m.node_offset))
-            .collect()
+        let mut out = Vec::new();
+        for i in 0..self.count {
+            let rec = self.record_at(i);
+            if rec.label_code == label_code {
+                out.push((rec.node_table_id, rec.node_offset));
+            }
+        }
+        out
     }
 
-    /// All records (ascending).
+    /// Number of membership records.
     #[must_use]
-    pub fn records(&self) -> &[LabelMembership] {
-        &self.records
+    pub fn record_count(&self) -> usize {
+        self.count
+    }
+
+    /// Reads the record at index `i` from the retained bytes.
+    fn record_at(&self, i: usize) -> LabelMembership {
+        let start = MEMBERSHIP_HEADER_LEN + i * MEMBERSHIP_RECORD_LEN;
+        LabelMembership::from_bytes(&self.bytes[start..start + MEMBERSHIP_RECORD_LEN])
+            .expect("validated in parse")
     }
 }
 
