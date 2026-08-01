@@ -133,6 +133,25 @@ impl MappedNodeIdIndex {
         }
         None
     }
+
+    /// Returns the record at positional index `i` as `(original_id, table_id,
+    /// dense_offset)`. Caller guarantees `i < len()`.
+    #[must_use]
+    pub fn lookup_at(&self, i: usize) -> Option<(u16, u64)> {
+        if i >= self.len() {
+            return None;
+        }
+        let (_, tid, off) = record_at(&self.data, i);
+        Some((tid, off))
+    }
+
+    /// Returns the original_id at positional index `i`. Caller guarantees
+    /// `i < len()`.
+    #[must_use]
+    pub fn original_id_at(&self, i: usize) -> u64 {
+        let (id, _, _) = record_at(&self.data, i);
+        id
+    }
 }
 
 /// Reads one record at index `i`. Caller guarantees `i < len`.

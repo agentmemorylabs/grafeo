@@ -152,6 +152,16 @@ pub struct CompactStore {
     column_null: Option<mapped::RowBitmapView>,
     /// Retained bytes backing the presence/null/membership views.
     companion_bytes: Option<bytes::Bytes>,
+    /// Presence segment body bytes (offsets in `column_presence` are relative
+    /// to this slice, not the whole payload).
+    presence_body: Option<bytes::Bytes>,
+    /// Null segment body bytes (offsets in `column_null` are relative to this
+    /// slice, not the whole payload).
+    null_body: Option<bytes::Bytes>,
+    /// Maps `(table_id, property_key)` to the flat column index used by the
+    /// presence/null bitmaps. Populated from the ColumnDirectory during
+    /// deserialization.
+    column_index_map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32>,
 }
 
 impl std::fmt::Debug for CompactStore {
@@ -231,6 +241,9 @@ impl CompactStore {
             column_presence: None,
             column_null: None,
             companion_bytes: None,
+            presence_body: None,
+            null_body: None,
+            column_index_map: FxHashMap::default(),
         }
     }
 
@@ -557,17 +570,67 @@ impl CompactStore {
 
     /// Installs the G-EM0.5b D0.8.0 source-true companion views from a v5
     /// payload (label membership + column presence/null).
+    ///
+    /// `presence_body` and `null_body` are the raw segment bodies the bitmap
+    /// offsets are relative to (the whole-payload `backing` is retained only
+    /// to keep the membership view's bytes alive).
     pub(crate) fn set_source_true_companions(
         &mut self,
         membership: Option<mapped::LabelMembershipView>,
         presence: Option<mapped::RowBitmapView>,
         null: Option<mapped::RowBitmapView>,
         backing: bytes::Bytes,
+        presence_body: Option<bytes::Bytes>,
+        null_body: Option<bytes::Bytes>,
     ) {
         self.label_membership = membership;
         self.column_presence = presence;
         self.column_null = null;
         self.companion_bytes = Some(backing);
+        self.presence_body = presence_body;
+        self.null_body = null_body;
+    }
+
+    /// Sets the column index map used to look up presence/null bitmaps.
+    pub(crate) fn set_column_index_map(
+        &mut self,
+        map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32>,
+    ) {
+        self.column_index_map = map;
+    }
+
+    /// Returns a property value filtered by presence/null companions.
+    ///
+    /// Returns `None` if the property is absent (presence bit = 0) or if it
+    /// is a present null (null bit = 1). Otherwise returns the typed value.
+    #[must_use]
+    pub(crate) fn get_property_filtered(
+        &self,
+        table_id: u16,
+        row: u32,
+        key: &grafeo_common::types::PropertyKey,
+        raw_value: Option<grafeo_common::types::Value>,
+    ) -> Option<grafeo_common::types::Value> {
+        let Some(col_idx) = self.column_index_map.get(&(table_id, key.clone())) else {
+            return raw_value;
+        };
+        // Presence: default true when no companion installed.
+        let present = match (&self.column_presence, &self.presence_body) {
+            (Some(view), Some(body)) => view.get(body, *col_idx, row).unwrap_or(true),
+            _ => true,
+        };
+        if !present {
+            return None;
+        }
+        // Null: default false when no companion installed.
+        let is_null = match (&self.column_null, &self.null_body) {
+            (Some(view), Some(body)) => view.get(body, *col_idx, row).unwrap_or(false),
+            _ => false,
+        };
+        if is_null {
+            return None;
+        }
+        raw_value
     }
 
     /// Returns the full logical label codes for one physical node row.

@@ -12,8 +12,12 @@ pub mod builder;
 pub mod column_pass;
 pub mod csr_pass;
 pub mod edge_pass;
+pub mod emit_columns;
+pub mod emit_ids;
+pub mod emit_meta;
 pub mod freeze;
 pub mod node_pass;
+pub mod orchestrator;
 pub mod staging;
 
 pub use builder::{StreamingBuildConfig, StreamingGenerationBuilder, StreamingGenerationOutput};
@@ -24,6 +28,8 @@ pub use freeze::{
 
 #[cfg(test)]
 mod csr_tests;
+#[cfg(test)]
+mod orchestrator_tests;
 #[cfg(test)]
 mod pipeline_tests;
 #[cfg(test)]

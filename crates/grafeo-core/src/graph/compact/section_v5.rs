@@ -898,7 +898,42 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
                 crate::graph::compact::mapped::RowBitmapView::parse(b, SegmentKind::ColumnRowNull)
             })
             .transpose()?;
-        store.set_source_true_companions(membership, presence, null, data_bytes.clone());
+        store.set_source_true_companions(
+            membership,
+            presence,
+            null,
+            data_bytes.clone(),
+            presence_bytes.map(bytes::Bytes::from),
+            null_bytes.map(bytes::Bytes::from),
+        );
+    }
+
+    // Build the (table_id, key) → flat column index map used to look up the
+    // presence/null companions. Columns are emitted in order: node tables
+    // first (each with its columns in sorted-key order), then rel tables
+    // (tagged with table_id 0x8000 | rel_index, matching column_pass).
+    {
+        use grafeo_common::utils::hash::FxHashMap;
+        let mut map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32> =
+            FxHashMap::default();
+        let mut col_idx: u32 = 0;
+        for (tid, nt) in meta.node_tables.iter().enumerate() {
+            let mut keys: Vec<&str> = nt.columns.iter().map(|c| c.key.as_str()).collect();
+            keys.sort();
+            for key in keys {
+                map.insert((tid as u16, key.into()), col_idx);
+                col_idx += 1;
+            }
+        }
+        for (rid, rt) in meta.rel_tables.iter().enumerate() {
+            let mut keys: Vec<&str> = rt.columns.iter().map(|c| c.key.as_str()).collect();
+            keys.sort();
+            for key in keys {
+                map.insert((0x8000 | rid as u16, key.into()), col_idx);
+                col_idx += 1;
+            }
+        }
+        store.set_column_index_map(map);
     }
 
     Ok(store)

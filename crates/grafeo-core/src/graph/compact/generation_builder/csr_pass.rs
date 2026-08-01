@@ -206,7 +206,7 @@ pub fn stream_reverse_csr(
         Ok(())
     })?;
 
-    if let Some(rel) = cur_rel {
+    if cur_rel.is_some() {
         let gg = geo;
         for _ in next_dst_row..=gg.dst_rows {
             rev_offsets_sink.write(&(rev_pos as u32).to_le_bytes())?;

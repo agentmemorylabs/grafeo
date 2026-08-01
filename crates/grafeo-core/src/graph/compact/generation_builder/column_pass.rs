@@ -15,7 +15,7 @@
 
 use crate::graph::compact::generation::{
     CancelToken, ExternalRunMerger, GenerationBudget, GenerationError, GenerationMetrics,
-    RunSetLease, SortRecord,
+    RunSetLease,
 };
 use grafeo_common::types::Value;
 
@@ -40,6 +40,24 @@ pub struct ColumnGeometry {
     pub vector_dims: Option<u16>,
     /// Family tag of first-seen typed value (for mixed-family detection).
     family: Option<&'static str>,
+    /// Maximum u64 bit width across unsigned int values (BitPacked sizing).
+    pub max_int_bits: u8,
+    /// Minimum int value (zone map, present non-null only).
+    pub min_int: Option<i64>,
+    /// Maximum int value (zone map).
+    pub max_int: Option<i64>,
+    /// Minimum float value (zone map, NaN-excluded).
+    pub min_float: Option<f64>,
+    /// Maximum float value (zone map).
+    pub max_float: Option<f64>,
+    /// Saw a false bool (zone min = !has_false).
+    pub saw_false: bool,
+    /// Saw a true bool (zone max = has_true).
+    pub saw_true: bool,
+    /// Minimum string (zone map, lexicographic).
+    pub min_str: Option<String>,
+    /// Maximum string (zone map).
+    pub max_str: Option<String>,
 }
 
 impl ColumnGeometry {
@@ -54,6 +72,15 @@ impl ColumnGeometry {
             saw_signed_int: false,
             vector_dims: None,
             family: None,
+            max_int_bits: 0,
+            min_int: None,
+            max_int: None,
+            min_float: None,
+            max_float: None,
+            saw_false: false,
+            saw_true: false,
+            min_str: None,
+            max_str: None,
         }
     }
 
@@ -194,20 +221,43 @@ pub fn compute_column_geometries(
                 g.present_count += 1;
                 if *n < 0 {
                     g.saw_signed_int = true;
+                } else {
+                    let bits = 64 - (*n as u64).leading_zeros() as u8;
+                    g.max_int_bits = g.max_int_bits.max(bits.max(1));
                 }
+                g.min_int = Some(g.min_int.map_or(*n, |m: i64| m.min(*n)));
+                g.max_int = Some(g.max_int.map_or(*n, |m: i64| m.max(*n)));
                 check_family(g, "Int64")?;
             }
-            Value::Float64(_) => {
+            Value::Float64(f) => {
                 g.present_count += 1;
+                if !f.is_nan() {
+                    g.min_float = Some(g.min_float.map_or(*f, |m: f64| m.min(*f)));
+                    g.max_float = Some(g.max_float.map_or(*f, |m: f64| m.max(*f)));
+                }
                 check_family(g, "Float64")?;
             }
-            Value::Bool(_) => {
+            Value::Bool(bv) => {
                 g.present_count += 1;
+                if *bv {
+                    g.saw_true = true;
+                } else {
+                    g.saw_false = true;
+                }
                 check_family(g, "Bool")?;
             }
-            Value::String(_) => {
+            Value::String(s) => {
                 g.present_count += 1;
                 g.has_string = true;
+                let st = s.as_str();
+                g.min_str = Some(match g.min_str.take() {
+                    Some(m) if m.as_str() <= st => m,
+                    _ => st.to_string(),
+                });
+                g.max_str = Some(match g.max_str.take() {
+                    Some(m) if m.as_str() >= st => m,
+                    _ => st.to_string(),
+                });
                 check_family(g, "String")?;
             }
             Value::Vector(vec) => {

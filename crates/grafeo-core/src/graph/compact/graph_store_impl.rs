@@ -30,8 +30,11 @@ impl GraphStore for CompactStore {
         let mut node = Node::new(id);
         node.add_label(nt.label());
         let props = nt.get_all_properties(row);
+        let row_u32 = u32::try_from(offset).ok()?;
         for (k, v) in props {
-            node.set_property(k, v);
+            if let Some(filtered) = self.get_property_filtered(table_id, row_u32, &k, Some(v)) {
+                node.set_property(k, filtered);
+            }
         }
         Some(node)
     }
@@ -85,7 +88,9 @@ impl GraphStore for CompactStore {
         let (table_id, offset) = self.resolve_node(id)?;
         let nt = self.resolve_node_table(table_id)?;
         let row = usize::try_from(offset).ok()?;
-        nt.get_property(row, key)
+        let raw = nt.get_property(row, key);
+        let row_u32 = u32::try_from(offset).ok()?;
+        self.get_property_filtered(table_id, row_u32, key, raw)
     }
 
     fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value> {

@@ -139,7 +139,7 @@ impl<'a> StreamingDictionary<'a> {
         code_index_sink: &mut dyn SegmentSink,
         remap_sink: &mut dyn crate::graph::compact::generation::runs::ExternalRunSink,
         cancel: Option<&CancelToken>,
-    ) -> Result<u64, GenerationError> {
+    ) -> Result<(u64, Vec<String>), GenerationError> {
         let mut byte_pos: u64 = 0;
         let mut prev_string: Option<Vec<u8>> = None;
 
@@ -170,6 +170,11 @@ impl<'a> StreamingDictionary<'a> {
                 byte_pos += string.len() as u64;
                 dict.next_code += 1;
                 dict.current_code = code;
+                dict.strings.push(
+                    std::str::from_utf8(string)
+                        .map_err(|_| GenerationError::Codec("dict string not UTF-8".into()))?
+                        .to_string(),
+                );
                 prev_string = Some(string.clone());
                 code
             };
@@ -187,6 +192,7 @@ impl<'a> StreamingDictionary<'a> {
         let mut state = DictState {
             next_code: 0,
             current_code: 0,
+            strings: Vec::new(),
         };
         merger.merge_all(
             &occ_lease.handles,
@@ -200,13 +206,15 @@ impl<'a> StreamingDictionary<'a> {
         // StringOffsets trailing sentinel.
         offsets_sink.write(&byte_pos.to_le_bytes())?;
         self.metrics.global_string_count = next_code;
-        Ok(next_code)
+        Ok((next_code, state.strings))
     }
 }
 
 struct DictState {
     next_code: u64,
     current_code: u64,
+    /// Unique strings in lexicographic (code) order.
+    strings: Vec<String>,
 }
 
 /// Finalizes the three dictionary segment sinks into descriptors.

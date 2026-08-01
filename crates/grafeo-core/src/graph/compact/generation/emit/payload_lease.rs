@@ -12,10 +12,10 @@
 //! failure. The lease never exposes or constructs a complete-payload
 //! `Vec<u8>`.
 
+use crate::graph::compact::generation::GenerationMetrics;
 use crate::graph::compact::generation::emit::assembler::V5PayloadAssembler;
 use crate::graph::compact::generation::emit::descriptor::SegmentDescriptor;
 use crate::graph::compact::generation::error::GenerationError;
-use crate::graph::compact::generation::GenerationMetrics;
 
 /// A spool-owning streaming v5 payload lease.
 pub struct V5PayloadLease {

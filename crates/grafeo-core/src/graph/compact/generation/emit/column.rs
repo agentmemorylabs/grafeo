@@ -127,6 +127,41 @@ impl ColumnEncoder {
         Ok(())
     }
 
+    /// Feeds a placeholder row for an absent or present-null row (G-EM0.5b
+    /// D0.8.0 sparse/null support).
+    ///
+    /// The canonical column body carries deterministic placeholder bytes for
+    /// rows that do not carry a typed value; the `ColumnRowPresence` /
+    /// `ColumnRowNull` companions carry the real three-way distinction. This
+    /// pushes a neutral placeholder (`Some(Value::Null)`-marked) without
+    /// failing, recording the column's locked `family` so the body encoder
+    /// emits the family's zero/empty/false placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::MixedColumnTypes`] if `family` conflicts
+    /// with an already-seen family.
+    pub fn push_placeholder(&mut self, family_of_column: &str) -> Result<(), GenerationError> {
+        let family = match family_of_column {
+            "Int64" => Family::Int,
+            "Float64" => Family::Float,
+            "Bool" => Family::Bool,
+            "String" => Family::Str,
+            "Vector" => Family::Vector,
+            other => {
+                return Err(GenerationError::UnsupportedValue {
+                    kind: "unknown placeholder family",
+                    context: format!("{} ({other})", self.context),
+                });
+            }
+        };
+        if !self.families.contains(&family) {
+            self.families.push(family);
+        }
+        self.values.push(None); // placeholder; presence/null bitmaps disambiguate
+        Ok(())
+    }
+
     /// Finishes encoding and produces the codec, type, and zone map.
     ///
     /// # Errors
