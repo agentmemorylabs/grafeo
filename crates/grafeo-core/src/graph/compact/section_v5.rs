@@ -905,6 +905,7 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
             data_bytes.clone(),
             presence_bytes,
             null_bytes,
+            Some(global_dict.clone()),
         );
     }
 

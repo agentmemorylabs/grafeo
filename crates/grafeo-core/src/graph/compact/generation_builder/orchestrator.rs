@@ -47,8 +47,9 @@ use crate::graph::compact::generation_builder::emit_ids::{
 };
 use crate::graph::compact::generation_builder::emit_meta::CodecKind;
 use crate::graph::compact::generation_builder::node_pass::{self, NodeSchema};
-use crate::graph::compact::mapped::SegmentKind;
+use crate::graph::compact::generation_builder::staging;
 use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
+use crate::graph::compact::mapped::SegmentKind;
 use grafeo_common::utils::hash::FxHashMap;
 use std::path::PathBuf;
 
@@ -161,6 +162,7 @@ impl BoundedGenerationBuilder {
         sort_id_index_records(&mut id_index_bytes)?;
         let id_index = MappedNodeIdIndex::new(bytes::Bytes::from(id_index_bytes))?;
         let node_schema = node_out.schema;
+        let membership_runs = node_out.membership_runs.take();
 
         // Charge schema: node_schema (labels + label_to_table_id + table_row_counts)
         let schema_charge = node_schema.labels.iter().map(|s| s.len() as u64 + 8).sum::<u64>()
@@ -205,6 +207,7 @@ impl BoundedGenerationBuilder {
             &node_schema,
             &rel_keys,
             &occ_lease,
+            membership_runs.as_ref(),
             run_store.merger("occ")?.as_mut(),
             str_occ_sink.as_mut(),
             &budget,
@@ -356,6 +359,7 @@ impl BoundedGenerationBuilder {
             &id_index,
             &table_counts,
             &fwd_lease,
+            membership_runs.as_ref(),
             run_store,
             &chunks_path,
             offsets_sink,
@@ -383,6 +387,7 @@ impl BoundedGenerationBuilder {
         id_index: &MappedNodeIdIndex,
         table_counts: &[u64],
         fwd_lease: &RunSetLease,
+        membership_runs: Option<&RunSetLease>,
         run_store: &mut dyn RunStore,
         chunks_path: &std::path::Path,
         offsets_sink: Box<dyn SegmentSink>,
@@ -630,6 +635,27 @@ impl BoundedGenerationBuilder {
             ));
         }
 
+        // Add the NodeLabelMembership companion segment (only when at least
+        // one node carries more than one logical label). Emitted through a
+        // spool sink; records are re-sorted by (table_id, offset, label_code)
+        // via the external-sort infrastructure (bounded, no resident vector).
+        if let Some(membership_lease) = membership_runs {
+            let mut membership_sink =
+                Box::new(self.make_sink(SegmentKind::NodeLabelMembership, 8, 16, "memb"));
+            crate::graph::compact::generation_builder::membership_pass::emit_membership_segment(
+                membership_lease,
+                run_store.merger("membership")?.as_mut(),
+                id_index,
+                schema_strings,
+                run_store,
+                membership_sink.as_mut(),
+                &self.config.budget,
+                &mut self.metrics,
+                self.cancel.as_ref(),
+            )?;
+            descriptors.push(membership_sink.finish()?);
+        }
+
         // Sort by kind ascending.
         descriptors.sort_by_key(|d| d.kind.as_u16());
 
@@ -644,19 +670,21 @@ impl BoundedGenerationBuilder {
     }
 }
 
-/// Collects string occurrences from the node schema, rel keys, and occurrence run.
+/// Collects string occurrences from the node schema, rel keys, occurrence run,
+/// and membership runs (for multi-label nodes).
 #[allow(clippy::too_many_arguments)]
 fn collect_string_occurrences(
     node_schema: &NodeSchema,
     rel_keys: &[RelTableKey],
     occ_lease: &RunSetLease,
+    membership_runs: Option<&RunSetLease>,
     merger: &mut dyn crate::graph::compact::generation::ExternalRunMerger,
     str_occ_sink: &mut dyn crate::graph::compact::generation::ExternalRunSink,
     budget: &GenerationBudget,
     metrics: &mut GenerationMetrics,
     cancel: Option<&CancelToken>,
 ) -> Result<(), GenerationError> {
-    // Node labels.
+    // Node labels (physical labels from schema).
     for label in &node_schema.labels {
         str_occ_sink.push(occurrence_record(
             label.as_bytes(),
@@ -671,6 +699,20 @@ fn collect_string_occurrences(
             StringUseKind::EdgeType,
             &[],
         ))?;
+    }
+    // Membership labels (logical labels from multi-label nodes).
+    if let Some(membership_lease) = membership_runs {
+        merger.merge_all(&membership_lease.handles, budget, metrics, cancel, &mut |rec| {
+            let labels = staging::decode_labels(&rec.payload)?;
+            for label in labels {
+                str_occ_sink.push(occurrence_record(
+                    label.as_bytes(),
+                    StringUseKind::Label,
+                    &[],
+                ))?;
+            }
+            Ok(())
+        })?;
     }
     // Prop keys + string values from the occurrence run.
     merger.merge_all(&occ_lease.handles, budget, metrics, cancel, &mut |rec| {

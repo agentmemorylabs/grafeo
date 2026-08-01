@@ -247,8 +247,15 @@ impl LabelMembershipView {
         self.count
     }
 
+    /// Returns the number of membership records.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
     /// Reads the record at index `i` from the retained bytes.
-    fn record_at(&self, i: usize) -> LabelMembership {
+    #[must_use]
+    pub fn record_at(&self, i: usize) -> LabelMembership {
         let start = MEMBERSHIP_HEADER_LEN + i * MEMBERSHIP_RECORD_LEN;
         LabelMembership::from_bytes(&self.bytes[start..start + MEMBERSHIP_RECORD_LEN])
             .expect("validated in parse")

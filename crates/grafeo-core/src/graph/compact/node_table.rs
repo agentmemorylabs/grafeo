@@ -112,6 +112,17 @@ impl NodeTable {
             .collect()
     }
 
+    /// Returns the NodeId at the given row offset.
+    ///
+    /// Returns `None` if the offset is out of bounds.
+    #[must_use]
+    pub fn node_id_at(&self, offset: usize) -> Option<NodeId> {
+        if offset >= self.len {
+            return None;
+        }
+        Some(encode_node_id(self.schema.table_id, offset as u64))
+    }
+
     /// Returns the decoded property value at the given row offset.
     ///
     /// Returns `None` if the column does not exist or the offset is out of bounds.

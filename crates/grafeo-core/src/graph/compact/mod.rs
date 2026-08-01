@@ -162,6 +162,9 @@ pub struct CompactStore {
     /// presence/null bitmaps. Populated from the ColumnDirectory during
     /// deserialization.
     column_index_map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32>,
+    /// Global string dictionary (code→string) retained for membership resolution.
+    /// Present when the store was deserialized from v5 with a membership segment.
+    global_dict: Option<mapped::MappedStringDictionary>,
 }
 
 impl std::fmt::Debug for CompactStore {
@@ -244,6 +247,7 @@ impl CompactStore {
             presence_body: None,
             null_body: None,
             column_index_map: FxHashMap::default(),
+            global_dict: None,
         }
     }
 
@@ -582,6 +586,7 @@ impl CompactStore {
         backing: bytes::Bytes,
         presence_body: Option<bytes::Bytes>,
         null_body: Option<bytes::Bytes>,
+        global_dict: Option<mapped::MappedStringDictionary>,
     ) {
         self.label_membership = membership;
         self.column_presence = presence;
@@ -589,6 +594,7 @@ impl CompactStore {
         self.companion_bytes = Some(backing);
         self.presence_body = presence_body;
         self.null_body = null_body;
+        self.global_dict = global_dict;
     }
 
     /// Sets the column index map used to look up presence/null bitmaps.
@@ -597,6 +603,36 @@ impl CompactStore {
         map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32>,
     ) {
         self.column_index_map = map;
+    }
+
+    /// Returns the full logical label set for a node, consulting the membership
+    /// view when present. Falls back to the physical table label when no
+    /// membership segment exists or the node has no extra labels.
+    #[must_use]
+    pub(crate) fn logical_labels_for_node(&self, table_id: u16, offset: u32) -> Vec<ArcStr> {
+        let physical_label = self
+            .table_id_to_label
+            .get(table_id as usize)
+            .cloned()
+            .unwrap_or_default();
+
+        let Some(membership) = &self.label_membership else {
+            return vec![physical_label];
+        };
+
+        let Some(dict) = &self.global_dict else {
+            return vec![physical_label];
+        };
+
+        let label_codes = membership.labels_of(table_id, offset);
+        if label_codes.is_empty() {
+            return vec![physical_label];
+        }
+
+        label_codes
+            .iter()
+            .filter_map(|&code| dict.get(code).map(ArcStr::from))
+            .collect()
     }
 
     /// Returns a property value filtered by presence/null companions.

@@ -16,6 +16,7 @@ pub mod emit_columns;
 pub mod emit_ids;
 pub mod emit_meta;
 pub mod freeze;
+pub mod membership_pass;
 pub mod node_pass;
 pub mod orchestrator;
 pub mod staging;

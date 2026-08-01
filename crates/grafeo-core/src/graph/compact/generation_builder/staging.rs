@@ -72,6 +72,46 @@ pub fn decode_properties(bytes: &[u8]) -> Result<FxHashMap<PropertyKey, Value>, 
     Ok(map)
 }
 
+/// Serialize a label vector deterministically to bytes.
+///
+/// Layout: `count u16 || (label_len u16 || label)*`. Labels are already
+/// sorted and deduplicated by the input contract.
+///
+/// # Errors
+///
+/// Returns [`GenerationError::Codec`] on label count overflow.
+pub fn encode_labels(labels: &[String]) -> Result<Vec<u8>, GenerationError> {
+    let count = u16::try_from(labels.len()).map_err(|_| GenerationError::Codec(
+        format!("label count {} exceeds u16::MAX", labels.len())
+    ))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&count.to_le_bytes());
+    for label in labels {
+        let lb = label.as_bytes();
+        out.extend_from_slice(&(lb.len() as u16).to_le_bytes());
+        out.extend_from_slice(lb);
+    }
+    Ok(out)
+}
+
+/// Decode a label vector produced by [`encode_labels`].
+///
+/// # Errors
+///
+/// Returns [`GenerationError::Codec`] on malformed bytes.
+pub fn decode_labels(bytes: &[u8]) -> Result<Vec<String>, GenerationError> {
+    let mut pos = 0usize;
+    let count = read_u16(bytes, &mut pos)? as usize;
+    let mut labels = Vec::with_capacity(count);
+    for _ in 0..count {
+        let llen = read_u16(bytes, &mut pos)? as usize;
+        let label = std::str::from_utf8(read_slice(bytes, &mut pos, llen)?)
+            .map_err(|_| GenerationError::Codec("invalid UTF-8 label".into()))?;
+        labels.push(label.to_string());
+    }
+    Ok(labels)
+}
+
 fn encode_value(out: &mut Vec<u8>, v: &Value) -> Result<(), GenerationError> {
     match v {
         Value::Bool(b) => {

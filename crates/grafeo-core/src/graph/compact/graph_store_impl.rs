@@ -28,9 +28,12 @@ impl GraphStore for CompactStore {
         }
 
         let mut node = Node::new(id);
-        node.add_label(nt.label());
-        let props = nt.get_all_properties(row);
         let row_u32 = u32::try_from(offset).ok()?;
+        // Use the full logical label set (physical + membership extras).
+        for label in self.logical_labels_for_node(table_id, row_u32) {
+            node.add_label(label);
+        }
+        let props = nt.get_all_properties(row);
         for (k, v) in props {
             if let Some(filtered) = self.get_property_filtered(table_id, row_u32, &k, Some(v)) {
                 node.set_property(k, filtered);
@@ -236,19 +239,35 @@ impl GraphStore for CompactStore {
     }
 
     fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
-        let compact_ids = self
-            .label_to_table_id
-            .get(label)
-            .map(|&tid| self.node_tables_by_id[tid as usize].node_ids())
-            .unwrap_or_default();
+        let mut result = FxHashSet::default();
+
+        // Physical table nodes (existing behavior).
+        if let Some(&tid) = self.label_to_table_id.get(label) {
+            result.extend(self.node_tables_by_id[tid as usize].node_ids());
+        }
+
+        // Membership extras: scan for nodes with this label code.
+        if let (Some(membership), Some(dict)) = (&self.label_membership, &self.global_dict) {
+            if let Some(label_code) = dict.encode(label) {
+                for (table_id, offset) in membership.nodes_with(label_code) {
+                    if let Some(nt) = self.node_tables_by_id.get(table_id as usize) {
+                        if let Some(node_id) = nt.node_id_at(offset as usize) {
+                            result.insert(node_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut ids: Vec<NodeId> = result.into_iter().collect();
         if self.preserves_ids() {
-            compact_ids
+            ids = ids
                 .into_iter()
                 .map(|cid| self.to_original_node_id(cid))
-                .collect()
-        } else {
-            compact_ids
+                .collect();
         }
+        ids.sort_unstable();
+        ids
     }
 
     fn nodes_by_label_count(&self, label: &str) -> usize {
@@ -444,10 +463,25 @@ impl GraphStore for CompactStore {
     }
 
     fn all_labels(&self) -> Vec<String> {
-        self.table_id_to_label
+        let mut labels: FxHashSet<String> = self
+            .table_id_to_label
             .iter()
             .map(|s| s.to_string())
-            .collect()
+            .collect();
+
+        // Add membership labels from the global dictionary.
+        if let (Some(membership), Some(dict)) = (&self.label_membership, &self.global_dict) {
+            for i in 0..membership.len() {
+                let rec = membership.record_at(i);
+                if let Some(label_str) = dict.get(rec.label_code) {
+                    labels.insert(label_str.to_string());
+                }
+            }
+        }
+
+        let mut result: Vec<String> = labels.into_iter().collect();
+        result.sort();
+        result
     }
 
     fn all_edge_types(&self) -> Vec<String> {

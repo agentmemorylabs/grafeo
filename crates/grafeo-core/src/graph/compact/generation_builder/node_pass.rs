@@ -45,6 +45,10 @@ pub struct NodePassOutput {
     pub node_rows: RunSetLease,
     /// Sorted ID runs (merged to reject duplicate IDs).
     pub id_runs: RunSetLease,
+    /// Sorted membership runs (replayed after dictionary pass to emit
+    /// NodeLabelMembership). Key = (physical_label, original_id), payload =
+    /// framed logical labels. Only present when at least one node has >1 label.
+    pub membership_runs: Option<RunSetLease>,
 }
 
 /// Drives the bounded node staging pass.
@@ -79,8 +83,10 @@ impl<'a> NodePass<'a> {
     ) -> Result<NodePassOutput, GenerationError> {
         let mut row_sink = run_store.sink("node-rows", self.budget)?;
         let mut id_sink = run_store.sink("node-ids", self.budget)?;
+        let mut membership_sink = run_store.sink("membership", self.budget)?;
         let mut labels: FxHashSet<String> = FxHashSet::default();
         let mut count = 0u64;
+        let mut has_multi_label = false;
 
         while let Some(node) = nodes.next_node()? {
             self.check()?;
@@ -96,11 +102,28 @@ impl<'a> NodePass<'a> {
                 node.id.as_u64().to_be_bytes().to_vec(),
                 Vec::new(),
             ))?;
+            
+            // Emit membership record for multi-label nodes
+            if node.labels.len() > 1 {
+                has_multi_label = true;
+                let payload = staging::encode_labels(&node.labels)?;
+                membership_sink.push(SortRecord::new(
+                    staging::node_row_key(&physical, node.id.as_u64()),
+                    payload,
+                ))?;
+            }
+            
             count += 1;
         }
 
         let node_rows = row_sink.finish()?;
         let id_runs = id_sink.finish()?;
+        let membership_runs = if has_multi_label {
+            Some(membership_sink.finish()?)
+        } else {
+            membership_sink.cleanup();
+            None
+        };
 
         let mut label_vec: Vec<String> = labels.into_iter().collect();
         label_vec.sort();
@@ -123,6 +146,7 @@ impl<'a> NodePass<'a> {
             },
             node_rows,
             id_runs,
+            membership_runs,
         })
     }
 

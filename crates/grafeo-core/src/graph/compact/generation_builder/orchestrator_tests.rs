@@ -102,6 +102,78 @@ fn orchestrator_sparse_columns() {
     assert_eq!(n2.get_property("age"), None); // sparse
 }
 
+/// B6 (bounded writer): a multi-label node must round-trip through the bounded
+/// orchestrator + production reader with ALL logical labels visible, while the
+/// node is stored exactly once. Exercises the NodeLabelMembership companion
+/// segment (kind 21) emitted via the external-sort membership pass.
+#[test]
+fn orchestrator_multi_label_membership_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let input = GenerationInput::new()
+        .node(GenerationNode::with_labels(1u64, ["Person", "Employee"]).unwrap())
+        .node(GenerationNode::new(2u64, "Person"));
+
+    let mut store = InMemoryRunStore::new();
+    let mut builder = BoundedGenerationBuilder::new(config(tmp.path()));
+    let mut lease = builder
+        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .expect("build");
+
+    let mut payload = Vec::new();
+    lease.stream_to(&mut payload).expect("stream_to");
+    let bytes = bytes::Bytes::from(payload);
+    let compact = deserialize_v5(&bytes).expect("deserialize_v5");
+
+    // Node stored once per physical row (2 nodes total, not 3).
+    assert_eq!(compact.total_nodes(), 2);
+
+    // Both labels resolve the correct node sets.
+    let by_person = compact.nodes_by_label("Person");
+    let by_employee = compact.nodes_by_label("Employee");
+    assert_eq!(by_person.len(), 2, "Person must see both nodes");
+    assert_eq!(by_employee.len(), 1, "Employee must see node 1 only");
+
+    // get_node returns the complete logical label set for the multi-label node.
+    let n1 = compact.get_node(NodeId::new(1)).expect("node 1");
+    let labels: Vec<String> = n1.labels.iter().map(|l| l.to_string()).collect();
+    assert!(labels.contains(&"Person".to_string()), "labels: {labels:?}");
+    assert!(labels.contains(&"Employee".to_string()), "labels: {labels:?}");
+
+    // all_labels is the union of logical labels.
+    let all = compact.all_labels();
+    assert!(all.iter().any(|l| l == "Person"));
+    assert!(all.iter().any(|l| l == "Employee"));
+}
+
+/// B6: a three-label node keeps all three memberships through the bounded
+/// writer + reader round-trip.
+#[test]
+fn orchestrator_three_label_membership_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let input =
+        GenerationInput::new().node(GenerationNode::with_labels(7u64, ["A", "B", "C"]).unwrap());
+
+    let mut store = InMemoryRunStore::new();
+    let mut builder = BoundedGenerationBuilder::new(config(tmp.path()));
+    let mut lease = builder
+        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .expect("build");
+
+    let mut payload = Vec::new();
+    lease.stream_to(&mut payload).expect("stream_to");
+    let bytes = bytes::Bytes::from(payload);
+    let compact = deserialize_v5(&bytes).expect("deserialize_v5");
+
+    assert_eq!(compact.total_nodes(), 1);
+    for label in ["A", "B", "C"] {
+        assert_eq!(
+            compact.nodes_by_label(label).len(),
+            1,
+            "label {label} must resolve the node"
+        );
+    }
+}
+
 /// The eager lexicographic v5 reference payload for an input (D0.8.10 oracle).
 fn eager_lexicographic_payload(input: &GenerationInput) -> Vec<u8> {
     use crate::graph::compact::generation::generate_compact_store;
