@@ -1,15 +1,18 @@
 //! G-EM0.3c — recovery and publication fault proof (engine boundary).
 //!
-//! Proves, at the engine surface, that every state transition accepted by
-//! G-EM0.W0 recovers deterministically:
+//! Proves, at the engine surface, that the accepted G-EM0.W0 state
+//! transitions recover deterministically:
 //!
-//! 1. The complete publication crash matrix: a fresh child process aborts at
-//!    every named W0 fault-injection boundary (unpublished-dir creation,
-//!    streaming, generation fsync ×2, reopen validation, final naming,
-//!    directory fsync, slot write ×3, manifest fsync ×2 = commit point, WAL
-//!    advance ×2), and the parent proves the expected selected generation,
-//!    a replayable exact WAL boundary, query parity against the selected
-//!    generation, and correct orphan classification.
+//! 1. Engine-observable crash proofs: a fresh child process aborts at the
+//!    two boundaries the ENGINE owns (pre-commit build complete;
+//!    post-commit publication complete = the selection transition), and the
+//!    parent proves the expected selected generation, a replayable exact
+//!    WAL boundary, query parity against the selected generation, and
+//!    correct orphan classification. The remaining per-transition crash
+//!    points are W0's accepted proofs (`faults_tests.rs`,
+//!    `fresh_process_faults.rs`) against the same `publish_generation` the
+//!    engine calls; their expectations are locked here via
+//!    `PublicationCrashPoint` (see `crash_point_surface_is_complete_and_ordered`).
 //! 2. Torn/corrupt slots and generations fail or fall back exactly as
 //!    specified: torn newest generation → previous fallback; both corrupt →
 //!    typed fail-closed error preserving both causes.
@@ -41,7 +44,7 @@ use grafeo_storage::generation::wal_cursor::validate_replayable;
 use grafeo_storage::wal::{WalManager, WalRecord};
 use tempfile::TempDir;
 
-const HELPER_ENV: &str = "GRAEORECOV_HELPER";
+const HELPER_ENV: &str = "GRAFEORECOV_HELPER";
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -201,6 +204,63 @@ fn recover_genesis_root_fails_closed() {
         )
     );
     assert!(is_no_valid, "expected NoValidGeneration, got: {err}");
+}
+
+/// A second PROCESS recovering while the root lock is held fails through the
+/// typed `Lock` branch (Option S: one process owns the live root), never
+/// blocks silently or steals ownership. Proven cross-process: the parent
+/// holds the lock while a child attempts recovery and is rejected (flocks
+/// are per-fd within one process, so same-process threads cannot exercise
+/// this — the child is the honest Option-S boundary).
+#[test]
+fn recover_while_locked_fails_typed_lock_error() {
+    if std::env::var(HELPER_ENV).is_ok() {
+        // Child: attempt recovery on the parent's locked root; exit 0 only
+        // if rejected with the typed Lock error.
+        let root = std::env::var("GRAFEORECOV_ROOT").expect("child root env");
+        match recover_generation_root(std::path::Path::new(&root)) {
+            Err(grafeo_engine::RecoveryViewError::Lock(_)) => std::process::exit(0),
+            other => {
+                eprintln!("child expected typed Lock rejection, got: {other:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if in_any_child() {
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    let db = GrafeoDB::new_in_memory();
+    populate(&db, "held");
+    db.build_and_publish_generation(generation_build_request(&gen_root, "g-held"))
+        .expect("publish");
+    drop(db);
+
+    // Parent recovery holds the lock for its lifetime.
+    let held = recover_generation_root(&gen_root).expect("parent recovery");
+
+    // A second process attempting recovery is rejected with the typed Lock
+    // error (exit 0 from the child = rejected as expected).
+    let status = Command::new(std::env::current_exe().expect("current exe"))
+        .arg("recover_while_locked_fails_typed_lock_error")
+        .arg("--exact")
+        .env(HELPER_ENV, "1")
+        .env("GRAFEORECOV_ROOT", &gen_root)
+        .status()
+        .expect("spawn lock-contention child");
+    assert!(
+        status.success(),
+        "child must be rejected with typed Lock error, got {status}"
+    );
+    drop(held);
+
+    // After the parent's lock drops, recovery succeeds again.
+    let after = recover_generation_root(&gen_root).expect("recovery after lock release");
+    assert_eq!(after.selected.slot.generation_id, "g-held");
 }
 
 // ---------------------------------------------------------------------------
@@ -411,12 +471,20 @@ fn wal_advance_preserves_post_boundary_writes() {
     assert_eq!(recovery.selected.slot.generation_id, "g-two");
 
     // The selected boundary advanced past the first publication's boundary
-    // (log sequence monotonic) and the replay range from the new boundary —
-    // which must include any post-boundary frames retained by the floor —
+    // (log sequence monotonic) and the replay range from the new boundary
     // validates against the surviving real WAL files.
     assert!(second.wal_boundary.log_sequence >= first.wal_boundary.log_sequence);
     validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
         .expect("advanced boundary replayable; no accepted write discarded");
+
+    // The post-boundary frame actually survived truncation: replaying from
+    // the FIRST publication's boundary must still validate, which requires
+    // the frame's file (between the two boundaries) to exist and parse.
+    // This is the concrete "no accepted write silently discarded" proof —
+    // validating only from the new boundary would pass even if the frame's
+    // file had been wrongly truncated.
+    validate_replayable(&gen_root.join("wal"), &first.wal_boundary.to_cursor())
+        .expect("post-boundary frame's WAL file survived truncation");
 
     // The first generation's boundary log is still retained while its slot
     // survives (dual-slot retention floor).
@@ -456,7 +524,7 @@ fn wal_advance_preserves_post_boundary_writes() {
 /// at the engine-observable boundary named by `GRAFEO_3C_ABORT` (wired
 /// inside `build_generation_inner`; see generation_build.rs).
 fn child_main() {
-    let root = std::env::var("GRAEORECOV_ROOT").expect("child root env");
+    let root = std::env::var("GRAFEORECOV_ROOT").expect("child root env");
     let root = std::path::PathBuf::from(root);
 
     let db = GrafeoDB::new_in_memory();
@@ -489,10 +557,25 @@ fn engine_crash_case(boundary: &str, test_name: &str, expect_new: bool) {
         .arg(test_name)
         .arg("--exact")
         .env(HELPER_ENV, "1")
-        .env("GRAEORECOV_ROOT", &gen_root)
+        .env("GRAFEORECOV_ROOT", &gen_root)
         .env("GRAFEO_3C_ABORT", boundary)
         .status()
         .expect("spawn child");
+    // Pin the abort origin: the child must die by SIGABRT (the seam's
+    // `std::process::abort`), not merely fail (a panic or unrelated error
+    // exit would also be non-success but proves nothing about the boundary).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        // SIGABRT = 6 on Linux (the generation root lock allowlist is
+        // Linux-only); assert the signal directly without a libc dep.
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "child must die by SIGABRT at {boundary}, got {status}"
+        );
+    }
+    #[cfg(not(unix))]
     assert!(!status.success(), "child must abort at {boundary}");
 
     // The lock is released by the child's death; recovery selects from the
@@ -585,6 +668,22 @@ fn crash_point_surface_is_complete_and_ordered() {
     hooks.sort_unstable();
     hooks.dedup();
     assert_eq!(hooks.len(), 14, "every crash point has a distinct W0 hook");
+
+    // Cross-check against the REAL W0 hook registry: every engine hook name
+    // must literally appear as a `hook("<name>")` call in W0's
+    // `publication.rs` source. A W0 hook rename/addition fails this test at
+    // compile time of the suite instead of silently drifting. (W0 does not
+    // export the hook list programmatically; `include_str!` on its source is
+    // the no-new-surface drift pin.)
+    const W0_PUBLICATION_SRC: &str =
+        include_str!("../../grafeo-storage/src/generation/publication.rs");
+    for point in PublicationCrashPoint::ALL {
+        let needle = format!("hook(\"{}\")", point.hook_name());
+        assert!(
+            W0_PUBLICATION_SRC.contains(&needle),
+            "W0 publication.rs must contain {needle} for {point:?}"
+        );
+    }
 
     // Strictly ordered.
     for window in PublicationCrashPoint::ALL.windows(2) {

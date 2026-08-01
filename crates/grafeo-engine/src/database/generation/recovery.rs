@@ -44,20 +44,23 @@ pub enum OrphanClassification {
         /// Root-relative path recorded in the manifest slot.
         path: String,
     },
-    /// The immutable generation file of the still-retained previous slot
-    /// (the explicit W0 fallback; must be preserved while its slot survives).
+    /// The generation file referenced by the still-retained other slot.
+    /// Slot-authority only: the referenced bytes are NOT guaranteed valid
+    /// (it may be the torn generation recovery fell back away from); it must
+    /// be preserved while its slot survives, not trusted as a base.
     PreviousGeneration {
         /// Root-relative path recorded in the previous slot.
         path: String,
     },
-    /// A correlation-scoped unpublished build directory (`.unpublished-*`)
+    /// A correlation-scoped unpublished build artifact (`.unpublished-*`)
     /// left by a pre-commit crash. Never promoted; safe to collect later.
     UnpublishedBuildDir {
-        /// Directory name (no path separators).
+        /// Entry name (no path separators).
         name: String,
     },
-    /// An immutable generation file not referenced by any valid manifest
-    /// slot. Never promoted (W0 selection is manifest-authority only).
+    /// An immutable `.grafeo` generation file not referenced by any valid
+    /// manifest slot. Never promoted (W0 selection is manifest-authority
+    /// only).
     UnreferencedGeneration {
         /// File name under `generations/`.
         name: String,
@@ -77,8 +80,12 @@ pub struct RootRecovery {
     /// The selected generation's durable WAL boundary (the exact replay
     /// range start) as the engine boundary type.
     pub wal_boundary: WalBoundary,
-    /// The retained previous slot's root-relative generation path, when a
-    /// second valid slot exists (the explicit W0 fallback).
+    /// The other retained slot's root-relative generation path, when a
+    /// second structurally valid slot exists. Slot-authority only: the
+    /// referenced file's bytes are NOT guaranteed valid (it may be the torn
+    /// generation W0 recovery just fell back away from). Use
+    /// [`RootRecovery::selected`] as the base; this field exists for
+    /// retention/GC bookkeeping, not as a fallback recommendation.
     pub previous_generation_path: Option<String>,
     /// Classification of every surviving artifact observed under the root.
     pub orphans: Vec<OrphanClassification>,
@@ -87,9 +94,9 @@ pub struct RootRecovery {
 /// Errors from engine-level recovery.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryViewError {
-    /// The exclusive root lock could not be acquired.
+    /// The exclusive root lock could not be acquired (source preserved).
     #[error("root lock: {0}")]
-    Lock(String),
+    Lock(#[from] grafeo_storage::generation::lock::RootLockError),
     /// W0 recovery failed; the source identity (including both-causes
     /// `NoValidGeneration` detail) is preserved.
     #[error("recovery: {0}")]
@@ -121,7 +128,7 @@ impl From<RecoveryViewError> for grafeo_common::utils::error::Error {
 /// [`RecoveryViewError::Recovery`] for every W0 recovery failure branch, and
 /// [`RecoveryViewError::Io`] when orphan classification cannot read the root.
 pub fn recover_generation_root(root: &Path) -> Result<RootRecovery, RecoveryViewError> {
-    let lock = RootLock::try_acquire(root).map_err(|e| RecoveryViewError::Lock(e.to_string()))?;
+    let lock = RootLock::try_acquire(root).map_err(RecoveryViewError::Lock)?;
     let selected = recover(&lock)?;
     let wal_boundary = WalBoundary::from_cursor(&selected.wal_cursor);
 
@@ -172,17 +179,18 @@ fn classify_root_artifacts(
         });
     }
 
-    // Unpublished build directories at the root level.
+    // Unpublished build artifacts at the root level (any entry type: a
+    // pre-commit crash may leave a partial dir or file).
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(".unpublished-") && entry.file_type()?.is_dir() {
+        if name.starts_with(".unpublished-") {
             out.push(OrphanClassification::UnpublishedBuildDir { name });
         }
     }
 
-    // Unreferenced immutable generations: present under `generations/` but
-    // named by no valid slot.
+    // Unreferenced immutable generations: regular `.grafeo` files present
+    // under `generations/` but named by no valid slot.
     let generations_dir = root.join("generations");
     if generations_dir.is_dir() {
         let referenced: Vec<String> = out
@@ -197,9 +205,13 @@ fn classify_root_artifacts(
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let rel = format!("generations/{name}");
-            if !referenced.contains(&rel) {
-                out.push(OrphanClassification::UnreferencedGeneration { name });
+            if !entry.file_type()?.is_file()
+                || !name.ends_with(".grafeo")
+                || referenced.contains(&rel)
+            {
+                continue;
             }
+            out.push(OrphanClassification::UnreferencedGeneration { name });
         }
     }
 

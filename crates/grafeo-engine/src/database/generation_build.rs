@@ -7,7 +7,6 @@
 //! This module does **not** own publication, manifest, lock, WAL-cursor, or
 //! container-writer machinery — those stay in `grafeo-storage` (W0). It also
 //! does not select a published generation (selection belongs to W0 recovery).
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -172,9 +171,8 @@ fn map_generation_error(err: GenerationError) -> Error {
 ///
 /// Preserves the W0 [`PublicationError`] identity and tags the conservative
 /// failing [`super::generation::publication::PublicationPhase`] so a caller
-/// can learn whether the failure was pre-commit (new generation not durable)
-/// or post-commit. This satisfies the packet requirement to surface every
-/// publication phase/error rather than flattening to an untyped string.
+/// can learn whether the failure was pre-commit or post-commit, satisfying
+/// the packet requirement to surface every publication phase/error.
 fn map_publication_error(err: PublicationError) -> Error {
     PublicationPhaseError::from_publication(err).into()
 }
@@ -196,10 +194,10 @@ impl GrafeoDB {
     /// The freeze captures identity keys only; node/edge payloads (labels, edge
     /// types, properties) are read live from the graph while the build streams.
     /// Callers must ensure **no concurrent writes** mutate the graph during the
-    /// build (single-writer assumption). A mid-build node or edge deletion
-    /// fails closed (the record is skipped and endpoint validation rejects
-    /// dangling edges), but a concurrent property mutation does **not** fail
-    /// closed — the published payload reflects whatever the stream read live.
+    /// build. A mid-build node or edge deletion fails closed (the record is
+    /// skipped and endpoint validation rejects dangling edges), but a
+    /// concurrent property mutation does **not** fail closed — the published
+    /// payload reflects whatever the stream read live.
     ///
     /// # Errors
     ///
@@ -231,8 +229,7 @@ impl GrafeoDB {
     /// fresh-reopen-validated immutable generation, records the precise
     /// durable WAL boundary and overlay epoch in the manifest slot, and does
     /// not truncate/advance the WAL or reset overlay state before the manifest
-    /// selection is durable (the manifest fsync is the commit point, enforced
-    /// by W0 [`publish_generation`]).
+    /// selection is durable (the manifest fsync is the commit point).
     ///
     /// # Errors
     ///
@@ -289,13 +286,16 @@ impl GrafeoDB {
         )
         .map_err(map_generation_error)?;
 
-        // `#[doc(hidden)]` test-only fault seam (G-EM0.3c crash matrix): when
-        // `GRAFEO_3C_ABORT` names an engine-observable boundary, abort the
-        // process there so a fresh-process parent can prove recovery. Inert
-        // unless the env var is set; production paths never set it. Points:
-        // `after_generation_build` (pre-commit) / `after_publication`
-        // (post-commit, manifest fsync durable — the selection transition).
+        // `#[doc(hidden)]` test-only fault seam (G-EM0.3c crash matrix): in
+        // debug/test builds, `GRAFEO_3C_ABORT` hard-aborts the process at the
+        // named engine-owned boundary — `after_generation_build` (pre-commit)
+        // or `after_publication` (post-commit, manifest fsync durable) — so a
+        // fresh-process parent can prove recovery. `debug_assertions`-gated
+        // like W0's `#[cfg(test)]` fault hooks: compiled out of release
+        // builds, so a leaked env var can never abort a shipped process.
+        #[cfg(debug_assertions)]
         let abort_point = std::env::var("GRAFEO_3C_ABORT").ok();
+        #[cfg(debug_assertions)]
         if abort_point.as_deref() == Some("after_generation_build") {
             std::process::abort();
         }
@@ -335,6 +335,8 @@ impl GrafeoDB {
         .map_err(map_publication_error)?;
 
         // Post-commit crash point (3c): manifest fsync durable → select NEW.
+        // Same `debug_assertions` gate as the pre-commit point above.
+        #[cfg(debug_assertions)]
         if abort_point.as_deref() == Some("after_publication") {
             std::process::abort();
         }
