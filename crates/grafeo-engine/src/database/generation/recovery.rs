@@ -25,6 +25,38 @@
 //! WAL **replay** (applying frames from the selected boundary into a live
 //! overlay) is a later packet (G-EM0.5b/5c); this module stops at validated
 //! selection + exact replay boundary + orphan classification.
+//!
+//! ## Fault-proof coverage map (auditable division of evidence)
+//!
+//! The packet asks for deterministic fault injection at every accepted W0
+//! transition, each restarted in a fresh process. W0 paths are read-only to
+//! this packet and W0's fault hooks are `#[cfg(test)]`-gated inside
+//! grafeo-storage, so mid-transition injection is structurally impossible
+//! from an engine integration test; the engine's `build_generation_inner`
+//! calls the *identical* `publish_generation` W0's matrix exercises. The
+//! coverage therefore divides as follows (W0 = accepted W0 suite in
+//! `grafeo-storage`; ENGINE = `tests/compact_store_manifest_recovery.rs`):
+//!
+//! | Packet transition | Deterministic injection | Fresh process |
+//! |-------------------|-------------------------|---------------|
+//! | build-run creation (`.unpublished-*`) | W0 `fault_point_01` | — |
+//! | section finish / streaming | W0 `fault_point_02` | W0 `fp_abort_after_streaming` |
+//! | generation fsync (before/after) | W0 `fault_point_03/04` | — |
+//! | validation (fresh reopen) | W0 `fault_point_05` | — |
+//! | final naming (rename) | W0 `fault_point_06` | W0 `fp_abort_after_rename` |
+//! | directory fsync | W0 `fault_point_07` | — |
+//! | inactive-slot write/fsync (×3) | W0 `fault_point_08/09` | W0 `fp_abort_during_slot_write` |
+//! | selection transition (manifest sync) | W0 `fault_point_10` | W0 `fp_abort_after_manifest_sync` + ENGINE `crash_after_publication` |
+//! | WAL advance | W0 `fault_point_11/12` | — |
+//! | cleanup | W0 `fault_point_11/12` + publication Step 11 | — |
+//! | engine build complete (pre-commit) | — | ENGINE `crash_after_generation_build` |
+//!
+//! Engine-level expectations for ALL 14 W0 hooks are locked by
+//! [`PublicationCrashPoint::ALL`] + `crash_point_surface_is_complete_and_ordered`
+//! (hook names cross-checked against W0's real `publication.rs` source via
+//! `include_str!`). Orphan classification is exercised directly (planted
+//! `.unpublished-*` and unreferenced `.grafeo` artifacts) rather than only
+//! by crash analogy.
 
 use std::path::Path;
 

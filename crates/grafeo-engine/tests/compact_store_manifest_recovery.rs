@@ -425,6 +425,67 @@ fn orphan_future_mtime_generation_never_promoted() {
     );
 }
 
+/// A planted `.unpublished-*` build artifact (the shape a pre-commit crash
+/// leaves behind) is classified as an unpublished build dir — never
+/// promoted, never deleted — and never disturbs slot-authoritative
+/// selection. This exercises the `UnpublishedBuildDir` variant directly
+/// rather than only by crash analogy (the engine crash proofs abort before
+/// or after W0's unpublished-dir window, so they cannot leave one behind).
+#[test]
+fn unpublished_build_artifact_classified_never_promoted() {
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    let db = GrafeoDB::new_in_memory();
+    populate(&db, "one");
+    let first = db
+        .build_and_publish_generation(generation_build_request(&gen_root, "g-one"))
+        .expect("first publish")
+        .publication;
+    drop(db);
+
+    // Plant the crash leftover: W0's exact unpublished-dir shape plus a
+    // partial generation payload inside.
+    let unpublished_name = ".unpublished-deadbeefdeadbeefdeadbeefdeadbeef-g-00000000000000000002";
+    let unpublished_dir = gen_root.join(unpublished_name);
+    fs::create_dir_all(&unpublished_dir).unwrap();
+    fs::write(
+        unpublished_dir.join("generation.grafeo.partial"),
+        b"torn-partial",
+    )
+    .unwrap();
+
+    let recovery = recover_generation_root(&gen_root).expect("recovery with leftover");
+    assert_eq!(recovery.selected.slot.generation_id, "g-one");
+    assert_eq!(recovery.selected.slot.publication_sequence, 1);
+
+    assert!(
+        recovery
+            .orphans
+            .contains(&OrphanClassification::UnpublishedBuildDir {
+                name: unpublished_name.to_string()
+            }),
+        "unpublished artifact classified: {:?}",
+        recovery.orphans
+    );
+    // Never promoted, never deleted.
+    assert!(unpublished_dir.is_dir());
+    assert_eq!(
+        recovery.selected.slot.generation_path, first.generation_path,
+        "unpublished artifact never promoted"
+    );
+    // Genesis has no previous slot; nothing else classified.
+    assert!(
+        !recovery
+            .orphans
+            .iter()
+            .any(|c| matches!(c, OrphanClassification::UnreferencedGeneration { .. })),
+        "no unreferenced generations: {:?}",
+        recovery.orphans
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. WAL advancement: accepted writes after the boundary are never discarded
 // ---------------------------------------------------------------------------
