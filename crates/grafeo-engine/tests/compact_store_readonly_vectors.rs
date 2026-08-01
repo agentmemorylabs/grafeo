@@ -243,6 +243,35 @@ fn readonly_vector_parity_at_two_sizes_with_mmap_topology() {
     );
 }
 
+#[test]
+fn readonly_empty_vector_index_reopens_with_mmap_topology() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("empty_vec.grafeo");
+
+    {
+        let mut db = GrafeoDB::with_config(Config::persistent(&path)).expect("create db");
+        db.create_vector_index(LABEL, PROP, Some(DIMS), Some(METRIC), None, None, None)
+            .expect("create empty vector index");
+        db.compact().expect("compact empty graph");
+        db.wal_checkpoint().expect("checkpoint");
+        db.close().expect("close");
+    }
+
+    let db = GrafeoDB::open_read_only(&path).expect("read-only reopen");
+    assert!(db.has_vector_index(LABEL, PROP));
+    let diagnostics = db.vector_backing_diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(matches!(
+        diagnostics[0].topology,
+        VectorTopologyBacking::Mmap { .. }
+    ));
+    let results = db
+        .vector_search(LABEL, PROP, &[0.0; DIMS], 1, None, None)
+        .expect("search empty mapped index");
+    assert!(results.is_empty());
+    db.close().expect("close read-only db");
+}
+
 /// Corrupt VectorStore magic → open must fail closed (no empty-shell search).
 #[test]
 fn readonly_vector_corrupt_topology_fails_closed() {
