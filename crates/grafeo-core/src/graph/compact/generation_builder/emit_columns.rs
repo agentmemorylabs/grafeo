@@ -3,20 +3,15 @@
 //! Replays the property-occurrence run (sorted by `(table_id, prop_key,
 //! row_offset)`) and emits each column's body bytes into the shared
 //! `ColumnBodies` spool sink, plus the per-column directory records
-//! (`ColumnDirectory`, `ColumnBlockIndex`). Byte-exact with the eager
-//! `write_column_body` path: the column's values are fed through the
-//! incremental [`ColumnEncoder`] in row order, producing the identical
-//! `ColumnCodec`, then serialized via the production `write_column_body`.
-//!
-//! Boundedness: only the **current** column's values are retained (one
-//! column at a time, contiguous in the sorted occurrence run). Absent rows
-//! (sparse) and present-null rows are emitted as placeholders in the typed
-//! body; the three-way distinction is carried by the `ColumnRowPresence` /
-//! `ColumnRowNull` companion segments (D0.8.0), written here from the same
-//! stream.
+//! (`ColumnDirectory`, `ColumnBlockIndex`). Bodies stream directly through
+//! [`StreamingBodyWriter`]; presence/null companions stream through
+//! [`BitByteEmitter`] into optional spool sinks — no whole-column
+//! `ColumnCodec`, body `Vec`, or `Vec<bool>` retention.
 
 use crate::graph::compact::generation::emit::sink::SegmentSink;
-use crate::graph::compact::generation::emit::streaming_column::StreamingColumnEncoder;
+use crate::graph::compact::generation::emit::streaming_column::{
+    BitByteEmitter, StreamingBodyWriter,
+};
 use crate::graph::compact::generation::{
     CancelToken, ExternalRunMerger, GenerationBudget, GenerationError, GenerationMetrics,
     RunSetLease,
@@ -288,14 +283,14 @@ pub struct EmittedColumn {
 pub struct ColumnEmissionResult {
     /// Emitted columns in directory order.
     pub columns: Vec<EmittedColumn>,
-    /// Presence companion records `(column_index, row_count, bits)`.
-    pub presence: Vec<(u32, u32, Vec<bool>)>,
-    /// Null companion records `(column_index, row_count, bits)`.
-    pub null: Vec<(u32, u32, Vec<bool>)>,
+    /// True when at least one column wrote a presence companion record.
+    pub emitted_presence: bool,
+    /// True when at least one column wrote a null companion record.
+    pub emitted_null: bool,
 }
 
 /// Replays the occurrence run, emitting column bodies into `bodies_sink` and
-/// returning per-column directory data + presence/null records.
+/// streaming presence/null companions into optional sinks.
 ///
 /// `geometries` must be in the same order the occurrence run yields columns
 /// (`(table_id, prop_key)` ascending). `dict_chunks` resolves Dict global
@@ -312,6 +307,8 @@ pub(crate) fn emit_column_bodies(
     geometries: &[ColumnGeometry],
     dict_chunks: &mut DictChunkReader,
     bodies_sink: &mut dyn SegmentSink,
+    presence_sink: &mut dyn SegmentSink,
+    null_sink: &mut dyn SegmentSink,
     budget: &GenerationBudget,
     metrics: &mut GenerationMetrics,
     cancel: Option<&CancelToken>,
@@ -319,66 +316,54 @@ pub(crate) fn emit_column_bodies(
     let mut result = ColumnEmissionResult::default();
     let mut geo_iter = geometries.iter();
     let mut current_geo: Option<&ColumnGeometry> = None;
-    let mut encoder: Option<StreamingColumnEncoder> = None;
-    let mut col_row_count = 0u64;
-    let mut presence_bits: Vec<bool> = Vec::new();
-    let mut null_bits: Vec<bool> = Vec::new();
+    let mut writer: Option<StreamingBodyWriter> = None;
+    let mut presence_emitter: Option<BitByteEmitter> = None;
+    let mut null_emitter: Option<BitByteEmitter> = None;
     let mut body_cursor = 0u64;
     let mut next_row: u64 = 0;
 
-    let mut flush = |result: &mut ColumnEmissionResult,
+    let flush = |result: &mut ColumnEmissionResult,
                      geo: Option<&ColumnGeometry>,
-                     encoder: Option<StreamingColumnEncoder>,
-                     row_count: u64,
-                     presence: &mut Vec<bool>,
-                     null: &mut Vec<bool>,
+                     writer: Option<StreamingBodyWriter>,
+                     presence_emitter: &mut Option<BitByteEmitter>,
+                     null_emitter: &mut Option<BitByteEmitter>,
                      body_cursor: &mut u64,
-                     chunks: &mut DictChunkReader|
+                     bodies_sink: &mut dyn SegmentSink,
+                     presence_sink: &mut dyn SegmentSink,
+                     null_sink: &mut dyn SegmentSink|
      -> Result<(), GenerationError> {
-        let (Some(g), Some(enc)) = (geo, encoder) else {
+        let (Some(_g), Some(w)) = (geo, writer) else {
             return Ok(());
         };
-        let kind = codec_kind_of(g);
+        if let Some(em) = presence_emitter.as_mut() {
+            em.finish_record(presence_sink)?;
+        }
+        if let Some(em) = null_emitter.as_mut() {
+            em.finish_record(null_sink)?;
+        }
+        let kind = codec_kind_of(_g);
         let column_index = result.columns.len() as u32;
-        let codec = enc.finish()?;
-        // Resolve this column's Dict strings from the per-column chunk map
-        // (bounded by the column's distinct strings; discarded after flush).
-        let dict_map = chunks.map_for(g.table_id, &g.key)?;
-        // Compute per-block zone maps from the emitted codec (byte-exact with eager).
-        let block_zms = crate::graph::compact::zone_map::compute_block_zone_maps(&codec);
-        // Serialize the body via production write_column_body.
-        let mut body = Vec::new();
-        crate::graph::compact::section_v5::write_column_body(&mut body, &codec, &dict_map)
-            .map_err(GenerationError::Codec)?;
         let body_start = *body_cursor;
-        bodies_sink.write(&body)?;
-        *body_cursor += body.len() as u64;
+        let (body_len, codec_len, block_zms) = w.finish(bodies_sink)?;
+        *body_cursor += body_len;
         result.columns.push(EmittedColumn {
             column_index,
             kind,
-            body_len: body.len() as u32,
-            body_start: u32::try_from(body_start).map_err(|_| {
-                GenerationError::WireWidthOverflow {
-                    what: "col_body_offset",
-                    count: body_start,
-                    max: u64::from(u32::MAX),
-                }
+            body_len: u32::try_from(body_len).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "col_body_len",
+                count: body_len,
+                max: u64::from(u32::MAX),
             })?,
-            codec_len: codec.len() as u32,
+            body_start: u32::try_from(body_start).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "col_body_offset",
+                count: body_start,
+                max: u64::from(u32::MAX),
+            })?,
+            codec_len,
             block_zone_maps: block_zms,
         });
-        if g.needs_presence() {
-            result
-                .presence
-                .push((column_index, row_count as u32, presence.clone()));
-        }
-        if g.needs_null() {
-            result
-                .null
-                .push((column_index, row_count as u32, null.clone()));
-        }
-        presence.clear();
-        null.clear();
+        *presence_emitter = None;
+        *null_emitter = None;
         Ok(())
     };
 
@@ -390,24 +375,29 @@ pub(crate) fn emit_column_bodies(
         let matches = current_geo.is_some_and(|g| g.table_id == tid && g.key == prop);
         if !matches {
             // Fill trailing absent rows for the previous column.
-            if let Some(prev_enc) = encoder.as_mut() {
+            if let Some(w) = writer.as_mut() {
                 let prev_g = current_geo.expect("geometry set");
                 while next_row < prev_g.row_count {
-                    prev_enc.push_placeholder()?;
-                    presence_bits.push(false);
-                    null_bits.push(false);
+                    w.push_placeholder(bodies_sink)?;
+                    if let Some(em) = presence_emitter.as_mut() {
+                        em.push_bit(presence_sink, false)?;
+                    }
+                    if let Some(em) = null_emitter.as_mut() {
+                        em.push_bit(null_sink, false)?;
+                    }
                     next_row += 1;
                 }
             }
             flush(
                 &mut result,
                 current_geo,
-                encoder.take(),
-                col_row_count,
-                &mut presence_bits,
-                &mut null_bits,
+                writer.take(),
+                &mut presence_emitter,
+                &mut null_emitter,
                 &mut body_cursor,
-                dict_chunks,
+                bodies_sink,
+                presence_sink,
+                null_sink,
             )?;
             current_geo = geo_iter.next();
             let g = current_geo.ok_or_else(|| {
@@ -419,42 +409,62 @@ pub(crate) fn emit_column_bodies(
                     g.table_id, g.key
                 )));
             }
-            encoder = Some(StreamingColumnEncoder::from_geometry(
-                format!("table {tid} column {prop}"),
+            let (w, p_em, n_em) = begin_column_streams(
                 g,
-            ));
-            col_row_count = g.row_count;
+                dict_chunks,
+                &mut result,
+                bodies_sink,
+                presence_sink,
+                null_sink,
+                tid,
+                prop,
+            )?;
+            writer = Some(w);
+            presence_emitter = p_em;
+            null_emitter = n_em;
             next_row = 0;
         }
-        let enc = encoder.as_mut().expect("just set");
+        let w = writer.as_mut().expect("just set");
 
         // Fill absent rows (sparse) with placeholders up to this row offset.
         while next_row < row_off {
-            enc.push_placeholder()?;
-            presence_bits.push(false);
-            null_bits.push(false);
+            w.push_placeholder(bodies_sink)?;
+            if let Some(em) = presence_emitter.as_mut() {
+                em.push_bit(presence_sink, false)?;
+            }
+            if let Some(em) = null_emitter.as_mut() {
+                em.push_bit(null_sink, false)?;
+            }
             next_row += 1;
         }
         // This present row.
         let is_null = matches!(value, Value::Null);
-        presence_bits.push(true);
-        null_bits.push(is_null);
+        if let Some(em) = presence_emitter.as_mut() {
+            em.push_bit(presence_sink, true)?;
+        }
+        if let Some(em) = null_emitter.as_mut() {
+            em.push_bit(null_sink, is_null)?;
+        }
         if is_null {
-            enc.push_placeholder()?;
+            w.push_placeholder(bodies_sink)?;
         } else {
-            enc.push(&value)?;
+            w.push(bodies_sink, &value)?;
         }
         next_row += 1;
         Ok(())
     })?;
 
     // Trailing absent rows in the final column.
-    if let Some(enc) = encoder.as_mut() {
+    if let Some(w) = writer.as_mut() {
         let g = current_geo.expect("geometry set");
         while next_row < g.row_count {
-            enc.push_placeholder()?;
-            presence_bits.push(false);
-            null_bits.push(false);
+            w.push_placeholder(bodies_sink)?;
+            if let Some(em) = presence_emitter.as_mut() {
+                em.push_bit(presence_sink, false)?;
+            }
+            if let Some(em) = null_emitter.as_mut() {
+                em.push_bit(null_sink, false)?;
+            }
             next_row += 1;
         }
     }
@@ -462,16 +472,59 @@ pub(crate) fn emit_column_bodies(
     flush(
         &mut result,
         current_geo,
-        encoder.take(),
-        col_row_count,
-        &mut presence_bits,
-        &mut null_bits,
+        writer.take(),
+        &mut presence_emitter,
+        &mut null_emitter,
         &mut body_cursor,
-        dict_chunks,
+        bodies_sink,
+        presence_sink,
+        null_sink,
     )?;
-    // Every Dict column's chunk must have been consumed by the flushes.
+    // Every Dict column's chunk must have been consumed by the column opens/flushes.
     dict_chunks.verify_drained()?;
     Ok(result)
+}
+
+fn begin_column_streams(
+    g: &ColumnGeometry,
+    dict_chunks: &mut DictChunkReader,
+    result: &mut ColumnEmissionResult,
+    bodies_sink: &mut dyn SegmentSink,
+    presence_sink: &mut dyn SegmentSink,
+    null_sink: &mut dyn SegmentSink,
+    tid: u16,
+    prop: &str,
+) -> Result<(StreamingBodyWriter, Option<BitByteEmitter>, Option<BitByteEmitter>), GenerationError> {
+    let dict_map = dict_chunks.map_for(g.table_id, &g.key)?;
+    let w = StreamingBodyWriter::new(
+        bodies_sink,
+        g,
+        dict_map,
+        format!("table {tid} column {prop}"),
+    )?;
+    let column_index = result.columns.len() as u32;
+    let row_count = u32::try_from(g.row_count).map_err(|_| GenerationError::WireWidthOverflow {
+        what: "col_row_count",
+        count: g.row_count,
+        max: u64::from(u32::MAX),
+    })?;
+    let presence_emitter = if g.needs_presence() {
+        result.emitted_presence = true;
+        let mut em = BitByteEmitter::new();
+        em.begin_record(presence_sink, column_index, row_count)?;
+        Some(em)
+    } else {
+        None
+    };
+    let null_emitter = if g.needs_null() {
+        result.emitted_null = true;
+        let mut em = BitByteEmitter::new();
+        em.begin_record(null_sink, column_index, row_count)?;
+        Some(em)
+    } else {
+        None
+    };
+    Ok((w, presence_emitter, null_emitter))
 }
 
 /// Writes the ColumnDirectory + ColumnBlockIndex + per-table directory rows.

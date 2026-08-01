@@ -296,6 +296,9 @@ impl BoundedGenerationBuilder {
 
         let mut bodies_sink =
             Box::new(self.make_sink(SegmentKind::ColumnBodies, 1, 0, "colbodies"));
+        let mut presence_sink =
+            Box::new(self.make_sink(SegmentKind::ColumnRowPresence, 1, 0, "colpres"));
+        let mut null_sink = Box::new(self.make_sink(SegmentKind::ColumnRowNull, 1, 0, "colnull"));
         let mut chunk_file = std::fs::File::open(&chunks_path).map_err(|e| {
             GenerationError::Io(format!("open dict chunks {}: {e}", chunks_path.display()))
         })?;
@@ -306,6 +309,8 @@ impl BoundedGenerationBuilder {
             &geometries,
             &mut chunk_reader,
             bodies_sink.as_mut(),
+            presence_sink.as_mut(),
+            null_sink.as_mut(),
             &budget,
             &mut self.metrics,
             self.cancel.as_ref(),
@@ -378,6 +383,8 @@ impl BoundedGenerationBuilder {
             bytes_sink,
             code_index_sink,
             bodies_sink,
+            presence_sink,
+            null_sink,
             fwd_off_sink,
             fwd_tgt_sink,
             rev_off_sink,
@@ -472,6 +479,8 @@ impl BoundedGenerationBuilder {
         bytes_sink: Box<dyn SegmentSink>,
         code_index_sink: Box<dyn SegmentSink>,
         bodies_sink: Box<dyn SegmentSink>,
+        presence_sink: Box<dyn SegmentSink>,
+        null_sink: Box<dyn SegmentSink>,
         fwd_off_sink: Box<dyn SegmentSink>,
         fwd_tgt_sink: Box<dyn SegmentSink>,
         rev_off_sink: Box<dyn SegmentSink>,
@@ -683,34 +692,11 @@ impl BoundedGenerationBuilder {
             descriptors.push(block_zm_desc);
         }
 
-        // Add presence/null companions.
-        if !col_result.presence.is_empty() {
-            let mut presence_bytes = Vec::new();
-            crate::graph::compact::mapped::presence::write_presence_segment(
-                &mut |b| Ok::<_, String>(presence_bytes.extend_from_slice(b)),
-                &col_result.presence,
-            )
-            .map_err(GenerationError::Codec)?;
-            descriptors.push(make_resident_desc(
-                SegmentKind::ColumnRowPresence,
-                1,
-                0,
-                &presence_bytes,
-            ));
+        if col_result.emitted_presence {
+            descriptors.push(presence_sink.finish()?);
         }
-        if !col_result.null.is_empty() {
-            let mut null_bytes = Vec::new();
-            crate::graph::compact::mapped::presence::write_null_segment(
-                &mut |b| Ok::<_, String>(null_bytes.extend_from_slice(b)),
-                &col_result.null,
-            )
-            .map_err(GenerationError::Codec)?;
-            descriptors.push(make_resident_desc(
-                SegmentKind::ColumnRowNull,
-                1,
-                0,
-                &null_bytes,
-            ));
+        if col_result.emitted_null {
+            descriptors.push(null_sink.finish()?);
         }
 
         // Add the NodeLabelMembership companion segment (only when at least

@@ -30,7 +30,7 @@ pub use payload_lease::V5PayloadLease;
 pub use segments::emit_canonical_descriptors;
 pub use sink::{SegmentSink, SpoolSegmentSink};
 #[cfg(feature = "generation-streaming")]
-pub use streaming_column::StreamingColumnEncoder;
+pub use streaming_column::StreamingBodyWriter;
 // MemorySegmentSink is the legacy/test-only in-memory sink. When
 // `generation-streaming` is on, it is NOT re-exported from the emit
 // module — the bounded builder path must use SpoolSegmentSink. This
