@@ -15,8 +15,8 @@
 //! `ColumnRowNull` companion segments (D0.8.0), written here from the same
 //! stream.
 
-use crate::graph::compact::generation::emit::column::ColumnEncoder;
 use crate::graph::compact::generation::emit::sink::SegmentSink;
+use crate::graph::compact::generation::emit::streaming_column::StreamingColumnEncoder;
 use crate::graph::compact::generation::{
     CancelToken, ExternalRunMerger, GenerationBudget, GenerationError, GenerationMetrics,
     RunSetLease,
@@ -319,8 +319,7 @@ pub(crate) fn emit_column_bodies(
     let mut result = ColumnEmissionResult::default();
     let mut geo_iter = geometries.iter();
     let mut current_geo: Option<&ColumnGeometry> = None;
-    let mut encoder: Option<ColumnEncoder> = None;
-    let mut col_values: Vec<Option<Value>> = Vec::new();
+    let mut encoder: Option<StreamingColumnEncoder> = None;
     let mut col_row_count = 0u64;
     let mut presence_bits: Vec<bool> = Vec::new();
     let mut null_bits: Vec<bool> = Vec::new();
@@ -329,8 +328,7 @@ pub(crate) fn emit_column_bodies(
 
     let mut flush = |result: &mut ColumnEmissionResult,
                      geo: Option<&ColumnGeometry>,
-                     encoder: Option<ColumnEncoder>,
-                     values: &mut Vec<Option<Value>>,
+                     encoder: Option<StreamingColumnEncoder>,
                      row_count: u64,
                      presence: &mut Vec<bool>,
                      null: &mut Vec<bool>,
@@ -342,8 +340,7 @@ pub(crate) fn emit_column_bodies(
         };
         let kind = codec_kind_of(g);
         let column_index = result.columns.len() as u32;
-        let mut string_occ = Vec::new();
-        let (codec, _col_type, _zm) = enc.finish(&mut string_occ)?;
+        let codec = enc.finish()?;
         // Resolve this column's Dict strings from the per-column chunk map
         // (bounded by the column's distinct strings; discarded after flush).
         let dict_map = chunks.map_for(g.table_id, &g.key)?;
@@ -380,7 +377,6 @@ pub(crate) fn emit_column_bodies(
                 .null
                 .push((column_index, row_count as u32, null.clone()));
         }
-        values.clear();
         presence.clear();
         null.clear();
         Ok(())
@@ -394,10 +390,10 @@ pub(crate) fn emit_column_bodies(
         let matches = current_geo.is_some_and(|g| g.table_id == tid && g.key == prop);
         if !matches {
             // Fill trailing absent rows for the previous column.
-            if let (Some(prev_g), Some(prev_enc)) = (current_geo, encoder.as_mut()) {
-                let prev_family = family_of(prev_g);
+            if let Some(prev_enc) = encoder.as_mut() {
+                let prev_g = current_geo.expect("geometry set");
                 while next_row < prev_g.row_count {
-                    prev_enc.push_placeholder(prev_family)?;
+                    prev_enc.push_placeholder()?;
                     presence_bits.push(false);
                     null_bits.push(false);
                     next_row += 1;
@@ -407,7 +403,6 @@ pub(crate) fn emit_column_bodies(
                 &mut result,
                 current_geo,
                 encoder.take(),
-                &mut col_values,
                 col_row_count,
                 &mut presence_bits,
                 &mut null_bits,
@@ -424,17 +419,18 @@ pub(crate) fn emit_column_bodies(
                     g.table_id, g.key
                 )));
             }
-            encoder = Some(ColumnEncoder::new(format!("table {tid} column {prop}")));
+            encoder = Some(StreamingColumnEncoder::from_geometry(
+                format!("table {tid} column {prop}"),
+                g,
+            ));
             col_row_count = g.row_count;
             next_row = 0;
         }
         let enc = encoder.as_mut().expect("just set");
-        let g = current_geo.expect("geometry set");
-        let family = family_of(g);
 
         // Fill absent rows (sparse) with placeholders up to this row offset.
         while next_row < row_off {
-            enc.push_placeholder(family)?;
+            enc.push_placeholder()?;
             presence_bits.push(false);
             null_bits.push(false);
             next_row += 1;
@@ -444,19 +440,19 @@ pub(crate) fn emit_column_bodies(
         presence_bits.push(true);
         null_bits.push(is_null);
         if is_null {
-            enc.push_placeholder(family)?;
+            enc.push_placeholder()?;
         } else {
-            enc.push(Some(&value))?;
+            enc.push(&value)?;
         }
         next_row += 1;
         Ok(())
     })?;
 
     // Trailing absent rows in the final column.
-    if let (Some(g), Some(enc)) = (current_geo, encoder.as_mut()) {
-        let family = family_of(g);
+    if let Some(enc) = encoder.as_mut() {
+        let g = current_geo.expect("geometry set");
         while next_row < g.row_count {
-            enc.push_placeholder(family)?;
+            enc.push_placeholder()?;
             presence_bits.push(false);
             null_bits.push(false);
             next_row += 1;
@@ -467,7 +463,6 @@ pub(crate) fn emit_column_bodies(
         &mut result,
         current_geo,
         encoder.take(),
-        &mut col_values,
         col_row_count,
         &mut presence_bits,
         &mut null_bits,
@@ -477,23 +472,6 @@ pub(crate) fn emit_column_bodies(
     // Every Dict column's chunk must have been consumed by the flushes.
     dict_chunks.verify_drained()?;
     Ok(result)
-}
-
-/// Maps a geometry to its column family name (for placeholder encoding).
-fn family_of(g: &ColumnGeometry) -> &'static str {
-    if g.has_string {
-        "String"
-    } else if g.vector_dims.is_some() {
-        "Vector"
-    } else if g.saw_signed_int || g.min_int.is_some() {
-        "Int64"
-    } else if g.min_float.is_some() || g.max_float.is_some() {
-        "Float64"
-    } else if g.saw_true || g.saw_false {
-        "Bool"
-    } else {
-        "String" // empty column placeholder family
-    }
 }
 
 /// Writes the ColumnDirectory + ColumnBlockIndex + per-table directory rows.
