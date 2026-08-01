@@ -861,6 +861,39 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
     }
     store.set_memory_accounting(accounting);
     let _ = col_dir_bytes; // validated by existence; column geometry uses block index
+
+    // ── G-EM0.5b D0.8.0 source-true companions (optional, fail-closed) ──
+    // Presence of any companion segment is parsed and validated; a malformed
+    // companion fails the open rather than silently dropping labels, sparse
+    // absence, or stored nulls. Absence applies the old-v5 defaults.
+    let membership_bytes = directory
+        .get(SegmentKind::NodeLabelMembership)
+        .map(|e| slice_segment_checked(data_bytes, e))
+        .transpose()?;
+    let presence_bytes = directory
+        .get(SegmentKind::ColumnRowPresence)
+        .map(|e| slice_segment_checked(data_bytes, e))
+        .transpose()?;
+    let null_bytes = directory
+        .get(SegmentKind::ColumnRowNull)
+        .map(|e| slice_segment_checked(data_bytes, e))
+        .transpose()?;
+    if membership_bytes.is_some() || presence_bytes.is_some() || null_bytes.is_some() {
+        let membership = membership_bytes
+            .as_ref()
+            .map(crate::graph::compact::mapped::LabelMembershipView::parse)
+            .transpose()?;
+        let presence = presence_bytes
+            .as_ref()
+            .map(|b| crate::graph::compact::mapped::RowBitmapView::parse(b, SegmentKind::ColumnRowPresence))
+            .transpose()?;
+        let null = null_bytes
+            .as_ref()
+            .map(|b| crate::graph::compact::mapped::RowBitmapView::parse(b, SegmentKind::ColumnRowNull))
+            .transpose()?;
+        store.set_source_true_companions(membership, presence, null, data_bytes.clone());
+    }
+
     Ok(store)
 }
 

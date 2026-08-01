@@ -146,6 +146,11 @@ path = "tests/compact_store_generation_contract.rs"
 required-features = ["generation", "compact-store"]
 
 [[test]]
+name = "compact_store_source_true"
+path = "tests/compact_store_source_true.rs"
+required-features = ["generation", "compact-store"]
+
+[[test]]
 name = "generation_build_orchestration"
 path = "tests/generation_build_orchestration.rs"
 required-features = ["generation", "compact-store", "lpg"]

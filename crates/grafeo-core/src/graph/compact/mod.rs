@@ -138,6 +138,20 @@ pub struct CompactStore {
     mapped_edge_original_bases: Option<Vec<usize>>,
     /// Split memory accounting for Milestone R evidence.
     memory_accounting: Option<mapped::CompactMemoryAccounting>,
+
+    // ── G-EM0.5b D0.8.0 source-true companions ──────────────────────
+    /// Node logical-label membership (segment kind 21). `None` applies the
+    /// old-v5 default (each node belongs to exactly its physical table's
+    /// label).
+    label_membership: Option<mapped::LabelMembershipView>,
+    /// Per-column row-presence bitmap (segment kind 22). `None` applies the
+    /// old-v5 default (every encoded row present).
+    column_presence: Option<mapped::RowBitmapView>,
+    /// Per-column row-null bitmap (segment kind 23). `None` applies the
+    /// old-v5 default (every present row non-null).
+    column_null: Option<mapped::RowBitmapView>,
+    /// Retained bytes backing the presence/null/membership views.
+    companion_bytes: Option<bytes::Bytes>,
 }
 
 impl std::fmt::Debug for CompactStore {
@@ -213,6 +227,10 @@ impl CompactStore {
             mapped_edge_original_ids: None,
             mapped_edge_original_bases: None,
             memory_accounting: None,
+            label_membership: None,
+            column_presence: None,
+            column_null: None,
+            companion_bytes: None,
         }
     }
 
@@ -535,6 +553,87 @@ impl CompactStore {
     /// Records split memory accounting for this store.
     pub(crate) fn set_memory_accounting(&mut self, accounting: mapped::CompactMemoryAccounting) {
         self.memory_accounting = Some(accounting);
+    }
+
+    /// Installs the G-EM0.5b D0.8.0 source-true companion views from a v5
+    /// payload (label membership + column presence/null).
+    pub(crate) fn set_source_true_companions(
+        &mut self,
+        membership: Option<mapped::LabelMembershipView>,
+        presence: Option<mapped::RowBitmapView>,
+        null: Option<mapped::RowBitmapView>,
+        backing: bytes::Bytes,
+    ) {
+        self.label_membership = membership;
+        self.column_presence = presence;
+        self.column_null = null;
+        self.companion_bytes = Some(backing);
+    }
+
+    /// Returns the full logical label codes for one physical node row.
+    ///
+    /// When no membership companion exists, the old-v5 default applies: the
+    /// node belongs to exactly its physical table's label (whose code the
+    /// caller supplies).
+    #[must_use]
+    pub(crate) fn logical_label_codes_of(
+        &self,
+        node_table_id: u16,
+        node_offset: u32,
+        physical_label_code: u32,
+    ) -> Vec<u32> {
+        match &self.label_membership {
+            Some(view) => {
+                let mut codes = view.labels_of(node_table_id, node_offset);
+                if codes.is_empty() {
+                    codes.push(physical_label_code);
+                }
+                codes
+            }
+            None => vec![physical_label_code],
+        }
+    }
+
+    /// Returns `true` when a membership companion is installed (multi-label
+    /// payload).
+    #[must_use]
+    pub(crate) fn has_label_membership(&self) -> bool {
+        self.label_membership.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    /// Borrows the installed label-membership view, if any.
+    #[must_use]
+    pub(crate) fn label_membership_view(&self) -> Option<&mapped::LabelMembershipView> {
+        self.label_membership.as_ref()
+    }
+
+    /// Borrows the presence bitmap bytes, if any.
+    #[must_use]
+    pub(crate) fn companion_bytes(&self) -> Option<&bytes::Bytes> {
+        self.companion_bytes.as_ref()
+    }
+
+    /// Three-way per-`(column, row)` property state (D0.8.0 item 4).
+    ///
+    /// Returns `None` for absent, `Some(None)` for a present null, and
+    /// `Some(Some(body_value_present))` marker for a present typed value.
+    /// The caller combines this with the typed body read.
+    #[must_use]
+    pub(crate) fn property_state(
+        &self,
+        bytes: &bytes::Bytes,
+        column_index: u32,
+        row: u32,
+    ) -> (bool, bool) {
+        let present = match &self.column_presence {
+            Some(view) => view.get(bytes, column_index, row).unwrap_or(true),
+            None => true,
+        };
+        let is_null = match &self.column_null {
+            Some(view) => view.get(bytes, column_index, row).unwrap_or(false),
+            None => false,
+        };
+        (present, is_null)
     }
 
     /// Returns split memory accounting when recorded (mapped v5 open).
