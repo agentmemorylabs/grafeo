@@ -10,17 +10,26 @@
 //!   retains the WAL boundary and overlay epoch a published generation
 //!   represents.
 //!
+//! - [`recovery`]: runtime recovery + publication fault proof (G-EM0.3c) —
+//!   typed recovery view with orphan classification, and the locked
+//!   crash-point expectation surface for the fresh-process fault matrix.
+//!
 //! Neither module re-implements the W0 manifest schema, the 11-step
-//! publication ordering, or WAL-cursor mechanics — those stay in
-//! `grafeo-storage` (W0). This module only re-exposes them at the engine
-//! boundary and adds the observability G-EM0.3a did not provide.
+//! publication ordering, WAL-cursor mechanics, or recovery selection — those
+//! stay in `grafeo-storage` (W0). This module only re-exposes them at the
+//! engine boundary and adds the observability G-EM0.3a did not provide.
 
 pub mod manifest;
 pub mod publication;
+pub mod recovery;
 
 pub use manifest::{
     ManifestSelection, ManifestState, ManifestStateError, WalBoundary, read_manifest_state,
 };
 pub use publication::{
     BuildPublication, PublicationPhase, PublicationPhaseError, PublishedGeneration,
+};
+pub use recovery::{
+    ExpectedSelection, OrphanClassification, PublicationCrashPoint, RecoveryViewError,
+    RootRecovery, recover_generation_root,
 };

@@ -1,8 +1,8 @@
 //! Live engine orchestration for immutable generation build (G-EM0.3a).
 //!
 //! Wires the live engine's frozen graph view into W0's bounded record-source
-//! generator, streams a CompactStore section through W0's container writer, and
-//! publishes via W0's 11-step [`publish_generation`] ordering.
+//! generator, streams a CompactStore section through W0's container writer,
+//! and publishes via W0's 11-step [`publish_generation`] ordering.
 //!
 //! This module does **not** own publication, manifest, lock, WAL-cursor, or
 //! container-writer machinery — those stay in `grafeo-storage` (W0). It also
@@ -289,6 +289,17 @@ impl GrafeoDB {
         )
         .map_err(map_generation_error)?;
 
+        // `#[doc(hidden)]` test-only fault seam (G-EM0.3c crash matrix): when
+        // `GRAFEO_3C_ABORT` names an engine-observable boundary, abort the
+        // process there so a fresh-process parent can prove recovery. Inert
+        // unless the env var is set; production paths never set it. Points:
+        // `after_generation_build` (pre-commit) / `after_publication`
+        // (post-commit, manifest fsync durable — the selection transition).
+        let abort_point = std::env::var("GRAFEO_3C_ABORT").ok();
+        if abort_point.as_deref() == Some("after_generation_build") {
+            std::process::abort();
+        }
+
         let node_count = generated.store.total_nodes();
         let edge_count = generated.store.total_edges();
         let overlay_epoch = self.transaction_manager.current_epoch().0;
@@ -322,6 +333,11 @@ impl GrafeoDB {
             &OsGenerationFileOps,
         )
         .map_err(map_publication_error)?;
+
+        // Post-commit crash point (3c): manifest fsync durable → select NEW.
+        if abort_point.as_deref() == Some("after_publication") {
+            std::process::abort();
+        }
 
         debug_assert!(
             is_generation_root(root),
@@ -357,12 +373,9 @@ impl GrafeoDB {
 
 /// TEST-ONLY convenience constructor: builds a request with the test-scale
 /// [`GenerationBudget::for_tests`] budget so integration tests keep one-line
-/// call sites.
-///
-/// This is not a production entry point. Operator/production call sites must
-/// construct [`GenerationBuildRequest`] directly with an explicit production
-/// budget (`GenerationBuildRequest::budget` is non-optional); do not route
-/// production builds through this helper.
+/// call sites. Not a production entry point: production call sites construct
+/// [`GenerationBuildRequest`] directly with an explicit production budget
+/// (`GenerationBuildRequest::budget` is non-optional).
 #[must_use]
 pub fn generation_build_request(
     generation_root: impl Into<PathBuf>,

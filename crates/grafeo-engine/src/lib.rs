@@ -58,8 +58,10 @@ pub use database::GrafeoDB;
 pub use database::IndexedVectorRead;
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation::{
-    BuildPublication, ManifestSelection, ManifestState, ManifestStateError, PublicationPhase,
-    PublicationPhaseError, PublishedGeneration, WalBoundary, read_manifest_state,
+    BuildPublication, ExpectedSelection, ManifestSelection, ManifestState, ManifestStateError,
+    OrphanClassification, PublicationCrashPoint, PublicationPhase, PublicationPhaseError,
+    PublishedGeneration, RecoveryViewError, RootRecovery, WalBoundary, read_manifest_state,
+    recover_generation_root,
 };
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation_build::{
