@@ -31,6 +31,8 @@ use grafeo_storage::wal::WalManager;
 
 use super::GrafeoDB;
 use super::flush::is_generation_root;
+use super::generation::manifest::WalBoundary;
+use super::generation::publication::PublishedGeneration;
 
 /// Request to build and publish one immutable generation from the live graph.
 #[derive(Debug, Clone)]
@@ -64,6 +66,20 @@ pub struct PublishedGenerationDescriptor {
     pub generation_length: u64,
     /// Caller-supplied generation identifier.
     pub generation_id: String,
+}
+
+/// Result of a G-EM0.3b build+publish: the extended publication descriptor
+/// plus the absolute path of the immutable generation container.
+///
+/// The [`PublishedGeneration`] carries the durable WAL boundary, overlay
+/// epoch, and parent linkage recorded in the manifest slot; the absolute path
+/// is kept alongside for callers that need the on-disk container location.
+#[derive(Debug, Clone)]
+pub struct BuildPublication {
+    /// The extended published-generation descriptor (WAL boundary + epoch).
+    pub publication: PublishedGeneration,
+    /// Absolute path to the immutable generation container.
+    pub generation_abs_path: PathBuf,
 }
 
 /// Frozen ID snapshot used by streaming live record sources.
@@ -203,6 +219,47 @@ impl GrafeoDB {
         &self,
         request: GenerationBuildRequest,
     ) -> Result<PublishedGenerationDescriptor> {
+        let published = self.build_generation_inner(request)?;
+        let generation_abs_path = published.generation_abs_path.clone();
+        Ok(PublishedGenerationDescriptor {
+            publication_sequence: published.publication.publication_sequence,
+            generation_path: published.publication.generation_path.clone(),
+            generation_abs_path,
+            generation_sha256: published.publication.generation_sha256,
+            generation_length: published.publication.generation_length,
+            generation_id: published.publication.generation_id.clone(),
+        })
+    }
+
+    /// Build and publish one immutable generation, returning the extended
+    /// G-EM0.3b descriptor that retains the durable WAL boundary, overlay
+    /// epoch, and parent linkage.
+    ///
+    /// This is the manifest-publication entry point: it publishes only a
+    /// fresh-reopen-validated immutable generation, records the precise
+    /// durable WAL boundary and overlay epoch in the manifest slot, and does
+    /// not truncate/advance the WAL or reset overlay state before the manifest
+    /// selection is durable (the manifest fsync is the commit point, enforced
+    /// by W0 [`publish_generation`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a phase-tagged [`Error`] when the root lock cannot be acquired,
+    /// the live graph cannot be streamed, generation/publication fails, or
+    /// the caller points at a legacy standalone `.grafeo` file path.
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    pub fn build_and_publish_generation(
+        &self,
+        request: GenerationBuildRequest,
+    ) -> Result<BuildPublication> {
+        self.build_generation_inner(request)
+    }
+
+    /// Shared build+publish body for the 3a legacy descriptor and the 3b
+    /// extended descriptor. Runs the full W0 publication ordering once and
+    /// assembles the extended [`PublishedGeneration`] from the result.
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    fn build_generation_inner(&self, request: GenerationBuildRequest) -> Result<BuildPublication> {
         let root = request.generation_root.as_path();
         if root.is_file() {
             return Err(Error::Internal(
@@ -242,10 +299,11 @@ impl GrafeoDB {
 
         let node_count = generated.store.total_nodes();
         let edge_count = generated.store.total_edges();
+        let overlay_epoch = self.transaction_manager.current_epoch().0;
         let section = CompactStoreSectionSource::new(generated.store, generated.global_strings)
             .map_err(map_section_error)?;
         let header = GenerationContainerHeader {
-            epoch: self.transaction_manager.current_epoch().0,
+            epoch: overlay_epoch,
             transaction_id: self
                 .transaction_manager
                 .last_assigned_transaction_id()
@@ -254,15 +312,19 @@ impl GrafeoDB {
             edge_count,
         };
 
+        let parent_generation_id = request.parent_generation_id.clone();
+        let parent_publication_sequence = request.parent_publication_sequence;
+        let generation_id = request.generation_id.clone();
+
         let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![Box::new(section)];
         let result = publish_generation(
             &lock,
             PublicationInput {
                 header,
                 sections: &mut sections,
-                generation_id: request.generation_id.clone(),
-                parent_generation_id: request.parent_generation_id,
-                parent_publication_sequence: request.parent_publication_sequence,
+                generation_id: generation_id.clone(),
+                parent_generation_id: parent_generation_id.clone(),
+                parent_publication_sequence,
             },
             &wal,
             &OsGenerationFileOps,
@@ -275,13 +337,45 @@ impl GrafeoDB {
             "publish_generation must leave a recognizable generation root"
         );
 
-        Ok(PublishedGenerationDescriptor {
-            publication_sequence: result.publication_sequence,
-            generation_path: result.generation_path,
+        // Read back the manifest slot so the descriptor carries the exact
+        // parent linkage and durable WAL boundary the publication actually
+        // recorded (the manifest slot is the durable source of truth), not
+        // just what the caller requested or the pre-commit WAL cut produced.
+        let recorded = super::generation::manifest::read_manifest_state(root).ok();
+        let (parent_id, parent_seq, recorded_boundary, recorded_epoch) =
+            recorded.as_ref().map_or_else(
+                || {
+                    (
+                        parent_generation_id.unwrap_or_default(),
+                        parent_publication_sequence.unwrap_or(0),
+                        WalBoundary::from_cursor(&result.wal_cursor),
+                        overlay_epoch,
+                    )
+                },
+                |state| {
+                    (
+                        state.selected.parent_generation_id.clone(),
+                        state.selected.parent_publication_sequence,
+                        state.selected.wal_boundary,
+                        state.selected.overlay_epoch,
+                    )
+                },
+            );
+
+        let mut publication = PublishedGeneration::from_publication(
+            &result,
+            generation_id,
+            parent_id,
+            parent_seq,
+            recorded_epoch,
+        );
+        // Prefer the manifest-recorded boundary so descriptor and on-disk
+        // manifest agree by construction.
+        publication.wal_boundary = recorded_boundary;
+
+        Ok(BuildPublication {
+            publication,
             generation_abs_path,
-            generation_sha256: result.generation_sha256,
-            generation_length: result.generation_length,
-            generation_id: request.generation_id,
         })
     }
 

@@ -146,6 +146,11 @@ name = "generation_build_orchestration"
 path = "tests/generation_build_orchestration.rs"
 required-features = ["generation", "compact-store", "lpg"]
 
+[[test]]
+name = "compact_store_manifest_publication"
+path = "tests/compact_store_manifest_publication.rs"
+required-features = ["generation", "compact-store", "lpg"]
+
 [[bench]]
 name = "query_bench"
 harness = false
