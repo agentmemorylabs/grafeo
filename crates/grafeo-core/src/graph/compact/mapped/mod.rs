@@ -8,6 +8,7 @@
 pub(crate) mod accounting;
 pub(crate) mod code_index;
 pub(crate) mod directory;
+pub(crate) mod id_index;
 pub(crate) mod id_lookup;
 pub(crate) mod label_membership;
 pub(crate) mod presence;
@@ -23,6 +24,9 @@ pub use directory::{
     DIRECTORY_ENTRY_LEN, FORMAT_VERSION_V5, HEADER_LEN, SegmentDirectory, SegmentEntry,
     SegmentKind, V5_HEADER_LEN, parse_segment_directory, parse_v5_header, slice_segment_checked,
     validate_segment_range,
+};
+pub use id_index::{
+    ID_INDEX_RECORD_LEN, MappedNodeIdIndex, id_index_record_bytes, write_id_index_record,
 };
 pub use id_lookup::{
     MappedEdgeIdLookup, MappedNodeIdLookup, write_edge_id_record, write_node_id_record,

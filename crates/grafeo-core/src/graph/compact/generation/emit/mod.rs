@@ -15,6 +15,7 @@ pub mod assembler;
 pub mod column;
 pub mod descriptor;
 pub mod dictionary;
+pub mod global_dict;
 pub mod segments;
 pub mod sink;
 

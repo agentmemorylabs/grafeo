@@ -241,3 +241,49 @@ impl ExternalRunMerger for DiskMergerAdapter {
         self.inner.cleanup();
     }
 }
+
+// ── D0.8.4 disk-sorted mapped node-ID index ────────────────────────────────
+
+/// Maps a completed fixed-width ID-index file with `memmap2` and returns a
+/// checked core [`MappedNodeIdIndex`] over the mapping.
+///
+/// Per the D0.8.4 lock: the file is read-only mapped, wrapped in
+/// `Bytes::from_owner`, and passed to a checked core view. The file length is
+/// charged as temp, the mapping length is reported as mapped bytes, and only
+/// fixed binary-search scratch is charged anonymous. The mapped index is
+/// **never** copied into a resident `Vec`.
+///
+/// # Errors
+///
+/// Returns [`GenerationError`] when the file cannot be opened/mapped or the
+/// index fails core validation (unsorted, adjacent duplicate, truncated).
+#[cfg(unix)]
+pub fn map_node_id_index(
+    path: &std::path::Path,
+) -> Result<grafeo_core::graph::compact::mapped::MappedNodeIdIndex, GenerationError> {
+    use bytes::Bytes;
+    use memmap2::Mmap;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| GenerationError::Io(format!("open ID index {}: {e}", path.display())))?;
+    // SAFETY: the file is opened read-only and kept alive by the owner
+    // closure captured in `Bytes::from_owner`; the mapping is never exposed
+    // as `&mut`, and truncation of the underlying file is prevented because
+    // the lease keeps the file open for the mapping's lifetime.
+    #[allow(unsafe_code)]
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|e| GenerationError::Io(format!("mmap ID index {}: {e}", path.display())))?;
+    let owner = MmapOwner(mmap);
+    let bytes = Bytes::from_owner(owner);
+    grafeo_core::graph::compact::mapped::MappedNodeIdIndex::new(bytes)
+}
+
+#[cfg(unix)]
+struct MmapOwner(memmap2::Mmap);
+
+#[cfg(unix)]
+impl AsRef<[u8]> for MmapOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
