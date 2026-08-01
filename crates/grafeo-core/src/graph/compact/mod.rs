@@ -26,6 +26,12 @@ pub mod layered;
 pub mod mapped;
 /// Per-label node tables with columnar property storage.
 pub mod node_table;
+/// Overlay retained-capacity accounting, admission, and backpressure (G-EM0.5a).
+#[cfg(feature = "lpg")]
+pub mod overlay_budget;
+/// Retained-capacity cost estimation for overlay mutations (G-EM0.5a).
+#[cfg(feature = "lpg")]
+pub mod overlay_cost;
 /// Per-type relationship tables backed by forward/backward CSR.
 pub mod rel_table;
 /// Schema definitions for node tables and edge schemas.

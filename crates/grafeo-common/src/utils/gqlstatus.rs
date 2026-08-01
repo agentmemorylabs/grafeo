@@ -229,6 +229,10 @@ impl From<&super::error::Error> for GqlStatus {
             Error::Storage(_) => GqlStatus::DATA_EXCEPTION,
             Error::Serialization(_) => GqlStatus::DATA_EXCEPTION,
             Error::Io(_) => GqlStatus::DATA_EXCEPTION,
+            // G-EM0.5a: retryable backpressure maps to a rollback/retry
+            // condition; terminal rejection maps to a data exception.
+            Error::AdmissionRetryable(_) => GqlStatus::TX_ROLLBACK,
+            Error::AdmissionRejected(_) => GqlStatus::DATA_EXCEPTION,
             Error::Internal(_) => GqlStatus::DATA_EXCEPTION,
         }
     }

@@ -157,6 +157,11 @@ name = "compact_store_manifest_recovery"
 path = "tests/compact_store_manifest_recovery.rs"
 required-features = ["generation", "compact-store", "lpg"]
 
+[[test]]
+name = "compact_store_overlay_admission"
+path = "tests/compact_store_overlay_admission.rs"
+required-features = ["compact-store", "lpg"]
+
 [[bench]]
 name = "query_bench"
 harness = false

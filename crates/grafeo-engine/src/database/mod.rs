@@ -293,6 +293,16 @@ pub struct GrafeoDB {
     /// Observed compact-base backing after a persistent reopen.
     #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
     compact_backing: Option<CompactBacking>,
+    /// Overlay admission controller (G-EM0.5a), installed for writable
+    /// (W-mode) generation roots.
+    ///
+    /// When present, the layered store charges every overlay mutation's
+    /// retained capacity to this controller, and the WAL admission boundary
+    /// gates writers through [`Self::admit_overlay_write`] before a mutation
+    /// is durable. Read-only and legacy databases leave it `None`.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    overlay_admission:
+        Option<Arc<grafeo_core::graph::compact::overlay_budget::OverlayAdmissionController>>,
 }
 
 impl GrafeoDB {
@@ -759,6 +769,8 @@ impl GrafeoDB {
             compact_tiered: None,
             #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
             compact_backing: None,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            overlay_admission: None,
         };
 
         // Register storage sections as memory consumers for pressure tracking
@@ -916,6 +928,8 @@ impl GrafeoDB {
             compact_tiered: None,
             #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
             compact_backing: None,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            overlay_admission: None,
         })
     }
 
@@ -1009,6 +1023,8 @@ impl GrafeoDB {
             compact_tiered: None,
             #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
             compact_backing: None,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            overlay_admission: None,
         })
     }
 
@@ -2874,6 +2890,77 @@ impl GrafeoDB {
             wal.log(record)?;
         }
         Ok(())
+    }
+
+    /// Installs the overlay admission controller for a writable (W-mode)
+    /// generation root (G-EM0.5a).
+    ///
+    /// The controller is shared with the layered store (if one is installed)
+    /// so overlay mutations charge retained capacity, and is retained on the
+    /// database so the WAL admission boundary can gate writers through
+    /// [`Self::admit_overlay_write`]. Installing twice replaces the previous
+    /// controller; callers should install once, after `compact()` wires the
+    /// layered store.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    pub fn install_overlay_admission(
+        &mut self,
+        controller: Arc<grafeo_core::graph::compact::overlay_budget::OverlayAdmissionController>,
+    ) {
+        if let Some(ref layered) = self.layered_store {
+            layered.install_admission_controller(Arc::clone(&controller));
+        }
+        self.overlay_admission = Some(controller);
+    }
+
+    /// Returns the installed overlay admission controller, if any.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    #[must_use]
+    pub fn overlay_admission(
+        &self,
+    ) -> Option<Arc<grafeo_core::graph::compact::overlay_budget::OverlayAdmissionController>> {
+        self.overlay_admission.clone()
+    }
+
+    /// WAL admission gate (G-EM0.5a): blocks boundedly or returns a typed
+    /// retryable error before a mutation is admitted to the overlay.
+    ///
+    /// Callers must invoke this *before* writing the WAL record so that an
+    /// accepted write is durable in the WAL before acknowledgement (packet
+    /// §4). When no controller is installed (read-only / legacy), this is a
+    /// no-op that always admits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable admission error when the overlay is at hard
+    /// pressure and the bounded block times out, or a terminal rejection on
+    /// shutdown/cancel/oversized requests.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    pub fn admit_overlay_write(
+        &self,
+        category: grafeo_core::graph::compact::overlay_budget::RetainedCategory,
+        bytes: usize,
+    ) -> Result<()> {
+        use grafeo_core::graph::compact::overlay_budget::{AdmissionOutcome, RejectReason};
+        let Some(ref ctl) = self.overlay_admission else {
+            return Ok(());
+        };
+        match ctl.reserve(category, bytes as u64) {
+            AdmissionOutcome::Admitted { .. } => Ok(()),
+            AdmissionOutcome::Retryable { reason } => Err(Error::AdmissionRetryable(format!(
+                "overlay admission backpressure: {reason:?}"
+            ))),
+            AdmissionOutcome::Rejected { reason } => match reason {
+                RejectReason::Oversized => Err(Error::AdmissionRejected(format!(
+                    "overlay admission rejected: request of {bytes} bytes exceeds hard limit"
+                ))),
+                RejectReason::Shutdown => Err(Error::AdmissionRejected(
+                    "overlay admission: shutting down".into(),
+                )),
+                RejectReason::Cancelled => Err(Error::AdmissionRejected(
+                    "overlay admission: cancelled".into(),
+                )),
+            },
+        }
     }
 
     /// Registers storage sections as [`MemoryConsumer`]s with the BufferManager.
