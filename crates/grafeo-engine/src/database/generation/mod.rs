@@ -21,4 +21,6 @@ pub mod publication;
 pub use manifest::{
     ManifestSelection, ManifestState, ManifestStateError, WalBoundary, read_manifest_state,
 };
-pub use publication::{PublicationPhase, PublicationPhaseError, PublishedGeneration};
+pub use publication::{
+    BuildPublication, PublicationPhase, PublicationPhaseError, PublishedGeneration,
+};

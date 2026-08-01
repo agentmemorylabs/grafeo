@@ -146,6 +146,10 @@ pub fn read_manifest_state(root: &Path) -> Result<ManifestState, ManifestStateEr
     }
     let [slot0, slot1] =
         manifest::read_both_slots(&manifest_path).map_err(ManifestStateError::Io)?;
+    // Selection rule mirrors W0 `read_manifest` / `inactive_slot_index`
+    // (grafeo-storage/src/generation/manifest.rs: highest valid publication
+    // sequence wins; ties keep the lower slot index). If W0 changes that rule,
+    // this view must change with it — the engine does not define its own rule.
     match (slot0, slot1) {
         (Ok(a), Ok(b)) => {
             let (sel_index, sel, prev_index, prev) =

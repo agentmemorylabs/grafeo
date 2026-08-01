@@ -29,7 +29,11 @@ use super::manifest::WalBoundary;
 
 /// The ordered phases a manifest publication moves through.
 ///
-/// These map 1:1 onto the W0 §11 publication ordering. The commit point is
+/// These mirror the W0 §11 publication ordering and its commit point. The
+/// mapping is faithful about **ordering and the commit boundary** but is not
+/// a literal 1:1 step rename: W0's "sync final file" + "sync generations
+/// directory" (one logical step) is a single phase here, and W0's genesis-only
+/// layout/root-directory sync has no distinct phase. The commit point is
 /// [`PublicationPhase::ManifestSync`]: once that phase completes, the
 /// generation is selected/durable and WAL truncation + cleanup may run.
 /// Every phase before the commit point must leave the prior selected
@@ -132,12 +136,60 @@ impl PublicationPhaseError {
         }
     }
 
+    /// Tag a W0 publication error with the phase inferred from its variant.
+    ///
+    /// This is the producer used by the live build path: it preserves the W0
+    /// error identity and names the (conservative) failing phase so a caller
+    /// can learn whether the failure was pre-commit (new generation not
+    /// durable) or post-commit.
+    #[must_use]
+    pub fn from_publication(source: PublicationError) -> Self {
+        let phase = phase_for_error(&source);
+        Self::new(phase, source)
+    }
+
     /// True when the failure occurred at/after the durable commit point —
     /// i.e. the new generation is already selected and the failure is in
     /// post-commit WAL truncation or cleanup.
     #[must_use]
     pub fn is_post_commit(&self) -> bool {
         self.phase.is_post_commit()
+    }
+}
+
+impl From<PublicationPhaseError> for grafeo_common::utils::error::Error {
+    fn from(e: PublicationPhaseError) -> Self {
+        grafeo_common::utils::error::Error::Internal(e.to_string())
+    }
+}
+
+/// Map a W0 [`PublicationError`] to the most precise publication phase.
+///
+/// W0's `publish_generation` does not return its fault-hook position on
+/// failure, so the phase is inferred from the error variant. The mapping is
+/// conservative: several variants are ambiguous (an I/O error can occur at
+/// any step), so the returned phase is the **latest** phase the failing step
+/// could represent — always accurate about the pre/post-commit boundary,
+/// which is the distinction callers need (is the new generation durable?).
+///
+/// Boundary accuracy:
+/// - `WalCut` is the pre-commit boundary cut (step 0) or post-commit truncate
+///   (step 10); both are `>= WalBoundaryCut`, and the truncate case is
+///   post-commit. We report `WalBoundaryCut` (pre-commit) as the conservative
+///   floor — a post-commit truncate failure is indistinguishable at this seam.
+/// - `TargetExists` / `ValidationFailed` are unambiguous pre-commit phases.
+/// - `ManifestWrite` / `Io` / `NoLock` can arise at many steps; we report
+///   `StreamSections` (the earliest fallible step after the cut) — never
+///   falsely claiming the commit point was reached.
+fn phase_for_error(err: &PublicationError) -> PublicationPhase {
+    match err {
+        PublicationError::NoLock => PublicationPhase::WalBoundaryCut,
+        PublicationError::WalCut(_) => PublicationPhase::WalBoundaryCut,
+        PublicationError::ValidationFailed(_) => PublicationPhase::ReopenValidate,
+        PublicationError::TargetExists(_) => PublicationPhase::RenameImmutable,
+        PublicationError::ManifestWrite(_) | PublicationError::Io(_) => {
+            PublicationPhase::StreamSections
+        }
     }
 }
 
@@ -198,5 +250,85 @@ impl PublishedGeneration {
     #[must_use]
     pub fn wal_cursor(&self) -> WalReplayCursor {
         self.wal_boundary.to_cursor()
+    }
+}
+
+/// Result of a G-EM0.3b build+publish: the extended publication descriptor
+/// plus the absolute path of the immutable generation container.
+///
+/// The [`PublishedGeneration`] carries the durable WAL boundary, overlay
+/// epoch, and parent linkage recorded in the manifest slot; the absolute path
+/// is kept alongside for callers that need the on-disk container location.
+#[derive(Debug, Clone)]
+pub struct BuildPublication {
+    /// The extended published-generation descriptor (WAL boundary + epoch).
+    pub publication: PublishedGeneration,
+    /// Absolute path to the immutable generation container.
+    pub generation_abs_path: std::path::PathBuf,
+}
+
+/// Assemble a [`BuildPublication`] from a successful W0 publication, reading
+/// back the durable manifest slot so the descriptor agrees with the on-disk
+/// manifest by construction.
+///
+/// The manifest slot is the durable source of truth for parent linkage and
+/// the WAL boundary. A read-back failure downgrades provenance to the
+/// caller-supplied parent values and the pre-commit WAL-cut cursor (whose
+/// `transaction_id`/`epoch` come from WAL checkpoint metadata, not the durable
+/// slot); the downgrade is logged via `grafeo_warn!`, never silent.
+///
+/// `overlay_epoch` is the engine epoch captured at build time (used only when
+/// the read-back fails); `parent_generation_id`/`parent_publication_sequence`
+/// are the caller-supplied fallbacks.
+#[must_use]
+pub fn assemble_build_publication(
+    root: &std::path::Path,
+    result: &grafeo_storage::generation::publication::PublicationResult,
+    generation_id: String,
+    parent_generation_id: Option<String>,
+    parent_publication_sequence: Option<u64>,
+    overlay_epoch: u64,
+) -> BuildPublication {
+    let recorded = super::manifest::read_manifest_state(root);
+    if let Err(ref downgrade) = recorded {
+        grafeo_common::grafeo_warn!(
+            "manifest read-back after publication failed ({downgrade}); \
+             descriptor provenance downgraded to caller/pre-commit values"
+        );
+    }
+    let recorded = recorded.ok();
+    let (parent_id, parent_seq, recorded_boundary, recorded_epoch) = recorded.as_ref().map_or_else(
+        || {
+            (
+                parent_generation_id.unwrap_or_default(),
+                parent_publication_sequence.unwrap_or(0),
+                WalBoundary::from_cursor(&result.wal_cursor),
+                overlay_epoch,
+            )
+        },
+        |state| {
+            (
+                state.selected.parent_generation_id.clone(),
+                state.selected.parent_publication_sequence,
+                state.selected.wal_boundary,
+                state.selected.overlay_epoch,
+            )
+        },
+    );
+
+    let mut publication = PublishedGeneration::from_publication(
+        result,
+        generation_id,
+        parent_id,
+        parent_seq,
+        recorded_epoch,
+    );
+    // Prefer the manifest-recorded boundary so descriptor and on-disk
+    // manifest agree by construction.
+    publication.wal_boundary = recorded_boundary;
+
+    BuildPublication {
+        publication,
+        generation_abs_path: root.join(&result.generation_path),
     }
 }

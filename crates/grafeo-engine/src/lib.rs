@@ -58,13 +58,13 @@ pub use database::GrafeoDB;
 pub use database::IndexedVectorRead;
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation::{
-    ManifestSelection, ManifestState, ManifestStateError, PublicationPhase, PublicationPhaseError,
-    PublishedGeneration, WalBoundary, read_manifest_state,
+    BuildPublication, ManifestSelection, ManifestState, ManifestStateError, PublicationPhase,
+    PublicationPhaseError, PublishedGeneration, WalBoundary, read_manifest_state,
 };
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation_build::{
-    BuildPublication, GenerationBuildRequest, PublishedGenerationDescriptor,
-    generation_build_request, path_is_generation_root,
+    GenerationBuildRequest, PublishedGenerationDescriptor, generation_build_request,
+    path_is_generation_root,
 };
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use database::{VectorIndexBacking, VectorPayloadBacking, VectorTopologyBacking};

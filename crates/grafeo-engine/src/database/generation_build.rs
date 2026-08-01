@@ -31,8 +31,7 @@ use grafeo_storage::wal::WalManager;
 
 use super::GrafeoDB;
 use super::flush::is_generation_root;
-use super::generation::manifest::WalBoundary;
-use super::generation::publication::PublishedGeneration;
+use super::generation::publication::{BuildPublication, PublicationPhaseError};
 
 /// Request to build and publish one immutable generation from the live graph.
 #[derive(Debug, Clone)]
@@ -66,20 +65,6 @@ pub struct PublishedGenerationDescriptor {
     pub generation_length: u64,
     /// Caller-supplied generation identifier.
     pub generation_id: String,
-}
-
-/// Result of a G-EM0.3b build+publish: the extended publication descriptor
-/// plus the absolute path of the immutable generation container.
-///
-/// The [`PublishedGeneration`] carries the durable WAL boundary, overlay
-/// epoch, and parent linkage recorded in the manifest slot; the absolute path
-/// is kept alongside for callers that need the on-disk container location.
-#[derive(Debug, Clone)]
-pub struct BuildPublication {
-    /// The extended published-generation descriptor (WAL boundary + epoch).
-    pub publication: PublishedGeneration,
-    /// Absolute path to the immutable generation container.
-    pub generation_abs_path: PathBuf,
 }
 
 /// Frozen ID snapshot used by streaming live record sources.
@@ -183,8 +168,15 @@ fn map_generation_error(err: GenerationError) -> Error {
     Error::Internal(format!("generation build: {err}"))
 }
 
+/// Map a W0 publication failure to a phase-tagged engine error.
+///
+/// Preserves the W0 [`PublicationError`] identity and tags the conservative
+/// failing [`super::generation::publication::PublicationPhase`] so a caller
+/// can learn whether the failure was pre-commit (new generation not durable)
+/// or post-commit. This satisfies the packet requirement to surface every
+/// publication phase/error rather than flattening to an untyped string.
 fn map_publication_error(err: PublicationError) -> Error {
-    Error::Internal(format!("generation publish: {err}"))
+    PublicationPhaseError::from_publication(err).into()
 }
 
 fn map_section_error(err: Error) -> Error {
@@ -331,52 +323,21 @@ impl GrafeoDB {
         )
         .map_err(map_publication_error)?;
 
-        let generation_abs_path = root.join(&result.generation_path);
         debug_assert!(
             is_generation_root(root),
             "publish_generation must leave a recognizable generation root"
         );
 
-        // Read back the manifest slot so the descriptor carries the exact
-        // parent linkage and durable WAL boundary the publication actually
-        // recorded (the manifest slot is the durable source of truth), not
-        // just what the caller requested or the pre-commit WAL cut produced.
-        let recorded = super::generation::manifest::read_manifest_state(root).ok();
-        let (parent_id, parent_seq, recorded_boundary, recorded_epoch) =
-            recorded.as_ref().map_or_else(
-                || {
-                    (
-                        parent_generation_id.unwrap_or_default(),
-                        parent_publication_sequence.unwrap_or(0),
-                        WalBoundary::from_cursor(&result.wal_cursor),
-                        overlay_epoch,
-                    )
-                },
-                |state| {
-                    (
-                        state.selected.parent_generation_id.clone(),
-                        state.selected.parent_publication_sequence,
-                        state.selected.wal_boundary,
-                        state.selected.overlay_epoch,
-                    )
-                },
-            );
-
-        let mut publication = PublishedGeneration::from_publication(
+        // Assemble the extended descriptor from the durable manifest slot
+        // (read-back + fallback live in the generation module).
+        Ok(super::generation::publication::assemble_build_publication(
+            root,
             &result,
             generation_id,
-            parent_id,
-            parent_seq,
-            recorded_epoch,
-        );
-        // Prefer the manifest-recorded boundary so descriptor and on-disk
-        // manifest agree by construction.
-        publication.wal_boundary = recorded_boundary;
-
-        Ok(BuildPublication {
-            publication,
-            generation_abs_path,
-        })
+            parent_generation_id,
+            parent_publication_sequence,
+            overlay_epoch,
+        ))
     }
 
     /// Returns the merged live graph store (layered when compacted, else LPG).

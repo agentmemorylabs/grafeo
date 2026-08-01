@@ -207,9 +207,11 @@ fn publish_into_standalone_file_fails_closed() {
     );
 }
 
-/// 7. WAL files older than the retention floor are not truncated before the
-///    new selection is durable — proven by observing that the WAL directory
-///    never loses the boundary's own log file across two publications.
+/// 7. WAL retention honors the recorded boundary: the floor's own log file is
+///    never deleted by post-commit truncation (`truncate_before` deletes only
+///    files strictly older than the floor's log sequence). This proves the
+///    boundary log survives publication and stays replayable — the observable
+///    engine-side signal that WAL advancement follows the durable selection.
 #[test]
 fn wal_boundary_file_survives_publication() {
     let dir = TempDir::new().unwrap();
@@ -240,4 +242,36 @@ fn wal_boundary_file_survives_publication() {
     );
     validate_replayable(&wal_dir, &second.wal_boundary.to_cursor())
         .expect("selected boundary replayable after second publication");
+}
+
+/// 8. The phase-tagged publication error has a real producer: a W0
+///    `PublicationError` is tagged with its conservative failing phase and
+///    preserves the source identity (review repair — closes the "no producer"
+///    gap for req 5's "every publication phase/error").
+#[test]
+fn publication_error_is_phase_tagged() {
+    use grafeo_engine::PublicationPhaseError;
+    use grafeo_storage::generation::publication::PublicationError;
+
+    // A pre-commit validation failure tags ReopenValidate (not post-commit).
+    let err = PublicationPhaseError::from_publication(PublicationError::ValidationFailed(
+        "mmap empty".into(),
+    ));
+    assert_eq!(err.phase, PublicationPhase::ReopenValidate);
+    assert!(!err.is_post_commit());
+    // Source identity preserved through the tag.
+    assert!(matches!(err.source, PublicationError::ValidationFailed(_)));
+    // Display surfaces the phase name + source.
+    let msg = err.to_string();
+    assert!(msg.contains("reopen_validate"), "phase named: {msg}");
+    assert!(msg.contains("mmap empty"), "source preserved: {msg}");
+
+    // A target-exists failure tags RenameImmutable (pre-commit).
+    let err = PublicationPhaseError::from_publication(PublicationError::TargetExists("g".into()));
+    assert_eq!(err.phase, PublicationPhase::RenameImmutable);
+    assert!(!err.is_post_commit());
+
+    // The phase-tagged error converts into the engine error surface.
+    let engine_err: grafeo_common::utils::error::Error = err.into();
+    assert!(engine_err.to_string().contains("rename_immutable"));
 }
