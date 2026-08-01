@@ -265,6 +265,10 @@ pub fn codec_kind_of(g: &ColumnGeometry) -> CodecKind {
 pub struct EmittedColumn {
     /// Flat column index (directory order).
     pub column_index: u32,
+    /// Owning table id (node table or `0x8000 | rel_id`).
+    pub table_id: u16,
+    /// Property key (table-scoped identity).
+    pub key: String,
     /// Codec kind.
     pub kind: CodecKind,
     /// Byte length of the serialized body.
@@ -348,6 +352,8 @@ pub(crate) fn emit_column_bodies(
         *body_cursor += body_len;
         result.columns.push(EmittedColumn {
             column_index,
+            table_id: _g.table_id,
+            key: _g.key.clone(),
             kind,
             body_len: u32::try_from(body_len).map_err(|_| GenerationError::WireWidthOverflow {
                 what: "col_body_len",

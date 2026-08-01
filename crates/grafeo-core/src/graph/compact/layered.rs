@@ -222,6 +222,39 @@ impl LayeredStore {
         self.overlay.load_full()
     }
 
+    /// Captures overlay mutation sets for a generation freeze (schema-bounded).
+    #[must_use]
+    pub fn generation_freeze_epoch(&self) -> super::generation_builder::freeze::FrozenOverlayEpoch {
+        use super::generation_builder::freeze::FrozenOverlayEpoch;
+        FrozenOverlayEpoch {
+            epoch: self.overlay.load().current_epoch().0,
+            overlay_node_ids: self
+                .dirty_node_ids
+                .read()
+                .iter()
+                .map(NodeId::as_u64)
+                .collect(),
+            overlay_edge_ids: self
+                .dirty_edge_ids
+                .read()
+                .iter()
+                .map(EdgeId::as_u64)
+                .collect(),
+            deleted_base_node_ids: self
+                .deleted_from_base_nodes
+                .read()
+                .iter()
+                .map(NodeId::as_u64)
+                .collect(),
+            deleted_base_edge_ids: self
+                .deleted_from_base_edges
+                .read()
+                .iter()
+                .map(EdgeId::as_u64)
+                .collect(),
+        }
+    }
+
     /// Number of dirty (modified/created) entities in the overlay.
     #[must_use]
     pub fn overlay_mutation_count(&self) -> usize {

@@ -89,6 +89,12 @@ impl CancelToken {
         self.flag.load(AtomicOrdering::SeqCst)
     }
 
+    /// Shared cancellation flag (for bridging to storage-layer tokens).
+    #[must_use]
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
+
     /// Fail closed if cancelled.
     ///
     /// # Errors

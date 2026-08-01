@@ -635,10 +635,9 @@ impl CompactStore {
             .collect()
     }
 
-    /// Returns a property value filtered by presence/null companions.
-    ///
-    /// Returns `None` if the property is absent (presence bit = 0) or if it
-    /// is a present null (null bit = 1). Otherwise returns the typed value.
+    /// Returns `None` if the property is absent (presence bit = 0). Returns
+    /// `Some(Value::Null)` when the row is present-null (null bit = 1).
+    /// Otherwise returns the typed body value.
     #[must_use]
     pub(crate) fn get_property_filtered(
         &self,
@@ -664,7 +663,7 @@ impl CompactStore {
             _ => false,
         };
         if is_null {
-            return None;
+            return Some(grafeo_common::types::Value::Null);
         }
         raw_value
     }

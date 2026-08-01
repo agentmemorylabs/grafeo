@@ -44,6 +44,12 @@ impl CancelToken {
         Self::default()
     }
 
+    /// Shares an existing atomic flag (bridges core ↔ storage cancel tokens).
+    #[must_use]
+    pub fn from_shared(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+
     /// Request cancellation.
     pub fn cancel(&self) {
         self.flag.store(true, AtomicOrdering::SeqCst);

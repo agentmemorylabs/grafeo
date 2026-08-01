@@ -22,6 +22,8 @@ use crate::graph::compact::generation::{
     CancelToken, ExternalRunMerger, ExternalRunSink, GenerationBudget, GenerationError,
     GenerationMetrics, RunSetLease, RunStore, SortRecord,
 };
+use crate::graph::compact::generation_builder::live_graph::LogicalLabelLookup;
+use crate::graph::compact::generation_builder::node_pass::encode_single_value;
 use crate::graph::compact::generation_builder::staging;
 use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
 use grafeo_common::utils::hash::FxHashMap;
@@ -98,8 +100,8 @@ impl<'a> EdgePass<'a> {
     /// `rel_id_of` maps a [`RelTableKey`] to its assigned rel table id
     /// (schema-bounded, built from the rel-key run).
     ///
-    /// When `rel_decls` is non-empty, each edge's src/dst table labels are
-    /// validated against the declared `src_label`/`dst_label` (B9).
+    /// When `rel_decls` is non-empty, each edge's src/dst logical label sets are
+    /// checked for membership of the declared `src_label`/`dst_label` (B9).
     ///
     /// # Errors
     ///
@@ -113,7 +115,7 @@ impl<'a> EdgePass<'a> {
         rel_id_of: &dyn Fn(&RelTableKey) -> Option<u16>,
         fwd_sink: &mut dyn ExternalRunSink,
         metrics: &mut GenerationMetrics,
-        labels: &[String],
+        label_lookup: &LogicalLabelLookup,
         rel_decls: &[crate::graph::compact::generation::RelSchemaDecl],
     ) -> Result<u64, GenerationError> {
         // Build schema-bounded edge_type → (src_label, dst_label) map.
@@ -149,9 +151,7 @@ impl<'a> EdgePass<'a> {
                         })?;
                 // B9: validate endpoints against RelSchemaDecl if declared.
                 if let Some((exp_src, exp_dst)) = decl_map.get(edge_type) {
-                    let actual_src = labels.get(src_tid as usize).map(String::as_str).unwrap_or("");
-                    let actual_dst = labels.get(dst_tid as usize).map(String::as_str).unwrap_or("");
-                    if actual_src != exp_src.as_str() {
+                    if !label_lookup.has_label(src, src_tid, exp_src) {
                         return Err(GenerationError::WrongTableEndpoint {
                             edge_id: original_id,
                             node_id: src,
@@ -160,7 +160,7 @@ impl<'a> EdgePass<'a> {
                             is_source: true,
                         });
                     }
-                    if actual_dst != exp_dst.as_str() {
+                    if !label_lookup.has_label(dst, dst_tid, exp_dst) {
                         return Err(GenerationError::WrongTableEndpoint {
                             edge_id: original_id,
                             node_id: dst,
@@ -253,4 +253,50 @@ pub fn discover_rel_tables(
         map.insert(k.clone(), rid);
     }
     Ok((keys, map))
+}
+
+/// Replays the forward CSR run in merge order and explodes edge properties
+/// into the shared occurrence run (table_id = `0x8000 | rel_id`, row = CSR pos).
+///
+/// # Errors
+///
+/// Codec, budget, or I/O failure.
+pub fn explode_occurrences_from_forward(
+    fwd_lease: &RunSetLease,
+    merger: &mut dyn ExternalRunMerger,
+    occ_sink: &mut dyn ExternalRunSink,
+    budget: &GenerationBudget,
+    metrics: &mut GenerationMetrics,
+    cancel: Option<&CancelToken>,
+) -> Result<(), GenerationError> {
+    let mut fwd_pos: u64 = 0;
+    let mut cur_rel: Option<u16> = None;
+
+    merger.merge_all(&fwd_lease.handles, budget, metrics, cancel, &mut |rec| {
+        if rec.key.len() != 26 {
+            return Err(GenerationError::Codec(format!(
+                "forward key len {} != 26",
+                rec.key.len()
+            )));
+        }
+        let rel = u16::from_be_bytes([rec.key[0], rec.key[1]]);
+        if cur_rel != Some(rel) {
+            cur_rel = Some(rel);
+            fwd_pos = 0;
+        }
+        let table_id = 0x8000 | rel;
+        let props = staging::decode_properties(&rec.payload)?;
+        for (key, value) in &props {
+            let mut occ_key = Vec::with_capacity(2 + key.as_str().len() + 8);
+            occ_key.extend_from_slice(&table_id.to_be_bytes());
+            occ_key.extend_from_slice(key.as_str().as_bytes());
+            occ_key.extend_from_slice(&fwd_pos.to_be_bytes());
+            let mut payload = Vec::new();
+            encode_single_value(&mut payload, value)?;
+            occ_sink.push(SortRecord::new(occ_key, payload))?;
+        }
+        fwd_pos += 1;
+        Ok(())
+    })?;
+    Ok(())
 }

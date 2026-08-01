@@ -210,11 +210,13 @@ impl ExternalRunMerger for DiskMergerAdapter {
     fn merge_all(
         &mut self,
         runs: &[ExternalRunHandle],
-        _budget: &GenerationBudget,
+        budget: &GenerationBudget,
         metrics: &mut GenerationMetrics,
-        _cancel: Option<&grafeo_core::graph::compact::generation::CancelToken>,
+        cancel: Option<&grafeo_core::graph::compact::generation::CancelToken>,
         emit: &mut dyn FnMut(&SortRecord) -> Result<(), GenerationError>,
     ) -> Result<(), GenerationError> {
+        use super::external_sort::CancelToken as StorageCancelToken;
+
         // Resolve core handles (paths) back to storage RunHandles.
         let storage_runs: Vec<super::external_sort::RunHandle> = runs
             .iter()
@@ -226,12 +228,21 @@ impl ExternalRunMerger for DiskMergerAdapter {
             .collect();
         let mut sort_metrics = ExternalSortMetrics::default();
         let mut emit_err: Option<GenerationError> = None;
+        // Bridge core cancel into the storage merger's cancel checks.
+        let storage_cancel =
+            cancel.map(|c| StorageCancelToken::from_shared(c.shared_flag()));
         let result = merge_runs_recursive(
             &mut self.inner,
             &storage_runs,
             &mut sort_metrics,
-            None,
+            storage_cancel.as_ref(),
             &mut |framed: &FramedRecord| {
+                if let Some(c) = cancel {
+                    if c.is_cancelled() {
+                        emit_err = Some(GenerationError::Cancelled);
+                        return Err(ExternalSortMetricsError::Io("cancelled".into()));
+                    }
+                }
                 let rec = SortRecord::new(framed.key.clone(), framed.payload.clone());
                 match emit(&rec) {
                     Ok(()) => Ok(()),
@@ -242,10 +253,16 @@ impl ExternalRunMerger for DiskMergerAdapter {
                 }
             },
         );
-        // Fold sort metrics into core metrics.
+        // Fold sort metrics into the job ledger (truthful temp peaks + passes).
         metrics.merge_passes += sort_metrics.merge_passes;
         metrics.record_count += sort_metrics.record_count;
         metrics.max_open_runs = metrics.max_open_runs.max(sort_metrics.max_open_runs);
+        if sort_metrics.temp_bytes_peak > 0 {
+            metrics.reserve_temp(sort_metrics.temp_bytes_peak, budget.max_temp_bytes)?;
+            // Merge intermediates are released by storage after the call; drop
+            // current while keeping peak via reserve_temp's peak update.
+            metrics.release_temp(sort_metrics.temp_bytes_peak);
+        }
         if let Some(e) = emit_err {
             return Err(e);
         }

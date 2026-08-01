@@ -305,6 +305,17 @@ impl GraphStore for CompactStore {
             if let Some(col) = nt.column(&key) {
                 let table_id = nt.table_id();
                 for offset in col.find_eq(value) {
+                    let row_u32 = u32::try_from(offset).ok();
+                    let Some(row_u32) = row_u32 else {
+                        continue;
+                    };
+                    let raw = col.get(offset);
+                    if self.get_property_filtered(table_id, row_u32, &key, raw)
+                        .as_ref()
+                        != Some(value)
+                    {
+                        continue;
+                    }
                     let compact_id = encode_node_id(table_id, offset as u64);
                     results.push(self.to_original_node_id(compact_id));
                 }
@@ -377,6 +388,18 @@ impl GraphStore for CompactStore {
             if let Some(col) = nt.column(&key) {
                 let table_id = nt.table_id();
                 for offset in col.find_in_range(min, max, min_inclusive, max_inclusive) {
+                    let row_u32 = u32::try_from(offset).ok();
+                    let Some(row_u32) = row_u32 else {
+                        continue;
+                    };
+                    let raw = col.get(offset);
+                    let Some(val) = self.get_property_filtered(table_id, row_u32, &key, raw)
+                    else {
+                        continue;
+                    };
+                    if !value_in_range(&val, min, max, min_inclusive, max_inclusive) {
+                        continue;
+                    }
                     let compact_id = encode_node_id(table_id, offset as u64);
                     results.push(self.to_original_node_id(compact_id));
                 }
@@ -572,4 +595,42 @@ impl GraphStoreSearch for CompactStore {
 
         Box::new(per_table.flatten())
     }
+}
+
+fn value_in_range(
+    value: &Value,
+    min: Option<&Value>,
+    max: Option<&Value>,
+    min_inclusive: bool,
+    max_inclusive: bool,
+) -> bool {
+    use std::cmp::Ordering;
+    fn cmp(a: &Value, b: &Value) -> Option<Ordering> {
+        match (a, b) {
+            (Value::Int64(a), Value::Int64(b)) => Some(a.cmp(b)),
+            (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b),
+            (Value::Int64(a), Value::Float64(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float64(a), Value::Int64(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+    if let Some(min_val) = min {
+        match cmp(value, min_val) {
+            Some(Ordering::Less) => return false,
+            Some(Ordering::Equal) if !min_inclusive => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    if let Some(max_val) = max {
+        match cmp(value, max_val) {
+            Some(Ordering::Greater) => return false,
+            Some(Ordering::Equal) if !max_inclusive => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    true
 }

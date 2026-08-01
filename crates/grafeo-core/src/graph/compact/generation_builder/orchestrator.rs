@@ -45,6 +45,7 @@ use crate::graph::compact::generation_builder::emit_ids::{
     build_node_id_lookup, build_node_original_ids, build_table_zone_maps,
     count_edges_per_rel_table,
 };
+use crate::graph::compact::generation_builder::live_graph::LogicalLabelLookup;
 use crate::graph::compact::generation_builder::emit_meta::CodecKind;
 use crate::graph::compact::generation_builder::node_pass::{self, NodeSchema};
 use crate::graph::compact::generation_builder::staging;
@@ -154,14 +155,26 @@ impl BoundedGenerationBuilder {
             id_index_sink.as_mut(),
             &mut self.metrics,
         )?;
-        let occ_lease = occ_sink.finish()?;
         let id_index_lease = id_index_sink.finish()?;
+        // Occurrence run stays open until edge properties are appended (D0.8.0).
+        // Charge run-file temp for the job ledger (truthful nonzero counters).
+        let id_run_temp: u64 = id_index_lease.handles.iter().map(|h| h.byte_len).sum();
+        self.metrics
+            .reserve_temp(id_run_temp, budget.max_temp_bytes)?;
         // D0.8.4: external-sort ID-index records by original_id, stream the
         // fixed-width file, then open a read-only mapped view. Never retain a
         // resident Vec of the index.
         let id_index = self.materialize_mapped_id_index(run_store, &id_index_lease, &budget)?;
         let node_schema = node_out.schema;
         let membership_runs = node_out.membership_runs.take();
+        let label_lookup = LogicalLabelLookup::build(
+            &node_schema.labels,
+            membership_runs.as_ref(),
+            run_store,
+            &budget,
+            &mut self.metrics,
+            self.cancel.as_ref(),
+        )?;
 
         // Charge schema: node_schema (labels + label_to_table_id + table_row_counts)
         let schema_charge = node_schema.labels.iter().map(|s| s.len() as u64 + 8).sum::<u64>()
@@ -200,10 +213,30 @@ impl BoundedGenerationBuilder {
             &rel_id_of,
             fwd_sink.as_mut(),
             &mut self.metrics,
-            &node_schema.labels,
+            &label_lookup,
             &self.config.rel_schemas,
         )?;
         let fwd_lease = fwd_sink.finish()?;
+        edge_pass::explode_occurrences_from_forward(
+            &fwd_lease,
+            run_store.merger("fwd-csr")?.as_mut(),
+            occ_sink.as_mut(),
+            &budget,
+            &mut self.metrics,
+            self.cancel.as_ref(),
+        )?;
+        let occ_lease = occ_sink.finish()?;
+        let occ_temp: u64 = occ_lease.handles.iter().map(|h| h.byte_len).sum();
+        self.metrics.reserve_temp(occ_temp, budget.max_temp_bytes)?;
+
+        let rel_edge_counts = count_edges_per_rel_table(
+            &fwd_lease,
+            run_store.merger("fwd-csr")?.as_mut(),
+            &self.config.budget,
+            &mut self.metrics,
+            self.cancel.as_ref(),
+            rel_keys.len(),
+        )?;
 
         // ── 3. String occurrence collection ──────────────────────────
         let mut str_occ_sink = run_store.sink("str-occ", &budget)?;
@@ -274,7 +307,13 @@ impl BoundedGenerationBuilder {
         drop(remap_lease);
 
         // ── 5. Column geometry + bodies ──────────────────────────────
-        let table_row_count = |tid: u16| table_counts[tid as usize];
+        let table_row_count = |tid: u16| {
+            if tid >= 0x8000 {
+                rel_edge_counts[(tid - 0x8000) as usize]
+            } else {
+                table_counts[tid as usize]
+            }
+        };
         let geometries = compute_column_geometries(
             &occ_lease,
             run_store.merger("occ")?.as_mut(),
@@ -495,7 +534,7 @@ impl BoundedGenerationBuilder {
             .iter()
             .map(|k| (k.edge_type.clone(), k.src_table_id, k.dst_table_id))
             .collect();
-        let rel_edge_counts = count_edges_per_rel_table(
+        let rel_edge_counts_emit = count_edges_per_rel_table(
             fwd_lease,
             run_store.merger("fwd-csr")?.as_mut(),
             &self.config.budget,
@@ -508,7 +547,7 @@ impl BoundedGenerationBuilder {
             table_counts,
             &node_col_keys,
             &rel_keys_flat,
-            &rel_edge_counts,
+            &rel_edge_counts_emit,
             &rel_col_keys,
             schema_strings,
             geometries,
@@ -529,11 +568,11 @@ impl BoundedGenerationBuilder {
                 let col_indices: Vec<u32> = col_result
                     .columns
                     .iter()
-                    .filter(|c| c.kind != CodecKind::Dict || true) // all columns for this table
                     .filter(|c| {
-                        geometries.iter().any(|g| {
-                            g.table_id == tid as u16 && g.key == col_key_for(c, geometries)
-                        })
+                        c.table_id == tid as u16
+                            && geometries.iter().any(|g| {
+                                g.table_id == tid as u16 && g.key == c.key
+                            })
                     })
                     .map(|c| c.column_index)
                     .collect();
@@ -548,10 +587,10 @@ impl BoundedGenerationBuilder {
                     .columns
                     .iter()
                     .filter(|c| {
-                        geometries.iter().any(|g| {
-                            g.table_id == (0x8000 | rid as u16)
-                                && g.key == col_key_for(c, geometries)
-                        })
+                        c.table_id == (0x8000 | rid as u16)
+                            && geometries.iter().any(|g| {
+                                g.table_id == (0x8000 | rid as u16) && g.key == c.key
+                            })
                     })
                     .map(|c| c.column_index)
                     .collect();
@@ -559,7 +598,7 @@ impl BoundedGenerationBuilder {
                     rid as u16,
                     k.src_table_id,
                     k.dst_table_id,
-                    rel_edge_counts[rid],
+                    rel_edge_counts_emit[rid],
                     col_indices,
                 )
             })
@@ -856,9 +895,9 @@ fn consume_remap_run(
     })?;
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
 
-    // Current chunk accumulation: one column's distinct (string, code) pairs.
-    let mut current_col: Option<(u16, Vec<u8>)> = None;
-    let mut entries: Vec<(Vec<u8>, u32)> = Vec::new();
+    // Stream one column at a time: body spool holds entries; only the last
+    // string is retained for adjacent dedup (never a column-sized Vec).
+    let mut current: Option<DictChunkStreamer> = None;
 
     merger.merge_all(&remap_lease.handles, budget, metrics, cancel, &mut |rec| {
         let Some(&kind) = rec.key.first() else {
@@ -882,7 +921,6 @@ fn consume_remap_run(
 
         match kind {
             k if k == StringUseKind::DictValue as u8 => {
-                // Column-scoped: owner_key = table_id u16 BE || prop_key.
                 if rec.key.len() < 3 {
                     return Err(GenerationError::Codec(
                         "dict remap owner key too short".into(),
@@ -890,17 +928,23 @@ fn consume_remap_run(
                 }
                 let tid = u16::from_be_bytes([rec.key[1], rec.key[2]]);
                 let prop = &rec.key[3..];
-                let is_new_col = current_col
+                let is_new_col = current
                     .as_ref()
-                    .is_none_or(|(t, p)| *t != tid || p.as_slice() != prop);
+                    .is_none_or(|c| c.tid != tid || c.prop.as_slice() != prop);
                 if is_new_col {
-                    write_dict_chunk(&mut writer, current_col.as_ref(), &mut entries)?;
-                    current_col = Some((tid, prop.to_vec()));
+                    if let Some(prev) = current.take() {
+                        prev.finish_into(&mut writer)?;
+                    }
+                    current = Some(DictChunkStreamer::open(
+                        tid,
+                        prop,
+                        chunks_path.parent().unwrap_or(std::path::Path::new(".")),
+                    )?);
                 }
-                // Dedup: identical strings are adjacent within a column.
-                if entries.last().map(|(s, _)| s.as_slice()) != Some(string) {
-                    entries.push((string.to_vec(), code));
-                }
+                current
+                    .as_mut()
+                    .expect("just opened")
+                    .push_unique(string, code)?;
                 Ok(())
             }
             k if k == StringUseKind::Label as u8
@@ -908,7 +952,6 @@ fn consume_remap_run(
                 || k == StringUseKind::EdgeType as u8
                 || k == StringUseKind::ZoneString as u8 =>
             {
-                // Schema-scoped strings only.
                 let s = std::str::from_utf8(string)
                     .map_err(|_| GenerationError::Codec("remap string not UTF-8".into()))?;
                 schema.insert(s.to_string(), code);
@@ -919,65 +962,131 @@ fn consume_remap_run(
             ))),
         }
     })?;
-    write_dict_chunk(&mut writer, current_col.as_ref(), &mut entries)?;
+    if let Some(prev) = current.take() {
+        prev.finish_into(&mut writer)?;
+    }
     writer
         .flush()
         .map_err(|e| GenerationError::Io(format!("flush dict chunks: {e}")))?;
     Ok(schema)
 }
 
-/// Serializes one accumulated per-column chunk to the chunk file.
-///
-/// # Errors
-///
-/// I/O or width-overflow failure.
-fn write_dict_chunk(
-    writer: &mut std::io::BufWriter<std::fs::File>,
-    col: Option<&(u16, Vec<u8>)>,
-    entries: &mut Vec<(Vec<u8>, u32)>,
-) -> Result<(), GenerationError> {
-    use std::io::Write;
-    let Some((tid, prop)) = col else {
-        if !entries.is_empty() {
-            return Err(GenerationError::Codec(
-                "dict chunk entries without column".into(),
-            ));
+/// Streams one Dict column's distinct (string, code) pairs to a body spool,
+/// retaining only the last string for adjacent dedup.
+struct DictChunkStreamer {
+    tid: u16,
+    prop: Vec<u8>,
+    body_path: PathBuf,
+    body: Option<std::io::BufWriter<std::fs::File>>,
+    count: u32,
+    last: Option<Vec<u8>>,
+}
+
+impl DictChunkStreamer {
+    fn open(tid: u16, prop: &[u8], temp_dir: &std::path::Path) -> Result<Self, GenerationError> {
+        let body_path = temp_dir.join(format!(
+            "dictchunk-{}-{}.body",
+            tid,
+            {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                prop.hash(&mut h);
+                h.finish()
+            }
+        ));
+        let file = std::fs::File::create(&body_path).map_err(|e| {
+            GenerationError::Io(format!("create dict chunk body {}: {e}", body_path.display()))
+        })?;
+        Ok(Self {
+            tid,
+            prop: prop.to_vec(),
+            body_path,
+            body: Some(std::io::BufWriter::with_capacity(64 * 1024, file)),
+            count: 0,
+            last: None,
+        })
+    }
+
+    fn push_unique(&mut self, string: &[u8], code: u32) -> Result<(), GenerationError> {
+        use std::io::Write;
+        if self.last.as_deref() == Some(string) {
+            return Ok(());
         }
-        return Ok(());
-    };
-    let prop_len = u16::try_from(prop.len()).map_err(|_| GenerationError::WireWidthOverflow {
-        what: "dict_chunk_prop_len",
-        count: prop.len() as u64,
-        max: u64::from(u16::MAX),
-    })?;
-    let count = u32::try_from(entries.len()).map_err(|_| GenerationError::WireWidthOverflow {
-        what: "dict_chunk_entry_count",
-        count: entries.len() as u64,
-        max: u64::from(u32::MAX),
-    })?;
-    let mut hdr = Vec::with_capacity(4 + prop.len());
-    hdr.extend_from_slice(&tid.to_le_bytes());
-    hdr.extend_from_slice(&prop_len.to_le_bytes());
-    hdr.extend_from_slice(prop);
-    hdr.extend_from_slice(&count.to_le_bytes());
-    writer
-        .write_all(&hdr)
-        .map_err(|e| GenerationError::Io(format!("write dict chunk header: {e}")))?;
-    for (s, code) in entries.drain(..) {
-        let slen = u32::try_from(s.len()).map_err(|_| GenerationError::WireWidthOverflow {
+        let slen = u32::try_from(string.len()).map_err(|_| GenerationError::WireWidthOverflow {
             what: "dict_chunk_str_len",
-            count: s.len() as u64,
+            count: string.len() as u64,
             max: u64::from(u32::MAX),
         })?;
-        let mut rec = Vec::with_capacity(4 + s.len() + 4);
-        rec.extend_from_slice(&slen.to_le_bytes());
-        rec.extend_from_slice(&s);
-        rec.extend_from_slice(&code.to_le_bytes());
-        writer
-            .write_all(&rec)
+        let body = self
+            .body
+            .as_mut()
+            .ok_or_else(|| GenerationError::Io("dict chunk body closed".into()))?;
+        body.write_all(&slen.to_le_bytes())
+            .and_then(|_| body.write_all(string))
+            .and_then(|_| body.write_all(&code.to_le_bytes()))
             .map_err(|e| GenerationError::Io(format!("write dict chunk entry: {e}")))?;
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(GenerationError::WireWidthOverflow {
+                what: "dict_chunk_entry_count",
+                count: u64::from(u32::MAX) + 1,
+                max: u64::from(u32::MAX),
+            })?;
+        self.last = Some(string.to_vec());
+        Ok(())
     }
-    Ok(())
+
+    fn finish_into(
+        mut self,
+        writer: &mut std::io::BufWriter<std::fs::File>,
+    ) -> Result<(), GenerationError> {
+        use std::io::{Read, Write};
+        if let Some(mut body) = self.body.take() {
+            body.flush()
+                .map_err(|e| GenerationError::Io(format!("flush dict chunk body: {e}")))?;
+            drop(body);
+        }
+        let prop_len =
+            u16::try_from(self.prop.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "dict_chunk_prop_len",
+                count: self.prop.len() as u64,
+                max: u64::from(u16::MAX),
+            })?;
+        let body_path = std::mem::take(&mut self.body_path);
+        writer
+            .write_all(&self.tid.to_le_bytes())
+            .and_then(|_| writer.write_all(&prop_len.to_le_bytes()))
+            .and_then(|_| writer.write_all(&self.prop))
+            .and_then(|_| writer.write_all(&self.count.to_le_bytes()))
+            .map_err(|e| GenerationError::Io(format!("write dict chunk header: {e}")))?;
+        let mut body = std::fs::File::open(&body_path).map_err(|e| {
+            GenerationError::Io(format!("reopen dict chunk body {}: {e}", body_path.display()))
+        })?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = body
+                .read(&mut buf)
+                .map_err(|e| GenerationError::Io(format!("read dict chunk body: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| GenerationError::Io(format!("copy dict chunk body: {e}")))?;
+        }
+        let _ = std::fs::remove_file(&body_path);
+        Ok(())
+    }
+}
+
+impl Drop for DictChunkStreamer {
+    fn drop(&mut self) {
+        self.body.take();
+        if !self.body_path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.body_path);
+        }
+    }
 }
 
 fn split_occ_key(key: &[u8]) -> Result<(u16, &str, u64), GenerationError> {
@@ -1019,16 +1128,6 @@ fn build_rel_col_keys(geometries: &[ColumnGeometry], nrels: usize) -> Vec<Vec<St
         k.sort();
     }
     keys
-}
-
-fn col_key_for(
-    col: &crate::graph::compact::generation_builder::emit_columns::EmittedColumn,
-    geometries: &[ColumnGeometry],
-) -> String {
-    geometries
-        .get(col.column_index as usize)
-        .map(|g| g.key.clone())
-        .unwrap_or_default()
 }
 
 fn make_resident_desc(

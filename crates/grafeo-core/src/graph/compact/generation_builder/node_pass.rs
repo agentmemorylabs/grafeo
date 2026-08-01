@@ -252,7 +252,7 @@ impl<'a> NodePass<'a> {
 
 /// Encodes one value into a standalone framed record (tag + body), mirroring
 /// `staging::encode_properties` value encoding for a single occurrence.
-fn encode_single_value(
+pub(crate) fn encode_single_value(
     out: &mut Vec<u8>,
     v: &grafeo_common::types::Value,
 ) -> Result<(), GenerationError> {
