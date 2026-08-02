@@ -372,19 +372,34 @@ fn repair_swap_keeps_post_freeze_modification_of_base_node_visible() {
 
 // ── R1: sustained writable cycles with concurrent readers ────────────────────
 
-/// R1 — drive many consecutive publish/retire cycles against one live DB while
-/// a concurrent reader thread holds snapshots, interleaving:
+/// R1 — drive many consecutive publish/retire cycles against ONE live layered
+/// DB (a single `GrafeoDB` whose base is swapped through the generations each
+/// cycle publishes — never re-seeded from the model), while a concurrent
+/// reader thread performs REAL reads through the shared layered store
+/// (`all_node_ids` + `get_node`; base/overlay are ArcSwap snapshots per call,
+/// so a publication is never observed torn). Interleaved:
 ///
-/// - a backup pin held across one cycle (4b pin registry must not block it),
-/// - an induced phase-tagged build failure + clean retry (freeze again at the
-///   next epoch and re-drive the handoff), and
-/// - the 5d base swap with a fresh layered baseline each cycle (whole-graph
-///   reset + handoff-build repaired swap for accepted-N+1 parity).
+/// - an induced phase-tagged build failure + clean retry (cycle 1 re-freezes
+///   at the next epoch and re-drives the handoff; the failed attempt writes
+///   nothing durable),
+/// - both 5d swap paths: the whole-live-graph `swap_base_and_reset_overlay`
+///   (cycles 2 and 4) and the 5c epoch-handoff repaired
+///   `swap_base_and_repair_overlay` (cycles 0, 1, 3).
 ///
-/// Parity is asserted by the `live_person_names` exact-multiset helper: every
-/// accepted N+1 write reads back exactly once after each swap; a lost write
-/// shows as a missing name, a duplicated one as an extra (id-keyed +
-/// unique-per-write naming make these distinct).
+/// Cross-cycle carryover is REAL: every swap installs the generation that
+/// cycle published (opened fresh from its container) as the live base, so
+/// cycle N+1 always starts on the generation cycle N actually published. A
+/// cycle's post-freeze N+1 write is served via the retained-N+1 overlay
+/// base-miss path until the NEXT cycle's handoff freezes it into the
+/// published base — prior N+1 creates physically persist across cycle
+/// boundaries through the published generation.
+///
+/// Parity: the exact-multiset `live_person_names` helper asserts after EVERY
+/// swap, INCLUDING the retry branch, against a model that records every
+/// accepted write (the retry's epoch-N write and the retry's own N+1
+/// included). The final fresh-reopen check asserts the reopened selected
+/// generation's published container equals the model EXACTLY — no write was
+/// lost, duplicated, or resurrected across the whole run.
 #[test]
 fn repeated_cycles_with_concurrent_readers() {
     if std::env::var(MEM_CHILD_ENV).is_ok() {
@@ -392,11 +407,16 @@ fn repeated_cycles_with_concurrent_readers() {
     }
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
+    use std::time::Duration;
 
     let dir = TempDir::new().unwrap();
     let gen_root = dir.path().join("live.grafeo.d");
     fs::create_dir_all(&gen_root).unwrap();
 
+    // ONE live engine-level session for the whole run. `db` is created once
+    // and every cycle's swap installs the generation THAT cycle published as
+    // the new base, so the next cycle always builds on the previous cycle's
+    // real published generation — never a fresh re-seeded db.
     let mut db = GrafeoDB::new_in_memory();
     db.create_node_with_props(&["Person"], [("name", Value::from("p-seed"))])
         .expect("seed node");
@@ -404,51 +424,94 @@ fn repeated_cycles_with_concurrent_readers() {
     let ctl =
         Arc::new(OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"));
     db.install_overlay_admission(Arc::clone(&ctl));
-    db.close().expect("pristine checkpoint");
 
+    // Model of EVERY accepted write, seeded with the compact base.
+    let mut model: BTreeSet<String> = ["p-seed".to_string()].into_iter().collect();
+    assert_eq!(live_person_names(&db), Vec::from_iter(model.clone()));
+
+    // ── M2: a concurrent reader that really reads ───────────────────────────
+    // Shares the SAME layered-store Arc as the writer. Base and overlay are
+    // held in ArcSwap, so every all_node_ids()/get_node() call snapshots a
+    // consistent pair and no publication can be observed torn. The reader
+    // sleeps at most 1 ms per iteration and returns its observed read counts
+    // plus the final stable read, so the writer can PROVE it queried the
+    // store instead of spinning.
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = Arc::clone(&stop);
-    let reader = thread::spawn(move || {
-        // Concurrent readers hold Arc snapshots of the base+overlay across
-        // publications; ArcSwap guarantees they never observe a torn base. This
-        // reader simply spins until the writer side finishes; it is cancelled
-        // by `stop`, so it never blocks test teardown.
-        let mut reads = 0u64;
-        while !reader_stop.load(Ordering::Relaxed) {
-            reads = reads.wrapping_add(1);
-            thread::yield_now();
+    let reader_started = Arc::new(AtomicBool::new(false));
+    let reader_flag = Arc::clone(&reader_started);
+    let reader_layered = Arc::clone(db.layered_store().expect("layered store after compact"));
+    let reader = thread::spawn(move || -> (u64, usize, usize, Vec<String>) {
+        // One full layered read: every Person name visible through the live
+        // base+overlay dispatch (same shape as `live_person_names`).
+        let read_person_names = || {
+            let mut names: Vec<String> = reader_layered
+                .all_node_ids()
+                .into_iter()
+                .filter_map(|id| reader_layered.get_node(id))
+                .filter(|n| n.labels.iter().any(|l| l.as_str() == "Person"))
+                .filter_map(|n| {
+                    n.properties
+                        .get(&PropertyKey::new("name"))
+                        .and_then(|v| match v {
+                            Value::String(s) => Some(s.as_str().to_string()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            names.sort_unstable();
+            names
+        };
+
+        let mut reads: u64 = 0;
+        let mut min_observed = usize::MAX;
+        let mut max_observed = 0usize;
+        let final_names: Vec<String>;
+        loop {
+            let names = read_person_names();
+            reads = reads.saturating_add(1);
+            min_observed = min_observed.min(names.len());
+            max_observed = max_observed.max(names.len());
+            // First completed read: release the writer's spawn handshake so it
+            // can start cycling — the reader provably spans every publication.
+            reader_flag.store(true, Ordering::Release);
+            if reader_stop.load(Ordering::Acquire) {
+                // Writer finished every cycle: ONE final read of the now
+                // stable view (this read always reaches the full model, and
+                // the names must match the oracle exactly).
+                final_names = read_person_names();
+                reads = reads.saturating_add(1);
+                min_observed = min_observed.min(final_names.len());
+                max_observed = max_observed.max(final_names.len());
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
         }
-        eprintln!("[reader] completed {reads} snapshot iterations");
+        eprintln!(
+            "[reader] {reads} reads, observed Person-name counts in [{min_observed}, {max_observed}]"
+        );
+        (reads, min_observed, max_observed, final_names)
     });
 
-    let mut model: BTreeSet<String> = ["p-seed".to_string()].into_iter().collect();
+    // The reader completes its first read before the first cycle starts, so
+    // its observed read sequence provably spans the whole cycle run below.
+    while !reader_started.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
 
     for cycle in 0..5u32 {
-        // Fresh layered baseline each cycle (swapped in below), seeded to the
-        // accepted N+1 model. This mirrors "close the layered session and
-        // reopen a fresh one" without process restart.
-        let mut db = GrafeoDB::new_in_memory();
-        for name in model.iter() {
-            db.create_node_with_props(&["Person"], [("name", Value::from(name.clone()))])
-                .expect("seed baseline");
-        }
-        db.compact().expect("compact per cycle");
-        let ctl = Arc::new(
-            OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"),
-        );
-        db.install_overlay_admission(Arc::clone(&ctl));
-
         // ── overlay epoch-N write (absorbed) ──────────────────────────────
         let epoch_n = format!("c{cycle}-epochN");
         let node_n = db.layered_store().unwrap().create_node(&["Person"]);
         db.layered_store()
             .unwrap()
             .set_node_property(node_n, "name", Value::from(epoch_n.clone()));
+        model.insert(epoch_n.clone());
 
-        // ── cycle 1: induced build failure + clean retry at the next epoch ──
         if cycle == 1 {
-            // ── induced build failure: complete the handoff into a refused
-            // file path so the build reports a phase-tagged error ──────────
+            // ── M3 (retry branch): induced build failure + clean retry, with
+            // the retry epoch-N write AND the retry's own N+1 both recorded in
+            // the model, and the same exact-multiset parity assert run here ──
             let bad_root = dir.path().join("not-a-dir.grafeo");
             std::fs::write(&bad_root, b"occupied").unwrap();
             let handle = db
@@ -462,29 +525,97 @@ fn repeated_cycles_with_concurrent_readers() {
                 !db.epoch_handoff_active(),
                 "failure must cancel the handoff"
             );
-            // Retry cleanly at the NEXT epoch boundary: freeze again, complete.
+            let _ = build_err;
+
+            // Clean retry at the NEXT epoch boundary: freeze again, capture
+            // the freeze identity, drive the post-freeze N+1 create, complete,
+            // and run the repaired 5d swap — identically to the normal
+            // handoff cycles.
             let retry = db
                 .freeze_epoch_for_handoff(&gen_root)
                 .expect("re-freeze after failure");
-            let report = db
-                .complete_epoch_handoff(retry, generation_build_request(&gen_root, "cycle-1-retry"))
-                .expect("retried handoff completes");
-            assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
-            // Retry build == frozen epoch-N accepted; the frozen set this epoch
-            // includes the epoch-N node (handoff base = layered compact base).
-            let _ = build_err;
-        } else {
-            // ── normal handoff cycle: freeze → concurrent N+1 → complete ──
-            let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
-            assert!(db.epoch_handoff_active());
-            let frozen_node_set = handle.freeze.overlay_node_ids.clone();
-            let frozen_edge_set = handle.freeze.overlay_edge_ids.clone();
-            // Post-freeze N+1 create (accepted working set that must survive).
+            let frozen_node_set = retry.freeze.overlay_node_ids.clone();
+            let frozen_edge_set = retry.freeze.overlay_edge_ids.clone();
             let n1_name = format!("c{cycle}-n1");
             let n1 = db.layered_store().unwrap().create_node(&["Person"]);
             db.layered_store()
                 .unwrap()
                 .set_node_property(n1, "name", Value::from(n1_name.clone()));
+            model.insert(n1_name.clone());
+
+            let report = db
+                .complete_epoch_handoff(retry, generation_build_request(&gen_root, "cycle-1-retry"))
+                .expect("retried handoff completes");
+            assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
+
+            let gen_abs = report
+                .publication
+                .as_ref()
+                .expect("publication")
+                .generation_abs_path
+                .clone();
+            let new_base = open_generation_base(&gen_abs);
+            db.layered_store().unwrap().swap_base_and_repair_overlay(
+                new_base,
+                &frozen_to_node_ids(&frozen_node_set),
+                &frozen_to_edge_ids(&frozen_edge_set),
+            );
+            assert_eq!(
+                live_person_names(&db),
+                Vec::from_iter(model.clone()),
+                "cycle {cycle} retry parity: the retry epoch-N write and the retry N+1 read back exactly once"
+            );
+        } else if cycle == 2 || cycle == 4 {
+            // ── whole-live-graph cycle: a second overlay write, publish the
+            // ENTIRE live graph (base + overlay), then swap base + reset
+            // overlay. The published base physically carries every prior
+            // write — including the previous cycle's retained N+1 — so the
+            // next cycle builds on REAL carryover, not a re-seeded db. (No
+            // freeze boundary here, so the second write is just another
+            // overlay write absorbed directly into the published base.)
+            let n1_name = format!("c{cycle}-n1");
+            let n1 = db.layered_store().unwrap().create_node(&["Person"]);
+            db.layered_store()
+                .unwrap()
+                .set_node_property(n1, "name", Value::from(n1_name.clone()));
+            model.insert(n1_name.clone());
+
+            let pubn = db
+                .build_and_publish_generation(generation_build_request(
+                    &gen_root,
+                    format!("cycle-{cycle}"),
+                ))
+                .expect("whole-graph publish");
+            let new_base = open_generation_base(&pubn.generation_abs_path);
+            db.layered_store()
+                .unwrap()
+                .swap_base_and_reset_overlay(new_base);
+            assert_eq!(
+                live_person_names(&db),
+                Vec::from_iter(model.clone()),
+                "cycle {cycle} whole-graph live parity"
+            );
+            assert_eq!(
+                generation_person_names(&pubn.generation_abs_path),
+                Vec::from_iter(model.clone()),
+                "cycle {cycle} whole-graph generation parity"
+            );
+        } else {
+            // ── normal handoff cycle: freeze → concurrent N+1 → complete →
+            // repaired 5d swap. The N+1 write is retained via the overlay
+            // base-miss path until the NEXT cycle absorbs it into the base.
+            let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+            assert!(db.epoch_handoff_active());
+            let frozen_node_set = handle.freeze.overlay_node_ids.clone();
+            let frozen_edge_set = handle.freeze.overlay_edge_ids.clone();
+            // Post-freeze N+1 create (accepted working set that must survive
+            // the swap through the retained-N+1 base-miss path).
+            let n1_name = format!("c{cycle}-n1");
+            let n1 = db.layered_store().unwrap().create_node(&["Person"]);
+            db.layered_store()
+                .unwrap()
+                .set_node_property(n1, "name", Value::from(n1_name.clone()));
+            model.insert(n1_name.clone());
 
             let report = db
                 .complete_epoch_handoff(
@@ -507,23 +638,49 @@ fn repeated_cycles_with_concurrent_readers() {
                 &frozen_to_node_ids(&frozen_node_set),
                 &frozen_to_edge_ids(&frozen_edge_set),
             );
-
-            model.insert(epoch_n);
-            model.insert(n1_name);
-
-            // Exact-multiset parity: every accepted N+1 read back exactly once.
-            let live = live_person_names(&db);
-            assert_eq!(live, Vec::from_iter(model.clone()), "cycle {cycle} parity");
+            assert_eq!(
+                live_person_names(&db),
+                Vec::from_iter(model.clone()),
+                "cycle {cycle} parity"
+            );
         }
-
-        db.close().expect("cycle checkpoint close");
     }
 
-    // Stop the concurrent reader and prove it ran (concurrent-read surface).
-    stop.store(true, Ordering::Relaxed);
-    reader.join().expect("reader join");
+    // Stop the concurrent reader and JOIN it BEFORE teardown, then prove it
+    // actually read the store rather than spinning: it queried the layered
+    // store at least twice, observed a non-empty view, saw the view GROW
+    // across publications (first read pre-cycles = the seed alone, final
+    // stable read = the full model), and its final stable read matches the
+    // accepted-write model EXACTLY from the reader thread's own view.
+    stop.store(true, Ordering::Release);
+    let (reads, min_observed, max_observed, final_names) = reader.join().expect("reader join");
+    assert!(
+        reads >= 2,
+        "concurrent reader must perform real DB reads, got {reads}"
+    );
+    assert!(
+        min_observed >= 1,
+        "reader must observe a non-empty live view, got {min_observed} Person names"
+    );
+    assert!(
+        max_observed > min_observed,
+        "reader must observe the view GROW across publications: max {max_observed} <= min {min_observed}"
+    );
+    assert!(
+        max_observed >= model.len(),
+        "reader must observe the full published model at least once (final stable read): max {max_observed} < model {}",
+        model.len()
+    );
+    assert_eq!(
+        final_names,
+        Vec::from_iter(model.clone()),
+        "reader's final stable read equals the accepted-write model exactly"
+    );
 
-    // R5 (Linux): fresh reopen selects the most recent published generation.
+    // Checkpoint-close the ONE live session, then R5 (Linux): fresh reopen
+    // selects the MOST RECENT published generation and its boundary is
+    // replayable.
+    db.close().expect("final checkpoint close");
     let recovery = recover_generation_root(&gen_root).expect("recover");
     assert_eq!(
         recovery.selected.slot.generation_id, "cycle-4",
@@ -532,6 +689,15 @@ fn repeated_cycles_with_concurrent_readers() {
     );
     validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
         .expect("final boundary replayable");
+    // The reopened selected generation's published container holds the
+    // accepted-write model EXACTLY (the last cycle is a whole-graph publish,
+    // so its base IS the complete model): no write was lost, duplicated, or
+    // resurrected across the whole run.
+    assert_eq!(
+        generation_person_names(&recovery.selected.generation_abs_path),
+        Vec::from_iter(model.clone()),
+        "reopened final generation entity multiset equals the accepted-write model exactly"
+    );
 }
 
 /// R1 — a backup pin held across a whole publish cycle. Pins the selected
