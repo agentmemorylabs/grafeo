@@ -37,6 +37,40 @@ use super::types::{EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle};
 use crate::database::GrafeoDB;
 use crate::database::generation_build::GenerationBuildRequest;
 
+/// Debug-only test seam (G-EM0.5c MAJOR-1): when set, `freeze_epoch_for_handoff`
+/// parks inside its writer-barrier critical section immediately before
+/// capturing the frozen overlay payloads. [`FREEZE_STALL_ENTERED`] flips to
+/// `true` while parked so a test can deterministically prove that a concurrent
+/// writer is blocked across the freeze capture (no torn/duplicated entity).
+///
+/// Compiled out of release builds (mirrors the `GRAFEO_5C_ABORT` fault
+/// injection in [`maybe_abort`]).
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static FREEZE_STALL_BEFORE_CAPTURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// See [`FREEZE_STALL_BEFORE_CAPTURE`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static FREEZE_STALL_ENTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+fn maybe_stall_before_capture() {
+    use std::sync::atomic::Ordering;
+    if FREEZE_STALL_BEFORE_CAPTURE.load(Ordering::Acquire) {
+        FREEZE_STALL_ENTERED.store(true, Ordering::Release);
+        while FREEZE_STALL_BEFORE_CAPTURE.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        FREEZE_STALL_ENTERED.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_stall_before_capture() {}
+
 impl GrafeoDB {
     /// Freeze epoch N at WAL boundary B and open bounded epoch N+1 for writes.
     ///
@@ -69,13 +103,30 @@ impl GrafeoDB {
         let generation_root = std::fs::canonicalize(generation_root)
             .map_err(|e| Error::Internal(format!("canonicalize generation root: {e}")))?;
 
+        // MAJOR-1: freeze must be a writer linearization point. Hold the
+        // layered store's merge-guard WRITE barrier across WAL cut → epoch
+        // sync → payload capture → begin_epoch_handoff so no concurrent
+        // GraphStoreMut mutation (each holds the guard as `.read()` for the
+        // whole operation) can interleave. A writer is therefore either
+        // entirely before the freeze (WAL record ≤ B and captured into G(N))
+        // or entirely after it (epoch N+1, excluded from G(N)) — no torn or
+        // duplicated entity. The barrier is dropped right after the handoff
+        // install so N+1 writers proceed once the freeze is fully installed
+        // (build/publish stay concurrent — only the capture must be atomic).
+        let _barrier = self
+            .layered_store
+            .as_ref()
+            .map(|l| l.freeze_write_barrier());
+
         let wal_boundary = {
             let _lock = RootLock::try_acquire(&generation_root)
                 .map_err(|e| Error::Internal(format!("generation root lock: {e}")))?;
             let wal_dir = generation_root.join("wal");
             std::fs::create_dir_all(&wal_dir)?;
             let wal = WalManager::open(&wal_dir)?;
-            // Cut boundary B first so concurrent N+1 writes land after B.
+            // Cut boundary B first so concurrent N+1 writes land after B. The
+            // merge-guard barrier above guarantees no mutation lands between
+            // the cut and the capture below.
             let cut = cut_generation_boundary(&wal)
                 .map_err(|e| Error::Internal(format!("WAL freeze cut: {e}")))?;
             WalBoundary::from_cursor(&cut.cursor)
@@ -98,6 +149,10 @@ impl GrafeoDB {
                 store.sync_epoch(grafeo_common::types::EpochId::new(next_epoch));
             }
         }
+
+        // Debug test seam: parks here (barrier still held) so tests can prove
+        // concurrent writers cannot interleave with the capture.
+        maybe_stall_before_capture();
 
         // Capture freeze identity + materialize overlay payloads.
         let (freeze, frozen_nodes, frozen_edges) =
@@ -132,9 +187,14 @@ impl GrafeoDB {
                 post_freeze_edges: Default::default(),
                 frozen_retained_bytes,
                 frozen_category_bytes,
+                next_epoch_charged_bytes: 0,
             };
             layered.begin_epoch_handoff(live).map_err(Error::Internal)?;
         }
+
+        // Freeze capture + install complete: release the writer barrier so
+        // N+1 writers proceed strictly after the freeze linearization point.
+        drop(_barrier);
 
         let handle = FrozenEpochHandle {
             frozen_epoch,

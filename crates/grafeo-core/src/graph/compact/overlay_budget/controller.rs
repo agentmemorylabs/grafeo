@@ -291,6 +291,40 @@ impl OverlayAdmissionController {
         self.wake_front_locked(&inner);
     }
 
+    /// Moves `bytes` of retained capacity from one category to another without
+    /// changing the aggregate total (G-EM0.5c MAJOR-4).
+    ///
+    /// Used to re-attribute the next-epoch working set back to the mutable
+    /// payload category when a generation handoff retires: the surviving N+1
+    /// entities stay on the live overlay and become the next cycle's
+    /// `MutationPayload`, so their charges migrate `NextEpoch -> MutationPayload`
+    /// instead of vanishing (leak) or double-counting (ratchet). Because the
+    /// aggregate total is unchanged, no admission check applies and no blocked
+    /// writer can be admitted by this call.
+    ///
+    /// Fail-closed: if `from` holds fewer than `bytes`, only the available
+    /// amount is moved and an accounting error is recorded (mirrors
+    /// [`Inner::release`] underflow accounting).
+    pub fn transfer_retained(&self, from: RetainedCategory, to: RetainedCategory, bytes: u64) {
+        let mut inner = self.inner.lock();
+        let f = from.index();
+        let t = to.index();
+        if f == t || bytes == 0 {
+            return;
+        }
+        let available = inner.category_bytes[f].min(bytes);
+        if available < bytes {
+            inner.accounting_errors = inner.accounting_errors.saturating_add(1);
+        }
+        inner.category_bytes[f] = inner.category_bytes[f].saturating_sub(available);
+        inner.category_bytes[t] = inner.category_bytes[t].saturating_add(available);
+        if inner.category_bytes[t] > inner.category_high_water[t] {
+            inner.category_high_water[t] = inner.category_bytes[t];
+        }
+        // total_bytes is unchanged by design; the build-request latch is
+        // therefore untouched (capacity neither freed nor consumed).
+    }
+
     /// Releases all retained bytes across every category to zero.
     ///
     /// Called by the engine after a generation build drains the overlay: the

@@ -35,6 +35,10 @@ mod handoff;
 mod records;
 mod types;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use handoff::{FREEZE_STALL_BEFORE_CAPTURE, FREEZE_STALL_ENTERED};
+
 pub use types::{
     EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle,
 };

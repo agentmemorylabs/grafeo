@@ -128,6 +128,13 @@ pub struct OverlayHandoffLive {
     pub frozen_retained_bytes: u64,
     /// Per-category frozen bytes at freeze (index = RetainedCategory::index).
     pub frozen_category_bytes: [u64; RetainedCategory::COUNT],
+    /// Payload bytes charged to [`RetainedCategory::NextEpoch`] during this
+    /// handoff (every post-freeze mutation whose charge was rerouted from
+    /// MutationPayload). On retire these bytes are re-attributed to
+    /// [`RetainedCategory::MutationPayload`] (the surviving N+1 entities become
+    /// the next cycle's live working set) so the budget neither ratchets nor
+    /// leaks across handoffs (G-EM0.5c MAJOR-4).
+    pub next_epoch_charged_bytes: u64,
 }
 
 impl std::fmt::Debug for LayeredStore {
@@ -369,14 +376,24 @@ impl LayeredStore {
     /// [`RetainedCategory::NextEpoch`] so frozen epoch N and next epoch N+1
     /// both count toward the same hard budget (packet §5).
     fn charge_retained(&self, category: RetainedCategory, bytes: usize) {
-        let category =
-            if category == RetainedCategory::MutationPayload && self.handoff.read().is_some() {
-                RetainedCategory::NextEpoch
-            } else {
-                category
-            };
+        // During an active G-EM0.5c handoff, mutation-payload charges route to
+        // RetainedCategory::NextEpoch so frozen epoch N and next epoch N+1 both
+        // count toward the same hard budget (packet §5). The rerouted bytes are
+        // tracked on the live handoff state so retire can re-attribute them to
+        // MutationPayload for the surviving N+1 working set (MAJOR-4).
+        let mut charged = category;
+        if category == RetainedCategory::MutationPayload {
+            let mut handoff = self.handoff.write();
+            if handoff.is_some() {
+                charged = RetainedCategory::NextEpoch;
+                if let Some(h) = handoff.as_mut() {
+                    h.next_epoch_charged_bytes =
+                        h.next_epoch_charged_bytes.saturating_add(bytes as u64);
+                }
+            }
+        }
         if let Some(ctl) = self.admission_slot.read().as_ref() {
-            ctl.try_reserve(category, bytes as u64);
+            ctl.try_reserve(charged, bytes as u64);
         }
     }
 
@@ -410,6 +427,23 @@ impl LayeredStore {
         self.handoff.read().clone()
     }
 
+    /// Acquires the writer barrier for the freeze critical section
+    /// (G-EM0.5c MAJOR-1).
+    ///
+    /// Every [`GraphStoreMut`] overlay mutation holds the merge guard as
+    /// `.read()` for the duration of the whole operation (see
+    /// [`Self::merge_guard`]). Holding `.write()` here — across the WAL
+    /// boundary cut, the epoch sync, the freeze payload capture, and the
+    /// `begin_epoch_handoff` install — makes the freeze a writer
+    /// linearization point: no mutation can land between the cut and the
+    /// capture, so G(N) can neither duplicate a frozen entity (record > B)
+    /// nor include an N+1-epoch entity. The caller MUST drop the returned
+    /// guard before the freeze returns so N+1 writers proceed only after the
+    /// handoff is fully installed.
+    pub fn freeze_write_barrier(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.merge_guard.write()
+    }
+
     /// Installs live handoff tracking after the engine freezes epoch N.
     ///
     /// Fails closed when a handoff is already active. Does not mutate overlay
@@ -432,15 +466,56 @@ impl LayeredStore {
     }
 
     /// Clears live handoff tracking after successful retirement or cancel.
+    ///
+    /// On the cancel/failed path no G(N) is published and nothing is
+    /// absorbed, so only the next-epoch working-set charges are re-attributed
+    /// from [`RetainedCategory::NextEpoch`] to
+    /// [`RetainedCategory::MutationPayload`] (the N+1 writes remain the live
+    /// working set; G-EM0.5c MAJOR-4). The frozen snapshot bytes are NOT
+    /// released here — no absorption happened. Retirement uses
+    /// [`Self::retire_frozen_overlay_prefix`] instead of this path.
     pub fn end_epoch_handoff(&self) {
-        *self.handoff.write() = None;
+        let removed = self.handoff.write().take();
+        if let Some(state) = removed
+            && let Some(ctl) = self.admission_slot.read().as_ref()
+            && state.next_epoch_charged_bytes > 0
+        {
+            ctl.transfer_retained(
+                RetainedCategory::NextEpoch,
+                RetainedCategory::MutationPayload,
+                state.next_epoch_charged_bytes,
+            );
+        }
     }
 
-    /// Retires absorbed epoch-N overlay state after G(N) is the selected base.
+    /// Retires the frozen epoch-N overlay prefix after G(N) is published —
+    /// NON-DESTRUCTIVELY on the live read view (G-EM0.5c MAJOR-2).
     ///
-    /// Drops overlay entities that were frozen and not re-mutated after freeze,
-    /// clears matching dirty/deletion marks, releases frozen retained bytes,
-    /// and clears the handoff slot. Epoch N+1 dirty entities remain.
+    /// Overlay payloads, dirty sets, and base-deletion tombstones are left
+    /// fully intact, so `get_node`/`get_edge`/`is_*_deleted_from_base` return
+    /// exactly what they returned before retire for every entity. The live
+    /// base `Arc` is not swapped until G-EM0.5d; physically removing absorbed
+    /// payloads or clearing tombstones before that swap would regress
+    /// base-modified nodes to their stale base values, resurrect base-deleted
+    /// nodes, and make overlay-only nodes vanish — the "mutation falls between
+    /// generation and overlay state" corruption. Physical removal of the
+    /// absorbed prefix is deferred to the 5d base-swap, which owns the overlay
+    /// reset.
+    ///
+    /// What retire does:
+    /// - releases the frozen retained-accounting bytes charged at freeze
+    ///   (MutationPayload + DirtySets + DeletionSets) for the absorbed epoch-N
+    ///   state;
+    /// - re-attributes the next-epoch working-set bytes from
+    ///   [`RetainedCategory::NextEpoch`] to
+    ///   [`RetainedCategory::MutationPayload`] (the N+1 entities stay live on
+    ///   the overlay and become the next cycle's working set; the aggregate
+    ///   retained total is unchanged — no ratchet, no leak); G-EM0.5c MAJOR-4
+    /// - marks the handoff slot complete/cleared.
+    ///
+    /// Absorbed/retained counts are computed by the caller as pure set
+    /// arithmetic over the freeze and post-freeze id sets; no live state is
+    /// mutated here.
     ///
     /// # Errors
     ///
@@ -452,53 +527,8 @@ impl LayeredStore {
             .take()
             .ok_or_else(|| "no active epoch handoff to retire".to_string())?;
 
-        let overlay = self.overlay.load_full();
-
-        // Absorb frozen dirty nodes that were not re-mutated after freeze.
-        {
-            let mut dirty = self.dirty_node_ids.write();
-            for raw in &state.freeze_node_ids {
-                if state.post_freeze_nodes.contains(raw) {
-                    continue;
-                }
-                let id = NodeId::new(*raw);
-                dirty.remove(&id);
-                let _ = overlay.delete_node(id);
-            }
-        }
-        {
-            let mut dirty = self.dirty_edge_ids.write();
-            for raw in &state.freeze_edge_ids {
-                if state.post_freeze_edges.contains(raw) {
-                    continue;
-                }
-                let id = EdgeId::new(*raw);
-                dirty.remove(&id);
-                let _ = overlay.delete_edge(id);
-            }
-        }
-        // Base deletions represented by G(N) no longer need overlay tombstones
-        // unless the entity was recreated after freeze.
-        {
-            let mut del = self.deleted_from_base_nodes.write();
-            for raw in &state.freeze_deleted_nodes {
-                if state.post_freeze_nodes.contains(raw) {
-                    continue;
-                }
-                del.remove(&NodeId::new(*raw));
-            }
-        }
-        {
-            let mut del = self.deleted_from_base_edges.write();
-            for raw in &state.freeze_deleted_edges {
-                if state.post_freeze_edges.contains(raw) {
-                    continue;
-                }
-                del.remove(&EdgeId::new(*raw));
-            }
-        }
-
         if let Some(ctl) = self.admission_slot.read().as_ref() {
+            // (a) Release the frozen (absorbed) epoch-N accounting.
             for cat in [
                 RetainedCategory::MutationPayload,
                 RetainedCategory::DirtySets,
@@ -508,6 +538,16 @@ impl LayeredStore {
                 if bytes > 0 {
                     ctl.release(cat, bytes);
                 }
+            }
+            // (b) Re-attribute the N+1 working set: the post-freeze entities
+            // remain on the live overlay, so their charges move back from
+            // NextEpoch to MutationPayload atomically (aggregate unchanged).
+            if state.next_epoch_charged_bytes > 0 {
+                ctl.transfer_retained(
+                    RetainedCategory::NextEpoch,
+                    RetainedCategory::MutationPayload,
+                    state.next_epoch_charged_bytes,
+                );
             }
             ctl.set_active_epoch(state.next_epoch);
             ctl.complete_generation_build();

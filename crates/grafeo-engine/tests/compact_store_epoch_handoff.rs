@@ -13,10 +13,14 @@
 use std::fs;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use grafeo_common::storage::SectionType;
-use grafeo_common::types::{PropertyKey, Value};
+use grafeo_common::types::{NodeId, PropertyKey, Value};
 use grafeo_core::graph::compact::overlay_budget::{
     OverlayAdmissionController, OverlayBudgetConfig, RetainedCategory,
 };
@@ -480,5 +484,344 @@ fn second_handoff_advances_sequence_and_retains_previous() {
     assert_eq!(
         state.previous.as_ref().map(|p| p.generation_id.as_str()),
         Some("g-1")
+    );
+}
+
+// ── MAJOR-1: freeze is a writer linearization point ──────────────
+
+/// Freeze must be a writer linearization point (G-EM0.5c review MAJOR-1).
+///
+/// `freeze_epoch_for_handoff` holds the layered store's merge-guard WRITE
+/// barrier across WAL cut → epoch sync → payload capture → `begin_epoch_handoff`,
+/// so a concurrent `GraphStoreMut` writer (which holds the same guard as
+/// `.read()` for the whole mutation) cannot land between the cut and the
+/// capture. This test stalls the freeze *inside* the barrier right before the
+/// capture and proves:
+/// 1. a concurrent writer is completely blocked for the entire capture window
+///    (pre-fix it would sail through and be half-captured or write a record
+///    after boundary B into a captured entity — a torn/duplicated G(N));
+/// 2. once the freeze installs and drops the barrier, the writer lands
+///    strictly as an N+1 entity: excluded from the frozen snapshot, tracked in
+///    `post_freeze_nodes`, retained live after retire, and NOT in G(N).
+#[cfg(debug_assertions)]
+#[test]
+fn freeze_is_a_writer_linearization_point() {
+    if in_any_child() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+    let gen_root = fs::canonicalize(&gen_root).unwrap();
+
+    let mut db = GrafeoDB::new_in_memory();
+    populate(&db, "base");
+    db.compact().expect("compact");
+    let db = Arc::new(db);
+
+    let layered = db.layered_store().unwrap();
+    // Seed frozen epoch-N content through the layered store.
+    let a = layered.create_node(&["Person"]);
+    layered.set_node_property(a, "name", Value::from("frozen-lin-a"));
+    let b = layered.create_node(&["Person"]);
+    layered.set_node_property(b, "name", Value::from("frozen-lin-b"));
+
+    // Arm the stall: freeze parks inside its writer barrier right before
+    // capturing the overlay payloads (barrier still held).
+    grafeo_engine::FREEZE_STALL_BEFORE_CAPTURE.store(true, Ordering::SeqCst);
+
+    let db_f = Arc::clone(&db);
+    let root_f = gen_root.clone();
+    let freeze_thread = thread::spawn(move || {
+        db_f.freeze_epoch_for_handoff(&root_f)
+            .expect("freeze epoch N")
+    });
+
+    // Wait until the freeze is parked inside the critical section.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !grafeo_engine::FREEZE_STALL_ENTERED.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "freeze never reached the stall");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // A concurrent writer attempts a mutation while the freeze holds the
+    // writer barrier; it must be completely blocked across the capture.
+    let layered_w = Arc::clone(&layered);
+    let (tx_started, rx_started) = mpsc::channel();
+    let (tx_done, rx_done) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let _ = tx_started.send(());
+        let n = layered_w.create_node(&["Person"]);
+        layered_w.set_node_property(n, "name", Value::from("concurrent-lin"));
+        let _ = tx_done.send(n);
+        n
+    });
+    rx_started.recv().expect("writer started");
+    // Give the writer time to reach `merge_guard.read()` and block.
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        rx_done.try_recv().is_err(),
+        "concurrent writer must be blocked while the freeze holds the barrier"
+    );
+
+    // Release the stall: freeze completes cut → capture → install and drops
+    // the barrier; only then does the writer land.
+    grafeo_engine::FREEZE_STALL_BEFORE_CAPTURE.store(false, Ordering::SeqCst);
+
+    let handle = freeze_thread.join().expect("freeze thread");
+    let nid = writer.join().expect("writer thread");
+
+    // The concurrent write is strictly post-freeze: excluded from the frozen
+    // G(N) snapshot and tracked as an N+1-retained mutation.
+    assert!(
+        !handle.freeze.overlay_node_ids.contains(&nid.as_u64()),
+        "concurrent write must NOT be in the frozen capture"
+    );
+    let live = db
+        .layered_store()
+        .unwrap()
+        .handoff_live()
+        .expect("live handoff");
+    assert!(
+        live.post_freeze_nodes.contains(&nid.as_u64()),
+        "concurrent write must be tracked as post-freeze (N+1)"
+    );
+
+    let report = db
+        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-lin"))
+        .expect("complete");
+    let names = generation_person_names(&report.publication.as_ref().unwrap().generation_abs_path);
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "frozen-lin-a" || n == "frozen-lin-b"),
+        "G(N) must include the frozen content: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "concurrent-lin"),
+        "G(N) must NOT include the concurrent write: {names:?}"
+    );
+    assert!(
+        db.layered_store().unwrap().get_node(nid).is_some(),
+        "concurrent write must remain live after retire (N+1 retained)"
+    );
+}
+
+// ── MAJOR-2: retire is non-destructive on the live read view ─────
+
+/// Retirement must preserve the live read view exactly (G-EM0.5c review
+/// MAJOR-2).
+///
+/// The base `Arc` is not swapped until G-EM0.5d, so
+/// `retire_frozen_overlay_prefix` must NOT delete overlay payloads or clear
+/// `deleted_from_base_*` tombstones — doing so would regress a base-modified
+/// frozen node to its stale base value, resurrect a base-deleted node, and
+/// make an overlay-only node vanish. This test snapshots `get_node` for one
+/// of each kind before retire and asserts the read view is *identical* after
+/// retire, while absorbed/retained counts are still computed as pure set
+/// arithmetic.
+#[test]
+fn retire_keeps_live_reads_identical() {
+    if in_any_child() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+    let gen_root = fs::canonicalize(&gen_root).unwrap();
+
+    let (db, _ctl) = db_layered_with_admission();
+    let layered = db.layered_store().unwrap();
+
+    // `populate("base")` created two base nodes before compact.
+    let base_ids: Vec<NodeId> = layered.base_store_arc().all_node_ids();
+    assert!(base_ids.len() >= 2, "populate must seed two base nodes");
+    let (base_modified, base_deleted) = (base_ids[0], base_ids[1]);
+
+    let name_of = |layered: &Arc<grafeo_core::graph::compact::layered::LayeredStore>,
+                   id: NodeId|
+     -> Option<String> {
+        layered
+            .get_node(id)
+            .and_then(|n| match n.properties.get(&PropertyKey::new("name")) {
+                Some(Value::String(s)) => Some(s.as_str().to_string()),
+                _ => None,
+            })
+    };
+
+    // 1. Base-modified frozen node: overlay copy supersedes the base value.
+    layered.set_node_property(base_modified, "name", Value::from("base-modified-v2"));
+    // 2. Base-deleted frozen node: tombstone must keep it invisible. The base
+    //    KNOWS edge from `populate("base")` references it, so tombstone that
+    //    edge first (realistic cascade delete) or the generation build fails
+    //    on a missing endpoint.
+    layered.delete_node_edges(base_deleted);
+    assert!(layered.delete_node(base_deleted), "delete base node");
+    // 3. Overlay-only frozen node: exists only in the overlay.
+    let overlay_only = layered.create_node(&["Person"]);
+    layered.set_node_property(overlay_only, "name", Value::from("overlay-only"));
+
+    let ids = [base_modified, base_deleted, overlay_only];
+    let before: Vec<Option<String>> = ids.iter().map(|id| name_of(&layered, *id)).collect();
+    assert_eq!(
+        before[0].as_deref(),
+        Some("base-modified-v2"),
+        "precondition: base-modified must read as the overlay value"
+    );
+    assert_eq!(
+        before[1], None,
+        "precondition: base-deleted must be invisible"
+    );
+    assert_eq!(before[2].as_deref(), Some("overlay-only"));
+
+    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    // One N+1 write so both absorbed and retained paths are exercised.
+    let n1 = layered.create_node(&["Person"]);
+    layered.set_node_property(n1, "name", Value::from("n1-retained"));
+    let report = db
+        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-nondestr"))
+        .expect("complete");
+
+    // Absorbed/retained counts remain correct (pure set arithmetic over the
+    // freeze and post-freeze id sets — no live-state mutation involved).
+    assert_eq!(
+        report.absorbed_nodes, 2,
+        "absorbed = frozen overlay nodes not re-mutated: {report:?}"
+    );
+    assert_eq!(
+        report.retained_next_epoch_nodes, 1,
+        "retained = post-freeze nodes: {report:?}"
+    );
+
+    // The live read view is EXACTLY what it was before retire for every entity.
+    let after: Vec<Option<String>> = ids.iter().map(|id| name_of(&layered, *id)).collect();
+    assert_eq!(after, before, "retire must not change live reads");
+    assert_eq!(
+        after[0].as_deref(),
+        Some("base-modified-v2"),
+        "base-modified must NOT regress to its stale base value"
+    );
+    assert_eq!(after[1], None, "base-deleted must NOT resurrect");
+    assert_eq!(
+        after[2].as_deref(),
+        Some("overlay-only"),
+        "overlay-only must NOT vanish"
+    );
+    assert!(
+        layered.get_node(n1).is_some(),
+        "N+1 write must remain applied once"
+    );
+}
+
+// ── MAJOR-4: NextEpoch accounting must not ratchet the budget ────
+
+/// Next-epoch charges must be re-attributed at retire, not leaked (G-EM0.5c
+/// review MAJOR-4).
+///
+/// `charge_retained` reroutes post-freeze MutationPayload charges to
+/// `NextEpoch`; on retire those surviving N+1 entities become the next
+/// cycle's working set, so their bytes must move `NextEpoch -> MutationPayload`
+/// (aggregate unchanged) while the absorbed frozen bytes are released. With no
+/// release site the budget would ratchet every handoff. This test runs two
+/// consecutive handoffs and asserts the controller's `total_bytes` after each
+/// retire equals exactly that cycle's own post-freeze working set — no growth
+/// beyond the genuine live working set, `NextEpoch` drained, no accounting
+/// errors.
+#[test]
+fn next_epoch_reattribution_prevents_budget_ratchet() {
+    if in_any_child() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+    let gen_root = fs::canonicalize(&gen_root).unwrap();
+
+    let (db, ctl) = db_layered_with_admission();
+    let layered = db.layered_store().unwrap();
+
+    let bio = |i: usize| Value::String(arcstr::ArcStr::from(format!("w-{i}-{}", "x".repeat(128))));
+
+    // ── Cycle 1: 3 frozen nodes, 2 post-freeze nodes ────────────────────
+    for i in 0..3 {
+        let n = layered.create_node(&["Person"]);
+        layered.set_node_property(n, "bio", bio(i));
+    }
+    let h1 = db.freeze_epoch_for_handoff(&gen_root).expect("freeze 1");
+    for i in 3..5 {
+        let n = layered.create_node(&["Person"]);
+        layered.set_node_property(n, "bio", bio(i));
+    }
+    let mid1 = ctl.snapshot();
+    let next1 = mid1.categories[RetainedCategory::NextEpoch.index()].current_bytes;
+    let frozen_mp1 = mid1.categories[RetainedCategory::MutationPayload.index()].current_bytes;
+    assert!(
+        next1 > 0,
+        "post-freeze cycle-1 writes must charge NextEpoch: {mid1:?}"
+    );
+    assert!(
+        frozen_mp1 > 0,
+        "frozen cycle-1 payload must still be charged: {mid1:?}"
+    );
+    let mid1_total = mid1.total_bytes;
+
+    db.complete_epoch_handoff(h1, generation_build_request(&gen_root, "g-1"))
+        .expect("complete 1");
+
+    let after1 = ctl.snapshot();
+    assert_eq!(
+        after1.categories[RetainedCategory::NextEpoch.index()].current_bytes,
+        0,
+        "NextEpoch must drain on retire: {after1:?}"
+    );
+    assert_eq!(
+        after1.categories[RetainedCategory::MutationPayload.index()].current_bytes,
+        next1,
+        "N+1 working-set bytes must re-attribute to MutationPayload: {after1:?}"
+    );
+    assert_eq!(
+        after1.total_bytes,
+        mid1_total.saturating_sub(frozen_mp1),
+        "retire re-attribution must be total-neutral (release frozen only): {after1:?}"
+    );
+
+    // ── Cycle 2: freeze the retained working set, add 3 more post-freeze ──
+    let h2 = db.freeze_epoch_for_handoff(&gen_root).expect("freeze 2");
+    for i in 5..8 {
+        let n = layered.create_node(&["Person"]);
+        layered.set_node_property(n, "bio", bio(i));
+    }
+    let mid2 = ctl.snapshot();
+    let next2 = mid2.categories[RetainedCategory::NextEpoch.index()].current_bytes;
+    assert!(
+        next2 > 0,
+        "cycle-2 post-freeze writes must charge NextEpoch: {mid2:?}"
+    );
+
+    db.complete_epoch_handoff(h2, generation_build_request(&gen_root, "g-2"))
+        .expect("complete 2");
+
+    let after2 = ctl.snapshot();
+    assert_eq!(
+        after2.categories[RetainedCategory::NextEpoch.index()].current_bytes,
+        0,
+        "NextEpoch must drain on the second retire: {after2:?}"
+    );
+    assert_eq!(
+        after2.total_bytes, next2,
+        "budget must NOT ratchet across consecutive handoffs: {after2:?}"
+    );
+    assert_eq!(
+        after2.total_bytes,
+        after2
+            .categories
+            .iter()
+            .map(|c| c.current_bytes)
+            .sum::<u64>(),
+        "total must equal the sum of categories: {after2:?}"
+    );
+    assert_eq!(
+        after2.accounting_errors, 0,
+        "no accounting drift: {after2:?}"
     );
 }

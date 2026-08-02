@@ -56,6 +56,14 @@ pub use database::CompactBacking;
 pub use database::GrafeoDB;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use database::IndexedVectorRead;
+#[cfg(all(
+    debug_assertions,
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store"
+))]
+#[doc(hidden)]
+pub use database::generation::epoch_handoff::{FREEZE_STALL_BEFORE_CAPTURE, FREEZE_STALL_ENTERED};
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation::{
     BACKUP_MANIFEST_NAME, BackedUpWalFile, BackupPin, BackupPinGuard, ClassifiedGeneration,
