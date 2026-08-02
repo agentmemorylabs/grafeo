@@ -20,7 +20,7 @@ use crate::graph::compact::generation::emit::dict_column_lookup::DictCodeLookup;
 use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::error::GenerationError;
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
-use crate::graph::compact::zone_map::{ZoneMap, fold_value_into_block_zone_map};
+use crate::graph::compact::zone_map::{fold_value_into_block_zone_map, ZoneMap};
 use grafeo_common::types::Value;
 
 /// LSB-first bit packer with at most one open byte (presence/null companions).
@@ -63,7 +63,11 @@ impl BitByteEmitter {
     /// # Errors
     ///
     /// [`GenerationError::Io`] on sink write failure.
-    pub fn push_bit(&mut self, sink: &mut dyn SegmentSink, bit: bool) -> Result<(), GenerationError> {
+    pub fn push_bit(
+        &mut self,
+        sink: &mut dyn SegmentSink,
+        bit: bool,
+    ) -> Result<(), GenerationError> {
         if bit {
             self.open_byte |= 1 << self.bit_in_byte;
         }
@@ -165,7 +169,8 @@ impl StreamingBodyWriter {
                     index_in_word: 0,
                 }
             }
-        } else if geo.min_float.is_some() || geo.max_float.is_some() {
+        } else if geo.is_float64_family() {
+            // NaN-only columns have no zone min/max but are still Float64.
             BodyFamily::Float64
         } else if geo.saw_true || geo.saw_false {
             BodyFamily::Bitmap {
@@ -285,7 +290,11 @@ impl StreamingBodyWriter {
         Ok((body_len, codec_len, block_maps))
     }
 
-    fn write_value(&mut self, sink: &mut dyn SegmentSink, value: &Value) -> Result<(), GenerationError> {
+    fn write_value(
+        &mut self,
+        sink: &mut dyn SegmentSink,
+        value: &Value,
+    ) -> Result<(), GenerationError> {
         match value {
             Value::String(s) if matches!(self.family, BodyFamily::Dict { empty: false }) => {
                 let code = self.dict_code(s.as_str())?;
@@ -363,9 +372,9 @@ impl StreamingBodyWriter {
             .dict_lookup
             .as_mut()
             .ok_or_else(|| GenerationError::Codec("dict lookup missing".into()))?;
-        lookup.code_of(s.as_bytes()).ok_or_else(|| {
-            GenerationError::Codec(format!("dict string not interned: {s}"))
-        })
+        lookup
+            .code_of(s.as_bytes())
+            .ok_or_else(|| GenerationError::Codec(format!("dict string not interned: {s}")))
     }
 
     fn fold_zone(&mut self, value: &Value) {
@@ -377,7 +386,8 @@ impl StreamingBodyWriter {
         self.block_row += 1;
         let block_rows = DEFAULT_BLOCK_ROWS as usize;
         if self.block_row == block_rows {
-            self.block_maps.push(std::mem::take(&mut self.current_block));
+            self.block_maps
+                .push(std::mem::take(&mut self.current_block));
             self.block_row = 0;
         }
     }
@@ -390,7 +400,8 @@ impl StreamingBodyWriter {
             }];
         }
         if self.block_row > 0 || self.block_maps.is_empty() {
-            self.block_maps.push(std::mem::take(&mut self.current_block));
+            self.block_maps
+                .push(std::mem::take(&mut self.current_block));
         }
         std::mem::take(&mut self.block_maps)
     }
@@ -440,13 +451,13 @@ fn write_body_header(
             write(sink, &(row_count as u32).to_le_bytes())?;
         }
         BodyFamily::Float32Vector { dims } => {
-            let component_count = row_count
-                .checked_mul(u64::from(*dims))
-                .ok_or_else(|| GenerationError::WireWidthOverflow {
+            let component_count = row_count.checked_mul(u64::from(*dims)).ok_or_else(|| {
+                GenerationError::WireWidthOverflow {
                     what: "vector_component_count",
                     count: row_count,
                     max: u64::MAX,
-                })?;
+                }
+            })?;
             write(sink, &[5])?;
             write(sink, &dims.to_le_bytes())?;
             write(sink, &(component_count as u32).to_le_bytes())?;

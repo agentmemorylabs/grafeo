@@ -215,6 +215,14 @@ pub fn parse_table_zone_maps(
                 rec.block_index
             ));
         }
+        // Bounded generation tags relationship-table columns as
+        // `table_id = 0x8000 | rel_id`. Rel tables do not yet install zone
+        // maps on `RelTable`; skip those records rather than fail-closed on a
+        // node-table-only index. Pure node table_ids still fail closed when
+        // out of range.
+        if rec.table_id & 0x8000 != 0 {
+            continue;
+        }
         let tid = rec.table_id as usize;
         if tid >= table_count {
             return Err(format!(
@@ -245,6 +253,10 @@ pub fn parse_block_zone_maps(
     for rec in records {
         if rec.block_index == TABLE_ZONE_BLOCK_SENTINEL {
             return Err("BlockZoneMaps record has table-level sentinel block_index".into());
+        }
+        // Same as table zone maps: skip rel-tagged table_ids (0x8000 | rid).
+        if rec.table_id & 0x8000 != 0 {
+            continue;
         }
         let tid = rec.table_id as usize;
         if tid >= table_count {

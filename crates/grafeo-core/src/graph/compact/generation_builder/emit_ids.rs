@@ -10,17 +10,17 @@
 //! retain a graph-proportional vector. Zone-map string bounds resolve
 //! through the per-column DictValue chunk file, one column's map at a time.
 
+use crate::graph::compact::generation::emit::dict_column_lookup::DictChunkCatalog;
+use crate::graph::compact::generation::emit::dict_column_lookup::DictCodeLookup;
 use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::{
     CancelToken, ExternalRunMerger, GenerationBudget, GenerationError, GenerationMetrics,
     RunSetLease, RunStore, SortRecord,
 };
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
-use crate::graph::compact::generation::emit::dict_column_lookup::DictChunkCatalog;
 use crate::graph::compact::generation_builder::emit_columns::codec_kind_of;
 use crate::graph::compact::generation_builder::emit_meta::{w16, w32, w64};
 use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
-use crate::graph::compact::generation::emit::dict_column_lookup::DictCodeLookup;
 use grafeo_common::utils::hash::FxHashMap;
 
 /// Builds the Metadata segment bytes from bounded pass outputs.
@@ -190,11 +190,9 @@ fn forward_csr_edge_id(rec: &SortRecord) -> Result<u64, GenerationError> {
     if rec.key.len() < 26 {
         return Err(GenerationError::Codec("forward CSR key too short".into()));
     }
-    Ok(u64::from_be_bytes(
-        rec.key[18..26]
-            .try_into()
-            .map_err(|_| GenerationError::Codec("forward CSR key width".into()))?,
-    ))
+    Ok(u64::from_be_bytes(rec.key[18..26].try_into().map_err(
+        |_| GenerationError::Codec("forward CSR key width".into()),
+    )?))
 }
 
 /// Streams the EdgeIdLookup segment from forward CSR records into `sink`.
@@ -219,16 +217,25 @@ pub fn build_edge_id_lookup(
     sink: &mut dyn SegmentSink,
 ) -> Result<(), GenerationError> {
     let mut run_sink = run_store.sink("edge-lookup", budget)?;
+    // csr_position is per-rel-table (forward CSR order within that table).
+    // Forward CSR keys are sorted by rel_table_id first, so a change of rel
+    // resets the running position. A single global counter mis-labels the
+    // second+ rel table's edges (lookup then fails for their original IDs).
     let mut pos: u64 = 0;
+    let mut current_rel: Option<u16> = None;
     merger.merge_all(&fwd_lease.handles, budget, metrics, cancel, &mut |rec| {
         // Forward CSR key: rel_table_id u16 BE, src_off u64 BE, dst_off u64 BE, edge_id u64 BE.
         let edge_id = forward_csr_edge_id(rec)?;
         let rel_table_id = u16::from_be_bytes([rec.key[0], rec.key[1]]);
+        if current_rel != Some(rel_table_id) {
+            current_rel = Some(rel_table_id);
+            pos = 0;
+        }
         let mut key = Vec::with_capacity(26);
         key.extend_from_slice(&edge_id.to_be_bytes());
         key.extend_from_slice(&rel_table_id.to_be_bytes());
         key.extend_from_slice(&pos.to_be_bytes());
-        let mut payload = Vec::with_capacity(18);
+        let mut payload = Vec::with_capacity(10);
         payload.extend_from_slice(&rel_table_id.to_le_bytes());
         payload.extend_from_slice(&pos.to_le_bytes());
         run_sink.push(SortRecord::new(key, payload))?;
@@ -280,9 +287,15 @@ pub fn build_edge_original_ids(
     sink: &mut dyn SegmentSink,
 ) -> Result<(), GenerationError> {
     let mut run_sink = run_store.sink("edge-orig", budget)?;
+    // Per-rel-table csr_position (same contract as EdgeIdLookup).
     let mut pos: u64 = 0;
+    let mut current_rel: Option<u16> = None;
     merger.merge_all(&fwd_lease.handles, budget, metrics, cancel, &mut |rec| {
         let rel_table_id = u16::from_be_bytes([rec.key[0], rec.key[1]]);
+        if current_rel != Some(rel_table_id) {
+            current_rel = Some(rel_table_id);
+            pos = 0;
+        }
         let edge_id = forward_csr_edge_id(rec)?;
         let mut key = Vec::with_capacity(10);
         key.extend_from_slice(&rel_table_id.to_be_bytes());
@@ -475,9 +488,9 @@ fn lookup_zone_str(
     let lookup = str_lookup
         .as_mut()
         .ok_or_else(|| GenerationError::Codec("zone string lookup not loaded".into()))?;
-    lookup.code_of(s.as_bytes()).ok_or_else(|| {
-        GenerationError::Codec(format!("zone string not interned: {s}"))
-    })
+    lookup
+        .code_of(s.as_bytes())
+        .ok_or_else(|| GenerationError::Codec(format!("zone string not interned: {s}")))
 }
 
 /// Encodes an optional zone-map value to (tag, payload).

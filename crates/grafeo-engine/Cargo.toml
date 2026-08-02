@@ -152,6 +152,11 @@ path = "tests/compact_store_source_true.rs"
 required-features = ["generation-streaming", "compact-store"]
 
 [[test]]
+name = "compact_store_source_true_outer"
+path = "tests/compact_store_source_true_outer.rs"
+required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
+
+[[test]]
 name = "compact_store_disk_parity"
 path = "tests/compact_store_disk_parity.rs"
 required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]

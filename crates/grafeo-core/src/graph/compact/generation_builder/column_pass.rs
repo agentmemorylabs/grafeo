@@ -84,6 +84,16 @@ impl ColumnGeometry {
         }
     }
 
+    /// True when the locked typed family is Float64 (including NaN-only columns).
+    ///
+    /// Zone-map extremes deliberately exclude NaN, so `min_float`/`max_float`
+    /// alone cannot classify a NaN-only float column. Callers that select a
+    /// body codec must use this (or `typed_family`) rather than min/max.
+    #[must_use]
+    pub fn is_float64_family(&self) -> bool {
+        self.family == Some("Float64")
+    }
+
     /// True when some row is absent → emit a presence bitmap.
     #[must_use]
     pub fn needs_presence(&self) -> bool {

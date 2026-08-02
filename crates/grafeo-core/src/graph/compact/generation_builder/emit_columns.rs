@@ -18,7 +18,7 @@ use crate::graph::compact::generation::{
     RunSetLease,
 };
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
-use crate::graph::compact::generation_builder::emit_meta::{CodecKind, w16, w32, w64};
+use crate::graph::compact::generation_builder::emit_meta::{w16, w32, w64, CodecKind};
 use crate::graph::compact::mapped::SegmentKind;
 use crate::graph::compact::zone_map::ZoneMap;
 use grafeo_common::types::Value;
@@ -106,7 +106,7 @@ pub fn codec_kind_of(g: &ColumnGeometry) -> CodecKind {
         CodecKind::Float32Vector
     } else if g.saw_signed_int {
         CodecKind::RawI64
-    } else if g.min_float.is_some() || g.max_float.is_some() {
+    } else if g.is_float64_family() {
         CodecKind::Float64
     } else if g.min_int.is_some() || g.max_int.is_some() {
         CodecKind::BitPacked
