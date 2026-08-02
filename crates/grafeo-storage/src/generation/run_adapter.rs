@@ -19,6 +19,7 @@
 //! `(key, payload)` bytes translated to/from [`FramedRecord`].
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use grafeo_core::graph::compact::generation::{
     ExternalRunHandle, ExternalRunMerger, ExternalRunSink, GenerationBudget, GenerationError,
@@ -27,7 +28,7 @@ use grafeo_core::graph::compact::generation::{
 
 use super::budget::ExternalSortBudget;
 use super::external_sort::{DiskRunMerger, DiskRunSink, merge_runs_recursive};
-use super::metrics::{ExternalSortMetrics, ExternalSortMetricsError};
+use super::metrics::{ExternalSortMetrics, ExternalSortMetricsError, JobAnonLedger};
 use super::records::FramedRecord;
 
 /// Maps a core [`GenerationBudget`] onto a storage [`ExternalSortBudget`].
@@ -80,6 +81,10 @@ pub struct DiskRunStore {
     root: PathBuf,
     budget: GenerationBudget,
     correlation: String,
+    /// Shared concurrent anon ledger for every sink in this job. The whole-job
+    /// anonymous peak is the max concurrent total across all live sinks, not
+    /// the max of each sink's individual peak (G-EM0.5b D0.8.11).
+    job_anon: Arc<JobAnonLedger>,
 }
 
 impl DiskRunStore {
@@ -100,6 +105,7 @@ impl DiskRunStore {
             root,
             budget,
             correlation: correlation.into(),
+            job_anon: Arc::new(JobAnonLedger::new()),
         })
     }
 }
@@ -121,6 +127,7 @@ impl RunStore for DiskRunStore {
             dir,
             to_sort_budget(budget),
             format!("{}-{domain}", self.correlation),
+            Arc::clone(&self.job_anon),
         )
         .map_err(|e| GenerationError::Io(format!("create disk run sink: {e}")))?;
         Ok(Box::new(DiskSinkAdapter {
@@ -165,6 +172,10 @@ impl RunStore for DiskRunStore {
 
     fn cleanup_job_artifacts(&mut self) -> Result<(), GenerationError> {
         cleanup_disk_run_store_root(&self.root, &self.correlation)
+    }
+
+    fn job_anon_peak(&self) -> u64 {
+        self.job_anon.peak()
     }
 }
 

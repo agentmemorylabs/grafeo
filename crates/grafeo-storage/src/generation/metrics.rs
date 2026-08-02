@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// External-sort metrics: truthful temp-disk accounting + pass counters.
 #[derive(Debug, Clone, Default)]
@@ -187,5 +188,57 @@ fn read_rss_anon_kb(pid: u32) -> Option<u64> {
     {
         let _ = pid;
         None
+    }
+}
+
+/// Job-level concurrent anonymous-memory ledger shared across every sink in
+/// one generation job (G-EM0.5b D0.8.11).
+///
+/// A single sink's `ExternalSortMetrics::anon_bytes_peak` only captures that
+/// sink's own high-water mark. Several sinks are live at once (the node pass
+/// holds row + id + membership arenas simultaneously), so the truthful
+/// whole-job anonymous footprint is the **sum of concurrently live sinks**,
+/// not the max of their individual peaks. This shared counter is charged by
+/// each sink on every arena growth and released on flush/cleanup; `peak`
+/// records the maximum concurrent total observed across the whole job.
+#[derive(Debug, Default)]
+pub struct JobAnonLedger {
+    current: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl JobAnonLedger {
+    /// Create an empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `bytes` to the concurrent charge and update the peak.
+    pub fn reserve(&self, bytes: u64) {
+        let prev = self.current.fetch_add(bytes, Ordering::Relaxed);
+        let next = prev.saturating_add(bytes);
+        self.bump_peak(next);
+    }
+
+    /// Subtract `bytes` from the concurrent charge (saturating).
+    pub fn release(&self, bytes: u64) {
+        self.current.fetch_sub(bytes.min(self.current.load(Ordering::Relaxed)), Ordering::Relaxed);
+    }
+
+    /// Peak concurrent anonymous bytes observed across the whole job.
+    #[must_use]
+    pub fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    fn bump_peak(&self, candidate: u64) {
+        let mut cur = self.peak.load(Ordering::Relaxed);
+        while candidate > cur {
+            match self.peak.compare_exchange_weak(cur, candidate, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 }

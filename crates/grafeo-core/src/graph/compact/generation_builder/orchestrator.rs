@@ -156,19 +156,20 @@ impl BoundedGenerationBuilder {
         ))
     }
 
-    /// Fold a finished `DiskRunStore` sink's peak anonymous arena bytes into
-    /// the authoritative job-level anon ledger. Call immediately after
-    /// `sink.finish()` so the peak is recorded before the sink is dropped.
-    /// The reserve/release pair updates `anon_bytes_peak` without leaving a
-    /// live charge (the arena is already flushed to disk).
-    fn fold_sink_anon(&mut self, sink: &dyn crate::graph::compact::generation::ExternalRunSink) {
-        let peak = sink.anon_peak();
+    /// Fold the run store's peak *concurrent* anonymous arena bytes into the
+    /// authoritative job-level anon ledger. The whole-job anonymous footprint
+    /// is the maximum concurrent total of live sink arenas (several sinks are
+    /// live at once — e.g. the node pass holds row + id + membership arenas
+    /// simultaneously), not the max of each sink's individual peak. Called once
+    /// at the end of the build. The reserve/release pair updates
+    /// `anon_bytes_peak` without leaving a live charge (arenas are flushed).
+    fn fold_job_anon(&mut self, run_store: &dyn crate::graph::compact::generation::RunStore) {
+        let peak = run_store.job_anon_peak();
         if peak > 0 {
-            // reserve_anon updates peak; release_anon drops current back.
-            let _ = self
-                .metrics
-                .reserve_anon(peak, self.config.budget.max_anon_bytes);
-            self.metrics.release_anon(peak);
+            // Record the historical concurrent peak directly. This is not a
+            // live allocation — the arenas are already flushed — so we bypass
+            // the budget check and just update the high-water mark.
+            self.metrics.anon_bytes_peak = self.metrics.anon_bytes_peak.max(peak);
         }
     }
 
@@ -212,7 +213,6 @@ impl BoundedGenerationBuilder {
             &mut self.metrics,
         )?;
         let id_index_lease = id_index_sink.finish()?;
-        self.fold_sink_anon(id_index_sink.as_ref());
         // Occurrence run stays open until edge properties are appended (D0.8.0).
         // Charge run-file temp for the job ledger (truthful nonzero counters).
         let id_run_temp: u64 = id_index_lease.handles.iter().map(|h| h.byte_len).sum();
@@ -274,7 +274,6 @@ impl BoundedGenerationBuilder {
             &self.config.rel_schemas,
         )?;
         let fwd_lease = fwd_sink.finish()?;
-        self.fold_sink_anon(fwd_sink.as_ref());
         edge_pass::explode_occurrences_from_forward(
             &fwd_lease,
             run_store.merger("fwd-csr")?.as_mut(),
@@ -284,7 +283,6 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let occ_lease = occ_sink.finish()?;
-        self.fold_sink_anon(occ_sink.as_ref());
         let occ_temp: u64 = occ_lease.handles.iter().map(|h| h.byte_len).sum();
         self.metrics.reserve_temp(occ_temp, budget.max_temp_bytes)?;
 
@@ -311,7 +309,6 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let str_occ_lease = str_occ_sink.finish()?;
-        self.fold_sink_anon(str_occ_sink.as_ref());
 
         // ── 4. Global dictionary ─────────────────────────────────────
         let mut offsets_sink = Box::new(self.make_sink(SegmentKind::StringOffsets, 8, 8, "stroff")?);
@@ -330,7 +327,6 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let remap_lease = remap_sink.finish()?;
-        self.fold_sink_anon(remap_sink.as_ref());
 
         // ── 4b. Consume the remap run (bounded) ───────────────────────
         // The dictionary pass re-emitted every string occurrence as a remap
@@ -453,7 +449,6 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let rev_lease = rev_sink.finish()?;
-        self.fold_sink_anon(rev_sink.as_ref());
         let mut rev_off_sink =
             Box::new(self.make_sink(SegmentKind::ReverseCsrOffsets, 4, 4, "revoff")?);
         let mut rev_tgt_sink =
@@ -472,6 +467,10 @@ impl BoundedGenerationBuilder {
         )?;
 
         // ── 7–8. Metadata, directories, ID lookups, zone maps, assemble ──
+        // Fold the peak concurrent anonymous arena bytes across all sinks into
+        // the authoritative job-level anon ledger BEFORE the lease snapshots
+        // the metrics, so the reported anon_bytes_peak is truthful.
+        self.fold_job_anon(run_store);
         let job_temp_dir = self.config.temp_dir.clone();
         let lease = self.emit_all(
             &node_schema,

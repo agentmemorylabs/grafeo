@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use super::budget::ExternalSortBudget;
 use super::merge::{kway_merge_emit, kway_merge_to_file};
-use super::metrics::{ExternalSortMetrics, ExternalSortMetricsError};
+use super::metrics::{ExternalSortMetrics, ExternalSortMetricsError, JobAnonLedger};
 use super::records::FramedRecord;
 
 /// Shared cancellation token (thread-safe).
@@ -83,7 +83,20 @@ pub struct DiskRunSink {
     metrics: ExternalSortMetrics,
     cancel: Option<CancelToken>,
     arena: Vec<FramedRecord>,
+    /// Logical arena bytes (sum of per-record `arena_len`) — drives the
+    /// flush threshold against `sort_run_bytes`. Unchanged from D0.8.10.
     arena_bytes: u64,
+    /// Sum of `key.capacity() + payload.capacity()` across all live records.
+    heap_bytes_total: u64,
+    /// Complete anonymous charge currently held against the ledger:
+    /// `arena.capacity() * size_of::<FramedRecord>() + heap_bytes_total`.
+    /// Includes Vec growth-doubling excess. Released on flush/cleanup.
+    anon_charged: u64,
+    /// Shared job-level concurrent anon ledger. Every sink in the job charges
+    /// here so the whole-job peak reflects concurrently live arenas (the node
+    /// pass holds row + id + membership sinks at once), not just this sink's
+    /// own high-water mark.
+    job_anon: Arc<JobAnonLedger>,
     runs: Vec<RunHandle>,
     next_id: u64,
     correlation: String,
@@ -98,6 +111,7 @@ impl DiskRunSink {
         dir: impl Into<PathBuf>,
         budget: ExternalSortBudget,
         correlation: impl Into<String>,
+        job_anon: Arc<JobAnonLedger>,
     ) -> Result<Self, io::Error> {
         budget
             .validate()
@@ -111,6 +125,9 @@ impl DiskRunSink {
             cancel: None,
             arena: Vec::new(),
             arena_bytes: 0,
+            heap_bytes_total: 0,
+            anon_charged: 0,
+            job_anon,
             runs: Vec::new(),
             next_id: 0,
             correlation: correlation.into(),
@@ -160,19 +177,44 @@ impl DiskRunSink {
                 limit: self.budget.max_record_bytes,
             });
         }
-        // Bound the arena by its real in-memory footprint (struct + heap
-        // capacity), not the smaller on-disk encoded length, so the
-        // `sort_run_bytes` budget actually caps anonymous bytes.
+        // Flush threshold: the logical arena footprint (sum of per-record
+        // `arena_len`), unchanged from D0.8.10. This is NOT the ledger charge.
         let mem = record.arena_len();
         if self.arena_bytes > 0 && self.arena_bytes.saturating_add(mem) > self.budget.sort_run_bytes
         {
             self.flush_run()?;
         }
-        // Charge the authoritative anon ledger for the in-memory footprint
-        // BEFORE growing the arena. If the job-level anon budget is exhausted,
-        // fail closed rather than silently exceeding it.
-        self.metrics
-            .reserve_anon(mem, self.budget.max_anon_bytes)?;
+        // Grow the backing array first so `arena.capacity()` reflects the
+        // allocation we are about to charge (reserve mirrors push's own
+        // amortized growth, so behavior is unchanged).
+        self.arena.reserve(1);
+        // Complete live anonymous charge for THIS sink:
+        //   backing array  = arena.capacity() * size_of::<FramedRecord>()
+        //                    (includes Vec growth-doubling excess)
+        //   + record heaps = key.capacity() + payload.capacity()
+        // Charged to the authoritative job ledger BEFORE the push so an
+        // exhausted anon budget fails closed with no partial state.
+        let new_heap = self
+            .heap_bytes_total
+            .saturating_add(record.key.capacity() as u64)
+            .saturating_add(record.payload.capacity() as u64);
+        let backing = (self.arena.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<FramedRecord>() as u64);
+        let new_complete = backing.saturating_add(new_heap);
+        if new_complete > self.anon_charged {
+            let delta = new_complete - self.anon_charged;
+            self.metrics
+                .reserve_anon(delta, self.budget.max_anon_bytes)?;
+            // Mirror the charge onto the shared job ledger so concurrent
+            // sinks are summed into the whole-job peak.
+            self.job_anon.reserve(delta);
+        } else {
+            let delta = self.anon_charged - new_complete;
+            self.metrics.release_anon(delta);
+            self.job_anon.release(delta);
+        }
+        self.anon_charged = new_complete;
+        self.heap_bytes_total = new_heap;
         self.arena_bytes = self.arena_bytes.saturating_add(mem);
         self.metrics.record_count += 1;
         self.arena.push(record);
@@ -184,7 +226,17 @@ impl DiskRunSink {
         if self.arena.is_empty() {
             return Ok(());
         }
-        let anon_to_release = self.arena_bytes;
+        // Release the complete anon charge for the arena we are about to
+        // consume. `run` (the taken Vec) still physically holds the memory
+        // until it drops at function exit; the ledger tracks the job-level
+        // live charge, and the peak is already captured in anon_bytes_peak.
+        let anon_to_release = self.anon_charged;
+        self.metrics.release_anon(anon_to_release);
+        self.job_anon.release(anon_to_release);
+        self.anon_charged = 0;
+        self.heap_bytes_total = 0;
+        self.arena_bytes = 0;
+
         let mut run = std::mem::take(&mut self.arena);
         run.sort_unstable();
         // Truthful accounting (W0 §8): reserve run bytes against max_temp_bytes
@@ -193,6 +245,17 @@ impl DiskRunSink {
         self.metrics
             .reserve_temp(byte_len, self.budget.max_temp_bytes)
             .inspect_err(|_| run.clear())?;
+        // The write path allocates an `io_buffer_bytes` BufWriter on top of
+        // the still-live `run`. Charge it to the anon ledger so the flush peak
+        // (run backing + heaps + I/O buffer) is truthful, then release it.
+        let io_buf = self.budget.io_buffer_bytes as u64;
+        self.metrics
+            .reserve_anon(io_buf, self.budget.max_anon_bytes)
+            .inspect_err(|_| {
+                self.metrics.release_temp(byte_len);
+                run.clear();
+            })?;
+        self.job_anon.reserve(io_buf);
         let path = self
             .dir
             .join(format!("run-{}-{:06}.bin", self.correlation, self.next_id));
@@ -207,11 +270,9 @@ impl DiskRunSink {
             w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
             Ok(())
         })();
-        // Release the anon charge: the arena data is about to be dropped
-        // (on success `run` drops at function exit; on error it drops when
-        // we return Err). Either way the memory is freed.
-        self.metrics.release_anon(anon_to_release);
-        self.arena_bytes = 0;
+        // Release the transient I/O buffer charge (the BufWriter is gone).
+        self.metrics.release_anon(io_buf);
+        self.job_anon.release(io_buf);
         if let Err(e) = write_result {
             self.metrics.release_temp(byte_len);
             let _ = fs::remove_file(&path);
@@ -242,14 +303,27 @@ impl DiskRunSink {
         self.metrics.anon_bytes_peak
     }
 
+    /// Peak concurrent anonymous bytes across the whole job (shared ledger).
+    #[must_use]
+    pub fn job_anon_peak(&self) -> u64 {
+        self.job_anon.peak()
+    }
+
     /// Idempotent cleanup of all tracked run files.
     pub fn cleanup(&mut self) {
         for r in self.runs.drain(..) {
             self.metrics.release_temp(r.byte_len);
             let _ = fs::remove_file(&r.path);
         }
+        // Release any live arena anon charge (unflushed records).
+        if self.anon_charged > 0 {
+            self.metrics.release_anon(self.anon_charged);
+            self.job_anon.release(self.anon_charged);
+            self.anon_charged = 0;
+        }
         self.arena.clear();
         self.arena_bytes = 0;
+        self.heap_bytes_total = 0;
     }
 }
 

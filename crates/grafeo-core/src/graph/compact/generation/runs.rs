@@ -286,6 +286,17 @@ pub trait RunStore {
         let _ = self;
         Ok(())
     }
+
+    /// Peak concurrent anonymous bytes across all sinks created by this store.
+    ///
+    /// The whole-job anonymous footprint is the maximum *concurrent* total of
+    /// live sink arenas (several sinks are live at once), not the max of each
+    /// sink's individual peak. Disk-backed stores track this via a shared
+    /// job ledger; in-memory stores default to 0. Folded into the job-level
+    /// anon ledger at the end of the build (G-EM0.5b D0.8.11).
+    fn job_anon_peak(&self) -> u64 {
+        0
+    }
 }
 
 /// Shared run-body registry connecting in-memory sinks to in-memory mergers

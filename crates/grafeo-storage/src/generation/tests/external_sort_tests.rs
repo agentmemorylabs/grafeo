@@ -10,9 +10,15 @@ use crate::generation::budget::ExternalSortBudget;
 use crate::generation::external_sort::{
     CancelToken, DiskRunMerger, DiskRunSink, merge_runs_recursive,
 };
-use crate::generation::metrics::{ExternalSortMetrics, ExternalSortMetricsError};
+use crate::generation::metrics::{ExternalSortMetrics, ExternalSortMetricsError, JobAnonLedger};
 use crate::generation::records::FramedRecord;
+use std::sync::Arc;
 use tempfile::tempdir;
+
+/// Fresh shared job anon ledger for test sinks.
+fn job_ledger() -> Arc<JobAnonLedger> {
+    Arc::new(JobAnonLedger::new())
+}
 
 /// Create a budget with small run size to force multiple runs.
 fn small_budget(sort_run_bytes: u64, fan_in: u32) -> ExternalSortBudget {
@@ -28,7 +34,7 @@ fn small_budget(sort_run_bytes: u64, fan_in: u32) -> ExternalSortBudget {
 fn run_write_and_merge_basic() {
     let dir = tempdir().unwrap();
     let budget = small_budget(1024, 4);
-    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "basic").unwrap();
+    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "basic", job_ledger()).unwrap();
     for i in (0..20u32).rev() {
         sink.push(FramedRecord::new(
             format!("{i:04}").into_bytes(),
@@ -67,7 +73,7 @@ fn recursive_fan_in_triggers_merge_passes() {
     // 200 runs with fan_in=32 → multiple recursive merge passes.
     let dir = tempdir().unwrap();
     let budget = small_budget(48, 32);
-    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "fan").unwrap();
+    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "fan", job_ledger()).unwrap();
     for i in (0..200u32).rev() {
         let key = format!("{i:08}").into_bytes();
         sink.push(FramedRecord::new(key, vec![i as u8])).unwrap();
@@ -108,7 +114,7 @@ fn cancel_mid_merge_leaves_no_temp_files() {
     let runs_dir = dir.path().join("runs");
     let merge_dir = dir.path().join("merge");
     let budget = small_budget(48, 2);
-    let mut sink = DiskRunSink::new(runs_dir.clone(), budget, "cx").unwrap();
+    let mut sink = DiskRunSink::new(runs_dir.clone(), budget, "cx", job_ledger()).unwrap();
     for i in (0..30u32).rev() {
         sink.push(FramedRecord::new(
             format!("{i:04}").into_bytes(),
@@ -147,7 +153,7 @@ fn cancellation_during_push() {
     let dir = tempdir().unwrap();
     let budget = small_budget(32, 2);
     let token = CancelToken::new();
-    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "cp")
+    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "cp", job_ledger())
         .unwrap()
         .with_cancel(token.clone());
     sink.push(FramedRecord::new(b"a", b"1")).unwrap();
@@ -166,7 +172,7 @@ fn temp_disk_budget_rejection() {
         merge_fan_in: 4,
         ..ExternalSortBudget::for_tests()
     };
-    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "tb").unwrap();
+    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "tb", job_ledger()).unwrap();
     let mut hit_budget_error = false;
     for i in 0..40u32 {
         let key = format!("{i:08}").into_bytes();
@@ -194,7 +200,7 @@ fn rejected_reservation_leaves_no_untracked_file() {
         merge_fan_in: 4,
         ..ExternalSortBudget::for_tests()
     };
-    let mut sink = DiskRunSink::new(runs_dir.clone(), budget, "rb").unwrap();
+    let mut sink = DiskRunSink::new(runs_dir.clone(), budget, "rb", job_ledger()).unwrap();
     let mut rejected = false;
     for i in 0..40u32 {
         let key = format!("{i:08}").into_bytes();
@@ -226,7 +232,7 @@ fn deterministic_output_across_runs() {
     let make = || {
         let dir = tempdir().unwrap();
         let budget = small_budget(48, 4);
-        let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "det").unwrap();
+        let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "det", job_ledger()).unwrap();
         for i in (0..20u32).rev() {
             sink.push(FramedRecord::new(
                 format!("{i:04}").into_bytes(),
@@ -267,7 +273,7 @@ fn merge_peak_includes_both_input_and_output() {
         max_temp_bytes: 64 * 1024 * 1024,
         ..ExternalSortBudget::for_tests()
     };
-    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "pk").unwrap();
+    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "pk", job_ledger()).unwrap();
     for i in (0..30u32).rev() {
         sink.push(FramedRecord::new(
             format!("{i:04}").into_bytes(),
@@ -309,7 +315,7 @@ fn peak_temp_matches_measured_file_sizes() {
     let dir = tempdir().unwrap();
     let runs_dir = dir.path().join("runs");
     let budget = small_budget(64, 4);
-    let mut sink = DiskRunSink::new(runs_dir.clone(), budget, "mc").unwrap();
+    let mut sink = DiskRunSink::new(runs_dir.clone(), budget, "mc", job_ledger()).unwrap();
     for i in (0..50u32).rev() {
         sink.push(FramedRecord::new(
             format!("{i:08}").into_bytes(),
@@ -360,7 +366,7 @@ fn empty_input_merges_cleanly() {
 fn single_run_no_merge_needed() {
     let dir = tempdir().unwrap();
     let budget = small_budget(1024, 4); // large arena → single run
-    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "one").unwrap();
+    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "one", job_ledger()).unwrap();
     for i in (0..5u32).rev() {
         sink.push(FramedRecord::new(
             format!("{i:04}").into_bytes(),
