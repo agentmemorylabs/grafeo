@@ -436,12 +436,26 @@ impl GraphStore for CompactStore {
 
     fn edge_property_might_match(
         &self,
-        _property: &PropertyKey,
-        _op: CompareOp,
-        _value: &Value,
+        property: &PropertyKey,
+        op: CompareOp,
+        value: &Value,
     ) -> bool {
-        // Conservative: no zone maps on edge properties
-        true
+        // R3-B2: use installed rel zone maps for pruning.
+        let mut might_match = false;
+        for rt in &self.rel_tables_by_id {
+            match rt.zone_map(property) {
+                Some(zm) => {
+                    if zm.might_match(op, value) {
+                        return true;
+                    }
+                }
+                None => {
+                    // No stats for this property in this rel table: conservatively assume match
+                    might_match = true;
+                }
+            }
+        }
+        might_match
     }
 
     fn statistics(&self) -> Arc<Statistics> {
