@@ -123,6 +123,24 @@ pub struct RootFixture {
     pub wal: WalManager,
 }
 
+/// Counts regular files under `root` (recursive).
+pub fn count_files_under(root: &Path) -> usize {
+    if !root.exists() {
+        return 0;
+    }
+    let mut count = 0;
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            count += count_files_under(&path);
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
 impl RootFixture {
     /// The writable root path.
     pub fn root(&self) -> &Path {

@@ -54,6 +54,34 @@ use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
 use grafeo_common::utils::hash::FxHashMap;
 use std::path::PathBuf;
 
+/// RAII cleanup for the job temp directory until payload-lease construction.
+///
+/// On build failure, cancellation, or unwind before [`V5PayloadLease`] is
+/// returned, removes `build-tmp` and any intermediate artifacts (`dictchunks.bin`,
+/// spool files, ID index). Disarmed on success so the lease owns cleanup.
+struct JobTempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl JobTempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for JobTempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 /// Configuration for one bounded build.
 #[derive(Debug, Clone)]
 pub struct BoundedBuildConfig {
@@ -136,6 +164,7 @@ impl BoundedGenerationBuilder {
         self.config.budget.validate()?;
         std::fs::create_dir_all(&self.config.temp_dir)
             .map_err(|e| GenerationError::Io(format!("create temp dir: {e}")))?;
+        let mut job_temp = JobTempGuard::new(self.config.temp_dir.clone());
         let budget = self.config.budget;
 
         // ── 1. Node pass ─────────────────────────────────────────────
@@ -406,7 +435,7 @@ impl BoundedGenerationBuilder {
         )?;
 
         // ── 7–8. Metadata, directories, ID lookups, zone maps, assemble ──
-        self.emit_all(
+        let lease = self.emit_all(
             &node_schema,
             &rel_keys,
             &geometries,
@@ -430,7 +459,9 @@ impl BoundedGenerationBuilder {
             rev_tgt_sink,
             pos_sink,
             total_edges,
-        )
+        )?;
+        job_temp.disarm();
+        Ok(lease)
     }
 
     /// External-sort ID-index runs, stream a fixed-width file, mmap/open it
@@ -793,7 +824,7 @@ fn collect_string_occurrences(
             label.as_bytes(),
             StringUseKind::Label,
             &[],
-        ))?;
+        )?)?;
     }
     // Edge types.
     for k in rel_keys {
@@ -801,7 +832,7 @@ fn collect_string_occurrences(
             k.edge_type.as_bytes(),
             StringUseKind::EdgeType,
             &[],
-        ))?;
+        )?)?;
     }
     // Membership labels (logical labels from multi-label nodes).
     if let Some(membership_lease) = membership_runs {
@@ -817,7 +848,7 @@ fn collect_string_occurrences(
                         label.as_bytes(),
                         StringUseKind::Label,
                         &[],
-                    ))?;
+                    )?)?;
                 }
                 Ok(())
             },
@@ -830,7 +861,7 @@ fn collect_string_occurrences(
             prop.as_bytes(),
             StringUseKind::PropertyKey,
             &[],
-        ))?;
+        )?)?;
         // String values. The DictValue owner_key carries the column
         // identity (`table_id u16 BE || prop_key`), so the dictionary
         // pass's remap stream groups each column's strings together for
@@ -846,7 +877,7 @@ fn collect_string_occurrences(
                     let mut owner = Vec::with_capacity(2 + prop.len());
                     owner.extend_from_slice(&tid.to_be_bytes());
                     owner.extend_from_slice(prop.as_bytes());
-                    str_occ_sink.push(occurrence_record(s, StringUseKind::DictValue, &owner))?;
+                    str_occ_sink.push(occurrence_record(s, StringUseKind::DictValue, &owner)?)?;
                 }
             }
         }

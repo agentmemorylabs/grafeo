@@ -76,13 +76,28 @@ impl StringUseKind {
 
 /// Builds one occurrence [`SortRecord`]: key = string bytes, payload = framed
 /// `(use_kind, owner_key)`.
-#[must_use]
-pub fn occurrence_record(string: &[u8], use_kind: StringUseKind, owner_key: &[u8]) -> SortRecord {
+///
+/// # Errors
+///
+/// Returns [`GenerationError::WireWidthOverflow`] when `owner_key` exceeds `u16::MAX`.
+pub fn occurrence_record(
+    string: &[u8],
+    use_kind: StringUseKind,
+    owner_key: &[u8],
+) -> Result<SortRecord, GenerationError> {
     let mut payload = Vec::with_capacity(3 + owner_key.len());
     payload.push(use_kind as u8);
-    payload.extend_from_slice(&(owner_key.len() as u16).to_le_bytes());
+    payload.extend_from_slice(
+        &u16::try_from(owner_key.len())
+            .map_err(|_| GenerationError::WireWidthOverflow {
+                what: "occurrence_owner_key_len",
+                count: owner_key.len() as u64,
+                max: u64::from(u16::MAX),
+            })?
+            .to_le_bytes(),
+    );
     payload.extend_from_slice(owner_key);
-    SortRecord::new(string.to_vec(), payload)
+    Ok(SortRecord::new(string.to_vec(), payload))
 }
 
 /// Decodes the framed `(use_kind, owner_key)` from an occurrence payload.

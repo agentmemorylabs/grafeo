@@ -439,3 +439,158 @@ fn diag_diff_byte_by_byte() {
 
     assert_eq!(eager, bounded, "not byte-identical");
 }
+
+/// Counts regular files under `root` (recursive).
+fn count_files_under(root: &std::path::Path) -> usize {
+    if !root.exists() {
+        return 0;
+    }
+    let mut count = 0;
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            count += count_files_under(&path);
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Asserts the job temp root and optional run root have zero leftover artifacts.
+fn assert_zero_job_artifacts(build_tmp: &std::path::Path, build_runs: Option<&std::path::Path>) {
+    assert!(
+        !build_tmp.exists(),
+        "build-tmp must be removed after failure, found: {:?}",
+        build_tmp
+    );
+    if let Some(runs) = build_runs {
+        assert_eq!(
+            count_files_under(runs),
+            0,
+            "build-runs must have zero leftover files after failure: {}",
+            runs.display()
+        );
+    }
+}
+
+fn large_parity_input() -> GenerationInput {
+    let mut input = GenerationInput::new();
+    for id in 1..=256u64 {
+        input = input.node(
+            GenerationNode::new(id, "Person")
+                .with_prop("name", format!("node-{id}"))
+                .with_prop("age", grafeo_common::types::Value::Int64((id % 100) as i64)),
+        );
+    }
+    for id in 0..255u64 {
+        input = input.edge(GenerationEdge::new(
+            10_000 + id,
+            id + 1,
+            id + 2,
+            "KNOWS",
+        ));
+    }
+    input
+}
+
+/// Pre-lease failure (duplicate node id) must not orphan job temp artifacts
+/// (spools, dictchunks.bin, id-index.bin).
+#[test]
+fn failure_before_payload_lease_cleans_job_temp() {
+    let tmp = TempDir::new().unwrap();
+    let build_tmp = tmp.path().join("build-tmp");
+    let input = GenerationInput::new()
+        .node(GenerationNode::new(1u64, "Person").with_prop("name", "Ada"))
+        .node(GenerationNode::new(1u64, "Person").with_prop("name", "Dup"));
+    let mut store = InMemoryRunStore::new();
+    let config = BoundedBuildConfig {
+        budget: budget(),
+        temp_dir: build_tmp.clone(),
+        correlation_id: "pre-lease-dup".into(),
+        spool_buf_cap: 64 * 1024,
+        rel_schemas: Vec::new(),
+    };
+    let mut builder = BoundedGenerationBuilder::new(config);
+    let err = builder
+        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .expect_err("duplicate node id must fail before payload lease");
+    assert!(
+        matches!(err, crate::graph::compact::generation::GenerationError::DuplicateNodeId(1)),
+        "unexpected error: {err}"
+    );
+    assert_zero_job_artifacts(&build_tmp, None);
+}
+
+/// Tiny temp budget must fail mid-build and leave zero job temp artifacts.
+#[test]
+fn failure_tiny_budget_cleans_job_temp() {
+    let tmp = TempDir::new().unwrap();
+    let build_tmp = tmp.path().join("build-tmp");
+    let input = large_parity_input();
+    let mut store = InMemoryRunStore::new();
+    let tiny = GenerationBudget {
+        max_temp_bytes: 512,
+        sort_run_bytes: 32,
+        ..GenerationBudget::for_tests()
+    };
+    let config = BoundedBuildConfig {
+        budget: tiny,
+        temp_dir: build_tmp.clone(),
+        correlation_id: "tiny-budget".into(),
+        spool_buf_cap: 256,
+        rel_schemas: Vec::new(),
+    };
+    let mut builder = BoundedGenerationBuilder::new(config);
+    let err = builder
+        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .expect_err("tiny budget must fail mid-build");
+    assert!(
+        matches!(
+            err,
+            crate::graph::compact::generation::GenerationError::BudgetExceeded { .. }
+        ),
+        "unexpected error: {err}"
+    );
+    assert_zero_job_artifacts(&build_tmp, None);
+}
+
+/// Cancellation mid-build must leave zero job temp artifacts.
+#[test]
+fn failure_cancel_mid_build_cleans_job_temp() {
+    use crate::graph::compact::generation::CancelToken;
+    use std::thread;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let build_tmp = tmp.path().join("build-tmp");
+    let input = large_parity_input();
+    let mut store = InMemoryRunStore::new();
+    let token = CancelToken::new();
+    let cancel = token.clone();
+    let killer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1));
+        cancel.cancel();
+    });
+    let config = BoundedBuildConfig {
+        budget: budget(),
+        temp_dir: build_tmp.clone(),
+        correlation_id: "cancel-mid".into(),
+        spool_buf_cap: 64 * 1024,
+        rel_schemas: Vec::new(),
+    };
+    let mut builder = BoundedGenerationBuilder::new(config).with_cancel(token);
+    let err = builder
+        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .expect_err("cancel mid-build must fail");
+    killer.join().unwrap();
+    assert!(
+        matches!(
+            err,
+            crate::graph::compact::generation::GenerationError::Cancelled
+        ),
+        "unexpected error: {err}"
+    );
+    assert_zero_job_artifacts(&build_tmp, None);
+}

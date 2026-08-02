@@ -24,6 +24,16 @@ use crate::graph::compact::generation::{
     GenerationMetrics, RunSetLease, SortRecord,
 };
 
+fn u32_wire(value: u64, what: &'static str) -> Result<[u8; 4], GenerationError> {
+    Ok(u32::try_from(value)
+        .map_err(|_| GenerationError::WireWidthOverflow {
+            what,
+            count: value,
+            max: u64::from(u32::MAX),
+        })?
+        .to_le_bytes())
+}
+
 /// Per-rel-table row counts needed for CSR sentinel/fill emission.
 pub struct RelTableGeometry {
     /// Rel table id.
@@ -94,7 +104,7 @@ pub fn stream_forward_csr(
                 // Fill remaining offsets up to sentinel.
                 let g = geometry(prev);
                 for _ in next_src_row..=g.src_rows {
-                    fwd_offsets_sink.write(&(fwd_pos as u32).to_le_bytes())?;
+                    fwd_offsets_sink.write(&u32_wire(fwd_pos, "forward_csr_offset")?)?;
                 }
             }
             cur_rel = Some(rel);
@@ -105,17 +115,17 @@ pub fn stream_forward_csr(
 
         // Fill empty source rows before this edge.
         while next_src_row < src_off {
-            fwd_offsets_sink.write(&(fwd_pos as u32).to_le_bytes())?;
+            fwd_offsets_sink.write(&u32_wire(fwd_pos, "forward_csr_offset")?)?;
             next_src_row += 1;
         }
         // First edge of a new src row: write its starting offset.
         if next_src_row == src_off {
-            fwd_offsets_sink.write(&(fwd_pos as u32).to_le_bytes())?;
+            fwd_offsets_sink.write(&u32_wire(fwd_pos, "forward_csr_offset")?)?;
             next_src_row += 1;
         }
 
         // Forward target = dst offset.
-        fwd_targets_sink.write(&(dst_off as u32).to_le_bytes())?;
+        fwd_targets_sink.write(&u32_wire(dst_off, "forward_csr_target")?)?;
 
         // Reverse record: key (rel, dst_off, src_off, edge_id), payload
         // = forward position (u32).
@@ -126,7 +136,7 @@ pub fn stream_forward_csr(
         rkey.extend_from_slice(&_eid.to_be_bytes());
         rev_sink.push(SortRecord::new(
             rkey,
-            (fwd_pos as u32).to_le_bytes().to_vec(),
+            u32_wire(fwd_pos, "forward_csr_position")?.to_vec(),
         ))?;
 
         fwd_pos += 1;
@@ -139,7 +149,7 @@ pub fn stream_forward_csr(
         let _ = g;
         let gg = geo;
         for _ in next_src_row..=gg.src_rows {
-            fwd_offsets_sink.write(&(fwd_pos as u32).to_le_bytes())?;
+            fwd_offsets_sink.write(&u32_wire(fwd_pos, "forward_csr_offset")?)?;
         }
     }
     Ok(())
@@ -182,7 +192,7 @@ pub fn stream_reverse_csr(
             if let Some(prev) = cur_rel {
                 let g = geometry(prev);
                 for _ in next_dst_row..=g.dst_rows {
-                    rev_offsets_sink.write(&(rev_pos as u32).to_le_bytes())?;
+                    rev_offsets_sink.write(&u32_wire(rev_pos, "reverse_csr_offset")?)?;
                 }
             }
             cur_rel = Some(rel);
@@ -192,15 +202,15 @@ pub fn stream_reverse_csr(
         }
 
         while next_dst_row < dst_off {
-            rev_offsets_sink.write(&(rev_pos as u32).to_le_bytes())?;
+            rev_offsets_sink.write(&u32_wire(rev_pos, "reverse_csr_offset")?)?;
             next_dst_row += 1;
         }
         if next_dst_row == dst_off {
-            rev_offsets_sink.write(&(rev_pos as u32).to_le_bytes())?;
+            rev_offsets_sink.write(&u32_wire(rev_pos, "reverse_csr_offset")?)?;
             next_dst_row += 1;
         }
 
-        rev_targets_sink.write(&(src_off as u32).to_le_bytes())?;
+        rev_targets_sink.write(&u32_wire(src_off, "reverse_csr_target")?)?;
         fwd_positions_sink.write(&fwd_pos.to_le_bytes())?;
         rev_pos += 1;
         Ok(())
@@ -209,7 +219,7 @@ pub fn stream_reverse_csr(
     if cur_rel.is_some() {
         let gg = geo;
         for _ in next_dst_row..=gg.dst_rows {
-            rev_offsets_sink.write(&(rev_pos as u32).to_le_bytes())?;
+            rev_offsets_sink.write(&u32_wire(rev_pos, "reverse_csr_offset")?)?;
         }
     }
     Ok(())
