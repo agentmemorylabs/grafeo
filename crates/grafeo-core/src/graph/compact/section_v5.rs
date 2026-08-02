@@ -121,6 +121,15 @@ pub fn serialize_v5_with_string_order(
                 }
             }
         }
+        // R3-B2: intern rel zone map strings.
+        for zm in rt.zone_maps().values() {
+            intern_zone_strings(zm, &mut intern);
+        }
+        for zms in rt.block_zone_maps().values() {
+            for zm in zms {
+                intern_zone_strings(zm, &mut intern);
+            }
+        }
     }
 
     if string_order == StringCodeOrder::Lexicographic {

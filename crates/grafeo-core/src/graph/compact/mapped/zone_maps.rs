@@ -339,7 +339,11 @@ fn finalize_block_maps(
     Ok(tables)
 }
 
-/// Builds TableZoneMaps + BlockZoneMaps segment bodies for all node tables.
+/// Builds TableZoneMaps + BlockZoneMaps segment bodies for all node tables
+/// and relationship tables.
+///
+/// Relationship-table zone maps are tagged with `table_id = 0x8000 | rel_id`
+/// so the reader can install them on the correct `RelTable` (R3-B2).
 ///
 /// # Errors
 ///
@@ -384,6 +388,43 @@ pub fn build_zone_map_segments(
             for (block_idx, zm) in zms.iter().enumerate() {
                 let bi = u32::try_from(block_idx).map_err(|_| "block index overflow")?;
                 write_zone_map_record(&mut block_seg, table_id, code, bi, zm, string_index)?;
+            }
+        }
+    }
+    // R3-B2: emit relationship-table zone maps tagged with 0x8000 | rel_id.
+    for (rid, rt) in store.rel_tables_by_id.iter().enumerate() {
+        let tagged_id = 0x8000u16
+            | u16::try_from(rid).map_err(|_| "rel table id overflow for zone map tag")?;
+        let mut keys: Vec<_> = rt.zone_maps().keys().cloned().collect();
+        keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for key in &keys {
+            let Some(zm) = rt.zone_maps().get(key) else {
+                continue;
+            };
+            let code = *string_index
+                .get(key.as_str())
+                .ok_or_else(|| format!("rel zone map key not interned: {}", key.as_str()))?;
+            write_zone_map_record(
+                &mut table_seg,
+                tagged_id,
+                code,
+                TABLE_ZONE_BLOCK_SENTINEL,
+                zm,
+                string_index,
+            )?;
+        }
+        let mut bkeys: Vec<_> = rt.block_zone_maps().keys().cloned().collect();
+        bkeys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for key in &bkeys {
+            let Some(zms) = rt.block_zone_maps().get(key) else {
+                continue;
+            };
+            let code = *string_index
+                .get(key.as_str())
+                .ok_or_else(|| format!("rel block zone map key not interned: {}", key.as_str()))?;
+            for (block_idx, zm) in zms.iter().enumerate() {
+                let bi = u32::try_from(block_idx).map_err(|_| "rel block index overflow")?;
+                write_zone_map_record(&mut block_seg, tagged_id, code, bi, zm, string_index)?;
             }
         }
     }

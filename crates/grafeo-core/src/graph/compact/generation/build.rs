@@ -332,16 +332,33 @@ pub fn generate_compact_store(
         key_list.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
         let mut properties: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
+        let mut rel_zone_maps: FxHashMap<PropertyKey, ZoneMap> = FxHashMap::default();
         let mut col_defs: Vec<ColumnDef> = Vec::new();
         for key in &key_list {
             charge_schema(&mut metrics, budget, key.as_str())?;
             string_occ.push(key.as_str().to_string());
             let values: Vec<Option<&Value>> = edges.iter().map(|e| e.properties.get(key)).collect();
             let ctx = format!("rel table {edge_type} column {key}");
-            let (codec, col_type, _) = encode_column(&values, &ctx, &mut string_occ)?;
+            let (codec, col_type, zm) = encode_column(&values, &ctx, &mut string_occ)?;
             col_defs.push(ColumnDef::new(key.as_str(), col_type));
+            if let Some(z) = zm {
+                push_zone_strings(&z, &mut string_occ);
+                rel_zone_maps.insert(key.clone(), z);
+            }
             properties.insert(key.clone(), codec);
         }
+
+        // R3-B2: compute block-level zone maps for rel property columns.
+        let rel_block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>> = properties
+            .iter()
+            .map(|(k, c)| {
+                let zms = compute_block_zone_maps(c);
+                for zm in &zms {
+                    push_zone_strings(zm, &mut string_occ);
+                }
+                (k.clone(), zms)
+            })
+            .collect();
 
         let src_label = table_id_to_label[*src_tid as usize].as_str();
         let dst_label = table_id_to_label[*dst_tid as usize].as_str();
@@ -358,13 +375,15 @@ pub fn generate_compact_store(
             .entry(et)
             .or_default()
             .push(rel_table_id);
-        rel_tables_by_id.push(RelTable::new(
+        rel_tables_by_id.push(RelTable::with_zone_maps(
             schema,
             fwd,
             Some(bwd),
             properties,
             *src_tid,
             *dst_tid,
+            rel_zone_maps,
+            rel_block_zone_maps,
         ));
     }
 
