@@ -269,6 +269,16 @@ pub trait RunStore {
         &self,
         path: &std::path::Path,
     ) -> Result<crate::graph::compact::mapped::MappedNodeIdIndex, GenerationError>;
+
+    /// Remove job-scoped run/merge artifacts after a successful build.
+    ///
+    /// Disk-backed stores delete correlation-scoped directories under the run
+    /// root; in-memory stores are no-ops. Called on the success path after
+    /// every run lease has been dropped.
+    fn cleanup_job_artifacts(&mut self) -> Result<(), GenerationError> {
+        let _ = self;
+        Ok(())
+    }
 }
 
 /// Shared run-body registry connecting in-memory sinks to in-memory mergers

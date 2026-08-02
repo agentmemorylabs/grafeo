@@ -37,8 +37,9 @@ use crate::graph::compact::generation_builder::column_pass::{
 };
 use crate::graph::compact::generation_builder::csr_pass::{self, RelTableGeometry};
 use crate::graph::compact::generation_builder::edge_pass::{self, RelTableKey};
+use crate::graph::compact::generation::emit::dict_column_lookup::DictChunkCatalog;
 use crate::graph::compact::generation_builder::emit_columns::{
-    DictChunkReader, emit_column_bodies, write_directory_segments,
+    emit_column_bodies, write_directory_segments,
 };
 use crate::graph::compact::generation_builder::emit_ids::{
     build_block_zone_maps, build_edge_id_lookup, build_edge_original_ids, build_metadata,
@@ -132,13 +133,18 @@ impl BoundedGenerationBuilder {
     }
 
     fn make_sink(
-        &self,
+        &mut self,
         kind: SegmentKind,
         alignment: u16,
         element_width: u32,
         file_id: &str,
-    ) -> SpoolSegmentSink {
-        SpoolSegmentSink::new(
+    ) -> Result<SpoolSegmentSink, GenerationError> {
+        // Charge the in-memory spool buffer before allocation (truthful anon ledger).
+        self.metrics.reserve_anon(
+            self.config.spool_buf_cap as u64,
+            self.config.budget.max_anon_bytes,
+        )?;
+        Ok(SpoolSegmentSink::new(
             kind,
             1,
             0x0001,
@@ -147,7 +153,7 @@ impl BoundedGenerationBuilder {
             &self.config.temp_dir,
             format!("{}-{file_id}", self.config.correlation_id),
             self.config.spool_buf_cap,
-        )
+        ))
     }
 
     /// Runs the full bounded build, returning a streaming payload lease.
@@ -283,10 +289,10 @@ impl BoundedGenerationBuilder {
         let str_occ_lease = str_occ_sink.finish()?;
 
         // ── 4. Global dictionary ─────────────────────────────────────
-        let mut offsets_sink = Box::new(self.make_sink(SegmentKind::StringOffsets, 8, 8, "stroff"));
-        let mut bytes_sink = Box::new(self.make_sink(SegmentKind::StringBytes, 1, 1, "strbytes"));
+        let mut offsets_sink = Box::new(self.make_sink(SegmentKind::StringOffsets, 8, 8, "stroff")?);
+        let mut bytes_sink = Box::new(self.make_sink(SegmentKind::StringBytes, 1, 1, "strbytes")?);
         let mut code_index_sink =
-            Box::new(self.make_sink(SegmentKind::DictionaryCodeIndex, 8, 16, "codeidx"));
+            Box::new(self.make_sink(SegmentKind::DictionaryCodeIndex, 8, 16, "codeidx")?);
         let mut remap_sink = run_store.sink("remap", &budget)?;
         let mut dict = StreamingDictionary::new(&budget, &mut self.metrics);
         dict.run(
@@ -311,17 +317,18 @@ impl BoundedGenerationBuilder {
         //    column-body and zone-map passes and discarded).
         // This replaces the graph-proportional `FxHashMap<String, u32>` over
         // ALL unique strings (D0.8.3: consume the remap run, never retain it).
-        let chunks_path = self
+        let catalog_path = self
             .config
             .temp_dir
-            .join(format!("{}-dictchunks.bin", self.config.correlation_id));
+            .join(format!("{}-dictchunks.cat", self.config.correlation_id));
         let schema_strings = consume_remap_run(
             &remap_lease,
             run_store.merger("remap")?.as_mut(),
             &budget,
             &mut self.metrics,
             self.cancel.as_ref(),
-            &chunks_path,
+            &self.config.temp_dir,
+            &catalog_path,
         )?;
 
         // Charge schema: schema_strings (labels, prop keys, edge types — schema-bounded)
@@ -363,19 +370,22 @@ impl BoundedGenerationBuilder {
             .reserve_schema(geo_charge, budget.max_schema_bytes)?;
 
         let mut bodies_sink =
-            Box::new(self.make_sink(SegmentKind::ColumnBodies, 1, 0, "colbodies"));
+            Box::new(self.make_sink(SegmentKind::ColumnBodies, 1, 0, "colbodies")?);
         let mut presence_sink =
-            Box::new(self.make_sink(SegmentKind::ColumnRowPresence, 1, 0, "colpres"));
-        let mut null_sink = Box::new(self.make_sink(SegmentKind::ColumnRowNull, 1, 0, "colnull"));
-        let mut chunk_file = std::fs::File::open(&chunks_path).map_err(|e| {
-            GenerationError::Io(format!("open dict chunks {}: {e}", chunks_path.display()))
-        })?;
-        let mut chunk_reader = DictChunkReader::new(&mut chunk_file);
+            Box::new(self.make_sink(SegmentKind::ColumnRowPresence, 1, 0, "colpres")?);
+        let mut null_sink = Box::new(self.make_sink(SegmentKind::ColumnRowNull, 1, 0, "colnull")?);
+        let mut chunk_catalog =
+            DictChunkCatalog::open(&catalog_path, &self.config.temp_dir).map_err(|e| {
+                GenerationError::Io(format!(
+                    "open dict catalog {}: {e}",
+                    catalog_path.display()
+                ))
+            })?;
         let col_result = emit_column_bodies(
             &occ_lease,
             run_store.merger("occ")?.as_mut(),
             &geometries,
-            &mut chunk_reader,
+            &mut chunk_catalog,
             bodies_sink.as_mut(),
             presence_sink.as_mut(),
             null_sink.as_mut(),
@@ -401,9 +411,9 @@ impl BoundedGenerationBuilder {
             }
         };
         let mut fwd_off_sink =
-            Box::new(self.make_sink(SegmentKind::ForwardCsrOffsets, 4, 4, "fwdoff"));
+            Box::new(self.make_sink(SegmentKind::ForwardCsrOffsets, 4, 4, "fwdoff")?);
         let mut fwd_tgt_sink =
-            Box::new(self.make_sink(SegmentKind::ForwardCsrTargets, 4, 4, "fwdtgt"));
+            Box::new(self.make_sink(SegmentKind::ForwardCsrTargets, 4, 4, "fwdtgt")?);
         let mut rev_sink = run_store.sink("rev-csr", &budget)?;
         csr_pass::stream_forward_csr(
             &fwd_lease,
@@ -418,10 +428,10 @@ impl BoundedGenerationBuilder {
         )?;
         let rev_lease = rev_sink.finish()?;
         let mut rev_off_sink =
-            Box::new(self.make_sink(SegmentKind::ReverseCsrOffsets, 4, 4, "revoff"));
+            Box::new(self.make_sink(SegmentKind::ReverseCsrOffsets, 4, 4, "revoff")?);
         let mut rev_tgt_sink =
-            Box::new(self.make_sink(SegmentKind::ReverseCsrTargets, 4, 4, "revtgt"));
-        let mut pos_sink = Box::new(self.make_sink(SegmentKind::ForwardPositions, 4, 4, "fwdpos"));
+            Box::new(self.make_sink(SegmentKind::ReverseCsrTargets, 4, 4, "revtgt")?);
+        let mut pos_sink = Box::new(self.make_sink(SegmentKind::ForwardPositions, 4, 4, "fwdpos")?);
         csr_pass::stream_reverse_csr(
             &rev_lease,
             run_store.merger("rev-csr")?.as_mut(),
@@ -435,6 +445,7 @@ impl BoundedGenerationBuilder {
         )?;
 
         // ── 7–8. Metadata, directories, ID lookups, zone maps, assemble ──
+        let job_temp_dir = self.config.temp_dir.clone();
         let lease = self.emit_all(
             &node_schema,
             &rel_keys,
@@ -446,7 +457,8 @@ impl BoundedGenerationBuilder {
             &fwd_lease,
             membership_runs.as_ref(),
             run_store,
-            &chunks_path,
+            &catalog_path,
+            &job_temp_dir,
             offsets_sink,
             bytes_sink,
             code_index_sink,
@@ -460,6 +472,7 @@ impl BoundedGenerationBuilder {
             pos_sink,
             total_edges,
         )?;
+        run_store.cleanup_job_artifacts()?;
         job_temp.disarm();
         Ok(lease)
     }
@@ -544,7 +557,8 @@ impl BoundedGenerationBuilder {
         fwd_lease: &RunSetLease,
         membership_runs: Option<&RunSetLease>,
         run_store: &mut dyn RunStore,
-        chunks_path: &std::path::Path,
+        catalog_path: &std::path::Path,
+        temp_dir: &std::path::Path,
         offsets_sink: Box<dyn SegmentSink>,
         bytes_sink: Box<dyn SegmentSink>,
         code_index_sink: Box<dyn SegmentSink>,
@@ -649,10 +663,10 @@ impl BoundedGenerationBuilder {
         // original_id); the other three go through external sorts keyed by
         // their output order.
         let mut node_lookup_sink =
-            Box::new(self.make_sink(SegmentKind::NodeIdLookup, 8, 24, "nodeidlk"));
+            Box::new(self.make_sink(SegmentKind::NodeIdLookup, 8, 24, "nodeidlk")?);
         build_node_id_lookup(id_index, node_lookup_sink.as_mut())?;
         let mut node_orig_sink =
-            Box::new(self.make_sink(SegmentKind::NodeOriginalIds, 8, 8, "nodeorig"));
+            Box::new(self.make_sink(SegmentKind::NodeOriginalIds, 8, 8, "nodeorig")?);
         build_node_original_ids(
             id_index,
             run_store,
@@ -662,7 +676,7 @@ impl BoundedGenerationBuilder {
             node_orig_sink.as_mut(),
         )?;
         let mut edge_lookup_sink =
-            Box::new(self.make_sink(SegmentKind::EdgeIdLookup, 8, 24, "edgeidlk"));
+            Box::new(self.make_sink(SegmentKind::EdgeIdLookup, 8, 24, "edgeidlk")?);
         build_edge_id_lookup(
             fwd_lease,
             run_store.merger("fwd-csr")?.as_mut(),
@@ -673,7 +687,7 @@ impl BoundedGenerationBuilder {
             edge_lookup_sink.as_mut(),
         )?;
         let mut edge_orig_sink =
-            Box::new(self.make_sink(SegmentKind::EdgeOriginalIds, 8, 8, "edgeorig"));
+            Box::new(self.make_sink(SegmentKind::EdgeOriginalIds, 8, 8, "edgeorig")?);
         build_edge_original_ids(
             fwd_lease,
             run_store.merger("fwd-csr")?.as_mut(),
@@ -689,25 +703,16 @@ impl BoundedGenerationBuilder {
         // `schema_strings`); each builder reads the file sequentially in
         // column order, one column's map at a time.
         let table_zm = {
-            let file = std::fs::File::open(chunks_path).map_err(|e| {
-                GenerationError::Io(format!("open dict chunks {}: {e}", chunks_path.display()))
-            })?;
-            let mut buf = std::io::BufReader::new(file);
-            let mut reader = DictChunkReader::new(&mut buf);
-            build_table_zone_maps(geometries, schema_strings, &mut reader)?
+            let mut catalog = DictChunkCatalog::open(catalog_path, temp_dir)?;
+            build_table_zone_maps(geometries, schema_strings, &mut catalog)?
         };
         let block_zm = {
-            let file = std::fs::File::open(chunks_path).map_err(|e| {
-                GenerationError::Io(format!("open dict chunks {}: {e}", chunks_path.display()))
-            })?;
-            let mut buf = std::io::BufReader::new(file);
-            let mut reader = DictChunkReader::new(&mut buf);
-            build_block_zone_maps(&col_result.columns, geometries, schema_strings, &mut reader)?
+            let mut catalog = DictChunkCatalog::open(catalog_path, temp_dir)?;
+            build_block_zone_maps(&col_result.columns, geometries, schema_strings, &mut catalog)?
         };
-        // The chunk file is an intermediate; drop it now that every consumer
-        // has finished. Best-effort: the lease's temp-dir cleanup covers
-        // error paths.
-        let _ = std::fs::remove_file(chunks_path);
+        // Catalog + per-column `.dict` files are intermediates; remove the
+        // catalog now (`.dict` files are removed with the job temp dir).
+        let _ = std::fs::remove_file(catalog_path);
 
         // Finish all sinks → descriptors.
         let mut descriptors = vec![
@@ -775,7 +780,7 @@ impl BoundedGenerationBuilder {
         // via the external-sort infrastructure (bounded, no resident vector).
         if let Some(membership_lease) = membership_runs {
             let mut membership_sink =
-                Box::new(self.make_sink(SegmentKind::NodeLabelMembership, 8, 16, "memb"));
+                Box::new(self.make_sink(SegmentKind::NodeLabelMembership, 8, 16, "memb")?);
             crate::graph::compact::generation_builder::membership_pass::emit_membership_segment(
                 membership_lease,
                 run_store.merger("membership")?.as_mut(),
@@ -895,15 +900,14 @@ fn collect_string_occurrences(
 /// 1. The **schema-scoped** string→code map — labels, property keys, edge
 ///    types (and zone strings). Bounded by schema (column count), never by
 ///    the number of dictionary values.
-/// 2. A disk-backed **per-column chunk file** for `DictValue` records: one
-///    chunk per column (in `(table_id, prop_key)` order), each chunk holding
-///    that column's distinct `(string, code)` pairs sorted by string. The
-///    column-body and zone-map passes read one chunk at a time in lockstep
-///    with the occurrence run and discard it, so no graph-proportional
-///    string map is ever resident.
+/// 2. A disk-backed **per-column `.dict` catalog** for `DictValue` records:
+///    one seek/mmap chunk per column (in `(table_id, prop_key)` order). The
+///    column-body and zone-map passes open one chunk at a time in lockstep
+///    with the occurrence run — only the offset table is resident, never a
+///    `HashMap<String, u32>`.
 ///
-/// Chunk file layout (LE): `[tid u16][prop_len u16][prop][count u32]` then
-/// `count × [str_len u32][string][code u32]`. Clean EOF (0 bytes) terminates.
+/// Catalog layout (LE, repeated until EOF):
+/// `[tid u16][prop_len u16][prop][path_len u16][relative .dict path]`
 ///
 /// # Errors
 ///
@@ -915,19 +919,18 @@ fn consume_remap_run(
     budget: &GenerationBudget,
     metrics: &mut GenerationMetrics,
     cancel: Option<&CancelToken>,
-    chunks_path: &std::path::Path,
+    temp_dir: &std::path::Path,
+    catalog_path: &std::path::Path,
 ) -> Result<FxHashMap<String, u32>, GenerationError> {
     use crate::graph::compact::generation::emit::global_dict::StringUseKind;
     use std::io::Write;
 
     let mut schema: FxHashMap<String, u32> = FxHashMap::default();
-    let file = std::fs::File::create(chunks_path).map_err(|e| {
-        GenerationError::Io(format!("create dict chunks {}: {e}", chunks_path.display()))
+    let file = std::fs::File::create(catalog_path).map_err(|e| {
+        GenerationError::Io(format!("create dict catalog {}: {e}", catalog_path.display()))
     })?;
-    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+    let mut catalog = std::io::BufWriter::with_capacity(64 * 1024, file);
 
-    // Stream one column at a time: body spool holds entries; only the last
-    // string is retained for adjacent dedup (never a column-sized Vec).
     let mut current: Option<DictChunkStreamer> = None;
 
     merger.merge_all(&remap_lease.handles, budget, metrics, cancel, &mut |rec| {
@@ -964,13 +967,9 @@ fn consume_remap_run(
                     .is_none_or(|c| c.tid != tid || c.prop.as_slice() != prop);
                 if is_new_col {
                     if let Some(prev) = current.take() {
-                        prev.finish_into(&mut writer)?;
+                        prev.finish_into(&mut catalog, temp_dir)?;
                     }
-                    current = Some(DictChunkStreamer::open(
-                        tid,
-                        prop,
-                        chunks_path.parent().unwrap_or(std::path::Path::new(".")),
-                    )?);
+                    current = Some(DictChunkStreamer::open(tid, prop, temp_dir)?);
                 }
                 current
                     .as_mut()
@@ -994,11 +993,11 @@ fn consume_remap_run(
         }
     })?;
     if let Some(prev) = current.take() {
-        prev.finish_into(&mut writer)?;
+        prev.finish_into(&mut catalog, temp_dir)?;
     }
-    writer
+    catalog
         .flush()
-        .map_err(|e| GenerationError::Io(format!("flush dict chunks: {e}")))?;
+        .map_err(|e| GenerationError::Io(format!("flush dict catalog: {e}")))?;
     Ok(schema)
 }
 
@@ -1007,32 +1006,45 @@ fn consume_remap_run(
 struct DictChunkStreamer {
     tid: u16,
     prop: Vec<u8>,
+    dict_name: String,
     body_path: PathBuf,
+    offsets_path: PathBuf,
     body: Option<std::io::BufWriter<std::fs::File>>,
+    offsets: Option<std::io::BufWriter<std::fs::File>>,
+    body_bytes: u64,
     count: u32,
     last: Option<Vec<u8>>,
 }
 
 impl DictChunkStreamer {
     fn open(tid: u16, prop: &[u8], temp_dir: &std::path::Path) -> Result<Self, GenerationError> {
-        let body_path = temp_dir.join(format!(
-            "dictchunk-{}-{}.body",
-            tid,
-            {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                prop.hash(&mut h);
-                h.finish()
-            }
-        ));
-        let file = std::fs::File::create(&body_path).map_err(|e| {
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            prop.hash(&mut h);
+            h.finish()
+        };
+        let dict_name = format!("dictchunk-{tid}-{hash}.dict");
+        let body_path = temp_dir.join(format!("dictchunk-{tid}-{hash}.body"));
+        let offsets_path = temp_dir.join(format!("dictchunk-{tid}-{hash}.off"));
+        let body_file = std::fs::File::create(&body_path).map_err(|e| {
             GenerationError::Io(format!("create dict chunk body {}: {e}", body_path.display()))
+        })?;
+        let off_file = std::fs::File::create(&offsets_path).map_err(|e| {
+            GenerationError::Io(format!(
+                "create dict chunk offsets {}: {e}",
+                offsets_path.display()
+            ))
         })?;
         Ok(Self {
             tid,
             prop: prop.to_vec(),
+            dict_name,
             body_path,
-            body: Some(std::io::BufWriter::with_capacity(64 * 1024, file)),
+            offsets_path,
+            body: Some(std::io::BufWriter::with_capacity(64 * 1024, body_file)),
+            offsets: Some(std::io::BufWriter::with_capacity(64 * 1024, off_file)),
+            body_bytes: 0,
             count: 0,
             last: None,
         })
@@ -1048,6 +1060,15 @@ impl DictChunkStreamer {
             count: string.len() as u64,
             max: u64::from(u32::MAX),
         })?;
+        {
+            let offsets = self
+                .offsets
+                .as_mut()
+                .ok_or_else(|| GenerationError::Io("dict chunk offsets closed".into()))?;
+            offsets
+                .write_all(&self.body_bytes.to_le_bytes())
+                .map_err(|e| GenerationError::Io(format!("write dict chunk offset: {e}")))?;
+        }
         let body = self
             .body
             .as_mut()
@@ -1056,6 +1077,14 @@ impl DictChunkStreamer {
             .and_then(|_| body.write_all(string))
             .and_then(|_| body.write_all(&code.to_le_bytes()))
             .map_err(|e| GenerationError::Io(format!("write dict chunk entry: {e}")))?;
+        self.body_bytes = self
+            .body_bytes
+            .checked_add(4 + u64::from(slen) + 4)
+            .ok_or(GenerationError::WireWidthOverflow {
+                what: "dict_chunk_body_bytes",
+                count: u64::MAX,
+                max: u64::MAX,
+            })?;
         self.count = self
             .count
             .checked_add(1)
@@ -1070,13 +1099,18 @@ impl DictChunkStreamer {
 
     fn finish_into(
         mut self,
-        writer: &mut std::io::BufWriter<std::fs::File>,
+        catalog: &mut std::io::BufWriter<std::fs::File>,
+        temp_dir: &std::path::Path,
     ) -> Result<(), GenerationError> {
         use std::io::{Read, Write};
         if let Some(mut body) = self.body.take() {
             body.flush()
                 .map_err(|e| GenerationError::Io(format!("flush dict chunk body: {e}")))?;
-            drop(body);
+        }
+        if let Some(mut offsets) = self.offsets.take() {
+            offsets
+                .flush()
+                .map_err(|e| GenerationError::Io(format!("flush dict chunk offsets: {e}")))?;
         }
         let prop_len =
             u16::try_from(self.prop.len()).map_err(|_| GenerationError::WireWidthOverflow {
@@ -1085,28 +1119,80 @@ impl DictChunkStreamer {
                 max: u64::from(u16::MAX),
             })?;
         let body_path = std::mem::take(&mut self.body_path);
-        writer
-            .write_all(&self.tid.to_le_bytes())
-            .and_then(|_| writer.write_all(&prop_len.to_le_bytes()))
-            .and_then(|_| writer.write_all(&self.prop))
-            .and_then(|_| writer.write_all(&self.count.to_le_bytes()))
-            .map_err(|e| GenerationError::Io(format!("write dict chunk header: {e}")))?;
         let mut body = std::fs::File::open(&body_path).map_err(|e| {
             GenerationError::Io(format!("reopen dict chunk body {}: {e}", body_path.display()))
         })?;
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = body
-                .read(&mut buf)
-                .map_err(|e| GenerationError::Io(format!("read dict chunk body: {e}")))?;
-            if n == 0 {
-                break;
+        // Remap merge order is by `(use_kind, owner_key)` — not string order within
+        // a column. Sort once per column here so binary search works; transient
+        // O(unique) for this column only, discarded before the body pass.
+        let mut entries: Vec<(Vec<u8>, u32)> = Vec::with_capacity(self.count as usize);
+        let mut scratch = [0u8; 65536];
+        for _ in 0..self.count {
+            let mut slen = [0u8; 4];
+            body.read_exact(&mut slen)
+                .map_err(|e| GenerationError::Io(format!("read dict chunk entry len: {e}")))?;
+            let sl = u32::from_le_bytes(slen) as usize;
+            if sl > scratch.len() {
+                return Err(GenerationError::Codec(format!(
+                    "dict chunk string too long: {sl}"
+                )));
             }
-            writer
-                .write_all(&buf[..n])
-                .map_err(|e| GenerationError::Io(format!("copy dict chunk body: {e}")))?;
+            body.read_exact(&mut scratch[..sl])
+                .map_err(|e| GenerationError::Io(format!("read dict chunk string: {e}")))?;
+            let mut code = [0u8; 4];
+            body.read_exact(&mut code)
+                .map_err(|e| GenerationError::Io(format!("read dict chunk code: {e}")))?;
+            entries.push((scratch[..sl].to_vec(), u32::from_le_bytes(code)));
         }
         let _ = std::fs::remove_file(&body_path);
+        let offsets_path = std::mem::take(&mut self.offsets_path);
+        let _ = std::fs::remove_file(&offsets_path);
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let dict_path = temp_dir.join(&self.dict_name);
+        let mut out = std::fs::File::create(&dict_path).map_err(|e| {
+            GenerationError::Io(format!("create dict chunk {}: {e}", dict_path.display()))
+        })?;
+        let count = u32::try_from(entries.len()).map_err(|_| GenerationError::WireWidthOverflow {
+            what: "dict_chunk_entry_count",
+            count: entries.len() as u64,
+            max: u64::from(u32::MAX),
+        })?;
+        out.write_all(&count.to_le_bytes())
+            .map_err(|e| GenerationError::Io(format!("write dict count: {e}")))?;
+        let mut body_bytes = Vec::new();
+        let mut offsets = Vec::with_capacity(entries.len());
+        for (s, code) in &entries {
+            offsets.push(body_bytes.len() as u64);
+            let slen = u32::try_from(s.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "dict_chunk_str_len",
+                count: s.len() as u64,
+                max: u64::from(u32::MAX),
+            })?;
+            body_bytes.extend_from_slice(&slen.to_le_bytes());
+            body_bytes.extend_from_slice(s);
+            body_bytes.extend_from_slice(&code.to_le_bytes());
+        }
+        for off in &offsets {
+            out.write_all(&off.to_le_bytes())
+                .map_err(|e| GenerationError::Io(format!("write dict offset: {e}")))?;
+        }
+        out.write_all(&body_bytes)
+            .map_err(|e| GenerationError::Io(format!("write dict chunk body: {e}")))?;
+
+        let rel = self.dict_name.as_bytes();
+        let rlen = u16::try_from(rel.len()).map_err(|_| GenerationError::WireWidthOverflow {
+            what: "dict_catalog_path_len",
+            count: rel.len() as u64,
+            max: u64::from(u16::MAX),
+        })?;
+        catalog
+            .write_all(&self.tid.to_le_bytes())
+            .and_then(|_| catalog.write_all(&prop_len.to_le_bytes()))
+            .and_then(|_| catalog.write_all(&self.prop))
+            .and_then(|_| catalog.write_all(&rlen.to_le_bytes()))
+            .and_then(|_| catalog.write_all(rel))
+            .map_err(|e| GenerationError::Io(format!("write dict catalog entry: {e}")))?;
         Ok(())
     }
 }
@@ -1114,8 +1200,12 @@ impl DictChunkStreamer {
 impl Drop for DictChunkStreamer {
     fn drop(&mut self) {
         self.body.take();
+        self.offsets.take();
         if !self.body_path.as_os_str().is_empty() {
             let _ = std::fs::remove_file(&self.body_path);
+        }
+        if !self.offsets_path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.offsets_path);
         }
     }
 }

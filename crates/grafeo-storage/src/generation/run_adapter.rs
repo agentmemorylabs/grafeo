@@ -103,6 +103,12 @@ impl DiskRunStore {
     }
 }
 
+impl Drop for DiskRunStore {
+    fn drop(&mut self) {
+        let _ = cleanup_disk_run_store_root(&self.root, &self.correlation);
+    }
+}
+
 impl RunStore for DiskRunStore {
     fn sink(
         &mut self,
@@ -154,6 +160,10 @@ impl RunStore for DiskRunStore {
             grafeo_core::graph::compact::mapped::MappedNodeIdIndex::new(bytes::Bytes::from(bytes))
         }
     }
+
+    fn cleanup_job_artifacts(&mut self) -> Result<(), GenerationError> {
+        cleanup_disk_run_store_root(&self.root, &self.correlation)
+    }
 }
 
 /// Adapter sink: pushes core records into a [`DiskRunSink`], then transfers
@@ -204,6 +214,40 @@ impl ExternalRunSink for DiskSinkAdapter {
 struct DiskMergerAdapter {
     inner: DiskRunMerger,
     budget: GenerationBudget,
+}
+
+/// Removes every file and correlation-scoped directory under `root`.
+fn cleanup_disk_run_store_root(root: &std::path::Path, correlation: &str) -> Result<(), GenerationError> {
+    use std::fs;
+
+    if !root.exists() {
+        return Ok(());
+    }
+    let prefix = format!("{correlation}-");
+    let entries = fs::read_dir(root).map_err(|e| {
+        GenerationError::Io(format!("read run store dir {}: {e}", root.display()))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            GenerationError::Io(format!("read run store entry {}: {e}", root.display()))
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(|e| {
+                GenerationError::Io(format!("remove run dir {}: {e}", path.display()))
+            })?;
+        } else {
+            fs::remove_file(&path).map_err(|e| {
+                GenerationError::Io(format!("remove run file {}: {e}", path.display()))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 impl ExternalRunMerger for DiskMergerAdapter {

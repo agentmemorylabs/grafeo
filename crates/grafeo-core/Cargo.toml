@@ -51,6 +51,7 @@ unicode-normalization.workspace = true
 ordered-float = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 crc32fast.workspace = true
+memmap2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
@@ -62,7 +63,7 @@ default = ["lpg", "parallel", "spill", "mmap", "regex"]
 lpg = []  # Enable LPG (labeled property graph) model
 parallel = ["rayon", "crossbeam"]  # Morsel-driven parallelism (rayon, crossbeam work-stealing)
 spill = []                         # Disk spilling for out-of-core execution (sync only, async in grafeo-engine)
-mmap = []                          # File-backed vector storage (MmapStorage)
+mmap = ["dep:memmap2"]             # File-backed vector storage (MmapStorage)
 triple-store = []  # Enable RDF triple store model
 rdf = ["triple-store"]  # Deprecated: use triple-store
 tiered-storage = ["grafeo-common/tiered-storage"]  # Enable tiered hot/cold storage

@@ -496,7 +496,7 @@ fn large_parity_input() -> GenerationInput {
 }
 
 /// Pre-lease failure (duplicate node id) must not orphan job temp artifacts
-/// (spools, dictchunks.bin, id-index.bin).
+/// (spools, dictchunks.cat, id-index.bin).
 #[test]
 fn failure_before_payload_lease_cleans_job_temp() {
     let tmp = TempDir::new().unwrap();

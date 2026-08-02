@@ -16,9 +16,11 @@ use crate::graph::compact::generation::{
     RunSetLease, RunStore, SortRecord,
 };
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
-use crate::graph::compact::generation_builder::emit_columns::{codec_kind_of, DictChunkReader};
+use crate::graph::compact::generation::emit::dict_column_lookup::DictChunkCatalog;
+use crate::graph::compact::generation_builder::emit_columns::codec_kind_of;
 use crate::graph::compact::generation_builder::emit_meta::{w16, w32, w64};
 use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
+use crate::graph::compact::generation::emit::dict_column_lookup::DictCodeLookup;
 use grafeo_common::utils::hash::FxHashMap;
 
 /// Builds the Metadata segment bytes from bounded pass outputs.
@@ -336,7 +338,7 @@ pub fn count_edges_per_rel_table(
 pub(crate) fn build_table_zone_maps(
     geometries: &[ColumnGeometry],
     string_index: &FxHashMap<String, u32>,
-    chunks: &mut DictChunkReader,
+    chunks: &mut DictChunkCatalog,
 ) -> Result<Vec<u8>, GenerationError> {
     use crate::graph::compact::mapped::ZONE_MAP_RECORD_LEN;
     const TAG_ABSENT: u8 = 0;
@@ -354,14 +356,16 @@ pub(crate) fn build_table_zone_maps(
 
         // String bounds resolve through this column's DictValue chunk map
         // (loaded only when the column has string bounds, discarded after).
-        let mut str_map: Option<FxHashMap<String, u32>> = None;
+        let mut str_lookup: Option<Box<dyn DictCodeLookup>> = None;
         if g.min_str.is_some() || g.max_str.is_some() {
-            str_map = Some(chunks.map_for(g.table_id, &g.key)?);
+            str_lookup = chunks
+                .lookup_for(g.table_id, &g.key)?
+                .map(|lk| Box::new(lk) as Box<dyn DictCodeLookup>);
         }
 
         // Determine min/max tags and payloads from geometry.
         let (min_tag, min_payload) = if let Some(s) = &g.min_str {
-            let code = lookup_zone_str(str_map.as_ref(), s)?;
+            let code = lookup_zone_str(&mut str_lookup, s)?;
             (TAG_STRING_CODE, u64::from(code))
         } else if let Some(n) = g.min_int {
             (TAG_INT64, n as u64)
@@ -373,7 +377,7 @@ pub(crate) fn build_table_zone_maps(
             (TAG_ABSENT, 0)
         };
         let (max_tag, max_payload) = if let Some(s) = &g.max_str {
-            let code = lookup_zone_str(str_map.as_ref(), s)?;
+            let code = lookup_zone_str(&mut str_lookup, s)?;
             (TAG_STRING_CODE, u64::from(code))
         } else if let Some(n) = g.max_int {
             (TAG_INT64, n as u64)
@@ -411,7 +415,7 @@ pub(crate) fn build_block_zone_maps(
     columns: &[crate::graph::compact::generation_builder::emit_columns::EmittedColumn],
     geometries: &[ColumnGeometry],
     string_index: &FxHashMap<String, u32>,
-    chunks: &mut DictChunkReader,
+    chunks: &mut DictChunkCatalog,
 ) -> Result<Vec<u8>, GenerationError> {
     use crate::graph::compact::mapped::ZONE_MAP_RECORD_LEN;
 
@@ -423,12 +427,14 @@ pub(crate) fn build_block_zone_maps(
         })?;
         // Load this column's DictValue chunk map only when some block bound
         // is a string; discarded after the column.
-        let mut str_map: Option<FxHashMap<String, u32>> = None;
+        let mut str_lookup: Option<Box<dyn DictCodeLookup>> = None;
         if col.block_zone_maps.iter().any(|zm| {
             matches!(zm.min, Some(grafeo_common::types::Value::String(_)))
                 || matches!(zm.max, Some(grafeo_common::types::Value::String(_)))
         }) {
-            str_map = Some(chunks.map_for(g.table_id, &g.key)?);
+            str_lookup = chunks
+                .lookup_for(g.table_id, &g.key)?
+                .map(|lk| Box::new(lk) as Box<dyn DictCodeLookup>);
         }
         for (block_idx, zm) in col.block_zone_maps.iter().enumerate() {
             let bi = u32::try_from(block_idx).map_err(|_| GenerationError::WireWidthOverflow {
@@ -436,8 +442,8 @@ pub(crate) fn build_block_zone_maps(
                 count: block_idx as u64,
                 max: u64::from(u32::MAX),
             })?;
-            let (min_tag, min_payload) = encode_zone_value(&zm.min, str_map.as_ref())?;
-            let (max_tag, max_payload) = encode_zone_value(&zm.max, str_map.as_ref())?;
+            let (min_tag, min_payload) = encode_zone_value(&zm.min, &mut str_lookup)?;
+            let (max_tag, max_payload) = encode_zone_value(&zm.max, &mut str_lookup)?;
             let mut rec = [0u8; ZONE_MAP_RECORD_LEN];
             rec[0..2].copy_from_slice(&g.table_id.to_le_bytes());
             rec[2..4].copy_from_slice(&0u16.to_le_bytes()); // reserved
@@ -463,22 +469,21 @@ pub(crate) fn build_block_zone_maps(
 /// [`GenerationError::Codec`] when the string is not interned or the map is
 /// missing (fail closed: the bound must be a value of this column).
 fn lookup_zone_str(
-    str_map: Option<&FxHashMap<String, u32>>,
+    str_lookup: &mut Option<Box<dyn DictCodeLookup>>,
     s: &str,
 ) -> Result<u32, GenerationError> {
-    let map = str_map.ok_or_else(|| GenerationError::Codec("zone string map not loaded".into()))?;
-    map.get(s)
-        .copied()
-        .ok_or_else(|| GenerationError::Codec(format!("zone string not interned: {s}")))
+    let lookup = str_lookup
+        .as_mut()
+        .ok_or_else(|| GenerationError::Codec("zone string lookup not loaded".into()))?;
+    lookup.code_of(s.as_bytes()).ok_or_else(|| {
+        GenerationError::Codec(format!("zone string not interned: {s}"))
+    })
 }
 
 /// Encodes an optional zone-map value to (tag, payload).
-///
-/// `str_map` is the current column's DictValue chunk map (`None` when the
-/// column has no string bounds).
 fn encode_zone_value(
     v: &Option<grafeo_common::types::Value>,
-    str_map: Option<&FxHashMap<String, u32>>,
+    str_lookup: &mut Option<Box<dyn DictCodeLookup>>,
 ) -> Result<(u8, u64), GenerationError> {
     const TAG_ABSENT: u8 = 0;
     const TAG_INT64: u8 = 1;
@@ -490,7 +495,7 @@ fn encode_zone_value(
         Some(grafeo_common::types::Value::Int64(n)) => Ok((TAG_INT64, *n as u64)),
         Some(grafeo_common::types::Value::Bool(b)) => Ok((TAG_BOOL, u64::from(*b))),
         Some(grafeo_common::types::Value::String(s)) => {
-            let code = lookup_zone_str(str_map, s.as_str())?;
+            let code = lookup_zone_str(str_lookup, s.as_str())?;
             Ok((TAG_STRING_CODE, u64::from(code)))
         }
         Some(grafeo_common::types::Value::Float64(f)) => Ok((TAG_FLOAT64, f.to_bits())),

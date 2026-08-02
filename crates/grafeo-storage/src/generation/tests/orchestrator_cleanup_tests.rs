@@ -8,10 +8,10 @@ use grafeo_core::graph::compact::generation::{
 use grafeo_core::graph::compact::generation_builder::orchestrator::{
     BoundedBuildConfig, BoundedGenerationBuilder,
 };
-use tempfile::TempDir;
 
 use super::support::count_files_under;
 use crate::generation::DiskRunStore;
+use tempfile::TempDir;
 
 fn large_input() -> GenerationInput {
     let mut input = GenerationInput::new();
@@ -69,6 +69,45 @@ fn disk_run_store_failure_leaves_zero_artifacts() {
         count_files_under(&build_runs),
         0,
         "build-runs must have zero leftover files"
+    );
+}
+
+#[test]
+fn disk_run_store_success_leaves_zero_artifacts() {
+    let tmp = TempDir::new().unwrap();
+    let build_tmp = tmp.path().join("build-tmp");
+    let build_runs = tmp.path().join("build-runs");
+    let budget = GenerationBudget::for_tests();
+    let input = large_input();
+    let mut run_store =
+        DiskRunStore::new(&build_runs, budget, "disk-success").expect("run store");
+    let config = BoundedBuildConfig {
+        budget,
+        temp_dir: build_tmp.clone(),
+        correlation_id: "disk-success".into(),
+        spool_buf_cap: 64 * 1024,
+        rel_schemas: Vec::new(),
+    };
+    let mut builder = BoundedGenerationBuilder::new(config);
+    let mut lease = builder
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut run_store,
+        )
+        .expect("bounded build must succeed");
+    let mut payload = Vec::new();
+    lease.stream_to(&mut payload).expect("stream_to");
+    drop(lease);
+    drop(run_store);
+    assert!(
+        !build_tmp.exists(),
+        "build-tmp must be removed after successful lease drop"
+    );
+    assert_eq!(
+        count_files_under(&build_runs),
+        0,
+        "build-runs must have zero leftover files after success"
     );
 }
 

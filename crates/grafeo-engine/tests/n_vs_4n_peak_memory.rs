@@ -203,9 +203,6 @@ fn run_isolated_scale(n: usize, root: &Path) -> ChildReport {
         .build(&mut nodes, &mut edges, &mut run_store)
         .expect("bounded build");
 
-    stop.store(true, Ordering::Relaxed);
-    sampler.join().expect("sampler join");
-
     let payload_len = usize::try_from(lease.exact_len().expect("exact_len")).expect("usize");
     let metrics = lease.metrics().clone();
     let node_count = lease.total_nodes();
@@ -219,7 +216,7 @@ fn run_isolated_scale(n: usize, root: &Path) -> ChildReport {
         node_count,
         edge_count,
     };
-    let mut section_source = StreamingPayloadSectionSource::new(lease);
+    let section_source = StreamingPayloadSectionSource::new(lease);
     let mut sections: Vec<Box<dyn grafeo_storage::file::generation_writer::ExactSectionSource>> =
         vec![Box::new(section_source)];
     let published = publish_generation(
@@ -248,6 +245,15 @@ fn run_isolated_scale(n: usize, root: &Path) -> ChildReport {
     let mut cs = CompactStoreSection::empty();
     cs.deserialize_from_bytes(Bytes::from(data)).expect("reopen");
     assert_eq!(cs.store().expect("store").total_nodes(), node_count);
+
+    // Drop publication sections (owns the payload lease / spool files) and the
+    // run store before counting leftovers. Sampling covers the full production path.
+    drop(sections);
+    drop(cs);
+    drop(manager);
+    drop(run_store);
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().expect("sampler join");
 
     let leftover_files = count_files_under(&build_tmp) + count_files_under(&runs_dir);
     let outer_sha256 = hex::encode(published.generation_sha256);

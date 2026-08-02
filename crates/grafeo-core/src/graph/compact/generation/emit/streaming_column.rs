@@ -16,12 +16,12 @@
 )]
 
 use crate::codec::DEFAULT_BLOCK_ROWS;
+use crate::graph::compact::generation::emit::dict_column_lookup::DictCodeLookup;
 use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::error::GenerationError;
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
 use crate::graph::compact::zone_map::{ZoneMap, fold_value_into_block_zone_map};
 use grafeo_common::types::Value;
-use grafeo_common::utils::hash::FxHashMap;
 
 /// LSB-first bit packer with at most one open byte (presence/null companions).
 pub(crate) struct BitByteEmitter {
@@ -123,7 +123,7 @@ enum BodyFamily {
 pub struct StreamingBodyWriter {
     context: String,
     family: BodyFamily,
-    dict_map: Option<FxHashMap<String, u32>>,
+    dict_lookup: Option<Box<dyn DictCodeLookup>>,
     rows_written: usize,
     body_len: u64,
     block_maps: Vec<ZoneMap>,
@@ -134,8 +134,8 @@ pub struct StreamingBodyWriter {
 impl StreamingBodyWriter {
     /// Opens a column body on `sink`, writing the v5 header from `geo`.
     ///
-    /// `dict_map` supplies string→global_code for Dict columns (one column's
-    /// distinct strings; discarded after the column finishes).
+    /// `dict_lookup` supplies string→global_code for Dict columns (one column's
+    /// distinct strings via seek/mmap; discarded after the column finishes).
     ///
     /// # Errors
     ///
@@ -143,7 +143,7 @@ impl StreamingBodyWriter {
     pub fn new(
         sink: &mut dyn SegmentSink,
         geo: &ColumnGeometry,
-        dict_map: FxHashMap<String, u32>,
+        dict_lookup: Option<Box<dyn DictCodeLookup>>,
         context: impl Into<String>,
     ) -> Result<Self, GenerationError> {
         let context = context.into();
@@ -178,15 +178,15 @@ impl StreamingBodyWriter {
 
         let body_len = write_body_header(sink, &family, row_count)?;
 
-        let dict_map = match &family {
-            BodyFamily::Dict { empty: false } => Some(dict_map),
+        let dict_lookup = match &family {
+            BodyFamily::Dict { empty: false } => dict_lookup,
             _ => None,
         };
 
         Ok(Self {
             context,
             family,
-            dict_map,
+            dict_lookup,
             rows_written: 0,
             body_len,
             block_maps: Vec::new(),
@@ -358,12 +358,12 @@ impl StreamingBodyWriter {
         Ok(())
     }
 
-    fn dict_code(&self, s: &str) -> Result<u32, GenerationError> {
-        let map = self
-            .dict_map
-            .as_ref()
-            .ok_or_else(|| GenerationError::Codec("dict map missing".into()))?;
-        map.get(s).copied().ok_or_else(|| {
+    fn dict_code(&mut self, s: &str) -> Result<u32, GenerationError> {
+        let lookup = self
+            .dict_lookup
+            .as_mut()
+            .ok_or_else(|| GenerationError::Codec("dict lookup missing".into()))?;
+        lookup.code_of(s.as_bytes()).ok_or_else(|| {
             GenerationError::Codec(format!("dict string not interned: {s}"))
         })
     }
