@@ -50,6 +50,7 @@ use grafeo_engine::{
     EpochHandoffPhase, GrafeoDB, generation_build_request, recover_generation_root,
 };
 use grafeo_storage::file::GrafeoFileManager;
+use grafeo_storage::file::generation_writer::GenerationFileOps;
 use grafeo_storage::generation::wal_cursor::validate_replayable;
 use tempfile::TempDir;
 
@@ -419,9 +420,102 @@ fn repeated_cycles_with_concurrent_readers() {
         .expect("final boundary replayable");
 }
 
+/// R1 — a backup pin held across a whole publish cycle. Pins the selected
+/// generation with the real 4b backup primitive, then runs a handoff cycle that
+/// publishes a NEW generation to the same root (advancing the sequence), and
+/// proves the pinned bytes still restore byte-identically from the backup dir
+/// (they were protected from GC/deletion while the root moved on).
+#[test]
+fn backup_pin_held_across_a_cycle_restores_pinned_bytes() {
+    if std::env::var(MEM_CHILD_ENV).is_ok() {
+        return;
+    }
+    use grafeo_engine::{
+        BACKUP_MANIFEST_NAME, RetirementAuthority, RootOwnership, backup_generation_root,
+    };
+
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    let mut db = GrafeoDB::new_in_memory();
+    db.create_node_with_props(&["Person"], [("name", Value::from("pinned-seed"))])
+        .expect("seed");
+    db.compact().expect("compact");
+    let first = db
+        .build_and_publish_generation(generation_build_request(&gen_root, "g-pinned"))
+        .expect("publish first");
+    db.close().expect("checkpoint");
+
+    // Pin via a REAL backup (copies exact bytes + WAL; records the pinned seq).
+    let backup_root = dir.path().join("backups");
+    let ownership = RootOwnership::open(&gen_root).expect("owned root");
+    let auth = RetirementAuthority::new(&ownership);
+    let receipt = backup_generation_root(&auth, &ownership, &backup_root, "pin-pre-cycle")
+        .expect("backup pins the selected generation");
+    assert_eq!(
+        receipt.publication_sequence, first.publication.publication_sequence,
+        "backup pinned the first published sequence"
+    );
+    drop(ownership); // release the lock before the writable cycle re-opens it
+
+    // ── run a full cycle on the SAME root (advances sequence past the pin) ──
+    let mut db = GrafeoDB::new_in_memory();
+    db.create_node_with_props(&["Person"], [("name", Value::from("cycle-writer"))])
+        .expect("writer");
+    db.compact().expect("compact");
+    let ctl =
+        Arc::new(OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"));
+    db.install_overlay_admission(Arc::clone(&ctl));
+    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let report = db
+        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-after-cycle"))
+        .expect("cycle completes");
+    assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
+    assert!(
+        report
+            .publication
+            .as_ref()
+            .expect("publication")
+            .publication
+            .publication_sequence
+            > receipt.publication_sequence,
+        "the cycle advanced the sequence beyond the pinned one"
+    );
+    db.close().expect("cycle checkpoint");
+
+    // The pinned backup's manifest + bytes survive the cycle and match the pin.
+    let manifest_bytes =
+        fs::read(receipt.backup_dir.join(BACKUP_MANIFEST_NAME)).expect("read backup manifest");
+    let (record, _): (grafeo_engine::GenerationBackupManifest, usize) =
+        bincode::serde::decode_from_slice(&manifest_bytes, bincode::config::standard())
+            .expect("decode backup manifest");
+    assert_eq!(record.publication_sequence, receipt.publication_sequence);
+    assert_eq!(record.generation_id, "g-pinned");
+
+    // The copied generation in the backup is byte-identical to what the pin
+    // recorded (proof the pinned bytes were protected across the root advancing).
+    let copied = receipt.backup_dir.join(
+        std::path::Path::new(&record.generation_path)
+            .file_name()
+            .expect("generation file name"),
+    );
+    assert_eq!(record.generation_sha256.len(), 32);
+    let copied_hash = grafeo_storage::file::generation_writer::OsGenerationFileOps
+        .sha256(&copied)
+        .expect("hash pinned backup generation");
+    assert_eq!(
+        copied_hash, record.generation_sha256,
+        "pinned generation bytes unchanged across the publish cycle"
+    );
+}
+
 // ── R2/R3: N-vs-4N transient build-event memory boundedness (isolated child) ─
 
 /// Private-anonymous peak of one isolated whole-graph build child, as printed.
+/// Fields are read via the parent eprintln! (Debug), so allow dead_code for the
+/// read-once report struct.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct BuildPeakReport {
     nodes: usize,
