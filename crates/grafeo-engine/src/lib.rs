@@ -76,7 +76,8 @@ pub use database::generation::{
 };
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation::{
-    BuildPublication, ExpectedSelection, ManifestSelection, ManifestState, ManifestStateError,
+    BuildPublication, EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport,
+    ExpectedSelection, FrozenEpochHandle, ManifestSelection, ManifestState, ManifestStateError,
     OrphanClassification, PublicationCrashPoint, PublicationPhase, PublicationPhaseError,
     PublishedGeneration, RecoveryViewError, RootRecovery, WalBoundary, read_manifest_state,
     recover_generation_root,

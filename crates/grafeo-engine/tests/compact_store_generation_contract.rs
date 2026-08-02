@@ -530,6 +530,7 @@ fn lifecycle_publish_recover_snapshot_end_to_end() {
             generation_id: "g-e2e".to_string(),
             parent_generation_id: None,
             parent_publication_sequence: None,
+            pre_cut_cursor: None,
         },
         &wal,
         &OsGenerationFileOps,

@@ -88,6 +88,46 @@ pub struct LayeredStore {
     /// Wrapped in an `RwLock` so the engine can install it through `&self`
     /// after construction (the store is shared via `Arc`).
     admission_slot: RwLock<Option<Arc<OverlayAdmissionController>>>,
+    /// Live dual-epoch handoff state (G-EM0.5c).
+    ///
+    /// When `Some`, a freeze of epoch N is in progress: new mutations are
+    /// charged to [`RetainedCategory::NextEpoch`] and tracked in the
+    /// post-freeze dirty sets so retirement can leave epoch N+1 applied
+    /// exactly once. Readers continue against the same overlay; only the
+    /// generation build consumes the materialized freeze snapshot owned
+    /// by the engine handoff coordinator.
+    handoff: RwLock<Option<OverlayHandoffLive>>,
+}
+
+/// Live dual-epoch handoff bookkeeping on the layered store (G-EM0.5c).
+///
+/// The freeze snapshot (payloads + WAL boundary) lives in the engine
+/// coordinator; this struct only tracks which live overlay mutations
+/// arrived after freeze so retirement can drop absorbed epoch-N state
+/// without discarding N+1.
+#[derive(Debug, Clone, Default)]
+pub struct OverlayHandoffLive {
+    /// Frozen overlay epoch N.
+    pub frozen_epoch: u64,
+    /// Active next epoch N+1 open for concurrent writes.
+    pub next_epoch: u64,
+    /// Dirty node ids captured at freeze (epoch N).
+    pub freeze_node_ids: FxHashSet<u64>,
+    /// Dirty edge ids captured at freeze (epoch N).
+    pub freeze_edge_ids: FxHashSet<u64>,
+    /// Base-deletion node ids captured at freeze.
+    pub freeze_deleted_nodes: FxHashSet<u64>,
+    /// Base-deletion edge ids captured at freeze.
+    pub freeze_deleted_edges: FxHashSet<u64>,
+    /// Nodes dirtied after freeze (epoch N+1).
+    pub post_freeze_nodes: FxHashSet<u64>,
+    /// Edges dirtied after freeze (epoch N+1).
+    pub post_freeze_edges: FxHashSet<u64>,
+    /// Retained bytes charged to frozen categories at freeze time
+    /// (MutationPayload + DirtySets + DeletionSets). Released on retire.
+    pub frozen_retained_bytes: u64,
+    /// Per-category frozen bytes at freeze (index = RetainedCategory::index).
+    pub frozen_category_bytes: [u64; RetainedCategory::COUNT],
 }
 
 impl std::fmt::Debug for LayeredStore {
@@ -175,6 +215,7 @@ impl LayeredStore {
             deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
             admission_slot: RwLock::new(None),
+            handoff: RwLock::new(None),
         }
     }
 
@@ -189,6 +230,7 @@ impl LayeredStore {
             deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
             admission_slot: RwLock::new(None),
+            handoff: RwLock::new(None),
         }
     }
 
@@ -223,24 +265,35 @@ impl LayeredStore {
     }
 
     /// Captures overlay mutation sets for a generation freeze (schema-bounded).
+    ///
+    /// Includes every entity currently resident in the overlay (created or
+    /// modified), not only the dirty-set bookkeeping. After `compact()`,
+    /// `GrafeoDB::create_node*` may write the shared overlay Arc without
+    /// marking dirty; those nodes must still enter the freeze.
     #[cfg(feature = "generation-streaming")]
     #[must_use]
     pub fn generation_freeze_epoch(&self) -> super::generation_builder::freeze::FrozenOverlayEpoch {
         use super::generation_builder::freeze::FrozenOverlayEpoch;
+        let overlay = self.overlay.load_full();
+        let mut overlay_node_ids: FxHashSet<u64> = overlay
+            .all_node_ids()
+            .into_iter()
+            .map(|id| id.as_u64())
+            .collect();
+        for id in self.dirty_node_ids.read().iter() {
+            overlay_node_ids.insert(id.as_u64());
+        }
+        let mut overlay_edge_ids: FxHashSet<u64> = Default::default();
+        for e in overlay.all_edges() {
+            overlay_edge_ids.insert(e.id.as_u64());
+        }
+        for id in self.dirty_edge_ids.read().iter() {
+            overlay_edge_ids.insert(id.as_u64());
+        }
         FrozenOverlayEpoch {
-            epoch: self.overlay.load().current_epoch().0,
-            overlay_node_ids: self
-                .dirty_node_ids
-                .read()
-                .iter()
-                .map(NodeId::as_u64)
-                .collect(),
-            overlay_edge_ids: self
-                .dirty_edge_ids
-                .read()
-                .iter()
-                .map(EdgeId::as_u64)
-                .collect(),
+            epoch: overlay.current_epoch().0,
+            overlay_node_ids,
+            overlay_edge_ids,
             deleted_base_node_ids: self
                 .deleted_from_base_nodes
                 .read()
@@ -311,10 +364,156 @@ impl LayeredStore {
 
     /// Charges retained capacity for an overlay mutation, if a controller is
     /// installed. No-op for read-only/legacy stores.
+    ///
+    /// During an active G-EM0.5c handoff, mutation-payload charges route to
+    /// [`RetainedCategory::NextEpoch`] so frozen epoch N and next epoch N+1
+    /// both count toward the same hard budget (packet §5).
     fn charge_retained(&self, category: RetainedCategory, bytes: usize) {
+        let category =
+            if category == RetainedCategory::MutationPayload && self.handoff.read().is_some() {
+                RetainedCategory::NextEpoch
+            } else {
+                category
+            };
         if let Some(ctl) = self.admission_slot.read().as_ref() {
             ctl.try_reserve(category, bytes as u64);
         }
+    }
+
+    /// Records a dirty node id and, when a handoff is active, marks it as a
+    /// post-freeze (epoch N+1) mutation.
+    fn mark_dirty_node(&self, id: NodeId) {
+        self.dirty_node_ids.write().insert(id);
+        if let Some(h) = self.handoff.write().as_mut() {
+            h.post_freeze_nodes.insert(id.as_u64());
+        }
+    }
+
+    /// Records a dirty edge id and, when a handoff is active, marks it as a
+    /// post-freeze (epoch N+1) mutation.
+    fn mark_dirty_edge(&self, id: EdgeId) {
+        self.dirty_edge_ids.write().insert(id);
+        if let Some(h) = self.handoff.write().as_mut() {
+            h.post_freeze_edges.insert(id.as_u64());
+        }
+    }
+
+    /// True when a dual-epoch handoff freeze is active.
+    #[must_use]
+    pub fn handoff_active(&self) -> bool {
+        self.handoff.read().is_some()
+    }
+
+    /// Snapshot of the live handoff bookkeeping, if any.
+    #[must_use]
+    pub fn handoff_live(&self) -> Option<OverlayHandoffLive> {
+        self.handoff.read().clone()
+    }
+
+    /// Installs live handoff tracking after the engine freezes epoch N.
+    ///
+    /// Fails closed when a handoff is already active. Does not mutate overlay
+    /// payloads; concurrent readers keep seeing frozen + next-epoch state on
+    /// the single live overlay until retirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a handoff is already in progress.
+    pub fn begin_epoch_handoff(&self, state: OverlayHandoffLive) -> Result<(), String> {
+        let mut slot = self.handoff.write();
+        if slot.is_some() {
+            return Err("epoch handoff already active".into());
+        }
+        if let Some(ctl) = self.admission_slot.read().as_ref() {
+            ctl.set_active_epoch(state.next_epoch);
+        }
+        *slot = Some(state);
+        Ok(())
+    }
+
+    /// Clears live handoff tracking after successful retirement or cancel.
+    pub fn end_epoch_handoff(&self) {
+        *self.handoff.write() = None;
+    }
+
+    /// Retires absorbed epoch-N overlay state after G(N) is the selected base.
+    ///
+    /// Drops overlay entities that were frozen and not re-mutated after freeze,
+    /// clears matching dirty/deletion marks, releases frozen retained bytes,
+    /// and clears the handoff slot. Epoch N+1 dirty entities remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no handoff is active.
+    pub fn retire_frozen_overlay_prefix(&self) -> Result<OverlayHandoffLive, String> {
+        let state = self
+            .handoff
+            .write()
+            .take()
+            .ok_or_else(|| "no active epoch handoff to retire".to_string())?;
+
+        let overlay = self.overlay.load_full();
+
+        // Absorb frozen dirty nodes that were not re-mutated after freeze.
+        {
+            let mut dirty = self.dirty_node_ids.write();
+            for raw in &state.freeze_node_ids {
+                if state.post_freeze_nodes.contains(raw) {
+                    continue;
+                }
+                let id = NodeId::new(*raw);
+                dirty.remove(&id);
+                let _ = overlay.delete_node(id);
+            }
+        }
+        {
+            let mut dirty = self.dirty_edge_ids.write();
+            for raw in &state.freeze_edge_ids {
+                if state.post_freeze_edges.contains(raw) {
+                    continue;
+                }
+                let id = EdgeId::new(*raw);
+                dirty.remove(&id);
+                let _ = overlay.delete_edge(id);
+            }
+        }
+        // Base deletions represented by G(N) no longer need overlay tombstones
+        // unless the entity was recreated after freeze.
+        {
+            let mut del = self.deleted_from_base_nodes.write();
+            for raw in &state.freeze_deleted_nodes {
+                if state.post_freeze_nodes.contains(raw) {
+                    continue;
+                }
+                del.remove(&NodeId::new(*raw));
+            }
+        }
+        {
+            let mut del = self.deleted_from_base_edges.write();
+            for raw in &state.freeze_deleted_edges {
+                if state.post_freeze_edges.contains(raw) {
+                    continue;
+                }
+                del.remove(&EdgeId::new(*raw));
+            }
+        }
+
+        if let Some(ctl) = self.admission_slot.read().as_ref() {
+            for cat in [
+                RetainedCategory::MutationPayload,
+                RetainedCategory::DirtySets,
+                RetainedCategory::DeletionSets,
+            ] {
+                let bytes = state.frozen_category_bytes[cat.index()];
+                if bytes > 0 {
+                    ctl.release(cat, bytes);
+                }
+            }
+            ctl.set_active_epoch(state.next_epoch);
+            ctl.complete_generation_build();
+        }
+
+        Ok(state)
     }
 
     /// Replaces the overlay with a fresh empty `LpgStore` and clears
@@ -380,6 +579,18 @@ impl LayeredStore {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Snapshot of overlay dirty (created/modified) node ids.
+    #[must_use]
+    pub fn snapshot_dirty_node_ids(&self) -> Vec<NodeId> {
+        self.dirty_node_ids.read().iter().copied().collect()
+    }
+
+    /// Snapshot of overlay dirty (created/modified) edge ids.
+    #[must_use]
+    pub fn snapshot_dirty_edge_ids(&self) -> Vec<EdgeId> {
+        self.dirty_edge_ids.read().iter().copied().collect()
     }
 
     /// Seeds the deleted-from-base sets from a previously-persisted
@@ -1258,7 +1469,7 @@ impl GraphStoreMut for LayeredStore {
     fn create_node(&self, labels: &[&str]) -> NodeId {
         let _guard = self.merge_guard.read();
         let id = self.overlay.load().create_node(labels);
-        self.dirty_node_ids.write().insert(id);
+        self.mark_dirty_node(id);
         self.charge_retained(
             RetainedCategory::MutationPayload,
             overlay_cost::node_creation_retained_bytes(labels),
@@ -1277,7 +1488,7 @@ impl GraphStoreMut for LayeredStore {
             .overlay
             .load()
             .create_node_versioned(labels, epoch, transaction_id);
-        self.dirty_node_ids.write().insert(id);
+        self.mark_dirty_node(id);
         self.charge_retained(
             RetainedCategory::MutationPayload,
             overlay_cost::node_creation_retained_bytes(labels),
@@ -1291,7 +1502,7 @@ impl GraphStoreMut for LayeredStore {
         self.ensure_in_overlay(src);
         self.ensure_in_overlay(dst);
         let id = self.overlay.load().create_edge(src, dst, edge_type);
-        self.dirty_edge_ids.write().insert(id);
+        self.mark_dirty_edge(id);
         self.charge_retained(
             RetainedCategory::MutationPayload,
             overlay_cost::edge_creation_retained_bytes(edge_type),
@@ -1314,7 +1525,7 @@ impl GraphStoreMut for LayeredStore {
             self.overlay
                 .load()
                 .create_edge_versioned(src, dst, edge_type, epoch, transaction_id);
-        self.dirty_edge_ids.write().insert(id);
+        self.mark_dirty_edge(id);
         self.charge_retained(
             RetainedCategory::MutationPayload,
             overlay_cost::edge_creation_retained_bytes(edge_type),
@@ -1329,11 +1540,9 @@ impl GraphStoreMut for LayeredStore {
             self.ensure_in_overlay(dst);
         }
         let ids = self.overlay.load().batch_create_edges(edges);
-        let mut dirty = self.dirty_edge_ids.write();
         for &id in &ids {
-            dirty.insert(id);
+            self.mark_dirty_edge(id);
         }
-        drop(dirty);
         for &(_, _, edge_type) in edges {
             self.charge_retained(
                 RetainedCategory::MutationPayload,
@@ -1613,7 +1822,7 @@ impl LayeredStore {
                 .set_node_property(id, key.as_str(), value.clone());
         }
 
-        self.dirty_node_ids.write().insert(id);
+        self.mark_dirty_node(id);
     }
 
     /// Ensures an edge exists in the overlay.
@@ -1650,7 +1859,7 @@ impl LayeredStore {
                 .set_edge_property(id, key.as_str(), value.clone());
         }
 
-        self.dirty_edge_ids.write().insert(id);
+        self.mark_dirty_edge(id);
     }
 }
 

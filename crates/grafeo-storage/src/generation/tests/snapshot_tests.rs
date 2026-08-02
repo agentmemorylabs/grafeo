@@ -23,6 +23,7 @@ fn publish_once(
         generation_id: generation_id.to_string(),
         parent_generation_id: None,
         parent_publication_sequence: None,
+        pre_cut_cursor: None,
     };
     publish_generation(lock, input, &fixture.wal, &OsGenerationFileOps, None).expect("publish");
 }

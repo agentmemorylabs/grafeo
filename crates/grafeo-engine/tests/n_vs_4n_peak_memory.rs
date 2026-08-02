@@ -229,6 +229,7 @@ fn run_isolated_scale(n: usize, root: &Path) -> ChildReport {
             generation_id: format!("nvs4n-{label}"),
             parent_generation_id: None,
             parent_publication_sequence: None,
+            pre_cut_cursor: None,
         },
         &wal,
         &OsGenerationFileOps,

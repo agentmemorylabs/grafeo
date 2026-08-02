@@ -303,6 +303,9 @@ pub struct GrafeoDB {
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
     overlay_admission:
         Option<Arc<grafeo_core::graph::compact::overlay_budget::OverlayAdmissionController>>,
+    /// Dual-epoch handoff coordinator (G-EM0.5c).
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    epoch_handoff: generation::EpochHandoffCoordinator,
 }
 
 impl GrafeoDB {
@@ -771,6 +774,8 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
+            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            epoch_handoff: generation::EpochHandoffCoordinator::new(),
         };
 
         // Register storage sections as memory consumers for pressure tracking
@@ -930,6 +935,8 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
+            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            epoch_handoff: generation::EpochHandoffCoordinator::new(),
         })
     }
 
@@ -1025,6 +1032,8 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
+            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            epoch_handoff: generation::EpochHandoffCoordinator::new(),
         })
     }
 
