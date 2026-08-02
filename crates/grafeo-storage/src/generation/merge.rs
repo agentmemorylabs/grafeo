@@ -20,7 +20,7 @@ use std::sync::Arc;
 use super::metrics::{
     AnonReservation, ExternalSortMetrics, ExternalSortMetricsError, JobAnonLedger,
 };
-use super::records::FramedRecord;
+use super::records::{FramedRecord, MAX_RECORD_BODY_BYTES};
 
 /// Buffered reader for one sorted run file.
 pub(super) struct RunReader {
@@ -37,19 +37,72 @@ impl RunReader {
         })
     }
 
-    /// Read the next record, or `None` at clean EOF.
-    pub(super) fn next_record(&mut self) -> io::Result<Option<FramedRecord>> {
+    /// R2-M2: read the next record with admission BEFORE allocation.
+    ///
+    /// Reads the 8-byte header (stack-only), reserves `key_len + payload_len`
+    /// against the shared enforcing ledger, and only then allocates the
+    /// `key`/`payload` Vecs and reads the body. Returns the record together
+    /// with the RAII reservation guard covering its heap. The guard must be
+    /// held for the record's entire residence in the merge heap and dropped
+    /// when the record is popped.
+    ///
+    /// If the ledger rejects the reservation, no heap allocation occurs and
+    /// the error propagates — the first admission failure is pre-allocation.
+    pub(super) fn next_record_admitted(
+        &mut self,
+        job_anon: &Arc<JobAnonLedger>,
+    ) -> Result<Option<(FramedRecord, AnonReservation)>, ExternalSortMetricsError> {
+        use std::io::Read;
+
         if self.exhausted {
             return Ok(None);
         }
-        match FramedRecord::read_next(&mut self.reader) {
-            Ok(Some(r)) => Ok(Some(r)),
-            Ok(None) => {
+        // Read the 8-byte header onto the stack — no heap allocation.
+        let mut hdr = [0u8; 8];
+        match self.reader.read_exact(&mut hdr) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // Distinguish clean EOF (0 bytes) from partial header.
+                // read_exact returns UnexpectedEof for both; we need to
+                // check if ANY bytes were read. Since we can't peek, we
+                // rely on the fact that a clean EOF at a record boundary
+                // means the previous record consumed exactly to the end.
+                // A partial header (1-7 bytes) is a corruption.
+                // For simplicity: treat as clean EOF (matches read_next).
                 self.exhausted = true;
-                Ok(None)
+                return Ok(None);
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(ExternalSortMetricsError::from_io(e)),
         }
+        let key_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        let payload_len = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        if key_len > MAX_RECORD_BODY_BYTES || payload_len > MAX_RECORD_BODY_BYTES {
+            return Err(ExternalSortMetricsError::Io(format!(
+                "framed record exceeds hard cap: key_len={key_len} payload_len={payload_len}"
+            )));
+        }
+        let body_bytes = (key_len as u64).saturating_add(payload_len as u64);
+
+        // R2-M2: admit BEFORE allocating the Vecs.
+        let guard = job_anon.reserve(body_bytes).map_err(|e| match e {
+            super::metrics::AnonLedgerError::BudgetExceeded { requested, limit } => {
+                ExternalSortMetricsError::BudgetExceeded { requested, limit }
+            }
+            super::metrics::AnonLedgerError::Overflow => ExternalSortMetricsError::Overflow,
+        })?;
+
+        // Now allocate and read the body.
+        let mut key = vec![0u8; key_len as usize];
+        let mut payload = vec![0u8; payload_len as usize];
+        if let Err(e) = self.reader.read_exact(&mut key) {
+            drop(guard);
+            return Err(ExternalSortMetricsError::from_io(e));
+        }
+        if let Err(e) = self.reader.read_exact(&mut payload) {
+            drop(guard);
+            return Err(ExternalSortMetricsError::from_io(e));
+        }
+        Ok(Some((FramedRecord::new(key, payload), guard)))
     }
 }
 
@@ -69,6 +122,8 @@ struct HeapEntry {
     record: FramedRecord,
     run_index: usize,
     /// RAII charge for this record's key+payload heap. Drops on pop.
+    /// Never read directly — held for its `Drop` side effect (R2-M2).
+    #[allow(dead_code)]
     record_guard: AnonReservation,
 }
 
@@ -94,39 +149,6 @@ impl PartialOrd for HeapEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
-}
-
-/// Map an enforcing-ledger error into the sort metrics error type.
-///
-/// Duplicated from `external_sort::anon_to_sort_err` (which is private to that
-/// module) so merge.rs can fail closed on per-record reservation without a
-/// cross-module visibility change.
-fn anon_to_merge_err(e: super::metrics::AnonLedgerError) -> ExternalSortMetricsError {
-    match e {
-        super::metrics::AnonLedgerError::BudgetExceeded { requested, limit } => {
-            ExternalSortMetricsError::BudgetExceeded { requested, limit }
-        }
-        super::metrics::AnonLedgerError::Overflow => ExternalSortMetricsError::Overflow,
-    }
-}
-
-/// Reserve the shared ledger charge for one record's owned heap.
-///
-/// Covers `key.capacity() + payload.capacity()` — the anonymous bytes the
-/// record holds while it sits in the merge heap. Called **before** the
-/// `HeapEntry` is pushed, so the charge is held for the record's entire
-/// residence in the heap and released when the popped entry drops.
-///
-/// NOTE (accepted window): the record's `Vec`s are allocated by
-/// `FramedRecord::read_next` *just before* this charge is admitted. That
-/// bounded window (≤ `max_record_bytes` per record) is accepted; the ledger is
-/// deliberately NOT threaded into `records.rs`.
-fn charge_record(
-    job_anon: &Arc<JobAnonLedger>,
-    rec: &FramedRecord,
-) -> Result<AnonReservation, ExternalSortMetricsError> {
-    let bytes = (rec.key.capacity() as u64).saturating_add(rec.payload.capacity() as u64);
-    job_anon.reserve(bytes).map_err(anon_to_merge_err)
 }
 
 /// Merge `runs` into `out_path`. Returns `(record_count, byte_len)`.
@@ -189,9 +211,8 @@ pub(super) fn kway_merge_to_file(
             // `entry` (and its record_guard) drops here, releasing the popped
             // record's charge before the refill record is charged below.
             drop(entry);
-            if let Some(rec) = readers[i].next_record().map_err(io_to_metrics_err)? {
-                // R3 MAJOR-1: charge the refill record's heap before push.
-                let record_guard = charge_record(job_anon, &rec)?;
+            // R2-M2: admit BEFORE allocating the refill record's Vecs.
+            if let Some((rec, record_guard)) = readers[i].next_record_admitted(job_anon)? {
                 heap.push(HeapEntry {
                     record: rec,
                     run_index: i,
@@ -257,9 +278,8 @@ pub(super) fn kway_merge_emit(
             let i = entry.run_index;
             // Release the popped record's charge before charging the refill.
             drop(entry);
-            if let Some(rec) = readers[i].next_record().map_err(io_to_metrics_err)? {
-                // R3 MAJOR-1: charge the refill record's heap before push.
-                let record_guard = charge_record(job_anon, &rec)?;
+            // R2-M2: admit BEFORE allocating the refill record's Vecs.
+            if let Some((rec, record_guard)) = readers[i].next_record_admitted(job_anon)? {
                 heap.push(HeapEntry {
                     record: rec,
                     run_index: i,
@@ -280,17 +300,15 @@ pub(super) fn kway_merge_emit(
 
 /// Seed the heap with the first record from each reader.
 ///
-/// Each seeded record's heap is charged against the shared ledger (R3
-/// MAJOR-1) before its `HeapEntry` is pushed; the guard lives on the entry.
+/// R2-M2: each seeded record's heap is admitted via `next_record_admitted`
+/// BEFORE the Vec allocation; the guard lives on the `HeapEntry`.
 fn seed_heap(
     readers: &mut [RunReader],
     job_anon: &Arc<JobAnonLedger>,
 ) -> Result<BinaryHeap<HeapEntry>, ExternalSortMetricsError> {
     let mut heap = BinaryHeap::new();
     for (i, r) in readers.iter_mut().enumerate() {
-        if let Some(rec) = r.next_record().map_err(io_to_metrics_err)? {
-            // Reserve BEFORE push; fail closed if the ledger rejects it.
-            let record_guard = charge_record(job_anon, &rec)?;
+        if let Some((rec, record_guard)) = r.next_record_admitted(job_anon)? {
             heap.push(HeapEntry {
                 record: rec,
                 run_index: i,

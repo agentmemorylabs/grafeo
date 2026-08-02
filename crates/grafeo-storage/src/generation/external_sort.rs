@@ -181,27 +181,41 @@ impl DiskRunSink {
         // --- R2: reserve BEFORE allocation ---
         // Predict backing-array growth. Vec doubles capacity when len == cap.
         let old_cap = self.arena.capacity() as u64;
+        let old_len = self.arena.len();
         let predicted_cap = if self.arena.len() == self.arena.capacity() {
             old_cap.saturating_mul(2).max(4)
         } else {
             old_cap
         };
+        // R2-M3: add one extra element of headroom so the post-reserve
+        // reconciliation grow() can never be the FIRST admission failure.
+        // The pre-charge covers predicted growth + rounding headroom; the
+        // post-reserve grow() only reconciles actual vs predicted (accuracy),
+        // never gates admission for the first time.
         let backing_delta = predicted_cap
             .saturating_sub(old_cap)
+            .saturating_add(1) // allocator rounding headroom
             .saturating_mul(std::mem::size_of::<FramedRecord>() as u64);
         let heap_delta =
             (record.key.capacity() as u64).saturating_add(record.payload.capacity() as u64);
         let total_delta = backing_delta.saturating_add(heap_delta);
 
-        // R2: flush based on ACTUAL ledger charge (guard bytes), not logical
-        // arena_bytes. Vec doubling means a "64 MiB" arena can charge ~128 MiB;
-        // two concurrent sinks would blow the enforcing limit. Flushing at
-        // sort_run_bytes / 2 per sink coordinates concurrent sinks inside the
-        // locked max_anon_bytes profile (R2 packet: "coordinate concurrently
-        // live 64 MiB sort arenas inside the locked 128 MiB profile").
-        let flush_threshold = self.budget.sort_run_bytes / 2;
+        // R2-B1: flush based on the CONFIGURED sort_run_bytes — true 64 MiB
+        // arena semantics. Concurrent arenas are coordinated by the shared
+        // enforcing JobAnonLedger (max_anon_bytes = 128 MiB under the
+        // acceptance profile), NOT by halving the per-sink flush threshold.
+        // Two coordination triggers:
+        //   1. Per-sink: this sink's charge exceeds sort_run_bytes → flush.
+        //   2. Whole-job: the job ledger current + this growth would exceed
+        //      max_anon_bytes → flush this sink to make room (admission
+        //      coordination via the shared ledger).
+        let flush_threshold = self.budget.sort_run_bytes;
         let current_charge = self.anon_guard.as_ref().map_or(0, AnonReservation::bytes);
-        if current_charge > 0 && current_charge.saturating_add(total_delta) > flush_threshold {
+        let job_current = self.job_anon.current();
+        if (current_charge > 0
+            && current_charge.saturating_add(total_delta) > flush_threshold)
+            || job_current.saturating_add(total_delta) > self.budget.max_anon_bytes
+        {
             self.flush_run()?;
         }
 
@@ -226,6 +240,10 @@ impl DiskRunSink {
         self.arena.reserve(1);
 
         // Reconcile: actual capacity may exceed prediction (allocator rounding).
+        // R2-M3: this grow() is a reconciliation of allocator rounding AFTER a
+        // successful pre-charge that includes rounding headroom. It can only
+        // fail if the allocator exceeded the headroom — in that case we undo
+        // the allocation and propagate the error (first fail was pre-charge).
         let actual_backing = (self.arena.capacity() as u64)
             .saturating_mul(std::mem::size_of::<FramedRecord>() as u64);
         let actual_heap = self.heap_bytes_total.saturating_add(heap_delta);
@@ -236,7 +254,14 @@ impl DiskRunSink {
         if actual_total > predicted_total {
             let extra = actual_total - predicted_total;
             if let Some(guard) = &mut self.anon_guard {
-                guard.grow(extra).map_err(anon_to_sort_err)?;
+                if let Err(e) = guard.grow(extra) {
+                    // Undo the allocation: truncate back to old length.
+                    // The pre-charged reservation covers the predicted amount;
+                    // the extra was never successfully charged.
+                    self.arena.truncate(old_len);
+                    self.metrics.release_anon(total_delta);
+                    return Err(anon_to_sort_err(e));
+                }
             }
             self.metrics
                 .reserve_anon(extra, self.budget.max_anon_bytes)?;

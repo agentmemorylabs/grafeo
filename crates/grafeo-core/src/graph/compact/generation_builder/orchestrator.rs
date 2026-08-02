@@ -199,6 +199,45 @@ impl BoundedGenerationBuilder {
         }
     }
 
+    /// R2-M5: verify ALL resource categories have zero current charges at
+    /// build exit. Categories: anonymous (job ledger), temp, schema, mapped.
+    /// Run/chunk files are charged as temp; spool/copy buffers, merge I/O,
+    /// and generated-output zone maps are charged as anon. Every category
+    /// must reconcile to zero on success, typed failure, cancellation, and
+    /// final lease drop — never silent leftovers.
+    fn verify_all_categories_zero(&self) -> Result<(), GenerationError> {
+        let snap = self.job_anon.snapshot();
+        if snap.current != 0 {
+            return Err(GenerationError::BudgetExceeded {
+                counter: "max_anon_bytes",
+                requested: snap.current,
+                limit: 0,
+            });
+        }
+        if self.metrics.temp_bytes_current != 0 {
+            return Err(GenerationError::BudgetExceeded {
+                counter: "temp_bytes",
+                requested: self.metrics.temp_bytes_current,
+                limit: 0,
+            });
+        }
+        if self.metrics.schema_bytes_current != 0 {
+            return Err(GenerationError::BudgetExceeded {
+                counter: "max_schema_bytes",
+                requested: self.metrics.schema_bytes_current,
+                limit: 0,
+            });
+        }
+        if self.metrics.mapped_bytes_current != 0 {
+            return Err(GenerationError::BudgetExceeded {
+                counter: "mapped_bytes",
+                requested: self.metrics.mapped_bytes_current,
+                limit: 0,
+            });
+        }
+        Ok(())
+    }
+
     /// R2: verify the enforcing ledger has zero current charges at build exit.
     /// All RAII guards (spool buffers, block zone maps) must have been dropped.
     /// The run store's sinks release via their own guards on flush/cleanup.
@@ -625,7 +664,25 @@ impl BoundedGenerationBuilder {
         // dropped here. (On a failure path above, `spool_guards` would instead
         // drop via RAII at build() exit — no zero-assertion there.)
         spool_guards.clear();
-        self.verify_zero_charges()?;
+
+        // R2-M5: release ALL resource categories on the success path so the
+        // multi-category snapshot verifies zero. Run/chunk temp was charged
+        // for id_index_lease + occ_lease handles; schema was charged for
+        // node_schema + rel_keys + schema_strings + geometries; mapped was
+        // charged for the ID index mmap. All are consumed/dropped by now.
+        // The ID index file temp charge equals its mapped length (same file).
+        let id_index_bytes = id_index.byte_len() as u64;
+        self.metrics.release_temp(id_run_temp);
+        self.metrics.release_temp(occ_temp);
+        self.metrics.release_temp(id_index_bytes);
+        self.metrics.release_schema(schema_charge);
+        self.metrics.release_schema(rel_schema_charge);
+        self.metrics.release_schema(schema_strings_charge);
+        self.metrics.release_schema(geo_charge);
+        self.metrics.release_mapped(id_index_bytes);
+
+        // R2-M5: verify ALL categories (anon, temp, schema, mapped) are zero.
+        self.verify_all_categories_zero()?;
 
         job_temp.disarm();
         Ok(lease)
@@ -877,6 +934,34 @@ impl BoundedGenerationBuilder {
         // DictValue chunk file (schema-scoped key codes come from
         // `schema_strings`); each builder reads the file sequentially in
         // column order, one column's map at a time.
+        //
+        // R2-M4: the output `table_zm`/`block_zm` Vecs are graph-proportional
+        // (block zone maps scale with row count). While they're built, the
+        // source `col_result.columns[].block_zone_maps` are still live and
+        // already charged via `zone_map_guards`. Charge the OUTPUT vectors
+        // BEFORE building so the dual-live overlap is admitted by the ledger.
+        let table_zm_predicted = (geometries.len() as u64)
+            .saturating_mul(crate::graph::compact::mapped::ZONE_MAP_RECORD_LEN as u64);
+        let block_zm_predicted: u64 = col_result
+            .columns
+            .iter()
+            .map(|c| {
+                (c.block_zone_maps.len() as u64)
+                    .saturating_mul(crate::graph::compact::mapped::ZONE_MAP_RECORD_LEN as u64)
+            })
+            .sum();
+        let zm_output_total = table_zm_predicted.saturating_add(block_zm_predicted);
+        let zm_output_guard = if zm_output_total > 0 {
+            Some(self.job_anon.reserve(zm_output_total).map_err(|_| {
+                GenerationError::BudgetExceeded {
+                    counter: "max_anon_bytes",
+                    requested: zm_output_total,
+                    limit: self.config.budget.max_anon_bytes,
+                }
+            })?)
+        } else {
+            None
+        };
         let table_zm = {
             let mut catalog = DictChunkCatalog::open(catalog_path, temp_dir)?;
             build_table_zone_maps(geometries, schema_strings, &mut catalog)?
@@ -890,6 +975,10 @@ impl BoundedGenerationBuilder {
                 &mut catalog,
             )?
         };
+        // R2-M4: reconcile actual vs predicted (output may be smaller if some
+        // columns have no zone maps). Release the guard; the Vecs are about to
+        // be consumed by make_resident_desc and dropped.
+        drop(zm_output_guard);
         // Catalog + per-column `.dict` files are intermediates; remove the
         // catalog now (`.dict` files are removed with the job temp dir).
         let _ = std::fs::remove_file(catalog_path);

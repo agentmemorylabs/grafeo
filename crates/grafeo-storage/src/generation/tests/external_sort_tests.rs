@@ -398,3 +398,240 @@ fn single_run_no_merge_needed() {
     sink.cleanup();
     merger.cleanup();
 }
+
+// ── R2 adversarial tests ──────────────────────────────────────────────────
+
+/// R2-B1: effective flush threshold must equal configured `sort_run_bytes`,
+/// NOT `sort_run_bytes / 2`. With a tiny budget, push records and assert no
+/// flush fires while the arena charge is below `sort_run_bytes` (i.e. the
+/// threshold was not halved).
+#[test]
+fn r2_b1_flush_threshold_equals_configured_sort_run_bytes() {
+    let dir = tempdir().unwrap();
+    // sort_run_bytes = 512. Each record charges ~64 bytes (48 struct + 16
+    // heap). After 4 pushes the charge is ~448 (below 512). With the OLD
+    // halved threshold (256), a flush would fire at push 1 (charge 320 > 256).
+    // With the TRUE threshold (512), no flush fires until push 4 (charge 704).
+    let budget = small_budget(512, 4);
+    let ledger = job_ledger();
+    let mut sink =
+        DiskRunSink::new(dir.path().join("runs"), budget, "b1", Arc::clone(&ledger)).unwrap();
+
+    let mut flush_count_at_4 = 0u64;
+    for i in 0..8u32 {
+        sink.push(FramedRecord::new(
+            format!("{i:08}").into_bytes(),
+            vec![i as u8; 8],
+        ))
+        .unwrap();
+        // After 4 pushes the arena charge is ~448 (below 512, above 256).
+        // With the halved threshold a flush would have fired by now.
+        if i == 3 {
+            flush_count_at_4 = sink.metrics().run_count;
+        }
+    }
+    let runs = sink.finish().unwrap();
+
+    // With the TRUE 512 threshold, no flush should have fired by push 3
+    // (arena charge ~448 < 512). With the halved 256 threshold, at least
+    // one flush would have fired by push 1.
+    assert_eq!(
+        flush_count_at_4, 0,
+        "R2-B1: flush fired at ~448 bytes with sort_run_bytes=512 — threshold was halved!"
+    );
+    assert!(
+        runs.len() <= 3,
+        "R2-B1: too many runs ({}) — threshold may be halved",
+        runs.len()
+    );
+    sink.cleanup();
+}
+
+/// R2-M3: a budget-exceeded error must occur BEFORE `Vec::reserve` grows
+/// anonymous memory. With a tiny anon limit, the first push that would
+/// exceed the limit must fail at the pre-charge step, not post-reserve.
+#[test]
+fn r2_m3_admission_fails_before_vec_reserve() {
+    let dir = tempdir().unwrap();
+    // Tiny anon limit: 100 bytes. First record's predicted growth will
+    // exceed this, so the pre-charge must reject it.
+    let budget = ExternalSortBudget {
+        max_anon_bytes: 100,
+        max_temp_bytes: 64 * 1024 * 1024,
+        sort_run_bytes: 64 * 1024,
+        io_buffer_bytes: 4096,
+        merge_fan_in: 4,
+        max_record_bytes: 8 * 1024 * 1024,
+    };
+    let ledger = Arc::new(JobAnonLedger::new(100));
+    let mut sink =
+        DiskRunSink::new(dir.path().join("runs"), budget, "m3", Arc::clone(&ledger)).unwrap();
+
+    // The first push should fail at pre-charge (predicted growth > 100).
+    let result = sink.push(FramedRecord::new(
+        b"key".to_vec(),
+        b"payload".to_vec(),
+    ));
+    assert!(
+        result.is_err(),
+        "R2-M3: push should fail at pre-charge with 100-byte anon limit"
+    );
+    // The ledger must NOT have been charged (pre-charge failed).
+    assert_eq!(
+        ledger.current(),
+        0,
+        "R2-M3: ledger charged despite pre-charge failure"
+    );
+    sink.cleanup();
+}
+
+/// R2-M2: merge heap seed/refill must admit BEFORE allocating record Vecs.
+/// With a tiny anon limit that allows I/O buffers but not record heap, the
+/// merge must fail at admission, not after allocation.
+#[test]
+fn r2_m2_merge_admits_before_allocation() {
+    let dir = tempdir().unwrap();
+    let budget = small_budget(1024, 4);
+    let ledger = Arc::new(JobAnonLedger::new(64 * 1024 * 1024));
+
+    // First, create a run with some records.
+    let mut sink = DiskRunSink::new(
+        dir.path().join("runs"),
+        budget,
+        "m2",
+        Arc::clone(&ledger),
+    )
+    .unwrap();
+    for i in 0..5u32 {
+        sink.push(FramedRecord::new(
+            format!("{i:04}").into_bytes(),
+            vec![i as u8],
+        ))
+        .unwrap();
+    }
+    let runs = sink.finish().unwrap();
+    sink.cleanup();
+
+    // Now merge with a ledger that has only enough for I/O buffers but NOT
+    // for record heap. I/O = 2 * io_buffer_bytes (1 reader + 1 writer).
+    // With io_buffer_bytes=4096, I/O = 8192. Set limit to 8192 + 1 so I/O
+    // fits but the first record's heap (key+payload ~12 bytes) does not.
+    let tight_ledger = Arc::new(JobAnonLedger::new(8192 + 1));
+    let mut merger = DiskRunMerger::new(
+        dir.path().join("merge"),
+        budget,
+        "m2",
+        Arc::clone(&tight_ledger),
+    )
+    .unwrap();
+    let mut metrics = ExternalSortMetrics::default();
+    let result = merge_runs_recursive(&mut merger, &runs, &mut metrics, None, &mut |_| Ok(()));
+    // The merge should fail because the record heap cannot be admitted.
+    assert!(
+        result.is_err(),
+        "R2-M2: merge should fail when record heap cannot be admitted"
+    );
+    // The tight ledger must be back to zero (I/O guard dropped on error).
+    assert_eq!(
+        tight_ledger.current(),
+        0,
+        "R2-M2: ledger not reconciled after merge failure"
+    );
+    merger.cleanup();
+}
+
+/// R2-M5 (storage-side): after a successful sink+merge cycle, the shared
+/// job ledger must have zero current charges.
+#[test]
+fn r2_m5_storage_ledger_zero_after_success() {
+    let dir = tempdir().unwrap();
+    let budget = small_budget(1024, 4);
+    let ledger = job_ledger();
+    let mut sink = DiskRunSink::new(
+        dir.path().join("runs"),
+        budget,
+        "m5",
+        Arc::clone(&ledger),
+    )
+    .unwrap();
+    for i in 0..10u32 {
+        sink.push(FramedRecord::new(
+            format!("{i:04}").into_bytes(),
+            vec![i as u8],
+        ))
+        .unwrap();
+    }
+    let runs = sink.finish().unwrap();
+
+    let mut merger = DiskRunMerger::new(
+        dir.path().join("merge"),
+        budget,
+        "m5",
+        Arc::clone(&ledger),
+    )
+    .unwrap();
+    let mut metrics = ExternalSortMetrics::default();
+    merge_runs_recursive(&mut merger, &runs, &mut metrics, None, &mut |_| Ok(())).unwrap();
+
+    // After success, the shared ledger must be zero.
+    assert_eq!(
+        ledger.current(),
+        0,
+        "R2-M5: shared ledger has nonzero current after successful merge"
+    );
+    sink.cleanup();
+    merger.cleanup();
+}
+
+/// R2-M5 (storage-side): after a cancelled merge, the shared ledger must
+/// have zero current charges.
+#[test]
+fn r2_m5_storage_ledger_zero_after_cancel() {
+    let dir = tempdir().unwrap();
+    let budget = small_budget(1024, 4);
+    let ledger = job_ledger();
+    let mut sink = DiskRunSink::new(
+        dir.path().join("runs"),
+        budget,
+        "m5c",
+        Arc::clone(&ledger),
+    )
+    .unwrap();
+    for i in 0..10u32 {
+        sink.push(FramedRecord::new(
+            format!("{i:04}").into_bytes(),
+            vec![i as u8],
+        ))
+        .unwrap();
+    }
+    let runs = sink.finish().unwrap();
+
+    let cancel = CancelToken::new();
+    cancel.cancel(); // cancel before merge starts
+
+    let mut merger = DiskRunMerger::new(
+        dir.path().join("merge"),
+        budget,
+        "m5c",
+        Arc::clone(&ledger),
+    )
+    .unwrap();
+    let mut metrics = ExternalSortMetrics::default();
+    let result = merge_runs_recursive(
+        &mut merger,
+        &runs,
+        &mut metrics,
+        Some(&cancel),
+        &mut |_| Ok(()),
+    );
+    assert!(result.is_err(), "cancelled merge must fail");
+
+    // After cancellation, the shared ledger must be zero.
+    assert_eq!(
+        ledger.current(),
+        0,
+        "R2-M5: shared ledger has nonzero current after cancelled merge"
+    );
+    sink.cleanup();
+    merger.cleanup();
+}

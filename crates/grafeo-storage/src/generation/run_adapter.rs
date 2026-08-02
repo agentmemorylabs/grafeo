@@ -64,20 +64,17 @@ fn map_err(e: ExternalSortMetricsError) -> GenerationError {
     }
 }
 
-/// Clone a core [`SortRecord`] into a storage [`FramedRecord`].
+/// Convert a core [`SortRecord`] into a storage [`FramedRecord`].
 ///
-/// # R3 (MAJOR-4): accepted bounded clone window
+/// # R2-M1: no clone before admission
 ///
-/// This clones `key`/`payload` into fresh `Vec`s (heap allocated) *before*
-/// `DiskRunSink::push` admits them. That is an accepted bounded window: the
-/// clone is ≤ `max_record_bytes` (8 MiB under the acceptance profile) and is
-/// admitted immediately in `DiskRunSink::push`, which computes
-/// `heap_delta = record.key.capacity() + record.payload.capacity()` and
-/// reserves it against the shared enforcing ledger **before** `arena.reserve(1)`
-/// (see external_sort.rs `push`). No second charge is added here — that would
-/// double-count. This is the same accepted class as MAJOR-1's read window.
-fn to_framed(r: &SortRecord) -> FramedRecord {
-    FramedRecord::new(r.key.clone(), r.payload.clone())
+/// Takes `SortRecord` by value and **moves** the owned `key`/`payload`
+/// `Vec<u8>`s into the `FramedRecord` — zero allocation. The previous
+/// implementation cloned both Vecs (heap-allocating up to `max_record_bytes`)
+/// *before* `DiskRunSink::push` admitted them against the enforcing ledger.
+/// Moving the Vecs means no anonymous bytes are allocated before admission.
+fn to_framed(r: SortRecord) -> FramedRecord {
+    FramedRecord::new(r.key, r.payload)
 }
 
 fn to_handle(h: &super::external_sort::RunHandle) -> ExternalRunHandle {
@@ -217,7 +214,8 @@ impl ExternalRunSink for DiskSinkAdapter {
             .inner
             .as_mut()
             .ok_or_else(|| GenerationError::InvalidInput("push after finish".into()))?;
-        sink.push(to_framed(&record)).map_err(map_err)
+        // R2-M1: move the record's owned Vecs — no clone before admission.
+        sink.push(to_framed(record)).map_err(map_err)
     }
 
     fn finish(&mut self) -> Result<RunSetLease, GenerationError> {
