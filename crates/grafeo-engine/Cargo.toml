@@ -153,7 +153,7 @@ required-features = ["generation-streaming", "compact-store"]
 
 [[test]]
 name = "compact_store_source_true_outer"
-path = "tests/compact_store_source_true_outer.rs"
+path = "tests/compact_store_source_true_outer/main.rs"
 required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
 
 [[test]]

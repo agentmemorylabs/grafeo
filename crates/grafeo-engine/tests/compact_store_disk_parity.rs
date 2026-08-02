@@ -44,8 +44,7 @@ fn golden_fixture(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../grafeo-core/tests/golden/gem0_5b")
         .join(format!("{name}.v5"));
-    std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("read golden fixture {}: {e}", path.display()))
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden fixture {}: {e}", path.display()))
 }
 
 fn disk_run_store_payload(input: &GenerationInput, tmp: &TempDir, job: &str) -> Vec<u8> {
@@ -62,7 +61,11 @@ fn disk_run_store_payload(input: &GenerationInput, tmp: &TempDir, job: &str) -> 
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut run_store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut run_store,
+        )
         .expect("bounded build");
     let mut payload = Vec::new();
     lease.stream_to(&mut payload).expect("stream_to");
@@ -79,7 +82,10 @@ fn disk_run_store_byte_parity_with_golden() {
     let golden = golden_fixture("parity_dense");
 
     assert_eq!(golden.len(), bounded.len(), "payload length mismatch");
-    assert_eq!(golden, bounded, "DiskRunStore payload != golden parity_dense");
+    assert_eq!(
+        golden, bounded,
+        "DiskRunStore payload != golden parity_dense"
+    );
 }
 
 #[test]
@@ -89,7 +95,10 @@ fn disk_run_store_two_job_determinism() {
     let payload_a = disk_run_store_payload(&input, &tmp, "job-a");
     let payload_b = disk_run_store_payload(&input, &tmp, "job-b");
 
-    assert_eq!(payload_a, payload_b, "two job dirs must yield identical payloads");
+    assert_eq!(
+        payload_a, payload_b,
+        "two job dirs must yield identical payloads"
+    );
 
     let hash_a = crc32fast::hash(&payload_a);
     let hash_b = crc32fast::hash(&payload_b);

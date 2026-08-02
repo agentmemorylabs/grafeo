@@ -54,7 +54,14 @@ impl V5PayloadLease {
         preserves_ids: bool,
         metrics: GenerationMetrics,
     ) -> Self {
-        Self::with_temp_dir(descriptors, total_nodes, total_edges, preserves_ids, metrics, None)
+        Self::with_temp_dir(
+            descriptors,
+            total_nodes,
+            total_edges,
+            preserves_ids,
+            metrics,
+            None,
+        )
     }
 
     /// Creates a lease that owns the job temp directory for RAII cleanup.
@@ -72,8 +79,7 @@ impl V5PayloadLease {
         metrics: GenerationMetrics,
         temp_dir: Option<PathBuf>,
     ) -> Self {
-        let layout_flags =
-            V5PayloadAssembler::layout_flags_from_descriptors(&descriptors);
+        let layout_flags = V5PayloadAssembler::layout_flags_from_descriptors(&descriptors);
         let assembler = V5PayloadAssembler::new(total_nodes, total_edges, preserves_ids)
             .with_layout_flags(layout_flags);
         Self {

@@ -68,13 +68,12 @@ pub fn emit_membership_segment(
                     original_id
                 ))
             })?;
-            let offset = u32::try_from(dense_offset).map_err(|_| {
-                GenerationError::WireWidthOverflow {
+            let offset =
+                u32::try_from(dense_offset).map_err(|_| GenerationError::WireWidthOverflow {
                     what: "membership_node_offset",
                     count: dense_offset,
                     max: u64::from(u32::MAX),
-                }
-            })?;
+                })?;
 
             for label in logical_labels {
                 let label_code = schema_strings.get(&label).copied().ok_or_else(|| {

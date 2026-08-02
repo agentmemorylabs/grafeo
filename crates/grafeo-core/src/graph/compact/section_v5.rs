@@ -170,7 +170,9 @@ pub fn serialize_v5_with_string_order(
         let descriptors = emit_canonical_descriptors(store, &string_index, &str_refs)
             .map_err(|e| e.to_string())?;
         let assembler = V5PayloadAssembler::new(total_nodes, total_edges, store.preserves_ids())
-            .with_layout_flags(V5PayloadAssembler::layout_flags_from_descriptors(&descriptors));
+            .with_layout_flags(V5PayloadAssembler::layout_flags_from_descriptors(
+                &descriptors,
+            ));
         return assembler.assemble(&descriptors).map_err(|e| e.to_string());
     }
 
@@ -484,9 +486,15 @@ pub fn serialize_v5_with_string_order(
     let directory_crc = crc32fast::hash(&dir_bytes);
 
     let layout_flags = layout_flags::from_companion_segments(
-        segments.iter().any(|(k, ..)| *k == SegmentKind::NodeLabelMembership),
-        segments.iter().any(|(k, ..)| *k == SegmentKind::ColumnRowPresence),
-        segments.iter().any(|(k, ..)| *k == SegmentKind::ColumnRowNull),
+        segments
+            .iter()
+            .any(|(k, ..)| *k == SegmentKind::NodeLabelMembership),
+        segments
+            .iter()
+            .any(|(k, ..)| *k == SegmentKind::ColumnRowPresence),
+        segments
+            .iter()
+            .any(|(k, ..)| *k == SegmentKind::ColumnRowNull),
     );
 
     let mut out = Vec::with_capacity((data_offset as usize) + data_bytes.len() + 4);
@@ -773,7 +781,14 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
         let rel_zm = rel_table_zone_maps.get(rid).cloned().unwrap_or_default();
         let rel_bzm = rel_block_zone_maps.get(rid).cloned().unwrap_or_default();
         let table = RelTable::with_zone_maps(
-            schema, fwd, bwd, properties, rec.src_tid, rec.dst_tid, rel_zm, rel_bzm,
+            schema,
+            fwd,
+            bwd,
+            properties,
+            rec.src_tid,
+            rec.dst_tid,
+            rel_zm,
+            rel_bzm,
         );
         let et = ArcStr::from(rt_meta.edge_type.as_str());
         edge_type_to_rel_id

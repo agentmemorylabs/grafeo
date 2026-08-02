@@ -122,7 +122,12 @@ impl<'a> EdgePass<'a> {
         use grafeo_common::utils::hash::FxHashMap;
         let decl_map: FxHashMap<String, (String, String)> = rel_decls
             .iter()
-            .map(|d| (d.edge_type.clone(), (d.src_label.clone(), d.dst_label.clone())))
+            .map(|d| {
+                (
+                    d.edge_type.clone(),
+                    (d.src_label.clone(), d.dst_label.clone()),
+                )
+            })
             .collect();
         let mut total = 0u64;
         edge_merger.merge_all(

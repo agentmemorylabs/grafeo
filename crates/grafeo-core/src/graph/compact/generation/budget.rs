@@ -205,14 +205,13 @@ impl GenerationMetrics {
     ///
     /// [`GenerationError::BudgetExceeded`] when the reservation would cross the limit.
     pub fn reserve_mapped(&mut self, bytes: u64, limit: u64) -> Result<(), GenerationError> {
-        let next = self
-            .mapped_bytes_current
-            .checked_add(bytes)
-            .ok_or(GenerationError::BudgetExceeded {
+        let next = self.mapped_bytes_current.checked_add(bytes).ok_or(
+            GenerationError::BudgetExceeded {
                 counter: "mapped_bytes",
                 requested: bytes,
                 limit,
-            })?;
+            },
+        )?;
         if next > limit {
             return Err(GenerationError::BudgetExceeded {
                 counter: "mapped_bytes",

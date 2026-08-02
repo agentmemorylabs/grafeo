@@ -3,7 +3,7 @@
 #![cfg(feature = "generation-streaming")]
 
 use crate::graph::compact::generation::{
-    GenerationBudget, GenerationInput, GenerationNode, GenerationEdge, InMemoryRunStore,
+    GenerationBudget, GenerationEdge, GenerationInput, GenerationNode, InMemoryRunStore,
 };
 use crate::graph::compact::generation_builder::orchestrator::{
     BoundedBuildConfig, BoundedGenerationBuilder,
@@ -42,24 +42,23 @@ fn orchestrator_produces_deserializable_payload() {
                 .with_prop("name", "Bob")
                 .with_prop("age", Value::Int64(25)),
         )
-        .node(
-            GenerationNode::new(100u64, "Project")
-                .with_prop("title", "Grafeo"),
-        )
+        .node(GenerationNode::new(100u64, "Project").with_prop("title", "Grafeo"))
         .edge(GenerationEdge::new(10u64, 1u64, 2u64, "KNOWS"))
         .edge(GenerationEdge::new(11u64, 1u64, 100u64, "WORKS_ON"));
 
     let mut store = InMemoryRunStore::new();
     let mut builder = BoundedGenerationBuilder::new(config(tmp.path()));
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect("build");
 
     // Stream the payload.
     let mut payload = Vec::new();
-    lease
-        .stream_to(&mut payload)
-        .expect("stream_to");
+    lease.stream_to(&mut payload).expect("stream_to");
 
     // Deserialize.
     let bytes = bytes::Bytes::from(payload);
@@ -88,7 +87,11 @@ fn orchestrator_sparse_columns() {
     let mut store = InMemoryRunStore::new();
     let mut builder = BoundedGenerationBuilder::new(config(tmp.path()));
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect("build");
 
     let mut payload = Vec::new();
@@ -117,7 +120,11 @@ fn orchestrator_multi_label_membership_round_trip() {
     let mut store = InMemoryRunStore::new();
     let mut builder = BoundedGenerationBuilder::new(config(tmp.path()));
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect("build");
 
     let mut payload = Vec::new();
@@ -138,7 +145,10 @@ fn orchestrator_multi_label_membership_round_trip() {
     let n1 = compact.get_node(NodeId::new(1)).expect("node 1");
     let labels: Vec<String> = n1.labels.iter().map(|l| l.to_string()).collect();
     assert!(labels.contains(&"Person".to_string()), "labels: {labels:?}");
-    assert!(labels.contains(&"Employee".to_string()), "labels: {labels:?}");
+    assert!(
+        labels.contains(&"Employee".to_string()),
+        "labels: {labels:?}"
+    );
 
     // all_labels is the union of logical labels.
     let all = compact.all_labels();
@@ -157,7 +167,11 @@ fn orchestrator_three_label_membership_round_trip() {
     let mut store = InMemoryRunStore::new();
     let mut builder = BoundedGenerationBuilder::new(config(tmp.path()));
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect("build");
 
     let mut payload = Vec::new();
@@ -192,7 +206,11 @@ fn bounded_payload(input: &GenerationInput, temp: &std::path::Path) -> Vec<u8> {
     let mut store = InMemoryRunStore::new();
     let mut builder = BoundedGenerationBuilder::new(config(temp));
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect("bounded build");
     let mut payload = Vec::new();
     lease.stream_to(&mut payload).expect("stream_to");
@@ -256,8 +274,7 @@ fn golden_fixture(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/gem0_5b")
         .join(format!("{name}.v5"));
-    std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("read golden fixture {}: {e}", path.display()))
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden fixture {}: {e}", path.display()))
 }
 
 /// One-time fixture generator: writes the golden payloads to
@@ -270,8 +287,7 @@ fn golden_fixture(name: &str) -> Vec<u8> {
 fn write_golden_fixtures() {
     let input = gem0_5b_parity_input();
     let eager = eager_lexicographic_payload(&input);
-    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/golden/gem0_5b");
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/gem0_5b");
     std::fs::create_dir_all(&out_dir).expect("create golden dir");
     let path = out_dir.join("parity_dense.v5");
     std::fs::write(&path, &eager).expect("write golden fixture");
@@ -296,7 +312,11 @@ fn raii_cleanup_on_success() {
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect("build");
 
     // Stream the payload (consumes spool files).
@@ -331,7 +351,11 @@ fn raii_cleanup_on_drop_without_stream() {
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect("build");
     drop(lease);
     assert!(
@@ -385,12 +409,7 @@ fn large_parity_input() -> GenerationInput {
         );
     }
     for id in 0..255u64 {
-        input = input.edge(GenerationEdge::new(
-            10_000 + id,
-            id + 1,
-            id + 2,
-            "KNOWS",
-        ));
+        input = input.edge(GenerationEdge::new(10_000 + id, id + 1, id + 2, "KNOWS"));
     }
     input
 }
@@ -415,10 +434,17 @@ fn failure_before_payload_lease_cleans_job_temp() {
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let err = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect_err("duplicate node id must fail before payload lease");
     assert!(
-        matches!(err, crate::graph::compact::generation::GenerationError::DuplicateNodeId(1)),
+        matches!(
+            err,
+            crate::graph::compact::generation::GenerationError::DuplicateNodeId(1)
+        ),
         "unexpected error: {err}"
     );
     assert_zero_job_artifacts(&build_tmp, None);
@@ -446,7 +472,11 @@ fn failure_tiny_budget_cleans_job_temp() {
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let err = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect_err("tiny budget must fail mid-build");
     assert!(
         matches!(
@@ -485,7 +515,11 @@ fn failure_cancel_mid_build_cleans_job_temp() {
     };
     let mut builder = BoundedGenerationBuilder::new(config).with_cancel(token);
     let err = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect_err("cancel mid-build must fail");
     killer.join().unwrap();
     assert!(

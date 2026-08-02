@@ -71,13 +71,11 @@ pub mod layout_flags {
     /// any companion requirement bit.
     pub fn validate(flags: u32) -> Result<(), String> {
         if flags & !KNOWN_MASK != 0 {
-            return Err(format!(
-                "v5 layout_flags unknown bits set: {flags:#010x}"
-            ));
+            return Err(format!("v5 layout_flags unknown bits set: {flags:#010x}"));
         }
         if flags & SOURCE_TRUE_EXTENDED != 0 {
-            let requires =
-                flags & (REQUIRES_LABEL_MEMBERSHIP | REQUIRES_COLUMN_PRESENCE | REQUIRES_COLUMN_NULL);
+            let requires = flags
+                & (REQUIRES_LABEL_MEMBERSHIP | REQUIRES_COLUMN_PRESENCE | REQUIRES_COLUMN_NULL);
             if requires == 0 {
                 return Err(
                     "v5 layout_flags SOURCE_TRUE_EXTENDED set without companion requirement bits"

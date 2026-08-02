@@ -393,8 +393,8 @@ pub fn build_zone_map_segments(
     }
     // R3-B2: emit relationship-table zone maps tagged with 0x8000 | rel_id.
     for (rid, rt) in store.rel_tables_by_id.iter().enumerate() {
-        let tagged_id = 0x8000u16
-            | u16::try_from(rid).map_err(|_| "rel table id overflow for zone map tag")?;
+        let tagged_id =
+            0x8000u16 | u16::try_from(rid).map_err(|_| "rel table id overflow for zone map tag")?;
         let mut keys: Vec<_> = rt.zone_maps().keys().cloned().collect();
         keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for key in &keys {

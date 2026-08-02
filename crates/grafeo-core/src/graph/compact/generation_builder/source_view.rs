@@ -215,9 +215,10 @@ impl GenerationSourceView for CompactStore {
         pos: usize,
         max_record_bytes: u64,
     ) -> Result<Option<GenerationEdge>, GenerationError> {
-        let rt = self.rel_tables_by_id.get(rel_idx).ok_or_else(|| {
-            GenerationError::InvalidInput(format!("rel_idx {rel_idx} OOB"))
-        })?;
+        let rt = self
+            .rel_tables_by_id
+            .get(rel_idx)
+            .ok_or_else(|| GenerationError::InvalidInput(format!("rel_idx {rel_idx} OOB")))?;
         if pos >= rt.num_edges() {
             return Ok(None);
         }

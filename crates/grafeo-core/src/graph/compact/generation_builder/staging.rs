@@ -81,9 +81,9 @@ pub fn decode_properties(bytes: &[u8]) -> Result<FxHashMap<PropertyKey, Value>, 
 ///
 /// Returns [`GenerationError::Codec`] on label count overflow.
 pub fn encode_labels(labels: &[String]) -> Result<Vec<u8>, GenerationError> {
-    let count = u16::try_from(labels.len()).map_err(|_| GenerationError::Codec(
-        format!("label count {} exceeds u16::MAX", labels.len())
-    ))?;
+    let count = u16::try_from(labels.len()).map_err(|_| {
+        GenerationError::Codec(format!("label count {} exceeds u16::MAX", labels.len()))
+    })?;
     let mut out = Vec::new();
     out.extend_from_slice(&count.to_le_bytes());
     for label in labels {

@@ -20,7 +20,7 @@ use crate::graph::compact::generation::emit::dict_column_lookup::DictCodeLookup;
 use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::error::GenerationError;
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
-use crate::graph::compact::zone_map::{fold_value_into_block_zone_map, ZoneMap};
+use crate::graph::compact::zone_map::{ZoneMap, fold_value_into_block_zone_map};
 use grafeo_common::types::Value;
 
 /// LSB-first bit packer with at most one open byte (presence/null companions).

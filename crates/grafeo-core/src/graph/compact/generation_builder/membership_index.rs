@@ -156,12 +156,10 @@ impl MappedLabelMembershipIndex {
     fn labels_at(&self, byte_offset: u64) -> impl Iterator<Item = &str> {
         let off = byte_offset as usize;
         // Skip original_id (8 bytes), read label_count (2 bytes).
-        let count =
-            u16::from_le_bytes(self.data[off + 8..off + 10].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(self.data[off + 8..off + 10].try_into().unwrap()) as usize;
         let mut pos = off + 10;
         (0..count).map(move |_| {
-            let llen =
-                u16::from_le_bytes(self.data[pos..pos + 2].try_into().unwrap()) as usize;
+            let llen = u16::from_le_bytes(self.data[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
             let s = std::str::from_utf8(&self.data[pos..pos + llen]).unwrap_or("");
             pos += llen;

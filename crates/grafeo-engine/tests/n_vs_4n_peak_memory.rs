@@ -9,8 +9,8 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -24,15 +24,15 @@ use grafeo_core::graph::compact::generation_builder::orchestrator::{
     BoundedBuildConfig, BoundedGenerationBuilder,
 };
 use grafeo_core::graph::compact::section::CompactStoreSection;
+use grafeo_storage::file::GrafeoFileManager;
 use grafeo_storage::file::generation_writer::{
     GenerationContainerHeader, OsGenerationFileOps, StreamingPayloadSectionSource,
 };
-use grafeo_storage::file::GrafeoFileManager;
+use grafeo_storage::generation::RssAnonSampler;
 use grafeo_storage::generation::lock::RootLock;
 use grafeo_storage::generation::publication::{PublicationInput, publish_generation};
 use grafeo_storage::generation::recovery::recover;
 use grafeo_storage::generation::run_adapter::DiskRunStore;
-use grafeo_storage::generation::RssAnonSampler;
 use grafeo_storage::wal::WalManager;
 use tempfile::TempDir;
 
@@ -242,11 +242,17 @@ fn run_isolated_scale(n: usize, root: &Path) -> ChildReport {
 
     let manager = GrafeoFileManager::open_read_only(&selected.generation_abs_path).expect("open");
     let section_dir = manager.read_section_directory().unwrap().unwrap();
-    let entry = section_dir.find(SectionType::CompactStore).expect("cs section");
+    let entry = section_dir
+        .find(SectionType::CompactStore)
+        .expect("cs section");
     // Production fresh-reopen: mmap the CompactStore section and open through
     // the mapped reader (zero-copy owner). Verifies counts — do not skip
     // deserialize to make RssAnon look flat.
-    let mmap = Arc::new(manager.mmap_section(entry).expect("mmap compact-store section"));
+    let mmap = Arc::new(
+        manager
+            .mmap_section(entry)
+            .expect("mmap compact-store section"),
+    );
     assert_eq!(mmap.section_type(), SectionType::CompactStore);
     let mapped_bytes = grafeo_storage::container::MmapSection::into_bytes(mmap);
     let mut cs = CompactStoreSection::empty();
@@ -337,9 +343,18 @@ fn n_vs_4n_peak_memory_plateau() {
 
     for report in [&report_n, &report_4n] {
         assert_eq!(report.leftover_files, 0, "leftover artifacts: {report:?}");
-        assert!(report.temp_bytes_peak > 0, "temp peak must be nonzero: {report:?}");
-        assert!(report.anon_bytes_peak > 0, "anon peak must be nonzero: {report:?}");
-        assert!(report.mapped_bytes_peak > 0, "mapped peak must be nonzero: {report:?}");
+        assert!(
+            report.temp_bytes_peak > 0,
+            "temp peak must be nonzero: {report:?}"
+        );
+        assert!(
+            report.anon_bytes_peak > 0,
+            "anon peak must be nonzero: {report:?}"
+        );
+        assert!(
+            report.mapped_bytes_peak > 0,
+            "mapped peak must be nonzero: {report:?}"
+        );
     }
 
     let payload_ratio = report_4n.payload_len as f64 / report_n.payload_len as f64;
@@ -357,7 +372,8 @@ fn n_vs_4n_peak_memory_plateau() {
     assert!(
         rss_ratio < 2.0,
         "Peak RssAnon scaled with input: {} kB -> {} kB ({rss_ratio:.2}x)",
-        report_n.peak_rss_anon_kb, report_4n.peak_rss_anon_kb
+        report_n.peak_rss_anon_kb,
+        report_4n.peak_rss_anon_kb
     );
 
     let anon_limit_kb = 128 * 1024;

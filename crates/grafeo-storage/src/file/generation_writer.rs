@@ -648,9 +648,7 @@ mod adapter {
     impl StreamingPayloadSectionSource {
         /// Wraps a payload lease.
         #[must_use]
-        pub fn new(
-            lease: grafeo_core::graph::compact::generation::emit::V5PayloadLease,
-        ) -> Self {
+        pub fn new(lease: grafeo_core::graph::compact::generation::emit::V5PayloadLease) -> Self {
             Self { lease }
         }
 

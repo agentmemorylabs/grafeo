@@ -219,7 +219,9 @@ pub fn assemble_v5_payload_from_source<S: V5SegmentSource>(
         segments
             .iter()
             .any(|s| s.kind == SegmentKind::ColumnRowPresence),
-        segments.iter().any(|s| s.kind == SegmentKind::ColumnRowNull),
+        segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::ColumnRowNull),
     );
 
     // reason: data_offset + data_bytes.len() fits usize

@@ -13,7 +13,9 @@
 
 use super::descriptor::SegmentDescriptor;
 use crate::graph::compact::generation::error::GenerationError;
-use crate::graph::compact::mapped::{DIRECTORY_ENTRY_LEN, FORMAT_VERSION_V5, HEADER_LEN, SegmentKind, layout_flags};
+use crate::graph::compact::mapped::{
+    DIRECTORY_ENTRY_LEN, FORMAT_VERSION_V5, HEADER_LEN, SegmentKind, layout_flags,
+};
 use crate::graph::compact::section_v5::align_up;
 
 const MAGIC: [u8; 4] = *b"GCST";

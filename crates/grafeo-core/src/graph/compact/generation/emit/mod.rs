@@ -14,25 +14,25 @@
 pub mod assembler;
 pub mod column;
 pub mod descriptor;
+#[cfg(feature = "generation-streaming")]
+pub mod dict_column_lookup;
 pub mod dictionary;
 pub mod global_dict;
 pub mod payload_lease;
 pub mod segments;
 pub mod sink;
 #[cfg(feature = "generation-streaming")]
-pub mod dict_column_lookup;
-#[cfg(feature = "generation-streaming")]
 pub mod streaming_column;
 
 pub use assembler::V5PayloadAssembler;
 pub use column::ColumnEncoder;
 pub use descriptor::{SegmentBody, SegmentDescriptor};
+#[cfg(feature = "generation-streaming")]
+pub use dict_column_lookup::{DictChunkCatalog, DictCodeLookup, DictColumnLookup, EmptyDictLookup};
 pub use dictionary::{BoundedDictionary, DictionaryPassDriver, StringOccurrence, StringUseKind};
 pub use payload_lease::V5PayloadLease;
 pub use segments::emit_canonical_descriptors;
 pub use sink::{SegmentSink, SpoolSegmentSink};
-#[cfg(feature = "generation-streaming")]
-pub use dict_column_lookup::{DictChunkCatalog, DictCodeLookup, DictColumnLookup, EmptyDictLookup};
 #[cfg(feature = "generation-streaming")]
 pub use streaming_column::StreamingBodyWriter;
 // MemorySegmentSink is the legacy/test-only in-memory sink. When

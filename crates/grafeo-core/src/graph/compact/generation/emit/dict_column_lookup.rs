@@ -226,11 +226,7 @@ impl DictCodeLookup for DictColumnLookup {
     }
 }
 
-fn entry_at_mapped(
-    m: &Bytes,
-    data_base: u64,
-    rel: u64,
-) -> Result<(&[u8], u32), GenerationError> {
+fn entry_at_mapped(m: &Bytes, data_base: u64, rel: u64) -> Result<(&[u8], u32), GenerationError> {
     let base = data_base as usize + rel as usize;
     let slen = read_u32_at(m, base)? as usize;
     let str_start = base + 4;
@@ -334,7 +330,9 @@ impl DictChunkCatalog {
         }
         let mut plen = [0u8; 2];
         if !read_full(self.reader.as_mut(), &mut plen)? {
-            return Err(GenerationError::Codec("dict catalog path len truncated".into()));
+            return Err(GenerationError::Codec(
+                "dict catalog path len truncated".into(),
+            ));
         }
         let path_len = u16::from_le_bytes(plen) as usize;
         let mut rel = vec![0u8; path_len];
@@ -447,7 +445,10 @@ mod tests {
         assert!(catalog.lookup_for(0, "age").unwrap().is_none());
         let mut lk = catalog.lookup_for(0, "name").unwrap().expect("name chunk");
         assert_eq!(lk.code_of(b"x"), Some(1));
-        let mut lk = catalog.lookup_for(0, "title").unwrap().expect("title chunk");
+        let mut lk = catalog
+            .lookup_for(0, "title")
+            .unwrap()
+            .expect("title chunk");
         assert_eq!(lk.code_of(b"y"), Some(2));
         catalog.verify_drained().expect("drained");
     }

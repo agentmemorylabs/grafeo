@@ -19,6 +19,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use grafeo_common::storage::SectionType;
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey, Value};
+use grafeo_core::graph::Direction;
+use grafeo_core::graph::compact::CompactStore;
 use grafeo_core::graph::compact::generation::{
     GenerationBudget, GenerationEdge, GenerationInput, GenerationNode, InMemoryRunStore,
     RelSchemaDecl,
@@ -28,17 +30,15 @@ use grafeo_core::graph::compact::generation_builder::orchestrator::{
 };
 use grafeo_core::graph::compact::mapped::layout_flags;
 use grafeo_core::graph::compact::section::CompactStoreSection;
-use grafeo_core::graph::compact::CompactStore;
 use grafeo_core::graph::lpg::CompareOp;
 use grafeo_core::graph::traits::{GraphStore, GraphStoreMut};
-use grafeo_core::graph::Direction;
+use grafeo_storage::file::GrafeoFileManager;
 use grafeo_storage::file::generation_writer::{
     ExactSectionSource, GenerationContainerHeader, OsGenerationFileOps,
     StreamingPayloadSectionSource,
 };
-use grafeo_storage::file::GrafeoFileManager;
 use grafeo_storage::generation::lock::RootLock;
-use grafeo_storage::generation::publication::{publish_generation, PublicationInput};
+use grafeo_storage::generation::publication::{PublicationInput, publish_generation};
 use grafeo_storage::generation::recovery::recover;
 use grafeo_storage::generation::run_adapter::DiskRunStore;
 use grafeo_storage::wal::WalManager;
@@ -48,7 +48,7 @@ use tempfile::TempDir;
 
 /// Owns the mmap-backed store together with the TempDir that holds the
 /// on-disk generation files. Dropping the owner cleans up both.
-struct OuterOwner {
+pub(crate) struct OuterOwner {
     store: Arc<CompactStore>,
     _tmp: TempDir,
 }
@@ -70,12 +70,12 @@ impl Drop for OuterOwner {
 
 /// Full production path: DiskRunStore bounded build → W0 publication →
 /// recovery selection → fresh mmap reopen → `OuterOwner`.
-fn outer_publish_and_mmap_reopen(input: &GenerationInput, gen_id: &str) -> OuterOwner {
+pub(crate) fn outer_publish_and_mmap_reopen(input: &GenerationInput, gen_id: &str) -> OuterOwner {
     outer_publish_and_mmap_reopen_with_schemas(input, gen_id, Vec::new())
 }
 
 /// Same as above but with explicit rel_schemas for endpoint validation.
-fn outer_publish_and_mmap_reopen_with_schemas(
+pub(crate) fn outer_publish_and_mmap_reopen_with_schemas(
     input: &GenerationInput,
     gen_id: &str,
     rel_schemas: Vec<RelSchemaDecl>,
@@ -193,7 +193,10 @@ impl ExactSectionSource for RawBytesSectionSource {
 /// Publishes raw payload bytes through the full outer path and attempts
 /// mmap reopen. Returns Err if any stage fails (the expected outcome for
 /// surgery tests).
-fn outer_publish_raw_and_reopen(payload: Vec<u8>, gen_id: &str) -> Result<Arc<CompactStore>, String> {
+pub(crate) fn outer_publish_raw_and_reopen(
+    payload: Vec<u8>,
+    gen_id: &str,
+) -> Result<Arc<CompactStore>, String> {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("gen-root");
     let wal_dir = root.join("wal");
@@ -251,7 +254,7 @@ fn outer_publish_raw_and_reopen(payload: Vec<u8>, gen_id: &str) -> Result<Arc<Co
 }
 
 /// In-memory bounded build → raw v5 payload bytes (for surgery tests).
-fn bounded_payload(input: &GenerationInput) -> Vec<u8> {
+pub(crate) fn bounded_payload(input: &GenerationInput) -> Vec<u8> {
     let tmp = TempDir::new().unwrap();
     let mut store = InMemoryRunStore::new();
     let config = BoundedBuildConfig {
@@ -276,7 +279,7 @@ fn bounded_payload(input: &GenerationInput) -> Vec<u8> {
 }
 
 /// Recompute the trailing outer CRC after payload surgery.
-fn recompute_outer_crc(payload: &mut [u8]) {
+pub(crate) fn recompute_outer_crc(payload: &mut [u8]) {
     let tail = payload.len() - 4;
     let crc = crc32fast::hash(&payload[..tail]);
     payload[tail..].copy_from_slice(&crc.to_le_bytes());
@@ -287,7 +290,7 @@ fn recompute_outer_crc(payload: &mut [u8]) {
 ///   entry_len(10..12) layout_flags(12..16) dir_off(16..24) dir_len(24..32)
 ///   data_off(32..40) total_nodes(40..48) total_edges(48..56) dir_crc(56..60) res(60..64)
 #[allow(dead_code)]
-fn recompute_directory_crc(payload: &mut [u8]) {
+pub(crate) fn recompute_directory_crc(payload: &mut [u8]) {
     let seg_count = u16::from_le_bytes([payload[8], payload[9]]) as usize;
     let dir_start = 64usize; // HEADER_LEN
     let dir_len = seg_count * 48; // DIRECTORY_ENTRY_LEN
@@ -420,7 +423,10 @@ fn outer_absent_vs_present_null_all_types_and_read_paths() {
     let f1 = store
         .get_node_property(NodeId::new(1), &PropertyKey::new("float_key"))
         .expect("float present");
-    assert!(f64::is_nan(f1.as_float64().expect("float64")), "NaN must survive");
+    assert!(
+        f64::is_nan(f1.as_float64().expect("float64")),
+        "NaN must survive"
+    );
 
     let v1 = store
         .get_node_property(NodeId::new(1), &PropertyKey::new("vec_key"))
@@ -454,7 +460,11 @@ fn outer_absent_vs_present_null_all_types_and_read_paths() {
             true,
         )
         .collect();
-    assert_eq!(range_hits, vec![NodeId::new(1)], "range [40,50] hits only row 1");
+    assert_eq!(
+        range_hits,
+        vec![NodeId::new(1)],
+        "range [40,50] hits only row 1"
+    );
     let range_miss: Vec<NodeId> = store
         .find_nodes_in_range_iter(
             "int_key",
@@ -544,36 +554,77 @@ fn outer_rel_property_matrix_all_types_and_read_surfaces() {
         &[EdgeId::new(10), EdgeId::new(11)],
         &[PropertyKey::new("int_p"), PropertyKey::new("str_p")],
     );
-    assert_eq!(batch[0].get(&PropertyKey::new("int_p")), Some(&Value::Int64(7)));
-    assert_eq!(batch[0].get(&PropertyKey::new("str_p")), Some(&Value::from("world")));
-    assert_eq!(batch[1].get(&PropertyKey::new("int_p")), Some(&Value::Int64(99)));
-    assert_eq!(batch[1].get(&PropertyKey::new("str_p")), Some(&Value::from("other")));
+    assert_eq!(
+        batch[0].get(&PropertyKey::new("int_p")),
+        Some(&Value::Int64(7))
+    );
+    assert_eq!(
+        batch[0].get(&PropertyKey::new("str_p")),
+        Some(&Value::from("world"))
+    );
+    assert_eq!(
+        batch[1].get(&PropertyKey::new("int_p")),
+        Some(&Value::Int64(99))
+    );
+    assert_eq!(
+        batch[1].get(&PropertyKey::new("str_p")),
+        Some(&Value::from("other"))
+    );
 
     // ── get_all_edge_properties via rel table ──
     let rt = store.rel_table("R").expect("R rel table");
     let all10 = rt.get_all_edge_properties(0);
-    assert_eq!(all10.get(&PropertyKey::new("int_p")), Some(&Value::Int64(7)));
-    assert_eq!(all10.get(&PropertyKey::new("str_p")), Some(&Value::from("world")));
-    assert_eq!(all10.get(&PropertyKey::new("bool_p")), Some(&Value::Bool(false)));
+    assert_eq!(
+        all10.get(&PropertyKey::new("int_p")),
+        Some(&Value::Int64(7))
+    );
+    assert_eq!(
+        all10.get(&PropertyKey::new("str_p")),
+        Some(&Value::from("world"))
+    );
+    assert_eq!(
+        all10.get(&PropertyKey::new("bool_p")),
+        Some(&Value::Bool(false))
+    );
     let all11 = rt.get_all_edge_properties(1);
-    assert_eq!(all11.get(&PropertyKey::new("int_p")), Some(&Value::Int64(99)));
+    assert_eq!(
+        all11.get(&PropertyKey::new("int_p")),
+        Some(&Value::Int64(99))
+    );
 
     // ── Zone-map pruning (R3-B2 positive) ──
     assert!(
-        store.edge_property_might_match(&PropertyKey::new("int_p"), CompareOp::Eq, &Value::Int64(7)),
+        store.edge_property_might_match(
+            &PropertyKey::new("int_p"),
+            CompareOp::Eq,
+            &Value::Int64(7)
+        ),
         "zone map must allow matching value 7"
     );
     assert!(
-        !store.edge_property_might_match(&PropertyKey::new("int_p"), CompareOp::Eq, &Value::Int64(9999)),
+        !store.edge_property_might_match(
+            &PropertyKey::new("int_p"),
+            CompareOp::Eq,
+            &Value::Int64(9999)
+        ),
         "zone map must prune impossible value 9999"
     );
 
     // ── get_edge returns full edge with properties ──
     let e10 = store.get_edge(EdgeId::new(10)).expect("edge 10");
-    assert_eq!(e10.properties.get(&PropertyKey::new("int_p")), Some(&Value::Int64(7)));
-    assert_eq!(e10.properties.get(&PropertyKey::new("str_p")), Some(&Value::from("world")));
+    assert_eq!(
+        e10.properties.get(&PropertyKey::new("int_p")),
+        Some(&Value::Int64(7))
+    );
+    assert_eq!(
+        e10.properties.get(&PropertyKey::new("str_p")),
+        Some(&Value::from("world"))
+    );
     let e11 = store.get_edge(EdgeId::new(11)).expect("edge 11");
-    assert_eq!(e11.properties.get(&PropertyKey::new("int_p")), Some(&Value::Int64(99)));
+    assert_eq!(
+        e11.properties.get(&PropertyKey::new("int_p")),
+        Some(&Value::Int64(99))
+    );
 }
 
 // ── C: Multi-label membership through outer path ───────────────────
@@ -621,9 +672,15 @@ fn outer_two_and_three_label_membership() {
     }
 
     // Physical table = labels[0] after sort (lex-earlier).
-    assert!(store.node_table("Employee").is_some(), "physical table Employee");
+    assert!(
+        store.node_table("Employee").is_some(),
+        "physical table Employee"
+    );
     assert!(store.node_table("A").is_some(), "physical table A");
-    assert!(store.node_table("Person").is_some(), "Person table for node 3");
+    assert!(
+        store.node_table("Person").is_some(),
+        "Person table for node 3"
+    );
 }
 
 // ── R3-M2: Overlay add/remove + lex-earlier via LayeredStore ───────
@@ -670,20 +727,37 @@ fn outer_overlay_add_remove_label_and_lex_earlier() {
     assert!(labels.contains(&"Zebra".to_string()), "Zebra retained");
 
     // Overlay: remove a label from node 1.
-    assert!(layered.remove_label(NodeId::new(1), "Zebra"), "remove Zebra");
+    assert!(
+        layered.remove_label(NodeId::new(1), "Zebra"),
+        "remove Zebra"
+    );
     let n1_after = layered.get_node(NodeId::new(1)).expect("node 1 after");
     let labels_after: Vec<String> = n1_after.labels.iter().map(|l| l.to_string()).collect();
-    assert!(!labels_after.contains(&"Zebra".to_string()), "Zebra removed");
-    assert!(labels_after.contains(&"Apple".to_string()), "Apple still present");
+    assert!(
+        !labels_after.contains(&"Zebra".to_string()),
+        "Zebra removed"
+    );
+    assert!(
+        labels_after.contains(&"Apple".to_string()),
+        "Apple still present"
+    );
 
     // nodes_by_label through layered reflects overlay.
     assert_eq!(layered.nodes_by_label("Mango").len(), 1, "Mango visible");
     // Zebra: node 2 still has it, node 1 removed → 1.
-    assert_eq!(layered.nodes_by_label("Zebra").len(), 1, "Zebra only node 2");
+    assert_eq!(
+        layered.nodes_by_label("Zebra").len(),
+        1,
+        "Zebra only node 2"
+    );
 
     // Drop owner — base store + temp cleaned up; layered still works via Arc.
     drop(owner);
-    assert_eq!(layered.nodes_by_label("Apple").len(), 1, "layered survives owner drop");
+    assert_eq!(
+        layered.nodes_by_label("Apple").len(),
+        1,
+        "layered survives owner drop"
+    );
 }
 
 // ── R3-M2: Real rel_schemas + endpoint validation ──────────────────
@@ -719,10 +793,15 @@ fn outer_rel_schemas_endpoint_validation_rejects_wrong_label() {
         &mut input.edge_source(),
         &mut run_store,
     );
-    assert!(result.is_err(), "endpoint validation must reject wrong src label");
+    assert!(
+        result.is_err(),
+        "endpoint validation must reject wrong src label"
+    );
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
-        err_msg.contains("WrongTableEndpoint") || err_msg.contains("endpoint") || err_msg.contains("table"),
+        err_msg.contains("WrongTableEndpoint")
+            || err_msg.contains("endpoint")
+            || err_msg.contains("table"),
         "error mentions endpoint/table: {err_msg}"
     );
 }
@@ -824,7 +903,10 @@ fn outer_old_v5_defaults_single_label_no_companions() {
 #[test]
 fn outer_old_v5_fixture_reopen() {
     // Load committed fixture bytes (produced by feature-OFF eager path).
-    let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/old_v5_single_label.bin");
+    let fixture_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/golden/old_v5_single_label.bin"
+    );
     let fixture_bytes = std::fs::read(fixture_path).expect("fixture must be committed");
     assert!(fixture_bytes.len() > 64, "fixture must be non-trivial");
 
@@ -837,7 +919,11 @@ fn outer_old_v5_fixture_reopen() {
     assert_eq!(store.total_edges(), 1);
 
     let n0 = store.get_node(NodeId::new(0)).expect("node 0");
-    assert_eq!(n0.labels.len(), 1, "single physical label, no membership companion");
+    assert_eq!(
+        n0.labels.len(),
+        1,
+        "single physical label, no membership companion"
+    );
     assert_eq!(n0.labels[0].as_str(), "Person");
 
     // Property reads.
@@ -855,310 +941,4 @@ fn outer_old_v5_fixture_reopen() {
 // Each case: build payload → surgically modify → publish raw → recover
 // → mmap → deserialize. Must fail closed at the outer boundary.
 
-#[test]
-fn outer_surgery_missing_required_membership_fails_closed() {
-    // Single-label payload: set REQUIRES_LABEL_MEMBERSHIP flag without segment.
-    let single = GenerationInput::new().node(GenerationNode::new(1u64, "Z"));
-    let mut payload = bounded_payload(&single);
-    let flags = layout_flags::from_companion_segments(true, false, false);
-    payload[12..16].copy_from_slice(&flags.to_le_bytes());
-    recompute_outer_crc(&mut payload);
-    let err = outer_publish_raw_and_reopen(payload, "s1-mem-missing")
-        .expect_err("must fail closed on missing membership");
-    assert!(
-        err.contains("NodeLabelMembership") || err.contains("membership"),
-        "error: {err}"
-    );
-}
-
-#[test]
-fn outer_surgery_missing_required_presence_fails_closed() {
-    let input = GenerationInput::new().node(GenerationNode::new(1u64, "Z"));
-    let mut payload = bounded_payload(&input);
-    let flags = layout_flags::from_companion_segments(false, true, false);
-    payload[12..16].copy_from_slice(&flags.to_le_bytes());
-    recompute_outer_crc(&mut payload);
-    let err = outer_publish_raw_and_reopen(payload, "s1-pres-missing")
-        .expect_err("must fail closed on missing presence");
-    assert!(
-        err.contains("ColumnRowPresence") || err.contains("presence"),
-        "error: {err}"
-    );
-}
-
-#[test]
-fn outer_surgery_missing_required_null_fails_closed() {
-    let input = GenerationInput::new().node(GenerationNode::new(1u64, "Z"));
-    let mut payload = bounded_payload(&input);
-    let flags = layout_flags::from_companion_segments(false, false, true);
-    payload[12..16].copy_from_slice(&flags.to_le_bytes());
-    recompute_outer_crc(&mut payload);
-    let err = outer_publish_raw_and_reopen(payload, "s1-null-missing")
-        .expect_err("must fail closed on missing null");
-    assert!(
-        err.contains("ColumnRowNull") || err.contains("null"),
-        "error: {err}"
-    );
-}
-
-#[test]
-fn outer_surgery_extended_marker_without_companion_bits_fails_closed() {
-    let input = GenerationInput::new().node(GenerationNode::new(1u64, "Z"));
-    let mut payload = bounded_payload(&input);
-    payload[12..16].copy_from_slice(&layout_flags::SOURCE_TRUE_EXTENDED.to_le_bytes());
-    recompute_outer_crc(&mut payload);
-    let err = outer_publish_raw_and_reopen(payload, "s1-ext-no-companion")
-        .expect_err("must fail closed");
-    assert!(
-        err.contains("SOURCE_TRUE_EXTENDED"),
-        "error: {err}"
-    );
-}
-
-#[test]
-fn outer_surgery_unknown_layout_flags_bits_fail_closed() {
-    let input = GenerationInput::new().node(GenerationNode::new(1u64, "Z"));
-    let mut payload = bounded_payload(&input);
-    let bad_flags = layout_flags::KNOWN_MASK | 0x8000_0000;
-    payload[12..16].copy_from_slice(&bad_flags.to_le_bytes());
-    recompute_outer_crc(&mut payload);
-    let err = outer_publish_raw_and_reopen(payload, "s1-unknown-flags")
-        .expect_err("must fail closed on unknown bits");
-    assert!(err.contains("unknown bits"), "error: {err}");
-}
-
-#[test]
-fn outer_surgery_corrupted_directory_crc_fails_closed() {
-    let input =
-        GenerationInput::new().node(GenerationNode::new(1u64, "Z").with_prop("v", Value::Int64(1)));
-    let mut payload = bounded_payload(&input);
-    payload[64] ^= 0xFF;
-    recompute_outer_crc(&mut payload);
-    let err = outer_publish_raw_and_reopen(payload, "s1-dir-crc")
-        .expect_err("must fail closed on directory CRC mismatch");
-    assert!(err.to_lowercase().contains("crc"), "error: {err}");
-}
-
-#[test]
-fn outer_surgery_corrupted_outer_crc_fails_closed() {
-    let input =
-        GenerationInput::new().node(GenerationNode::new(1u64, "Z").with_prop("v", Value::Int64(1)));
-    let mut payload = bounded_payload(&input);
-    let tail = payload.len() - 1;
-    payload[tail] ^= 0xFF;
-    let err = outer_publish_raw_and_reopen(payload, "s1-outer-crc")
-        .expect_err("must fail closed on outer CRC mismatch");
-    assert!(err.to_lowercase().contains("crc"), "error: {err}");
-}
-
-#[test]
-fn outer_surgery_truncated_payload_fails_closed() {
-    let input =
-        GenerationInput::new().node(GenerationNode::new(1u64, "Z").with_prop("v", Value::Int64(1)));
-    let payload = bounded_payload(&input);
-    // Truncate to half.
-    let truncated = payload[..payload.len() / 2].to_vec();
-    let err = outer_publish_raw_and_reopen(truncated, "s1-truncated")
-        .expect_err("must fail closed on truncated payload");
-    assert!(!err.is_empty(), "must produce an error");
-}
-
-#[test]
-fn outer_surgery_mismatched_membership_flag_vs_content_fails_closed() {
-    // Multi-label payload HAS membership segment; strip the flag bit to create mismatch.
-    let input = GenerationInput::new().node(GenerationNode::with_labels(1u64, ["A", "B"]).unwrap());
-    let mut payload = bounded_payload(&input);
-    // Clear all companion flags (claim no companions) while segments are present.
-    payload[12..16].copy_from_slice(&0u32.to_le_bytes());
-    recompute_outer_crc(&mut payload);
-    // This should either succeed (ignoring extra segments) or fail closed.
-    // The contract: if segments are present but not flagged, the reader may
-    // ignore them. The critical direction (flag set, segment absent) is tested above.
-    // Here we verify no panic/UB — either outcome is acceptable.
-    let _result = outer_publish_raw_and_reopen(payload, "s1-mismatch-flag");
-}
-
-#[test]
-fn outer_surgery_unexpected_companion_present_single_label() {
-    // Single-label payload with no companions: inject a fake membership segment
-    // by setting the flag. Already covered by missing_required_membership above
-    // (flag set, segment absent). This test verifies the inverse: segment present
-    // but flag NOT set — the reader should ignore the unflagged segment.
-    let input = GenerationInput::new().node(GenerationNode::with_labels(1u64, ["A", "B"]).unwrap());
-    let mut payload = bounded_payload(&input);
-    // The payload has membership segment. Clear the REQUIRES_LABEL_MEMBERSHIP bit
-    // but keep SOURCE_TRUE_EXTENDED.
-    let flags = layout_flags::SOURCE_TRUE_EXTENDED; // extended but no companion requirements
-    payload[12..16].copy_from_slice(&flags.to_le_bytes());
-    recompute_outer_crc(&mut payload);
-    // SOURCE_TRUE_EXTENDED without companion bits must fail closed.
-    let err = outer_publish_raw_and_reopen(payload, "s1-unexpected-present")
-        .expect_err("extended without companion bits must fail");
-    assert!(err.contains("SOURCE_TRUE_EXTENDED"), "error: {err}");
-}
-
-// ── R3-B2: Rel zone map positive + negative ────────────────────────
-
-#[test]
-fn outer_rel_zone_map_positive_scan_and_prune() {
-    // Build graph with rel properties that produce zone maps.
-    let input = GenerationInput::new()
-        .node(GenerationNode::new(1u64, "N"))
-        .node(GenerationNode::new(2u64, "N"))
-        .node(GenerationNode::new(3u64, "N"))
-        .edge(
-            GenerationEdge::new(10u64, 1u64, 2u64, "E")
-                .with_prop("score", Value::Int64(10)),
-        )
-        .edge(
-            GenerationEdge::new(11u64, 2u64, 3u64, "E")
-                .with_prop("score", Value::Int64(20)),
-        )
-        .edge(
-            GenerationEdge::new(12u64, 3u64, 1u64, "E")
-                .with_prop("score", Value::Int64(30)),
-        );
-
-    let owner = outer_publish_and_mmap_reopen(&input, "b2-rel-zm");
-    let store = owner.store();
-
-    // Zone maps installed on rel table.
-    let rt = store.rel_table("E").expect("E");
-    let zm = rt.zone_map(&PropertyKey::new("score"));
-    assert!(zm.is_some(), "rel zone map must be installed (R3-B2)");
-    let zm = zm.unwrap();
-    assert_eq!(zm.min, Some(Value::Int64(10)));
-    assert_eq!(zm.max, Some(Value::Int64(30)));
-
-    // Positive: matching value passes zone filter.
-    assert!(
-        store.edge_property_might_match(&PropertyKey::new("score"), CompareOp::Eq, &Value::Int64(15)),
-        "15 is within [10,30]"
-    );
-    // Negative: impossible value pruned.
-    assert!(
-        !store.edge_property_might_match(&PropertyKey::new("score"), CompareOp::Eq, &Value::Int64(999)),
-        "999 is outside [10,30] — must prune"
-    );
-    assert!(
-        !store.edge_property_might_match(&PropertyKey::new("score"), CompareOp::Gt, &Value::Int64(30)),
-        ">30 must prune (max is 30)"
-    );
-    // Boundary: exactly at max.
-    assert!(
-        store.edge_property_might_match(&PropertyKey::new("score"), CompareOp::Le, &Value::Int64(30)),
-        "<=30 must pass"
-    );
-}
-
-#[test]
-fn outer_rel_zone_map_negative_corruption_fails_closed() {
-    // Build a payload with rel zone maps, then corrupt the zone map segment.
-    let input = GenerationInput::new()
-        .node(GenerationNode::new(1u64, "N"))
-        .node(GenerationNode::new(2u64, "N"))
-        .edge(
-            GenerationEdge::new(10u64, 1u64, 2u64, "E")
-                .with_prop("score", Value::Int64(10)),
-        );
-    let mut payload = bounded_payload(&input);
-
-    // Find the TableZoneMaps segment in the directory and corrupt its CRC.
-    // Directory starts at offset 64, each entry is 48 bytes.
-    let seg_count = u16::from_le_bytes([payload[8], payload[9]]) as usize;
-    let dir_start = 64usize;
-    let mut found_zm = false;
-    for i in 0..seg_count {
-        let entry_off = dir_start + i * 48;
-        let kind = u16::from_le_bytes([payload[entry_off], payload[entry_off + 1]]);
-        // SegmentKind::TableZoneMaps = 18
-        if kind == 18 {
-            // Corrupt the segment CRC (offset 32..36 in directory entry).
-            payload[entry_off + 32] ^= 0xFF;
-            found_zm = true;
-            break;
-        }
-    }
-    if found_zm {
-        recompute_outer_crc(&mut payload);
-        let err = outer_publish_raw_and_reopen(payload, "b2-rel-zm-corrupt")
-            .expect_err("corrupted zone map CRC must fail closed");
-        assert!(err.to_lowercase().contains("crc"), "error: {err}");
-    }
-    // If no zone map segment found (shouldn't happen), test still passes
-    // since the positive test above proves installation.
-}
-
-#[test]
-fn outer_rel_zone_map_out_of_range_rel_id_fails_closed() {
-    // Build payload, then patch a zone map record's table_id to an out-of-range rel id.
-    let input = GenerationInput::new()
-        .node(GenerationNode::new(1u64, "N"))
-        .node(GenerationNode::new(2u64, "N"))
-        .edge(
-            GenerationEdge::new(10u64, 1u64, 2u64, "E")
-                .with_prop("score", Value::Int64(10)),
-        );
-    let mut payload = bounded_payload(&input);
-
-    // Find TableZoneMaps segment data and patch the rel table_id to 0x7FFF (out of range).
-    let seg_count = u16::from_le_bytes([payload[8], payload[9]]) as usize;
-    let dir_start = 64usize;
-    for i in 0..seg_count {
-        let entry_off = dir_start + i * 48;
-        let kind = u16::from_le_bytes([payload[entry_off], payload[entry_off + 1]]);
-        if kind == 18 {
-            // Directory entry layout (48 bytes):
-            //   kind(0..2) enc(2..4) flags(4..6) align(6..8)
-            //   offset(8..16) length(16..24) elem_width(24..28)
-            //   elem_count(28..32) crc(32..36) res_a(36..40) res_b(40..48)
-            let data_off =
-                u64::from_le_bytes(payload[entry_off + 8..entry_off + 16].try_into().unwrap())
-                    as usize;
-            let seg_len =
-                u64::from_le_bytes(payload[entry_off + 16..entry_off + 24].try_into().unwrap())
-                    as usize;
-            // First 2 bytes of zone map record = table_id.
-            // Set to 0x8000 | 0x7FFF = 0xFFFF (rel id 32767, way out of range).
-            payload[data_off] = 0xFF;
-            payload[data_off + 1] = 0xFF;
-            // Recompute segment CRC.
-            let seg_crc = crc32fast::hash(&payload[data_off..data_off + seg_len]);
-            payload[entry_off + 32..entry_off + 36].copy_from_slice(&seg_crc.to_le_bytes());
-            recompute_directory_crc(&mut payload);
-            recompute_outer_crc(&mut payload);
-            break;
-        }
-    }
-
-    let err = outer_publish_raw_and_reopen(payload, "b2-rel-zm-oor")
-        .expect_err("out-of-range rel id must fail closed");
-    // The payload is rejected — either at directory CRC validation (if the
-    // surgery invalidated the directory CRC) or at zone-map parsing (if the
-    // CRC was correctly recomputed). Both are fail-closed outcomes.
-    assert!(
-        err.contains("out of range")
-            || err.contains("rel_count")
-            || err.to_lowercase().contains("crc"),
-        "error must indicate rejection: {err}"
-    );
-}
-
-// ── R3-M4: Drop cleanup test ───────────────────────────────────────
-
-#[test]
-fn outer_owner_drop_cleans_up_temp_dir() {
-    let input = GenerationInput::new()
-        .node(GenerationNode::new(1u64, "X").with_prop("v", Value::Int64(1)));
-
-    let owner = outer_publish_and_mmap_reopen(&input, "m4-drop");
-    let tmp_path = owner._tmp.path().to_path_buf();
-    assert!(tmp_path.exists(), "temp dir must exist while owner alive");
-
-    // Verify store works.
-    assert_eq!(owner.store().total_nodes(), 1);
-
-    drop(owner);
-    // After drop, TempDir cleans up.
-    assert!(!tmp_path.exists(), "temp dir must be cleaned up after drop");
-}
+mod surgery;

@@ -19,7 +19,7 @@ use crate::graph::compact::generation::{
     RunSetLease,
 };
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
-use crate::graph::compact::generation_builder::emit_meta::{w16, w32, w64, CodecKind};
+use crate::graph::compact::generation_builder::emit_meta::{CodecKind, w16, w32, w64};
 use crate::graph::compact::mapped::SegmentKind;
 use crate::graph::compact::zone_map::ZoneMap;
 use grafeo_common::types::Value;
@@ -246,13 +246,14 @@ pub(crate) fn emit_column_bodies(
         // before verify_zero_charges.
         let zm_bytes = zone_map_charge_bytes(&block_zms);
         if zm_bytes > 0 {
-            let guard = job_anon.reserve(zm_bytes).map_err(|_| {
-                GenerationError::BudgetExceeded {
-                    counter: "max_anon_bytes",
-                    requested: zm_bytes,
-                    limit: budget.max_anon_bytes,
-                }
-            })?;
+            let guard =
+                job_anon
+                    .reserve(zm_bytes)
+                    .map_err(|_| GenerationError::BudgetExceeded {
+                        counter: "max_anon_bytes",
+                        requested: zm_bytes,
+                        limit: budget.max_anon_bytes,
+                    })?;
             result.zone_map_guards.push(guard);
         }
         result.columns.push(EmittedColumn {

@@ -11,6 +11,7 @@
 pub mod builder;
 pub mod column_pass;
 pub mod csr_pass;
+pub mod dict_pass;
 pub mod edge_pass;
 pub mod emit_columns;
 pub mod emit_ids;

@@ -468,10 +468,7 @@ fn r2_m3_admission_fails_before_vec_reserve() {
         DiskRunSink::new(dir.path().join("runs"), budget, "m3", Arc::clone(&ledger)).unwrap();
 
     // The first push should fail at pre-charge (predicted growth > 100).
-    let result = sink.push(FramedRecord::new(
-        b"key".to_vec(),
-        b"payload".to_vec(),
-    ));
+    let result = sink.push(FramedRecord::new(b"key".to_vec(), b"payload".to_vec()));
     assert!(
         result.is_err(),
         "R2-M3: push should fail at pre-charge with 100-byte anon limit"
@@ -495,13 +492,8 @@ fn r2_m2_merge_admits_before_allocation() {
     let ledger = Arc::new(JobAnonLedger::new(64 * 1024 * 1024));
 
     // First, create a run with some records.
-    let mut sink = DiskRunSink::new(
-        dir.path().join("runs"),
-        budget,
-        "m2",
-        Arc::clone(&ledger),
-    )
-    .unwrap();
+    let mut sink =
+        DiskRunSink::new(dir.path().join("runs"), budget, "m2", Arc::clone(&ledger)).unwrap();
     for i in 0..5u32 {
         sink.push(FramedRecord::new(
             format!("{i:04}").into_bytes(),
@@ -547,13 +539,8 @@ fn r2_m5_storage_ledger_zero_after_success() {
     let dir = tempdir().unwrap();
     let budget = small_budget(1024, 4);
     let ledger = job_ledger();
-    let mut sink = DiskRunSink::new(
-        dir.path().join("runs"),
-        budget,
-        "m5",
-        Arc::clone(&ledger),
-    )
-    .unwrap();
+    let mut sink =
+        DiskRunSink::new(dir.path().join("runs"), budget, "m5", Arc::clone(&ledger)).unwrap();
     for i in 0..10u32 {
         sink.push(FramedRecord::new(
             format!("{i:04}").into_bytes(),
@@ -563,13 +550,8 @@ fn r2_m5_storage_ledger_zero_after_success() {
     }
     let runs = sink.finish().unwrap();
 
-    let mut merger = DiskRunMerger::new(
-        dir.path().join("merge"),
-        budget,
-        "m5",
-        Arc::clone(&ledger),
-    )
-    .unwrap();
+    let mut merger =
+        DiskRunMerger::new(dir.path().join("merge"), budget, "m5", Arc::clone(&ledger)).unwrap();
     let mut metrics = ExternalSortMetrics::default();
     merge_runs_recursive(&mut merger, &runs, &mut metrics, None, &mut |_| Ok(())).unwrap();
 
@@ -590,13 +572,8 @@ fn r2_m5_storage_ledger_zero_after_cancel() {
     let dir = tempdir().unwrap();
     let budget = small_budget(1024, 4);
     let ledger = job_ledger();
-    let mut sink = DiskRunSink::new(
-        dir.path().join("runs"),
-        budget,
-        "m5c",
-        Arc::clone(&ledger),
-    )
-    .unwrap();
+    let mut sink =
+        DiskRunSink::new(dir.path().join("runs"), budget, "m5c", Arc::clone(&ledger)).unwrap();
     for i in 0..10u32 {
         sink.push(FramedRecord::new(
             format!("{i:04}").into_bytes(),
@@ -609,21 +586,12 @@ fn r2_m5_storage_ledger_zero_after_cancel() {
     let cancel = CancelToken::new();
     cancel.cancel(); // cancel before merge starts
 
-    let mut merger = DiskRunMerger::new(
-        dir.path().join("merge"),
-        budget,
-        "m5c",
-        Arc::clone(&ledger),
-    )
-    .unwrap();
+    let mut merger =
+        DiskRunMerger::new(dir.path().join("merge"), budget, "m5c", Arc::clone(&ledger)).unwrap();
     let mut metrics = ExternalSortMetrics::default();
-    let result = merge_runs_recursive(
-        &mut merger,
-        &runs,
-        &mut metrics,
-        Some(&cancel),
-        &mut |_| Ok(()),
-    );
+    let result = merge_runs_recursive(&mut merger, &runs, &mut metrics, Some(&cancel), &mut |_| {
+        Ok(())
+    });
     assert!(result.is_err(), "cancelled merge must fail");
 
     // After cancellation, the shared ledger must be zero.

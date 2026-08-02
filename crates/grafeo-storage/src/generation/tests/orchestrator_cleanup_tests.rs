@@ -16,9 +16,8 @@ use tempfile::TempDir;
 fn large_input() -> GenerationInput {
     let mut input = GenerationInput::new();
     for id in 1..=128u64 {
-        input = input.node(
-            GenerationNode::new(id, "Person").with_prop("name", format!("node-{id}")),
-        );
+        input =
+            input.node(GenerationNode::new(id, "Person").with_prop("name", format!("node-{id}")));
     }
     for id in 0..127u64 {
         input = input.edge(GenerationEdge::new(10_000 + id, id + 1, id + 2, "KNOWS"));
@@ -44,8 +43,7 @@ fn disk_run_store_failure_leaves_zero_artifacts() {
         rel_schemas: Vec::new(),
         frozen_epoch: 0,
     };
-    let mut run_store =
-        DiskRunStore::new(&build_runs, budget, "disk-fail").expect("run store");
+    let mut run_store = DiskRunStore::new(&build_runs, budget, "disk-fail").expect("run store");
     let input = large_input();
     let mut builder = BoundedGenerationBuilder::new(config);
     let err = builder
@@ -80,8 +78,7 @@ fn disk_run_store_success_leaves_zero_artifacts() {
     let build_runs = tmp.path().join("build-runs");
     let budget = GenerationBudget::for_tests();
     let input = large_input();
-    let mut run_store =
-        DiskRunStore::new(&build_runs, budget, "disk-success").expect("run store");
+    let mut run_store = DiskRunStore::new(&build_runs, budget, "disk-success").expect("run store");
     let config = BoundedBuildConfig {
         budget,
         temp_dir: build_tmp.clone(),
@@ -127,8 +124,7 @@ fn disk_run_store_cancel_leaves_zero_artifacts() {
         rel_schemas: Vec::new(),
         frozen_epoch: 0,
     };
-    let mut run_store =
-        DiskRunStore::new(&build_runs, budget, "disk-cancel").expect("run store");
+    let mut run_store = DiskRunStore::new(&build_runs, budget, "disk-cancel").expect("run store");
     let token = CancelToken::new();
     token.cancel();
     let input = large_input();
@@ -147,7 +143,10 @@ fn disk_run_store_cancel_leaves_zero_artifacts() {
         ),
         "unexpected error: {err}"
     );
-    assert!(!build_tmp.exists(), "build-tmp must be removed after cancel");
+    assert!(
+        !build_tmp.exists(),
+        "build-tmp must be removed after cancel"
+    );
     assert_eq!(
         count_files_under(&build_runs),
         0,

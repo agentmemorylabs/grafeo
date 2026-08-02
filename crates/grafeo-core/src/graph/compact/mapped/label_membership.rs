@@ -154,15 +154,13 @@ impl LabelMembershipView {
         let mut prev: Option<LabelMembership> = None;
         for i in 0..count {
             let start = MEMBERSHIP_HEADER_LEN + i * MEMBERSHIP_RECORD_LEN;
-            let rec = LabelMembership::from_bytes(
-                &bytes[start..start + MEMBERSHIP_RECORD_LEN],
-            )
-            .ok_or_else(|| {
-                format!(
-                    "{:?} truncated record {i}",
-                    SegmentKind::NodeLabelMembership
-                )
-            })?;
+            let rec = LabelMembership::from_bytes(&bytes[start..start + MEMBERSHIP_RECORD_LEN])
+                .ok_or_else(|| {
+                    format!(
+                        "{:?} truncated record {i}",
+                        SegmentKind::NodeLabelMembership
+                    )
+                })?;
             if let Some(p) = prev {
                 if rec <= p {
                     return Err(format!(

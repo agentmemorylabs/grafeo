@@ -212,8 +212,7 @@ impl DiskRunSink {
         let flush_threshold = self.budget.sort_run_bytes;
         let current_charge = self.anon_guard.as_ref().map_or(0, AnonReservation::bytes);
         let job_current = self.job_anon.current();
-        if (current_charge > 0
-            && current_charge.saturating_add(total_delta) > flush_threshold)
+        if (current_charge > 0 && current_charge.saturating_add(total_delta) > flush_threshold)
             || job_current.saturating_add(total_delta) > self.budget.max_anon_bytes
         {
             self.flush_run()?;

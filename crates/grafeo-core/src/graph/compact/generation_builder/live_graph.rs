@@ -81,8 +81,6 @@ pub fn live_graph_sources_bounded(
     LiveGraphSources { nodes, edges }
 }
 
-
-
 // ── Overlay cursors (budget-bounded, R1) ──────────────────────────
 
 /// Streams overlay (LpgStore) nodes by iterating the frozen dirty-id set.

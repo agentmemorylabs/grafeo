@@ -9,7 +9,6 @@
 use bytes::Bytes;
 use grafeo_common::types::Value;
 use grafeo_core::graph::GraphStore;
-use grafeo_core::graph::compact::section::CompactStoreSection;
 use grafeo_core::graph::compact::generation::{
     GenerationBudget, GenerationInput, GenerationNode, InMemoryRunStore,
 };
@@ -17,6 +16,7 @@ use grafeo_core::graph::compact::generation_builder::orchestrator::{
     BoundedBuildConfig, BoundedGenerationBuilder,
 };
 use grafeo_core::graph::compact::mapped::layout_flags;
+use grafeo_core::graph::compact::section::CompactStoreSection;
 use tempfile::TempDir;
 
 fn budget() -> GenerationBudget {
@@ -39,7 +39,11 @@ fn bounded_round_trip(
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .expect("bounded build");
     let mut payload = Vec::new();
     lease.stream_to(&mut payload).expect("stream_to");
@@ -80,8 +84,8 @@ fn multi_label_node_survives_round_trip() {
 
 #[test]
 fn three_label_node_keeps_all_memberships() {
-    let input = GenerationInput::new()
-        .node(GenerationNode::with_labels(7u64, ["A", "B", "C"]).unwrap());
+    let input =
+        GenerationInput::new().node(GenerationNode::with_labels(7u64, ["A", "B", "C"]).unwrap());
     let store = bounded_round_trip(&input);
     for label in ["A", "B", "C"] {
         assert_eq!(
@@ -114,8 +118,12 @@ fn present_null_preserved_distinct_from_absent() {
         .node(GenerationNode::new(1u64, "T").with_prop("key", Value::Null))
         .node(GenerationNode::new(2u64, "T"));
     let store = bounded_round_trip(&input);
-    let n1 = store.get_node(grafeo_common::types::NodeId::new(1)).expect("n1");
-    let n2 = store.get_node(grafeo_common::types::NodeId::new(2)).expect("n2");
+    let n1 = store
+        .get_node(grafeo_common::types::NodeId::new(1))
+        .expect("n1");
+    let n2 = store
+        .get_node(grafeo_common::types::NodeId::new(2))
+        .expect("n2");
     assert_eq!(n1.get_property("key"), Some(&Value::Null));
     assert_eq!(n2.get_property("key"), None);
 }
@@ -129,7 +137,9 @@ fn old_v5_default_single_label_semantics() {
         .node(GenerationNode::new(2u64, "Person").with_prop("name", "Bob"));
     let store = bounded_round_trip(&input);
     assert_eq!(store.nodes_by_label_count("Person"), 2);
-    let n1 = store.get_node(grafeo_common::types::NodeId::new(1)).expect("n1");
+    let n1 = store
+        .get_node(grafeo_common::types::NodeId::new(1))
+        .expect("n1");
     assert_eq!(n1.labels.len(), 1, "single physical label, no membership");
 }
 
@@ -151,7 +161,11 @@ fn missing_required_membership_segment_fails_closed() {
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder
-        .build(&mut input.node_source(), &mut input.edge_source(), &mut store)
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
         .unwrap();
     let mut payload = Vec::new();
     lease.stream_to(&mut payload).unwrap();

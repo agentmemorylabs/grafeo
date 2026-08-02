@@ -18,12 +18,10 @@ use grafeo_core::graph::GraphStore;
 #[cfg(not(feature = "generation-streaming"))]
 use grafeo_core::graph::compact::generation::generate_compact_store;
 #[cfg(not(feature = "generation-streaming"))]
+use grafeo_core::graph::compact::generation::{EdgeRecordSource, NodeRecordSource};
 use grafeo_core::graph::compact::generation::{
-    EdgeRecordSource, NodeRecordSource,
-};
-use grafeo_core::graph::compact::generation::{
-    GenerationBudget, GenerationEdge, GenerationError, GenerationNode,
-    OriginalEdgeId, OriginalNodeId, RelSchemaDecl,
+    GenerationBudget, GenerationEdge, GenerationError, GenerationNode, OriginalEdgeId,
+    OriginalNodeId, RelSchemaDecl,
 };
 #[cfg(not(feature = "generation-streaming"))]
 use grafeo_storage::file::generation_writer::CompactStoreSectionSource;
@@ -284,8 +282,7 @@ impl GrafeoDB {
         let wal = WalManager::open(&wal_dir)?;
 
         #[cfg(feature = "generation-streaming")]
-        let mut live_sources =
-            self.live_graph_sources_bounded(request.budget.max_record_bytes)?;
+        let mut live_sources = self.live_graph_sources_bounded(request.budget.max_record_bytes)?;
         #[cfg(not(feature = "generation-streaming"))]
         let store = self.live_graph_store()?;
         #[cfg(not(feature = "generation-streaming"))]
@@ -439,7 +436,12 @@ impl GrafeoDB {
     }
 
     /// Returns the merged live graph store (layered when compacted, else LPG).
-    #[cfg(all(not(feature = "generation-streaming"), feature = "generation", feature = "lpg", feature = "compact-store"))]
+    #[cfg(all(
+        not(feature = "generation-streaming"),
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store"
+    ))]
     fn live_graph_store(&self) -> Result<Arc<dyn GraphStore>> {
         if let Some(layered) = self.layered_store.as_ref() {
             return Ok(Arc::clone(layered) as Arc<dyn GraphStore>);
@@ -458,14 +460,19 @@ impl GrafeoDB {
     /// store (when present), freezes the overlay epoch, and returns bounded
     /// row-by-row cursors. Falls back to the overlay-only path when the store
     /// is not layered (pure LPG).
-    #[cfg(all(feature = "generation-streaming", feature = "generation", feature = "lpg", feature = "compact-store"))]
+    #[cfg(all(
+        feature = "generation-streaming",
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store"
+    ))]
     fn live_graph_sources_bounded(
         &self,
         max_record_bytes: u64,
     ) -> Result<grafeo_core::graph::compact::generation_builder::live_graph::LiveGraphSources> {
+        use grafeo_common::utils::hash::FxHashSet;
         use grafeo_core::graph::compact::generation_builder::FrozenOverlayEpoch;
         use grafeo_core::graph::compact::generation_builder::live_graph_sources_bounded;
-        use grafeo_common::utils::hash::FxHashSet;
 
         if let Some(layered) = self.layered_store.as_ref() {
             let base = layered.base_store_arc();
@@ -483,10 +490,16 @@ impl GrafeoDB {
         }
         if let Some(store) = self.store.as_ref() {
             // Pure LPG store — no base; all data is overlay.
-            let overlay_node_ids: FxHashSet<u64> =
-                store.all_node_ids().into_iter().map(|id| id.as_u64()).collect();
-            let overlay_edge_ids: FxHashSet<u64> =
-                store.all_edges().into_iter().map(|e| e.id.as_u64()).collect();
+            let overlay_node_ids: FxHashSet<u64> = store
+                .all_node_ids()
+                .into_iter()
+                .map(|id| id.as_u64())
+                .collect();
+            let overlay_edge_ids: FxHashSet<u64> = store
+                .all_edges()
+                .into_iter()
+                .map(|e| e.id.as_u64())
+                .collect();
             let freeze = FrozenOverlayEpoch {
                 epoch: self.transaction_manager.current_epoch().0,
                 overlay_node_ids,

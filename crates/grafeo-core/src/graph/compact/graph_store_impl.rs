@@ -35,9 +35,7 @@ impl GraphStore for CompactStore {
         }
         for key in nt.columns().keys() {
             let raw = nt.get_property(row, key);
-            if let Some(filtered) =
-                self.get_property_filtered(table_id, row_u32, key, raw)
-            {
+            if let Some(filtered) = self.get_property_filtered(table_id, row_u32, key, raw) {
                 node.set_property(key.clone(), filtered);
             }
         }
@@ -312,7 +310,8 @@ impl GraphStore for CompactStore {
                         continue;
                     };
                     let raw = col.get(offset);
-                    if self.get_property_filtered(table_id, row_u32, &key, raw)
+                    if self
+                        .get_property_filtered(table_id, row_u32, &key, raw)
                         .as_ref()
                         != Some(value)
                     {
@@ -395,8 +394,7 @@ impl GraphStore for CompactStore {
                         continue;
                     };
                     let raw = col.get(offset);
-                    let Some(val) = self.get_property_filtered(table_id, row_u32, &key, raw)
-                    else {
+                    let Some(val) = self.get_property_filtered(table_id, row_u32, &key, raw) else {
                         continue;
                     };
                     if !value_in_range(&val, min, max, min_inclusive, max_inclusive) {
