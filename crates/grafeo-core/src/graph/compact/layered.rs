@@ -223,6 +223,7 @@ impl LayeredStore {
     }
 
     /// Captures overlay mutation sets for a generation freeze (schema-bounded).
+    #[cfg(feature = "generation-streaming")]
     #[must_use]
     pub fn generation_freeze_epoch(&self) -> super::generation_builder::freeze::FrozenOverlayEpoch {
         use super::generation_builder::freeze::FrozenOverlayEpoch;
