@@ -1,8 +1,17 @@
-//! Streaming-vs-eager payload parity tests (G-EM0.5b Phase 2).
+//! Streaming-vs-golden payload parity tests (G-EM0.5b Phase 2).
 //!
 //! The core acceptance criterion: the streaming bounded builder must produce
-//! a v5 payload **byte-identical** to the eager `generate_compact_store` +
-//! `serialize_v5_with_string_order(Lexicographic)` path for the same input.
+//! the **committed golden** v5 payload bytes for each adversarial input. The
+//! golden bytes are the eager `generate_compact_store` +
+//! `serialize_v5_with_string_order(Lexicographic)` output, frozen at commit
+//! time. The parity tests never run the eager heap path — they compare the
+//! streaming builder against frozen bytes, so the production build carries no
+//! runtime eager oracle.
+//!
+//! To regenerate the goldens after an *intentional* format change:
+//!   cargo test -p grafeo-core --features generation-streaming \
+//!     generation_builder::tests::regenerate_v5_golden_fixtures -- --ignored
+//! then commit the updated `fixtures/v5/*.bin` and refresh the README SHAs.
 
 #![cfg(feature = "generation-streaming")]
 
@@ -14,17 +23,7 @@ use crate::graph::compact::generation_builder::{StreamingBuildConfig, StreamingG
 use crate::graph::compact::section_v5::{StringCodeOrder, serialize_v5_with_string_order};
 use grafeo_common::types::Value;
 
-/// Build the eager reference payload for a given input.
-fn eager_payload(input: &GenerationInput) -> Vec<u8> {
-    let budget = GenerationBudget::for_tests();
-    let mut nodes = input.node_source();
-    let mut edges = input.edge_source();
-    let generated =
-        generate_compact_store(&mut nodes, &mut edges, &input.rel_schemas, &budget).unwrap();
-    serialize_v5_with_string_order(&generated.store, StringCodeOrder::Lexicographic).unwrap()
-}
-
-/// Build the streaming payload for a given input.
+/// Build the streaming payload for a given input (the path under test).
 fn streaming_payload(input: &GenerationInput, temp_dir: &std::path::Path) -> Vec<u8> {
     let config = StreamingBuildConfig::for_tests(temp_dir);
     let run_store = Box::new(InMemoryRunStore::new());
@@ -33,6 +32,20 @@ fn streaming_payload(input: &GenerationInput, temp_dir: &std::path::Path) -> Vec
     let mut edges = input.edge_source();
     let output = builder.build(&mut nodes, &mut edges).unwrap();
     output.payload
+}
+
+/// Load a committed golden v5 payload fixture.
+fn golden_payload(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/graph/compact/fixtures/v5")
+        .join(format!("{name}.v5.bin"));
+    std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "missing golden fixture {} ({}); run regenerate_v5_golden_fixtures --ignored",
+            path.display(),
+            e
+        )
+    })
 }
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -168,33 +181,75 @@ fn vector_input() -> GenerationInput {
 }
 
 macro_rules! parity_test {
-    ($name:ident, $input_fn:ident) => {
+    ($name:ident, $golden:literal, $input_fn:ident) => {
         #[test]
         fn $name() {
             let input = $input_fn();
-            let eager = eager_payload(&input);
+            let golden = golden_payload($golden);
             let dir = temp_dir(stringify!($name));
             let streaming = streaming_payload(&input, &dir);
             cleanup(&dir);
             assert_eq!(
-                eager, streaming,
-                "streaming payload must be byte-identical to eager payload"
+                golden, streaming,
+                "streaming payload must be byte-identical to committed golden fixture '{}'",
+                $golden
             );
         }
     };
 }
 
-parity_test!(parity_simple, simple_input);
-parity_test!(parity_complex, complex_input);
-parity_test!(parity_sparse_ids, sparse_id_input);
-parity_test!(parity_duplicate_endpoints, duplicate_endpoint_input);
-parity_test!(parity_self_loops, self_loop_input);
+parity_test!(parity_simple, "simple", simple_input);
+parity_test!(parity_complex, "complex", complex_input);
+parity_test!(parity_sparse_ids, "sparse_ids", sparse_id_input);
+parity_test!(
+    parity_duplicate_endpoints,
+    "duplicate_endpoints",
+    duplicate_endpoint_input
+);
+parity_test!(parity_self_loops, "self_loops", self_loop_input);
 parity_test!(
     parity_high_cardinality_strings,
+    "high_cardinality_strings",
     high_cardinality_string_input
 );
-parity_test!(parity_signed_ints, signed_int_input);
-parity_test!(parity_vectors, vector_input);
+parity_test!(parity_signed_ints, "signed_ints", signed_int_input);
+parity_test!(parity_vectors, "vectors", vector_input);
+
+/// Regenerator: writes the golden fixtures from the eager oracle. `#[ignore]`d
+/// so it never runs in CI; invoke explicitly after an intentional format change.
+#[test]
+#[ignore = "regenerates golden fixtures; run only on intentional format change"]
+fn regenerate_v5_golden_fixtures() {
+    fn eager_payload(input: &GenerationInput) -> Vec<u8> {
+        let budget = GenerationBudget::for_tests();
+        let mut nodes = input.node_source();
+        let mut edges = input.edge_source();
+        let generated =
+            generate_compact_store(&mut nodes, &mut edges, &input.rel_schemas, &budget).unwrap();
+        serialize_v5_with_string_order(&generated.store, StringCodeOrder::Lexicographic).unwrap()
+    }
+
+    let out_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/graph/compact/fixtures/v5");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let cases: &[(&str, fn() -> GenerationInput)] = &[
+        ("simple", simple_input),
+        ("complex", complex_input),
+        ("sparse_ids", sparse_id_input),
+        ("duplicate_endpoints", duplicate_endpoint_input),
+        ("self_loops", self_loop_input),
+        ("high_cardinality_strings", high_cardinality_string_input),
+        ("signed_ints", signed_int_input),
+        ("vectors", vector_input),
+    ];
+    for (name, input_fn) in cases {
+        let payload = eager_payload(&input_fn());
+        std::fs::write(out_dir.join(format!("{name}.v5.bin")), &payload).unwrap();
+        eprintln!("wrote {name}.v5.bin ({} bytes)", payload.len());
+    }
+    panic!("fixtures written; record SHA-256s with `sha256sum` in fixtures/v5/README.md");
+}
 
 /// Determinism: two runs of the streaming builder produce identical bytes.
 #[test]
