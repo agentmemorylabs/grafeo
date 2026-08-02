@@ -50,6 +50,7 @@ pub fn fixture_section() -> (Box<dyn ExactSectionSource>, GenerationContainerHea
             correlation_id: "fixture-section".to_string(),
             spool_buf_cap: usize::try_from(budget.io_buffer_bytes).unwrap_or(1024 * 1024),
             rel_schemas: input.rel_schemas.clone(),
+            frozen_epoch: 0,
         };
         let mut run_store =
             DiskRunStore::new(temp.path().join("build-runs"), budget, "fixture-section")

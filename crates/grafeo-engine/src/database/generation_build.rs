@@ -283,12 +283,11 @@ impl GrafeoDB {
         std::fs::create_dir_all(&wal_dir)?;
         let wal = WalManager::open(&wal_dir)?;
 
-        let store = self.live_graph_store()?;
         #[cfg(feature = "generation-streaming")]
         let mut live_sources =
-            grafeo_core::graph::compact::generation_builder::live_graph_sources(Arc::clone(
-                &store,
-            ));
+            self.live_graph_sources_bounded(request.budget.max_record_bytes)?;
+        #[cfg(not(feature = "generation-streaming"))]
+        let store = self.live_graph_store()?;
         #[cfg(not(feature = "generation-streaming"))]
         let frozen = Arc::new(FrozenLiveGraph::freeze(store));
         #[cfg(not(feature = "generation-streaming"))]
@@ -320,6 +319,9 @@ impl GrafeoDB {
             // when the run-set leases and payload lease drop (success or
             // failure). Correlation id = generation id for traceability.
             let temp_dir = root.join("build-tmp");
+            // R1.6: capture the frozen epoch before the build so the payload
+            // lease carries the same epoch as the container header.
+            let frozen_epoch = self.transaction_manager.current_epoch().0;
             let config = BoundedBuildConfig {
                 budget: request.budget,
                 temp_dir,
@@ -327,6 +329,7 @@ impl GrafeoDB {
                 spool_buf_cap: usize::try_from(request.budget.io_buffer_bytes)
                     .unwrap_or(1024 * 1024),
                 rel_schemas: request.rel_schemas.clone(),
+                frozen_epoch,
             };
             let mut run_store = DiskRunStore::new(
                 root.join("build-runs"),
@@ -436,13 +439,67 @@ impl GrafeoDB {
     }
 
     /// Returns the merged live graph store (layered when compacted, else LPG).
-    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    #[cfg(all(not(feature = "generation-streaming"), feature = "generation", feature = "lpg", feature = "compact-store"))]
     fn live_graph_store(&self) -> Result<Arc<dyn GraphStore>> {
         if let Some(layered) = self.layered_store.as_ref() {
             return Ok(Arc::clone(layered) as Arc<dyn GraphStore>);
         }
         if let Some(store) = self.store.as_ref() {
             return Ok(Arc::clone(store) as Arc<dyn GraphStore>);
+        }
+        Err(Error::Internal(
+            "no live graph store available for generation build".into(),
+        ))
+    }
+
+    /// Builds bounded live record sources from the concrete base/overlay stores.
+    ///
+    /// Extracts the `CompactStore` base and `LpgStore` overlay from the layered
+    /// store (when present), freezes the overlay epoch, and returns bounded
+    /// row-by-row cursors. Falls back to the overlay-only path when the store
+    /// is not layered (pure LPG).
+    #[cfg(all(feature = "generation-streaming", feature = "generation", feature = "lpg", feature = "compact-store"))]
+    fn live_graph_sources_bounded(
+        &self,
+        max_record_bytes: u64,
+    ) -> Result<grafeo_core::graph::compact::generation_builder::live_graph::LiveGraphSources> {
+        use grafeo_core::graph::compact::generation_builder::FrozenOverlayEpoch;
+        use grafeo_core::graph::compact::generation_builder::live_graph_sources_bounded;
+        use grafeo_common::utils::hash::FxHashSet;
+
+        if let Some(layered) = self.layered_store.as_ref() {
+            let base = layered.base_store_arc();
+            let overlay = layered.overlay_store();
+            // Snapshot dirty/deleted sets via the layered store's freeze helper,
+            // then override the epoch with the transaction manager's authoritative value.
+            let mut freeze = layered.generation_freeze_epoch();
+            freeze.epoch = self.transaction_manager.current_epoch().0;
+            return Ok(live_graph_sources_bounded(
+                Some(base),
+                Some(overlay),
+                freeze,
+                max_record_bytes,
+            ));
+        }
+        if let Some(store) = self.store.as_ref() {
+            // Pure LPG store — no base; all data is overlay.
+            let overlay_node_ids: FxHashSet<u64> =
+                store.all_node_ids().into_iter().map(|id| id.as_u64()).collect();
+            let overlay_edge_ids: FxHashSet<u64> =
+                store.all_edges().into_iter().map(|e| e.id.as_u64()).collect();
+            let freeze = FrozenOverlayEpoch {
+                epoch: self.transaction_manager.current_epoch().0,
+                overlay_node_ids,
+                overlay_edge_ids,
+                deleted_base_node_ids: FxHashSet::default(),
+                deleted_base_edge_ids: FxHashSet::default(),
+            };
+            return Ok(live_graph_sources_bounded(
+                None,
+                Some(Arc::clone(store)),
+                freeze,
+                max_record_bytes,
+            ));
         }
         Err(Error::Internal(
             "no live graph store available for generation build".into(),

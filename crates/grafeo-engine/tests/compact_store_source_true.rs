@@ -35,6 +35,7 @@ fn bounded_round_trip(
         correlation_id: "source-true".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder
@@ -146,6 +147,7 @@ fn missing_required_membership_segment_fails_closed() {
         correlation_id: "fail-closed".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder

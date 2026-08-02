@@ -99,6 +99,8 @@ pub struct BoundedBuildConfig {
     /// against the declared src_label/dst_label. Schema-bounded (not
     /// graph-proportional).
     pub rel_schemas: Vec<RelSchemaDecl>,
+    /// R1.6: frozen overlay epoch for payload identity.
+    pub frozen_epoch: u64,
 }
 
 /// The bounded orchestrator. Drives one full build.
@@ -831,7 +833,8 @@ impl BoundedGenerationBuilder {
             true,
             self.metrics.clone(),
             Some(self.config.temp_dir.clone()),
-        ))
+        )
+        .with_frozen_epoch(self.config.frozen_epoch))
     }
 }
 

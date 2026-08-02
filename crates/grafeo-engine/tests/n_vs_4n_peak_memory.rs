@@ -189,6 +189,7 @@ fn run_isolated_scale(n: usize, root: &Path) -> ChildReport {
         correlation_id: format!("nvs4n-{label}"),
         spool_buf_cap: 1024 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut run_store =
         DiskRunStore::new(&runs_dir, budget, format!("nvs4n-{label}")).expect("DiskRunStore");

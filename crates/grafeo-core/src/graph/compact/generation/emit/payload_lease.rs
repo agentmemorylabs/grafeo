@@ -28,6 +28,8 @@ pub struct V5PayloadLease {
     metrics: GenerationMetrics,
     /// Job temp directory (spools, build-tmp). Cleaned on Drop.
     temp_dir: Option<PathBuf>,
+    /// R1.6: frozen overlay epoch for payload identity.
+    frozen_epoch: u64,
 }
 
 impl std::fmt::Debug for V5PayloadLease {
@@ -82,7 +84,21 @@ impl V5PayloadLease {
             preserves_ids,
             metrics,
             temp_dir,
+            frozen_epoch: 0,
         }
+    }
+
+    /// R1.6: sets the frozen overlay epoch carried in the payload identity.
+    #[must_use]
+    pub fn with_frozen_epoch(mut self, epoch: u64) -> Self {
+        self.frozen_epoch = epoch;
+        self
+    }
+
+    /// R1.6: the frozen overlay epoch carried in the payload identity.
+    #[must_use]
+    pub fn frozen_epoch(&self) -> u64 {
+        self.frozen_epoch
     }
 
     /// Exact total payload byte length (computed from descriptor metadata

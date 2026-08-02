@@ -42,6 +42,7 @@ fn disk_run_store_failure_leaves_zero_artifacts() {
         correlation_id: "disk-fail".into(),
         spool_buf_cap: 256,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut run_store =
         DiskRunStore::new(&build_runs, budget, "disk-fail").expect("run store");
@@ -87,6 +88,7 @@ fn disk_run_store_success_leaves_zero_artifacts() {
         correlation_id: "disk-success".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder
@@ -123,6 +125,7 @@ fn disk_run_store_cancel_leaves_zero_artifacts() {
         correlation_id: "disk-cancel".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut run_store =
         DiskRunStore::new(&build_runs, budget, "disk-cancel").expect("run store");

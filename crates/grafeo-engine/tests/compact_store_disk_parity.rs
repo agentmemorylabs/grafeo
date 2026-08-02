@@ -58,6 +58,7 @@ fn disk_run_store_payload(input: &GenerationInput, tmp: &TempDir, job: &str) -> 
         correlation_id: job.into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder

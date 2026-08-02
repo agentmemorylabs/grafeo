@@ -24,6 +24,7 @@ fn config(temp: &std::path::Path) -> BoundedBuildConfig {
         correlation_id: "test".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     }
 }
 
@@ -291,6 +292,7 @@ fn raii_cleanup_on_success() {
         correlation_id: "raii-success".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let mut lease = builder
@@ -325,6 +327,7 @@ fn raii_cleanup_on_drop_without_stream() {
         correlation_id: "raii-nostream".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let lease = builder
@@ -408,6 +411,7 @@ fn failure_before_payload_lease_cleans_job_temp() {
         correlation_id: "pre-lease-dup".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let err = builder
@@ -438,6 +442,7 @@ fn failure_tiny_budget_cleans_job_temp() {
         correlation_id: "tiny-budget".into(),
         spool_buf_cap: 256,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config);
     let err = builder
@@ -476,6 +481,7 @@ fn failure_cancel_mid_build_cleans_job_temp() {
         correlation_id: "cancel-mid".into(),
         spool_buf_cap: 64 * 1024,
         rel_schemas: Vec::new(),
+        frozen_epoch: 0,
     };
     let mut builder = BoundedGenerationBuilder::new(config).with_cancel(token);
     let err = builder
