@@ -96,21 +96,89 @@ impl RelSchemaDecl {
 pub struct GenerationNode {
     /// Original sparse ID.
     pub id: OriginalNodeId,
-    /// Canonical node-table label (single label key for W0 fixtures).
-    pub label: String,
-    /// Properties keyed by name.
+    /// Canonical logical label vector: sorted (UTF-8 byte-lexicographic),
+    /// deduplicated, and non-empty (G-EM0.5b D0.8.0 item 1).
+    ///
+    /// The source-true contract carries **all** of a node's logical labels.
+    /// No source adapter may select one "primary" label and discard the rest.
+    /// The physical table is the first canonical label (`labels[0]`); the
+    /// writer emits every logical membership into the mapped label-membership
+    /// companion segment.
+    pub labels: Vec<String>,
+    /// Properties keyed by name. Absence of a key means the row does not
+    /// carry that property; a present `Value::Null` is a stored null.
     pub properties: FxHashMap<PropertyKey, Value>,
 }
 
 impl GenerationNode {
-    /// Convenience constructor.
+    /// Convenience constructor for a single-label node.
+    ///
+    /// # Panics
+    ///
+    /// Never panics; a single label always satisfies the canonical contract.
     #[must_use]
     pub fn new(id: impl Into<OriginalNodeId>, label: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            label: label.into(),
+            labels: vec![label.into()],
             properties: FxHashMap::default(),
         }
+    }
+
+    /// Constructs a node from an explicit label set, canonicalizing it
+    /// (sorted + deduplicated).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::InvalidInput`] when the label set is empty.
+    pub fn with_labels(
+        id: impl Into<OriginalNodeId>,
+        labels: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, GenerationError> {
+        let mut canonical: Vec<String> = labels.into_iter().map(Into::into).collect();
+        canonical.sort();
+        canonical.dedup();
+        if canonical.is_empty() {
+            return Err(GenerationError::InvalidInput(
+                "GenerationNode must carry at least one label".into(),
+            ));
+        }
+        Ok(Self {
+            id: id.into(),
+            labels: canonical,
+            properties: FxHashMap::default(),
+        })
+    }
+
+    /// Returns the canonical physical-table label (`labels[0]`).
+    ///
+    /// This is the deterministic physical-grouping rule of D0.8.0 item 2; it
+    /// is **not** a substitute for the full logical label set.
+    #[must_use]
+    pub fn physical_label(&self) -> &str {
+        self.labels[0].as_str()
+    }
+
+    /// Validates the canonical label contract (sorted, deduped, non-empty).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::InvalidInput`] on a violation.
+    pub fn validate_labels(&self) -> Result<(), GenerationError> {
+        if self.labels.is_empty() {
+            return Err(GenerationError::InvalidInput(
+                "GenerationNode labels must be non-empty".into(),
+            ));
+        }
+        for w in self.labels.windows(2) {
+            if w[1] <= w[0] {
+                return Err(GenerationError::InvalidInput(format!(
+                    "GenerationNode labels not canonical (sorted+deduped): {:?}",
+                    self.labels
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Adds a property.

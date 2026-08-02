@@ -4,7 +4,7 @@ use super::error::GenerationError;
 use super::strings::GlobalStringDictionary;
 use super::v5_emitter::{SegmentPlanEntry, build_segment_plan, emit_single_segment};
 use crate::graph::compact::CompactStore;
-use crate::graph::compact::mapped::{DIRECTORY_ENTRY_LEN, HEADER_LEN, SegmentKind};
+use crate::graph::compact::mapped::{DIRECTORY_ENTRY_LEN, HEADER_LEN, SegmentKind, layout_flags};
 use crate::graph::compact::section_v5::align_up;
 use grafeo_common::utils::hash::FxHashMap;
 
@@ -212,6 +212,17 @@ pub fn assemble_v5_payload_from_source<S: V5SegmentSource>(
 
     let directory_crc = crc32fast::hash(&dir_bytes);
     let flags: u8 = u8::from(preserves_ids);
+    let header_layout_flags = layout_flags::from_companion_segments(
+        segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::NodeLabelMembership),
+        segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::ColumnRowPresence),
+        segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::ColumnRowNull),
+    );
 
     // reason: data_offset + data_bytes.len() fits usize
     #[allow(clippy::cast_possible_truncation)]
@@ -227,7 +238,7 @@ pub fn assemble_v5_payload_from_source<S: V5SegmentSource>(
     // reason: DIRECTORY_ENTRY_LEN is 48
     #[allow(clippy::cast_possible_truncation)]
     write_u16(&mut out, DIRECTORY_ENTRY_LEN as u16);
-    write_u32(&mut out, 0); // layout_flags
+    write_u32(&mut out, header_layout_flags);
     // reason: HEADER_LEN is 64
     #[allow(clippy::cast_possible_truncation)]
     write_u64(&mut out, HEADER_LEN as u64); // directory_offset

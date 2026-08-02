@@ -630,7 +630,55 @@ mod adapter {
     fn write_u64(buf: &mut Vec<u8>, v: u64) {
         buf.extend_from_slice(&v.to_le_bytes());
     }
+
+    // ── D0.8.7 streaming payload lease adapter ─────────────────────────────
+
+    /// Adapter that presents a core [`V5PayloadLease`] as a container
+    /// [`ExactSectionSource`].
+    ///
+    /// The lease streams the assembled v5 payload from resident or spilled
+    /// segment bodies — never a whole-payload `Vec<u8>`. `exact_len` is
+    /// computed from descriptor metadata; `copy_to` streams through
+    /// [`V5PayloadLease::stream_to`]. Dropping the lease after the outer copy
+    /// cleans transferred spools on success or failure.
+    pub struct StreamingPayloadSectionSource {
+        lease: grafeo_core::graph::compact::generation::emit::V5PayloadLease,
+    }
+
+    impl StreamingPayloadSectionSource {
+        /// Wraps a payload lease.
+        #[must_use]
+        pub fn new(lease: grafeo_core::graph::compact::generation::emit::V5PayloadLease) -> Self {
+            Self { lease }
+        }
+
+        /// Borrows the lease's build metrics.
+        #[must_use]
+        pub fn metrics(&self) -> &grafeo_core::graph::compact::generation::GenerationMetrics {
+            self.lease.metrics()
+        }
+    }
+
+    impl ExactSectionSource for StreamingPayloadSectionSource {
+        fn section_type(&self) -> SectionType {
+            SectionType::CompactStore
+        }
+
+        fn directory_version(&self) -> u8 {
+            5 // CompactStore v5 format
+        }
+
+        fn exact_len(&self) -> u64 {
+            self.lease.exact_len().unwrap_or(0)
+        }
+
+        fn copy_to(&mut self, sink: &mut dyn Write) -> Result<()> {
+            self.lease
+                .stream_to(sink)
+                .map_err(|e| Error::Internal(format!("stream payload lease: {e}")))
+        }
+    }
 }
 
 #[cfg(feature = "generation")]
-pub use adapter::CompactStoreSectionSource;
+pub use adapter::{CompactStoreSectionSource, StreamingPayloadSectionSource};

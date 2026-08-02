@@ -16,6 +16,9 @@ pub mod csr;
 pub mod deletions_section;
 /// Source-true CompactStore generation on bounded runs (G-EM0.W0-A2).
 pub mod generation;
+/// Streaming bounded generation builder (G-EM0.5b Phase 2).
+#[cfg(feature = "generation-streaming")]
+pub mod generation_builder;
 mod graph_store_impl;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
@@ -135,6 +138,33 @@ pub struct CompactStore {
     mapped_edge_original_bases: Option<Vec<usize>>,
     /// Split memory accounting for Milestone R evidence.
     memory_accounting: Option<mapped::CompactMemoryAccounting>,
+
+    // ── G-EM0.5b D0.8.0 source-true companions ──────────────────────
+    /// Node logical-label membership (segment kind 21). `None` applies the
+    /// old-v5 default (each node belongs to exactly its physical table's
+    /// label).
+    label_membership: Option<mapped::LabelMembershipView>,
+    /// Per-column row-presence bitmap (segment kind 22). `None` applies the
+    /// old-v5 default (every encoded row present).
+    column_presence: Option<mapped::RowBitmapView>,
+    /// Per-column row-null bitmap (segment kind 23). `None` applies the
+    /// old-v5 default (every present row non-null).
+    column_null: Option<mapped::RowBitmapView>,
+    /// Retained bytes backing the presence/null/membership views.
+    companion_bytes: Option<bytes::Bytes>,
+    /// Presence segment body bytes (offsets in `column_presence` are relative
+    /// to this slice, not the whole payload).
+    presence_body: Option<bytes::Bytes>,
+    /// Null segment body bytes (offsets in `column_null` are relative to this
+    /// slice, not the whole payload).
+    null_body: Option<bytes::Bytes>,
+    /// Maps `(table_id, property_key)` to the flat column index used by the
+    /// presence/null bitmaps. Populated from the ColumnDirectory during
+    /// deserialization.
+    column_index_map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32>,
+    /// Global string dictionary (code→string) retained for membership resolution.
+    /// Present when the store was deserialized from v5 with a membership segment.
+    global_dict: Option<mapped::MappedStringDictionary>,
 }
 
 impl std::fmt::Debug for CompactStore {
@@ -210,6 +240,14 @@ impl CompactStore {
             mapped_edge_original_ids: None,
             mapped_edge_original_bases: None,
             memory_accounting: None,
+            label_membership: None,
+            column_presence: None,
+            column_null: None,
+            companion_bytes: None,
+            presence_body: None,
+            null_body: None,
+            column_index_map: FxHashMap::default(),
+            global_dict: None,
         }
     }
 
@@ -532,6 +570,170 @@ impl CompactStore {
     /// Records split memory accounting for this store.
     pub(crate) fn set_memory_accounting(&mut self, accounting: mapped::CompactMemoryAccounting) {
         self.memory_accounting = Some(accounting);
+    }
+
+    /// Installs the G-EM0.5b D0.8.0 source-true companion views from a v5
+    /// payload (label membership + column presence/null).
+    ///
+    /// `presence_body` and `null_body` are the raw segment bodies the bitmap
+    /// offsets are relative to (the whole-payload `backing` is retained only
+    /// to keep the membership view's bytes alive).
+    pub(crate) fn set_source_true_companions(
+        &mut self,
+        membership: Option<mapped::LabelMembershipView>,
+        presence: Option<mapped::RowBitmapView>,
+        null: Option<mapped::RowBitmapView>,
+        backing: bytes::Bytes,
+        presence_body: Option<bytes::Bytes>,
+        null_body: Option<bytes::Bytes>,
+        global_dict: Option<mapped::MappedStringDictionary>,
+    ) {
+        self.label_membership = membership;
+        self.column_presence = presence;
+        self.column_null = null;
+        self.companion_bytes = Some(backing);
+        self.presence_body = presence_body;
+        self.null_body = null_body;
+        self.global_dict = global_dict;
+    }
+
+    /// Sets the column index map used to look up presence/null bitmaps.
+    pub(crate) fn set_column_index_map(
+        &mut self,
+        map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32>,
+    ) {
+        self.column_index_map = map;
+    }
+
+    /// Returns the full logical label set for a node, consulting the membership
+    /// view when present. Falls back to the physical table label when no
+    /// membership segment exists or the node has no extra labels.
+    #[must_use]
+    pub(crate) fn logical_labels_for_node(&self, table_id: u16, offset: u32) -> Vec<ArcStr> {
+        let physical_label = self
+            .table_id_to_label
+            .get(table_id as usize)
+            .cloned()
+            .unwrap_or_default();
+
+        let Some(membership) = &self.label_membership else {
+            return vec![physical_label];
+        };
+
+        let Some(dict) = &self.global_dict else {
+            return vec![physical_label];
+        };
+
+        let label_codes = membership.labels_of(table_id, offset);
+        if label_codes.is_empty() {
+            return vec![physical_label];
+        }
+
+        label_codes
+            .iter()
+            .filter_map(|&code| dict.get(code).map(ArcStr::from))
+            .collect()
+    }
+
+    /// Returns `None` if the property is absent (presence bit = 0). Returns
+    /// `Some(Value::Null)` when the row is present-null (null bit = 1).
+    /// Otherwise returns the typed body value.
+    #[must_use]
+    pub(crate) fn get_property_filtered(
+        &self,
+        table_id: u16,
+        row: u32,
+        key: &grafeo_common::types::PropertyKey,
+        raw_value: Option<grafeo_common::types::Value>,
+    ) -> Option<grafeo_common::types::Value> {
+        let Some(col_idx) = self.column_index_map.get(&(table_id, key.clone())) else {
+            return raw_value;
+        };
+        // Presence: default true when no companion installed.
+        let present = match (&self.column_presence, &self.presence_body) {
+            (Some(view), Some(body)) => view.get(body, *col_idx, row).unwrap_or(true),
+            _ => true,
+        };
+        if !present {
+            return None;
+        }
+        // Null: default false when no companion installed.
+        let is_null = match (&self.column_null, &self.null_body) {
+            (Some(view), Some(body)) => view.get(body, *col_idx, row).unwrap_or(false),
+            _ => false,
+        };
+        if is_null {
+            return Some(grafeo_common::types::Value::Null);
+        }
+        raw_value
+    }
+
+    /// Returns the full logical label codes for one physical node row.
+    ///
+    /// When no membership companion exists, the old-v5 default applies: the
+    /// node belongs to exactly its physical table's label (whose code the
+    /// caller supplies).
+    #[must_use]
+    pub(crate) fn logical_label_codes_of(
+        &self,
+        node_table_id: u16,
+        node_offset: u32,
+        physical_label_code: u32,
+    ) -> Vec<u32> {
+        match &self.label_membership {
+            Some(view) => {
+                let mut codes = view.labels_of(node_table_id, node_offset);
+                if codes.is_empty() {
+                    codes.push(physical_label_code);
+                }
+                codes
+            }
+            None => vec![physical_label_code],
+        }
+    }
+
+    /// Returns `true` when a membership companion is installed (multi-label
+    /// payload).
+    #[must_use]
+    pub(crate) fn has_label_membership(&self) -> bool {
+        self.label_membership
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Borrows the installed label-membership view, if any.
+    #[must_use]
+    pub(crate) fn label_membership_view(&self) -> Option<&mapped::LabelMembershipView> {
+        self.label_membership.as_ref()
+    }
+
+    /// Borrows the presence bitmap bytes, if any.
+    #[must_use]
+    pub(crate) fn companion_bytes(&self) -> Option<&bytes::Bytes> {
+        self.companion_bytes.as_ref()
+    }
+
+    /// Three-way per-`(column, row)` property state (D0.8.0 item 4).
+    ///
+    /// Returns `None` for absent, `Some(None)` for a present null, and
+    /// `Some(Some(body_value_present))` marker for a present typed value.
+    /// The caller combines this with the typed body read.
+    #[must_use]
+    pub(crate) fn property_state(
+        &self,
+        bytes: &bytes::Bytes,
+        column_index: u32,
+        row: u32,
+    ) -> (bool, bool) {
+        let present = match &self.column_presence {
+            Some(view) => view.get(bytes, column_index, row).unwrap_or(true),
+            None => true,
+        };
+        let is_null = match &self.column_null {
+            Some(view) => view.get(bytes, column_index, row).unwrap_or(false),
+            None => false,
+        };
+        (present, is_null)
     }
 
     /// Returns split memory accounting when recorded (mapped v5 open).

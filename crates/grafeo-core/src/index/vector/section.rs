@@ -121,8 +121,11 @@ impl VectorStoreSection {
     /// # Errors
     ///
     /// Returns a serialization error on truncated/corrupt envelopes, bad magic,
-    /// unsupported version, empty topology for a matched key, or when the
-    /// section body does not restore any catalog index keys.
+    /// unsupported versions, or when the section body does not restore any
+    /// catalog index keys. A successfully decoded zero-node topology is valid:
+    /// catalog-registered vector indexes may be checkpointed before their first
+    /// vector is inserted. A topology that declares an entry point but contains
+    /// zero nodes is structurally inconsistent and is rejected (fail-closed).
     pub fn restore_from_mapped_bytes(&mut self, data: Bytes) -> Result<()> {
         if data.is_empty() {
             return Err(Error::Serialization(
@@ -217,6 +220,25 @@ fn serialize_v2(indexes: &[(String, Arc<VectorIndexKind>)]) -> Result<Vec<u8>> {
     }
 
     Ok(buf)
+}
+
+/// Rejects a structurally inconsistent topology: one that declares an
+/// entry point but contains zero nodes. Legitimate writers never emit
+/// this state — the entry point is set on first insert and cleared on
+/// last removal, and restore derives both fields from the same blob —
+/// so it is treated as corruption and fails closed. A valid empty
+/// topology is `entry_point = None` with zero nodes.
+fn reject_inconsistent_empty_topology(
+    entry_point: Option<NodeId>,
+    n_nodes: usize,
+    key: &str,
+) -> Result<()> {
+    if entry_point.is_some() && n_nodes == 0 {
+        return Err(Error::Serialization(format!(
+            "Vector Store v2 topology for key '{key}' declares an entry point but contains no nodes (fail-closed)"
+        )));
+    }
+    Ok(())
 }
 
 /// Restores indexes from a v2 paged envelope.
@@ -335,12 +357,7 @@ fn deserialize_v2(
                         meta.key
                     ))
                 })?;
-                if topo.is_empty() {
-                    return Err(Error::Serialization(format!(
-                        "Vector Store v2 topology for key '{}' is empty (fail-closed)",
-                        meta.key
-                    )));
-                }
+                reject_inconsistent_empty_topology(topo.entry_point(), topo.len(), &meta.key)?;
                 index.adopt_mmap_topology(topo);
             } else {
                 let (entry_point, max_level, nodes) = deserialize_topology(topology_bytes)
@@ -350,12 +367,7 @@ fn deserialize_v2(
                             meta.key
                         ))
                     })?;
-                if nodes.is_empty() {
-                    return Err(Error::Serialization(format!(
-                        "Vector Store v2 topology for key '{}' is empty (fail-closed)",
-                        meta.key
-                    )));
-                }
+                reject_inconsistent_empty_topology(entry_point, nodes.len(), &meta.key)?;
                 index.restore_topology(entry_point, max_level, nodes);
             }
             restored += 1;
@@ -645,6 +657,30 @@ mod tests {
         let (ep_b, _, _) = restored_b.snapshot_topology();
         assert_eq!(ep_a, Some(NodeId::new(10)));
         assert_eq!(ep_b, Some(NodeId::new(100)));
+    }
+
+    #[test]
+    fn empty_catalog_index_restores_on_heap_and_mmap_paths() {
+        let key = "SessionSummary:embedding".to_string();
+        let config = HnswConfig::new(16, DistanceMetric::Cosine);
+        let empty = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config.clone())));
+        let section = VectorStoreSection::new(vec![(key.clone(), empty)]);
+        let bytes = section.serialize().expect("serialize empty topology");
+
+        let heap_index = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config.clone())));
+        let mut heap_section =
+            VectorStoreSection::new(vec![(key.clone(), Arc::clone(&heap_index))]);
+        heap_section
+            .deserialize(&bytes)
+            .expect("heap restore accepts valid empty topology");
+        assert_eq!(heap_index.len(), 0);
+
+        let mmap_index = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config)));
+        let mut mmap_section = VectorStoreSection::new(vec![(key, Arc::clone(&mmap_index))]);
+        mmap_section
+            .restore_from_mapped_bytes(Bytes::from(bytes))
+            .expect("mmap restore accepts valid empty topology");
+        assert_eq!(mmap_index.len(), 0);
     }
 
     /// Truncated v2 envelope is rejected without panicking.

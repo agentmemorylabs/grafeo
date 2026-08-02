@@ -132,6 +132,10 @@ pub fn emit_single_segment(
 /// Panics if a property key exists in a column map but is missing from the
 /// string index (internal invariant violation — all keys are interned during
 /// plan construction).
+#[cfg_attr(
+    feature = "generation-streaming",
+    allow(unreachable_code, unused_variables, unused_mut)
+)]
 pub fn emit_v5_segments(
     store: &CompactStore,
     global_strings: &GlobalStringDictionary,
@@ -139,6 +143,35 @@ pub fn emit_v5_segments(
     let string_index = build_string_index(global_strings)?;
     let str_slice = global_strings.as_slice();
 
+    // ── Canonical bounded emission (G-EM0.5b Phase 1) ──────────────────
+    // Feature ON: delegate to the canonical emitter and convert descriptors
+    // back to V5Segment. The eager path below is held harmless for OFF.
+    #[cfg(feature = "generation-streaming")]
+    {
+        use super::emit::emit_canonical_descriptors;
+        let str_refs: Vec<&str> = str_slice.iter().map(String::as_str).collect();
+        let descriptors = emit_canonical_descriptors(store, &string_index, &str_refs)?;
+        let mut segments = Vec::with_capacity(descriptors.len());
+        for desc in descriptors {
+            let mut bytes = Vec::new();
+            desc.body.stream(&mut |chunk| {
+                bytes.extend_from_slice(chunk);
+                Ok(())
+            })?;
+            segments.push(V5Segment {
+                kind: desc.kind,
+                encoding_version: desc.encoding_version,
+                flags: desc.flags,
+                alignment: desc.alignment,
+                element_width: desc.element_width,
+                bytes,
+            });
+        }
+        return Ok(segments);
+    }
+
+    // ── Eager path (feature OFF) ────────────────────────────────────────
+    #[allow(unused_variables)]
     let mut segments: Vec<V5Segment> = Vec::new();
 
     // ── 0. Metadata ────────────────────────────────────────────────────────

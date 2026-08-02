@@ -56,6 +56,14 @@ pub use database::CompactBacking;
 pub use database::GrafeoDB;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use database::IndexedVectorRead;
+#[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+pub use database::generation::{
+    BACKUP_MANIFEST_NAME, BackedUpWalFile, BackupPin, BackupPinGuard, ClassifiedGeneration,
+    GenerationBackupManifest, GenerationBackupReceipt, OpenMode, OwnershipError, RetentionClass,
+    RetirementAuthority, RetirementError, RetirementPlan, RootLifecycleReport, RootLockOwnerState,
+    RootOwnership, backup_generation_root, collect_retirement, plan_retirement,
+    restore_generation_root,
+};
 #[cfg(all(
     feature = "generation",
     feature = "lpg",

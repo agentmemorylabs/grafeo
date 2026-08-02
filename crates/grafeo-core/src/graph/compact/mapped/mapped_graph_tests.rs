@@ -223,7 +223,7 @@ fn zone_map_segments_round_trip_and_reject_bad_reserved() {
     .unwrap();
     assert_eq!(seg.len(), ZONE_MAP_RECORD_LEN);
 
-    let parsed = parse_table_zone_maps(&seg, &dict, 1).unwrap();
+    let (parsed, _rel_parsed) = parse_table_zone_maps(&seg, &dict, 1, 0).unwrap();
     let got = parsed[0]
         .get(&grafeo_common::types::PropertyKey::new("age"))
         .expect("age zone map");
@@ -234,7 +234,7 @@ fn zone_map_segments_round_trip_and_reject_bad_reserved() {
     // Corrupt reserved field.
     let mut bad = seg.clone();
     bad[2] = 1;
-    let err = parse_table_zone_maps(&bad, &dict, 1).expect_err("reserved");
+    let err = parse_table_zone_maps(&bad, &dict, 1, 0).expect_err("reserved");
     assert!(err.contains("reserved"), "{err}");
 }
 
@@ -380,4 +380,18 @@ fn adversarial_many_block_zone_maps_round_trip() {
             .anonymous_proportional_structure_bytes,
         0
     );
+}
+
+#[test]
+fn layout_flags_validate_known_bits_and_requirements() {
+    use super::layout_flags;
+
+    assert!(layout_flags::validate(0).is_ok());
+    let flags = layout_flags::from_companion_segments(true, false, false);
+    assert!(layout_flags::validate(flags).is_ok());
+    assert_ne!(flags & layout_flags::SOURCE_TRUE_EXTENDED, 0);
+    assert_ne!(flags & layout_flags::REQUIRES_LABEL_MEMBERSHIP, 0);
+
+    assert!(layout_flags::validate(0x0000_0010).is_err());
+    assert!(layout_flags::validate(layout_flags::SOURCE_TRUE_EXTENDED).is_err());
 }

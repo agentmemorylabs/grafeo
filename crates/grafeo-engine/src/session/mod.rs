@@ -5039,7 +5039,7 @@ impl Session {
             .collect();
 
         let (epoch, transaction_id) = self.get_transaction_context();
-        let _graph_name = self.active_graph_storage_key();
+        let graph_name = self.active_graph_storage_key();
         let id = self.active_lpg_store().create_node_with_props_versioned(
             labels,
             props,

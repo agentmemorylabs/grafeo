@@ -15,12 +15,18 @@ use grafeo_common::utils::error::{Error, Result};
 use grafeo_common::utils::hash::FxHashMap;
 use grafeo_core::graph::Direction;
 use grafeo_core::graph::GraphStore;
+#[cfg(not(feature = "generation-streaming"))]
+use grafeo_core::graph::compact::generation::generate_compact_store;
+#[cfg(not(feature = "generation-streaming"))]
+use grafeo_core::graph::compact::generation::{EdgeRecordSource, NodeRecordSource};
 use grafeo_core::graph::compact::generation::{
-    EdgeRecordSource, GenerationBudget, GenerationEdge, GenerationError, GenerationNode,
-    NodeRecordSource, OriginalEdgeId, OriginalNodeId, RelSchemaDecl, generate_compact_store,
+    GenerationBudget, GenerationEdge, GenerationError, GenerationNode, OriginalEdgeId,
+    OriginalNodeId, RelSchemaDecl,
 };
+#[cfg(not(feature = "generation-streaming"))]
+use grafeo_storage::file::generation_writer::CompactStoreSectionSource;
 use grafeo_storage::file::generation_writer::{
-    CompactStoreSectionSource, ExactSectionSource, GenerationContainerHeader, OsGenerationFileOps,
+    ExactSectionSource, GenerationContainerHeader, OsGenerationFileOps,
 };
 use grafeo_storage::generation::lock::RootLock;
 use grafeo_storage::generation::publication::{
@@ -66,16 +72,18 @@ pub struct PublishedGenerationDescriptor {
     pub generation_id: String,
 }
 
-/// Frozen ID snapshot used by streaming live record sources.
+/// Frozen ID snapshot used by streaming live record sources (feature-off path).
 ///
 /// Holds only identity keys (not `GenerationNode` / `GenerationEdge` payloads).
 /// Payloads are loaded one-at-a-time in `next_*`.
+#[cfg(not(feature = "generation-streaming"))]
 struct FrozenLiveGraph {
     store: Arc<dyn GraphStore>,
     node_ids: Vec<NodeId>,
     edge_ids: Vec<EdgeId>,
 }
 
+#[cfg(not(feature = "generation-streaming"))]
 impl FrozenLiveGraph {
     fn freeze(store: Arc<dyn GraphStore>) -> Self {
         let node_ids = store.node_ids();
@@ -95,12 +103,14 @@ impl FrozenLiveGraph {
     }
 }
 
-/// Streams nodes from a frozen live-graph snapshot.
+/// Streams nodes from a frozen live-graph snapshot (feature-off path).
+#[cfg(not(feature = "generation-streaming"))]
 struct LiveNodeRecordSource {
     graph: Arc<FrozenLiveGraph>,
     cursor: usize,
 }
 
+#[cfg(not(feature = "generation-streaming"))]
 impl NodeRecordSource for LiveNodeRecordSource {
     fn next_node(&mut self) -> std::result::Result<Option<GenerationNode>, GenerationError> {
         while self.cursor < self.graph.node_ids.len() {
@@ -109,14 +119,24 @@ impl NodeRecordSource for LiveNodeRecordSource {
             let Some(node) = self.graph.store.get_node(id) else {
                 continue;
             };
-            let label = primary_label(&node.labels)?;
+            // D0.8.0 item 1: carry the node's complete canonical label set.
+            // Never select one primary label and discard the rest.
+            let mut labels: Vec<String> = node.labels.iter().map(|l| l.to_string()).collect();
+            labels.sort();
+            labels.dedup();
+            if labels.is_empty() {
+                return Err(GenerationError::InvalidInput(format!(
+                    "node {} has no labels",
+                    node.id.as_u64()
+                )));
+            }
             let mut properties = FxHashMap::default();
             for (key, value) in node.properties.iter() {
                 properties.insert(key.clone(), value.clone());
             }
             return Ok(Some(GenerationNode {
                 id: OriginalNodeId::new(node.id.as_u64()),
-                label,
+                labels,
                 properties,
             }));
         }
@@ -124,12 +144,14 @@ impl NodeRecordSource for LiveNodeRecordSource {
     }
 }
 
-/// Streams edges from a frozen live-graph snapshot.
+/// Streams edges from a frozen live-graph snapshot (feature-off path).
+#[cfg(not(feature = "generation-streaming"))]
 struct LiveEdgeRecordSource {
     graph: Arc<FrozenLiveGraph>,
     cursor: usize,
 }
 
+#[cfg(not(feature = "generation-streaming"))]
 impl EdgeRecordSource for LiveEdgeRecordSource {
     fn next_edge(&mut self) -> std::result::Result<Option<GenerationEdge>, GenerationError> {
         while self.cursor < self.graph.edge_ids.len() {
@@ -154,15 +176,6 @@ impl EdgeRecordSource for LiveEdgeRecordSource {
     }
 }
 
-fn primary_label(labels: &[arcstr::ArcStr]) -> std::result::Result<String, GenerationError> {
-    let mut names: Vec<&str> = labels.iter().map(|l| l.as_str()).collect();
-    names.sort_unstable();
-    names
-        .first()
-        .map(|s| (*s).to_string())
-        .ok_or_else(|| GenerationError::InvalidInput("node has no labels".into()))
-}
-
 fn map_generation_error(err: GenerationError) -> Error {
     Error::Internal(format!("generation build: {err}"))
 }
@@ -177,6 +190,7 @@ fn map_publication_error(err: PublicationError) -> Error {
     PublicationPhaseError::from_publication(err).into()
 }
 
+#[cfg(not(feature = "generation-streaming"))]
 fn map_section_error(err: Error) -> Error {
     Error::Internal(format!("generation section source: {err}"))
 }
@@ -267,24 +281,91 @@ impl GrafeoDB {
         std::fs::create_dir_all(&wal_dir)?;
         let wal = WalManager::open(&wal_dir)?;
 
+        #[cfg(feature = "generation-streaming")]
+        let mut live_sources = self.live_graph_sources_bounded(request.budget.max_record_bytes)?;
+        #[cfg(not(feature = "generation-streaming"))]
         let store = self.live_graph_store()?;
+        #[cfg(not(feature = "generation-streaming"))]
         let frozen = Arc::new(FrozenLiveGraph::freeze(store));
+        #[cfg(not(feature = "generation-streaming"))]
         let mut nodes = LiveNodeRecordSource {
             graph: Arc::clone(&frozen),
             cursor: 0,
         };
+        #[cfg(not(feature = "generation-streaming"))]
         let mut edges = LiveEdgeRecordSource {
             graph: Arc::clone(&frozen),
             cursor: 0,
         };
 
-        let generated = generate_compact_store(
-            &mut nodes,
-            &mut edges,
-            &request.rel_schemas,
-            &request.budget,
-        )
-        .map_err(map_generation_error)?;
+        // ── Generation build + section source ─────────────────────────────
+        // With `generation-streaming` the engine drives the bounded
+        // out-of-core orchestrator and streams a payload lease; otherwise it
+        // falls back to the eager heap `generate_compact_store` path. The
+        // accepted 3a commit/rollback/lease/publication state machine below
+        // is verbatim in both cases.
+        #[cfg(feature = "generation-streaming")]
+        let (section, node_count, edge_count) = {
+            use grafeo_core::graph::compact::generation_builder::orchestrator::{
+                BoundedBuildConfig, BoundedGenerationBuilder,
+            };
+            use grafeo_storage::file::generation_writer::StreamingPayloadSectionSource;
+            use grafeo_storage::generation::DiskRunStore;
+
+            // Job temp root: a scratch dir under the generation root, removed
+            // when the run-set leases and payload lease drop (success or
+            // failure). Correlation id = generation id for traceability.
+            let temp_dir = root.join("build-tmp");
+            // R1.6: capture the frozen epoch before the build so the payload
+            // lease carries the same epoch as the container header.
+            let frozen_epoch = self.transaction_manager.current_epoch().0;
+            let config = BoundedBuildConfig {
+                budget: request.budget,
+                temp_dir,
+                correlation_id: request.generation_id.clone(),
+                spool_buf_cap: usize::try_from(request.budget.io_buffer_bytes)
+                    .unwrap_or(1024 * 1024),
+                rel_schemas: request.rel_schemas.clone(),
+                frozen_epoch,
+            };
+            let mut run_store = DiskRunStore::new(
+                root.join("build-runs"),
+                request.budget,
+                request.generation_id.clone(),
+            )
+            .map_err(map_generation_error)?;
+            let mut builder = BoundedGenerationBuilder::new(config);
+            let lease = builder
+                .build(
+                    live_sources.nodes.as_mut(),
+                    live_sources.edges.as_mut(),
+                    &mut run_store,
+                )
+                .map_err(map_generation_error)?;
+            let node_count = lease.total_nodes();
+            let edge_count = lease.total_edges();
+            let section: Box<dyn ExactSectionSource> =
+                Box::new(StreamingPayloadSectionSource::new(lease));
+            (section, node_count, edge_count)
+        };
+
+        #[cfg(not(feature = "generation-streaming"))]
+        let (section, node_count, edge_count) = {
+            let generated = generate_compact_store(
+                &mut nodes,
+                &mut edges,
+                &request.rel_schemas,
+                &request.budget,
+            )
+            .map_err(map_generation_error)?;
+            let node_count = generated.store.total_nodes();
+            let edge_count = generated.store.total_edges();
+            let section: Box<dyn ExactSectionSource> = Box::new(
+                CompactStoreSectionSource::new(generated.store, generated.global_strings)
+                    .map_err(map_section_error)?,
+            );
+            (section, node_count, edge_count)
+        };
 
         // `#[doc(hidden)]` test-only fault seam (G-EM0.3c crash matrix): in
         // debug/test builds, `GRAFEO_3C_ABORT` hard-aborts the process at the
@@ -300,11 +381,7 @@ impl GrafeoDB {
             std::process::abort();
         }
 
-        let node_count = generated.store.total_nodes();
-        let edge_count = generated.store.total_edges();
         let overlay_epoch = self.transaction_manager.current_epoch().0;
-        let section = CompactStoreSectionSource::new(generated.store, generated.global_strings)
-            .map_err(map_section_error)?;
         let header = GenerationContainerHeader {
             epoch: overlay_epoch,
             transaction_id: self
@@ -319,7 +396,7 @@ impl GrafeoDB {
         let parent_publication_sequence = request.parent_publication_sequence;
         let generation_id = request.generation_id.clone();
 
-        let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![Box::new(section)];
+        let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![section];
         let result = publish_generation(
             &lock,
             PublicationInput {
@@ -359,13 +436,83 @@ impl GrafeoDB {
     }
 
     /// Returns the merged live graph store (layered when compacted, else LPG).
-    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    #[cfg(all(
+        not(feature = "generation-streaming"),
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store"
+    ))]
     fn live_graph_store(&self) -> Result<Arc<dyn GraphStore>> {
         if let Some(layered) = self.layered_store.as_ref() {
             return Ok(Arc::clone(layered) as Arc<dyn GraphStore>);
         }
         if let Some(store) = self.store.as_ref() {
             return Ok(Arc::clone(store) as Arc<dyn GraphStore>);
+        }
+        Err(Error::Internal(
+            "no live graph store available for generation build".into(),
+        ))
+    }
+
+    /// Builds bounded live record sources from the concrete base/overlay stores.
+    ///
+    /// Extracts the `CompactStore` base and `LpgStore` overlay from the layered
+    /// store (when present), freezes the overlay epoch, and returns bounded
+    /// row-by-row cursors. Falls back to the overlay-only path when the store
+    /// is not layered (pure LPG).
+    #[cfg(all(
+        feature = "generation-streaming",
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store"
+    ))]
+    fn live_graph_sources_bounded(
+        &self,
+        max_record_bytes: u64,
+    ) -> Result<grafeo_core::graph::compact::generation_builder::live_graph::LiveGraphSources> {
+        use grafeo_common::utils::hash::FxHashSet;
+        use grafeo_core::graph::compact::generation_builder::FrozenOverlayEpoch;
+        use grafeo_core::graph::compact::generation_builder::live_graph_sources_bounded;
+
+        if let Some(layered) = self.layered_store.as_ref() {
+            let base = layered.base_store_arc();
+            let overlay = layered.overlay_store();
+            // Snapshot dirty/deleted sets via the layered store's freeze helper,
+            // then override the epoch with the transaction manager's authoritative value.
+            let mut freeze = layered.generation_freeze_epoch();
+            freeze.epoch = self.transaction_manager.current_epoch().0;
+            return Ok(live_graph_sources_bounded(
+                Some(base),
+                Some(overlay),
+                freeze,
+                max_record_bytes,
+            ));
+        }
+        if let Some(store) = self.store.as_ref() {
+            // Pure LPG store — no base; all data is overlay.
+            let overlay_node_ids: FxHashSet<u64> = store
+                .all_node_ids()
+                .into_iter()
+                .map(|id| id.as_u64())
+                .collect();
+            let overlay_edge_ids: FxHashSet<u64> = store
+                .all_edges()
+                .into_iter()
+                .map(|e| e.id.as_u64())
+                .collect();
+            let freeze = FrozenOverlayEpoch {
+                epoch: self.transaction_manager.current_epoch().0,
+                overlay_node_ids,
+                overlay_edge_ids,
+                deleted_base_node_ids: FxHashSet::default(),
+                deleted_base_edge_ids: FxHashSet::default(),
+            };
+            return Ok(live_graph_sources_bounded(
+                None,
+                Some(Arc::clone(store)),
+                freeze,
+                max_record_bytes,
+            ));
         }
         Err(Error::Internal(
             "no live graph store available for generation build".into(),

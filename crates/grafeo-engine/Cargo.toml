@@ -96,6 +96,7 @@ wal = ["dep:grafeo-storage", "grafeo-storage/wal"]  # Write-ahead log storage
 async-storage = ["dep:grafeo-storage", "grafeo-storage/async-storage", "dep:tokio"]  # Async WAL and storage backend
 grafeo-file = ["dep:grafeo-storage", "grafeo-storage/grafeo-file", "dep:crc32fast"]  # Single-file .grafeo format
 generation = ["grafeo-file", "grafeo-storage/generation"]  # Streaming generation container writer
+generation-streaming = ["generation", "grafeo-storage/generation-streaming", "grafeo-core/generation-streaming"]  # Bounded out-of-core generation (G-EM0.5b)
 encryption = ["dep:grafeo-storage", "grafeo-common/encryption", "grafeo-storage/encryption"]  # AES-256-GCM encryption at rest
 spill = ["grafeo-core/spill"]  # Disk spilling for out-of-core execution
 mmap = ["grafeo-core/mmap", "dep:memmap2", "dep:arc-swap"]  # File-backed vector storage and compact-store spill
@@ -146,6 +147,21 @@ path = "tests/compact_store_generation_contract.rs"
 required-features = ["generation", "compact-store"]
 
 [[test]]
+name = "compact_store_source_true"
+path = "tests/compact_store_source_true.rs"
+required-features = ["generation-streaming", "compact-store"]
+
+[[test]]
+name = "compact_store_source_true_outer"
+path = "tests/compact_store_source_true_outer/main.rs"
+required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
+
+[[test]]
+name = "compact_store_disk_parity"
+path = "tests/compact_store_disk_parity.rs"
+required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
+
+[[test]]
 name = "generation_build_orchestration"
 path = "tests/generation_build_orchestration.rs"
 required-features = ["generation", "compact-store", "lpg"]
@@ -169,6 +185,11 @@ required-features = ["generation", "compact-store", "lpg", "mmap"]
 name = "compact_store_overlay_admission"
 path = "tests/compact_store_overlay_admission.rs"
 required-features = ["compact-store", "lpg"]
+
+[[test]]
+name = "compact_store_generation_retirement"
+path = "tests/compact_store_generation_retirement.rs"
+required-features = ["generation", "compact-store", "lpg", "mmap"]
 
 [[bench]]
 name = "query_bench"

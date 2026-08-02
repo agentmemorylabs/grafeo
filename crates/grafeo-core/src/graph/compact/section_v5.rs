@@ -19,7 +19,7 @@ use super::mapped::{
     CompactMemoryAccounting, DIRECTORY_ENTRY_LEN, DictionaryCodeIndex, FORMAT_VERSION_V5,
     HEADER_LEN, MappedEdgeIdLookup, MappedNodeIdLookup, MappedStringDictionary,
     SCHEMA_OWNER_BUDGET_BYTES, SegmentKind, U32View, ZONE_MAP_RECORD_LEN,
-    build_dictionary_code_index, build_string_segments, build_zone_map_segments,
+    build_dictionary_code_index, build_string_segments, build_zone_map_segments, layout_flags,
     parse_block_zone_maps, parse_segment_directory, parse_table_zone_maps, slice_segment_checked,
     write_edge_id_record, write_node_id_record,
 };
@@ -59,6 +59,10 @@ pub fn serialize_v5(store: &CompactStore) -> Result<Vec<u8>, String> {
 /// # Errors
 ///
 /// Returns an error when a collection length exceeds the wire encoding.
+#[cfg_attr(
+    feature = "generation-streaming",
+    allow(unreachable_code, unused_variables, unused_mut)
+)]
 pub fn serialize_v5_with_string_order(
     store: &CompactStore,
     string_order: StringCodeOrder,
@@ -117,6 +121,15 @@ pub fn serialize_v5_with_string_order(
                 }
             }
         }
+        // R3-B2: intern rel zone map strings.
+        for zm in rt.zone_maps().values() {
+            intern_zone_strings(zm, &mut intern);
+        }
+        for zms in rt.block_zone_maps().values() {
+            for zm in zms {
+                intern_zone_strings(zm, &mut intern);
+            }
+        }
     }
 
     if string_order == StringCodeOrder::Lexicographic {
@@ -137,6 +150,35 @@ pub fn serialize_v5_with_string_order(
     }
 
     let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+
+    // ── Canonical bounded emission (G-EM0.5b Phase 1) ──────────────────
+    // Feature ON: delegate to the canonical emitter + assembler. The eager
+    // path below is held harmless for feature OFF (Milestone R unchanged).
+    #[cfg(feature = "generation-streaming")]
+    {
+        use super::generation::emit::{V5PayloadAssembler, emit_canonical_descriptors};
+        let total_nodes = store
+            .node_tables_by_id
+            .iter()
+            .map(NodeTable::len)
+            .sum::<usize>() as u64;
+        let total_edges = store
+            .rel_tables_by_id
+            .iter()
+            .map(RelTable::num_edges)
+            .sum::<usize>() as u64;
+        let descriptors = emit_canonical_descriptors(store, &string_index, &str_refs)
+            .map_err(|e| e.to_string())?;
+        let assembler = V5PayloadAssembler::new(total_nodes, total_edges, store.preserves_ids())
+            .with_layout_flags(V5PayloadAssembler::layout_flags_from_descriptors(
+                &descriptors,
+            ));
+        return assembler.assemble(&descriptors).map_err(|e| e.to_string());
+    }
+
+    // ── Eager path (feature OFF; Milestone R held harmless) ─────────────
+    // With generation-streaming ON this code is unreachable (canonical path
+    // returns above). It is intentionally retained for feature OFF.
     let (off_bytes, str_bytes) = build_string_segments(&str_refs);
     segments.push((SegmentKind::StringOffsets, 1, 0x0001, 8, 8, off_bytes));
     segments.push((SegmentKind::StringBytes, 1, 0x0001, 1, 1, str_bytes));
@@ -443,6 +485,18 @@ pub fn serialize_v5_with_string_order(
     }
     let directory_crc = crc32fast::hash(&dir_bytes);
 
+    let layout_flags = layout_flags::from_companion_segments(
+        segments
+            .iter()
+            .any(|(k, ..)| *k == SegmentKind::NodeLabelMembership),
+        segments
+            .iter()
+            .any(|(k, ..)| *k == SegmentKind::ColumnRowPresence),
+        segments
+            .iter()
+            .any(|(k, ..)| *k == SegmentKind::ColumnRowNull),
+    );
+
     let mut out = Vec::with_capacity((data_offset as usize) + data_bytes.len() + 4);
     out.extend_from_slice(&MAGIC);
     out.push(FORMAT_VERSION_V5);
@@ -450,7 +504,7 @@ pub fn serialize_v5_with_string_order(
     write_u16(&mut out, HEADER_LEN as u16);
     write_u16(&mut out, segment_count);
     write_u16(&mut out, DIRECTORY_ENTRY_LEN as u16);
-    write_u32(&mut out, 0); // layout_flags
+    write_u32(&mut out, layout_flags);
     write_u64(&mut out, HEADER_LEN as u64); // directory_offset
     write_u64(&mut out, directory_length);
     write_u64(&mut out, data_offset);
@@ -555,19 +609,26 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
 
     // Zone maps (kinds 18–19); absent segments yield empty maps (legacy fallback).
     let table_count = meta.node_tables.len();
-    let table_zone_maps = match directory.get(SegmentKind::TableZoneMaps) {
+    let rel_count = meta.rel_tables.len();
+    let (table_zone_maps, rel_table_zone_maps) = match directory.get(SegmentKind::TableZoneMaps) {
         Some(entry) => {
             let bytes = slice_segment_checked(data_bytes, entry)?;
-            parse_table_zone_maps(bytes.as_ref(), &global_dict, table_count)?
+            parse_table_zone_maps(bytes.as_ref(), &global_dict, table_count, rel_count)?
         }
-        None => (0..table_count).map(|_| FxHashMap::default()).collect(),
+        None => (
+            (0..table_count).map(|_| FxHashMap::default()).collect(),
+            (0..rel_count).map(|_| FxHashMap::default()).collect(),
+        ),
     };
-    let block_zone_maps = match directory.get(SegmentKind::BlockZoneMaps) {
+    let (block_zone_maps, rel_block_zone_maps) = match directory.get(SegmentKind::BlockZoneMaps) {
         Some(entry) => {
             let bytes = slice_segment_checked(data_bytes, entry)?;
-            parse_block_zone_maps(bytes.as_ref(), &global_dict, table_count)?
+            parse_block_zone_maps(bytes.as_ref(), &global_dict, table_count, rel_count)?
         }
-        None => (0..table_count).map(|_| FxHashMap::default()).collect(),
+        None => (
+            (0..table_count).map(|_| FxHashMap::default()).collect(),
+            (0..rel_count).map(|_| FxHashMap::default()).collect(),
+        ),
     };
 
     // Build node tables
@@ -717,7 +778,18 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
             dst_label.as_str(),
             prop_defs,
         );
-        let table = RelTable::new(schema, fwd, bwd, properties, rec.src_tid, rec.dst_tid);
+        let rel_zm = rel_table_zone_maps.get(rid).cloned().unwrap_or_default();
+        let rel_bzm = rel_block_zone_maps.get(rid).cloned().unwrap_or_default();
+        let table = RelTable::with_zone_maps(
+            schema,
+            fwd,
+            bwd,
+            properties,
+            rec.src_tid,
+            rec.dst_tid,
+            rel_zm,
+            rel_bzm,
+        );
         let et = ArcStr::from(rt_meta.edge_type.as_str());
         edge_type_to_rel_id
             .entry(et.clone())
@@ -831,6 +903,102 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
     }
     store.set_memory_accounting(accounting);
     let _ = col_dir_bytes; // validated by existence; column geometry uses block index
+
+    // ── G-EM0.5b D0.8.0 source-true companions (fail-closed contract) ──
+    // `layout_flags` marks which companion segments are required; absence of a
+    // required segment fails the open. When no companions are present and
+    // layout_flags is zero, old-v5 defaults apply (one physical label per node,
+    // every encoded row present and non-null).
+    let header_layout_flags = directory.header.layout_flags;
+    let membership_bytes = directory
+        .get(SegmentKind::NodeLabelMembership)
+        .map(|e| slice_segment_checked(data_bytes, e))
+        .transpose()?;
+    let presence_bytes = directory
+        .get(SegmentKind::ColumnRowPresence)
+        .map(|e| slice_segment_checked(data_bytes, e))
+        .transpose()?;
+    let null_bytes = directory
+        .get(SegmentKind::ColumnRowNull)
+        .map(|e| slice_segment_checked(data_bytes, e))
+        .transpose()?;
+    layout_flags::require_companion(
+        header_layout_flags,
+        layout_flags::REQUIRES_LABEL_MEMBERSHIP,
+        SegmentKind::NodeLabelMembership,
+        membership_bytes.is_some(),
+    )?;
+    layout_flags::require_companion(
+        header_layout_flags,
+        layout_flags::REQUIRES_COLUMN_PRESENCE,
+        SegmentKind::ColumnRowPresence,
+        presence_bytes.is_some(),
+    )?;
+    layout_flags::require_companion(
+        header_layout_flags,
+        layout_flags::REQUIRES_COLUMN_NULL,
+        SegmentKind::ColumnRowNull,
+        null_bytes.is_some(),
+    )?;
+    if membership_bytes.is_some() || presence_bytes.is_some() || null_bytes.is_some() {
+        let membership = membership_bytes
+            .as_ref()
+            .map(crate::graph::compact::mapped::LabelMembershipView::parse)
+            .transpose()?;
+        let presence = presence_bytes
+            .as_ref()
+            .map(|b| {
+                crate::graph::compact::mapped::RowBitmapView::parse(
+                    b,
+                    SegmentKind::ColumnRowPresence,
+                )
+            })
+            .transpose()?;
+        let null = null_bytes
+            .as_ref()
+            .map(|b| {
+                crate::graph::compact::mapped::RowBitmapView::parse(b, SegmentKind::ColumnRowNull)
+            })
+            .transpose()?;
+        store.set_source_true_companions(
+            membership,
+            presence,
+            null,
+            data_bytes.clone(),
+            presence_bytes,
+            null_bytes,
+            Some(global_dict.clone()),
+        );
+    }
+
+    // Build the (table_id, key) → flat column index map used to look up the
+    // presence/null companions. Columns are emitted in order: node tables
+    // first (each with its columns in sorted-key order), then rel tables
+    // (tagged with table_id 0x8000 | rel_index, matching column_pass).
+    {
+        use grafeo_common::utils::hash::FxHashMap;
+        let mut map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32> =
+            FxHashMap::default();
+        let mut col_idx: u32 = 0;
+        for (tid, nt) in meta.node_tables.iter().enumerate() {
+            let mut keys: Vec<&str> = nt.columns.iter().map(|c| c.key.as_str()).collect();
+            keys.sort();
+            for key in keys {
+                map.insert((tid as u16, key.into()), col_idx);
+                col_idx += 1;
+            }
+        }
+        for (rid, rt) in meta.rel_tables.iter().enumerate() {
+            let mut keys: Vec<&str> = rt.columns.iter().map(|c| c.key.as_str()).collect();
+            keys.sort();
+            for key in keys {
+                map.insert((0x8000 | rid as u16, key.into()), col_idx);
+                col_idx += 1;
+            }
+        }
+        store.set_column_index_map(map);
+    }
+
     Ok(store)
 }
 

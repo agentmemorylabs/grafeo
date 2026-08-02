@@ -105,6 +105,8 @@ pub struct ExternalSortBudget {
     pub sort_run_bytes: u64,
     /// Maximum temporary disk bytes.
     pub max_temp_bytes: u64,
+    /// Maximum anonymous (in-memory arena) bytes.
+    pub max_anon_bytes: u64,
     /// Merge fan-in (`2..=64`).
     pub merge_fan_in: u32,
     /// Maximum single record bytes.
@@ -120,6 +122,7 @@ impl ExternalSortBudget {
         Self {
             sort_run_bytes: b.sort_run_bytes,
             max_temp_bytes: b.max_temp_bytes,
+            max_anon_bytes: b.max_anon_bytes,
             merge_fan_in: b.merge_fan_in,
             max_record_bytes: b.max_record_bytes,
             io_buffer_bytes: usize::try_from(b.io_buffer_bytes).unwrap_or(usize::MAX),
@@ -132,6 +135,7 @@ impl ExternalSortBudget {
         Self {
             sort_run_bytes: 64 * 1024,
             max_temp_bytes: 256 * 1024 * 1024,
+            max_anon_bytes: 64 * 1024 * 1024,
             merge_fan_in: 4,
             max_record_bytes: 8 * 1024 * 1024,
             io_buffer_bytes: 64 * 1024,

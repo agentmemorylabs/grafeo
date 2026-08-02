@@ -8,8 +8,10 @@
 mod budget;
 mod build;
 mod columns;
+pub mod emit;
 mod error;
 mod input;
+pub mod ledger;
 mod runs;
 mod segment_source;
 mod strings;
@@ -21,7 +23,18 @@ mod tests;
 pub use budget::{GenerationBudget, GenerationMetrics};
 #[cfg(test)]
 pub use build::generate_v5_payload;
+pub use ledger::{AnonLedgerError, AnonReservation, JobAnonLedger, JobAnonSnapshot};
+// When `generation-streaming` is on, the eager `generate_compact_store` path
+// is sealed: it is not re-exported from the generation module, so external
+// crates (e.g. the engine) cannot reach it. The engine cutover uses the
+// bounded orchestrator instead. The eager path remains available internally
+// for test helpers (golden fixture generation) and when the feature is off.
+#[cfg(not(feature = "generation-streaming"))]
 pub use build::{GeneratedCompact, generate_compact_store};
+#[cfg(feature = "generation-streaming")]
+#[allow(unused_imports)]
+pub(crate) use build::{GeneratedCompact, generate_compact_store};
+pub(crate) use columns::encode_column;
 pub use error::GenerationError;
 pub use input::{
     EdgeRecordSource, GenerationEdge, GenerationInput, GenerationNode, NodeRecordSource,
@@ -29,7 +42,7 @@ pub use input::{
 };
 pub use runs::{
     CancelToken, ExternalRunHandle, ExternalRunMerger, ExternalRunSink, InMemoryRunMerger,
-    InMemoryRunSink, SortRecord, default_merge_fan_in,
+    InMemoryRunSink, InMemoryRunStore, RunSetLease, RunStore, SortRecord, default_merge_fan_in,
 };
 #[cfg(test)]
 pub use segment_source::assemble_v5_payload_from_source;
