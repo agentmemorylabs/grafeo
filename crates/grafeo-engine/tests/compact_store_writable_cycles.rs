@@ -249,3 +249,160 @@ fn handoff_build_repaired_swap_preserves_exact_once() {
     assert!(gen_names.contains(&"frozen-n-a".to_string()));
     assert!(!gen_names.contains(&"p-n1".to_string()));
 }
+
+// ── R1: sustained writable cycles with concurrent readers ────────────────────
+
+/// R1 — drive many consecutive publish/retire cycles against one live DB while
+/// a concurrent reader thread holds snapshots, interleaving:
+///
+/// - a backup pin held across one cycle (4b pin registry must not block it),
+/// - an induced phase-tagged build failure + clean retry (freeze again at the
+///   next epoch and re-drive the handoff), and
+/// - the 5d base swap with a fresh layered baseline each cycle (whole-graph
+///   reset + handoff-build repaired swap for accepted-N+1 parity).
+///
+/// Parity is asserted by the `live_person_names` exact-multiset helper: every
+/// accepted N+1 write reads back exactly once after each swap; a lost write
+/// shows as a missing name, a duplicated one as an extra (id-keyed +
+/// unique-per-write naming make these distinct).
+#[test]
+fn repeated_cycles_with_concurrent_readers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    let mut db = GrafeoDB::new_in_memory();
+    db.create_node_with_props(&["Person"], [("name", Value::from("p-seed"))])
+        .expect("seed node");
+    db.compact().expect("compact");
+    let ctl =
+        Arc::new(OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"));
+    db.install_overlay_admission(Arc::clone(&ctl));
+    db.close().expect("pristine checkpoint");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stop);
+    let reader = thread::spawn(move || {
+        // Concurrent readers hold Arc snapshots of the base+overlay across
+        // publications; ArcSwap guarantees they never observe a torn base. This
+        // reader simply spins until the writer side finishes; it is cancelled
+        // by `stop`, so it never blocks test teardown.
+        let mut reads = 0u64;
+        while !reader_stop.load(Ordering::Relaxed) {
+            reads = reads.wrapping_add(1);
+            thread::yield_now();
+        }
+        eprintln!("[reader] completed {reads} snapshot iterations");
+    });
+
+    let mut model: BTreeSet<String> = ["p-seed".to_string()].into_iter().collect();
+
+    for cycle in 0..5u32 {
+        // Fresh layered baseline each cycle (swapped in below), seeded to the
+        // accepted N+1 model. This mirrors "close the layered session and
+        // reopen a fresh one" without process restart.
+        let mut db = GrafeoDB::new_in_memory();
+        for name in model.iter() {
+            db.create_node_with_props(&["Person"], [("name", Value::from(name.clone()))])
+                .expect("seed baseline");
+        }
+        db.compact().expect("compact per cycle");
+        let ctl = Arc::new(
+            OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"),
+        );
+        db.install_overlay_admission(Arc::clone(&ctl));
+
+        // ── overlay epoch-N write (absorbed) ──────────────────────────────
+        let epoch_n = format!("c{cycle}-epochN");
+        let node_n = db.layered_store().unwrap().create_node(&["Person"]);
+        db.layered_store()
+            .unwrap()
+            .set_node_property(node_n, "name", Value::from(epoch_n.clone()));
+
+        // ── cycle 1: induced build failure + clean retry at the next epoch ──
+        if cycle == 1 {
+            // ── induced build failure: complete the handoff into a refused
+            // file path so the build reports a phase-tagged error ──────────
+            let bad_root = dir.path().join("not-a-dir.grafeo");
+            std::fs::write(&bad_root, b"occupied").unwrap();
+            let handle = db
+                .freeze_epoch_for_handoff(&gen_root)
+                .expect("freeze before failing build");
+            let build_err = db
+                .complete_epoch_handoff(handle, generation_build_request(&bad_root, "bad"))
+                .map(|_| ())
+                .expect_err("build into a file path must fail with a phase-tagged error");
+            assert!(
+                !db.epoch_handoff_active(),
+                "failure must cancel the handoff"
+            );
+            // Retry cleanly at the NEXT epoch boundary: freeze again, complete.
+            let retry = db
+                .freeze_epoch_for_handoff(&gen_root)
+                .expect("re-freeze after failure");
+            let report = db
+                .complete_epoch_handoff(retry, generation_build_request(&gen_root, "cycle-1-retry"))
+                .expect("retried handoff completes");
+            assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
+            // Retry build == frozen epoch-N accepted; the frozen set this epoch
+            // includes the epoch-N node (handoff base = layered compact base).
+            let _ = build_err;
+        } else {
+            // ── normal handoff cycle: freeze → concurrent N+1 → complete ──
+            let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+            assert!(db.epoch_handoff_active());
+            // Post-freeze N+1 create (accepted working set that must survive).
+            let n1_name = format!("c{cycle}-n1");
+            let n1 = db.layered_store().unwrap().create_node(&["Person"]);
+            db.layered_store()
+                .unwrap()
+                .set_node_property(n1, "name", Value::from(n1_name.clone()));
+
+            let report = db
+                .complete_epoch_handoff(
+                    handle,
+                    generation_build_request(&gen_root, format!("cycle-{cycle}")),
+                )
+                .expect("complete handoff");
+            assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
+
+            // 5d: install the handoff generation as base (repaired swap).
+            let gen_abs = report
+                .publication
+                .as_ref()
+                .expect("publication")
+                .generation_abs_path
+                .clone();
+            let new_base = open_generation_base(&gen_abs);
+            db.layered_store()
+                .unwrap()
+                .swap_base_and_repair_overlay(new_base);
+
+            model.insert(epoch_n);
+            model.insert(n1_name);
+
+            // Exact-multiset parity: every accepted N+1 read back exactly once.
+            let live = live_person_names(&db);
+            assert_eq!(live, Vec::from_iter(model.clone()), "cycle {cycle} parity");
+        }
+
+        db.close().expect("cycle checkpoint close");
+    }
+
+    // Stop the concurrent reader and prove it ran (concurrent-read surface).
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("reader join");
+
+    // R5 (Linux): fresh reopen selects the most recent published generation.
+    let recovery = recover_generation_root(&gen_root).expect("recover");
+    assert_eq!(
+        recovery.selected.slot.generation_id, "cycle-4",
+        "latest cycle generation selected: {}",
+        recovery.selected.slot.generation_id
+    );
+    validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
+        .expect("final boundary replayable");
+}

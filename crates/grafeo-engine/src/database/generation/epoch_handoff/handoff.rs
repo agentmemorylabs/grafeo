@@ -86,6 +86,10 @@ impl GrafeoDB {
             EpochHandoffPhase::Idle
                 | EpochHandoffPhase::EpochRetired
                 | EpochHandoffPhase::Cancelled
+                // A failed build already ran the pre-commit cancel path: the
+                // freeze slot is cleared and the prior generation is intact, so
+                // a fresh freeze may start the next epoch's handoff (retry).
+                | EpochHandoffPhase::Failed
         ) {
             return Err(Error::Internal(format!(
                 "epoch handoff already active in phase {}",

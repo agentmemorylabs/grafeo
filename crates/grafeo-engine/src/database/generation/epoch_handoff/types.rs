@@ -173,6 +173,7 @@ impl EpochHandoffCoordinator {
             EpochHandoffPhase::Idle
                 | EpochHandoffPhase::EpochRetired
                 | EpochHandoffPhase::Cancelled
+                | EpochHandoffPhase::Failed
         )
     }
 }
