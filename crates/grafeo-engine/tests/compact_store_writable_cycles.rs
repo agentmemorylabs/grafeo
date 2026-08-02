@@ -210,6 +210,16 @@ fn restart_recovers_latest_generation_and_replayable_boundary() {
     assert_eq!(recovery.wal_boundary, pubn.publication.wal_boundary);
     validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
         .expect("boundary replayable after close/reopen");
+
+    // m4 (review): the reopened selected generation must serve the seeded
+    // entities as an exact multiset (5c MAJOR-3 entity-level survival), not
+    // merely a selection-id + boundary check. Read the published container's
+    // Person names through the durable bytes, not the live store.
+    assert_eq!(
+        generation_person_names(&pubn.generation_abs_path),
+        vec!["p-seed".to_string()],
+        "recovered selected generation must serve exactly the seeded entities"
+    );
 }
 
 #[test]
