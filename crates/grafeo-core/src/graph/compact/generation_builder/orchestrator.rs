@@ -172,13 +172,11 @@ impl BoundedGenerationBuilder {
             .map_err(|e| GenerationError::Io(format!("create temp dir: {e}")))?;
         let mut job_temp = JobTempGuard::new(self.config.temp_dir.clone());
         let budget = self.config.budget;
-        // Up to two sort arenas are live concurrently (e.g. node-rows + node-ids
-        // during staging, or occ + id-index during explode). Charge them on the
-        // job anon ledger before the first push.
-        self.metrics.reserve_anon(
-            budget.sort_run_bytes.saturating_mul(2),
-            budget.max_anon_bytes,
-        )?;
+        // Sort arenas: DiskRunStore charges run bytes as temp (not anon).
+        // InMemoryRunStore charges arena growth as records are pushed.
+        // Do NOT pre-charge 2×sort_run_bytes against max_anon_bytes — under
+        // acceptance_linux that is exactly 128 MiB and leaves zero headroom
+        // for spool buffers, making the locked profile unsatisfiable.
 
         // ── 1. Node pass ─────────────────────────────────────────────
         let npass = node_pass::NodePass::new(&budget, self.cancel.as_ref());
