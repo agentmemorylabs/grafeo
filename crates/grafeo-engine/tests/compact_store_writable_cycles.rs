@@ -818,8 +818,23 @@ fn n_vs_4n_transient_build_boundedness() {
     let payload_ratio = large.generation_bytes as f64 / small.generation_bytes as f64;
     eprintln!("Generation bytes ratio (4N/N): {payload_ratio:.2}x (expect ~4x)");
     assert!(
-        (2.5..5.0).contains(&payload_ratio),
-        "generation bytes ratio {payload_ratio:.2} outside [2.5, 5] (base not scaled 4x)"
+        (3.0..5.0).contains(&payload_ratio),
+        "generation bytes ratio {payload_ratio:.2} outside [3, 5] (base not scaled 4x)"
+    );
+
+    // The post-compact BASE FLOOR (the intentional in-memory base-buffer write
+    // surface) must also scale ~4x with the base — this is the residency the
+    // floor subtraction excludes from the build-transient metric. Assert it so
+    // the methodology's "base really grew 4x" claim is gated, not just printed.
+    let floor_ratio =
+        large.base_floor_rss_anon_kb as f64 / (small.base_floor_rss_anon_kb.max(1) as f64);
+    eprintln!("Base floor ratio (4N/N): {floor_ratio:.2}x");
+    assert!(
+        floor_ratio > 3.0,
+        "base floor {} -> {} ({floor_ratio:.2}x) did NOT scale ~4x with the base; \
+         the metric's floor-subtraction assumption is broken",
+        small.base_floor_rss_anon_kb,
+        large.base_floor_rss_anon_kb
     );
 
     // ── invariant: bounded build-event working set ──────────────────────────
