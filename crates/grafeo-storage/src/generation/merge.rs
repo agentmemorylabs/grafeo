@@ -54,11 +54,31 @@ impl RunReader {
 }
 
 /// One heap entry: current head record from run `run_index`.
-#[derive(Eq, PartialEq)]
+///
+/// # R3 (MAJOR-1): per-record heap charging
+///
+/// Each entry holds an [`AnonReservation`] (`record_guard`) covering its
+/// record's owned heap (`key.capacity() + payload.capacity()`). The charge is
+/// admitted **before** the entry is pushed (see [`charge_record`]) and released
+/// automatically when the entry is popped and dropped. This keeps the merge
+/// min-heap — which holds up to `fan_in` live `FramedRecord`s — on the shared
+/// enforcing ledger on a *per-record* basis. Worst-case charging
+/// (`fan_in × max_record_bytes`) is deliberately avoided: it would reserve
+/// 256 MiB under the acceptance profile and break the 128 MiB gate.
 struct HeapEntry {
     record: FramedRecord,
     run_index: usize,
+    /// RAII charge for this record's key+payload heap. Drops on pop.
+    record_guard: AnonReservation,
 }
+
+// `AnonReservation` is not `PartialEq`/`Eq`; compare only the ordering keys.
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.record == other.record && self.run_index == other.run_index
+    }
+}
+impl Eq for HeapEntry {}
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -74,6 +94,39 @@ impl PartialOrd for HeapEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Map an enforcing-ledger error into the sort metrics error type.
+///
+/// Duplicated from `external_sort::anon_to_sort_err` (which is private to that
+/// module) so merge.rs can fail closed on per-record reservation without a
+/// cross-module visibility change.
+fn anon_to_merge_err(e: super::metrics::AnonLedgerError) -> ExternalSortMetricsError {
+    match e {
+        super::metrics::AnonLedgerError::BudgetExceeded { requested, limit } => {
+            ExternalSortMetricsError::BudgetExceeded { requested, limit }
+        }
+        super::metrics::AnonLedgerError::Overflow => ExternalSortMetricsError::Overflow,
+    }
+}
+
+/// Reserve the shared ledger charge for one record's owned heap.
+///
+/// Covers `key.capacity() + payload.capacity()` — the anonymous bytes the
+/// record holds while it sits in the merge heap. Called **before** the
+/// `HeapEntry` is pushed, so the charge is held for the record's entire
+/// residence in the heap and released when the popped entry drops.
+///
+/// NOTE (accepted window): the record's `Vec`s are allocated by
+/// `FramedRecord::read_next` *just before* this charge is admitted. That
+/// bounded window (≤ `max_record_bytes` per record) is accepted; the ledger is
+/// deliberately NOT threaded into `records.rs`.
+fn charge_record(
+    job_anon: &Arc<JobAnonLedger>,
+    rec: &FramedRecord,
+) -> Result<AnonReservation, ExternalSortMetricsError> {
+    let bytes = (rec.key.capacity() as u64).saturating_add(rec.payload.capacity() as u64);
+    job_anon.reserve(bytes).map_err(anon_to_merge_err)
 }
 
 /// Merge `runs` into `out_path`. Returns `(record_count, byte_len)`.
@@ -115,7 +168,7 @@ pub(super) fn kway_merge_to_file(
             readers.push(RunReader::open(&r.path, io_buffer_bytes).map_err(io_to_metrics_err)?);
         }
         metrics.observe_open_runs(readers.len());
-        let mut heap = seed_heap(&mut readers)?;
+        let mut heap = seed_heap(&mut readers, job_anon)?;
 
         let file = File::create(out_path).map_err(io_to_metrics_err)?;
         let mut w = BufWriter::with_capacity(io_buffer_bytes, file);
@@ -133,10 +186,16 @@ pub(super) fn kway_merge_to_file(
             bytes += entry.record.encoded_len();
             count += 1;
             let i = entry.run_index;
+            // `entry` (and its record_guard) drops here, releasing the popped
+            // record's charge before the refill record is charged below.
+            drop(entry);
             if let Some(rec) = readers[i].next_record().map_err(io_to_metrics_err)? {
+                // R3 MAJOR-1: charge the refill record's heap before push.
+                let record_guard = charge_record(job_anon, &rec)?;
                 heap.push(HeapEntry {
                     record: rec,
                     run_index: i,
+                    record_guard,
                 });
             }
         }
@@ -187,7 +246,7 @@ pub(super) fn kway_merge_emit(
             readers.push(RunReader::open(&r.path, io_buffer_bytes).map_err(io_to_metrics_err)?);
         }
         metrics.observe_open_runs(readers.len());
-        let mut heap = seed_heap(&mut readers)?;
+        let mut heap = seed_heap(&mut readers, job_anon)?;
         while let Some(entry) = heap.pop() {
             if let Some(c) = cancel
                 && c.is_cancelled()
@@ -196,10 +255,15 @@ pub(super) fn kway_merge_emit(
             }
             emit(&entry.record)?;
             let i = entry.run_index;
+            // Release the popped record's charge before charging the refill.
+            drop(entry);
             if let Some(rec) = readers[i].next_record().map_err(io_to_metrics_err)? {
+                // R3 MAJOR-1: charge the refill record's heap before push.
+                let record_guard = charge_record(job_anon, &rec)?;
                 heap.push(HeapEntry {
                     record: rec,
                     run_index: i,
+                    record_guard,
                 });
             }
         }
@@ -215,13 +279,22 @@ pub(super) fn kway_merge_emit(
 }
 
 /// Seed the heap with the first record from each reader.
-fn seed_heap(readers: &mut [RunReader]) -> Result<BinaryHeap<HeapEntry>, ExternalSortMetricsError> {
+///
+/// Each seeded record's heap is charged against the shared ledger (R3
+/// MAJOR-1) before its `HeapEntry` is pushed; the guard lives on the entry.
+fn seed_heap(
+    readers: &mut [RunReader],
+    job_anon: &Arc<JobAnonLedger>,
+) -> Result<BinaryHeap<HeapEntry>, ExternalSortMetricsError> {
     let mut heap = BinaryHeap::new();
     for (i, r) in readers.iter_mut().enumerate() {
         if let Some(rec) = r.next_record().map_err(io_to_metrics_err)? {
+            // Reserve BEFORE push; fail closed if the ledger rejects it.
+            let record_guard = charge_record(job_anon, &rec)?;
             heap.push(HeapEntry {
                 record: rec,
                 run_index: i,
+                record_guard,
             });
         }
     }

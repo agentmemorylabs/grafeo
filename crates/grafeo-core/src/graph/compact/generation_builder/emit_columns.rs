@@ -13,6 +13,7 @@ use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::emit::streaming_column::{
     BitByteEmitter, StreamingBodyWriter,
 };
+use crate::graph::compact::generation::ledger::{AnonReservation, JobAnonLedger};
 use crate::graph::compact::generation::{
     CancelToken, ExternalRunMerger, GenerationBudget, GenerationError, GenerationMetrics,
     RunSetLease,
@@ -22,6 +23,7 @@ use crate::graph::compact::generation_builder::emit_meta::{w16, w32, w64, CodecK
 use crate::graph::compact::mapped::SegmentKind;
 use crate::graph::compact::zone_map::ZoneMap;
 use grafeo_common::types::Value;
+use std::sync::Arc;
 
 /// Sequential catalog over per-column DictValue chunk files.
 pub(crate) use crate::graph::compact::generation::emit::dict_column_lookup::DictChunkCatalog;
@@ -117,6 +119,26 @@ pub fn codec_kind_of(g: &ColumnGeometry) -> CodecKind {
     }
 }
 
+/// R3 (MAJOR-2): anonymous bytes owned by a column's retained zone maps.
+///
+/// Counts the `Vec<ZoneMap>` struct array (`len * size_of::<ZoneMap>()`) PLUS
+/// the string heap: for every zone map whose `min`/`max` is a `Value::String`,
+/// the `ArcStr` byte length of that string. This is the memory that stays live
+/// after `StreamingBodyWriter::finish` returns the `Vec<ZoneMap>` and before
+/// `build_block_zone_maps` consumes it in `emit_all`.
+fn zone_map_charge_bytes(zms: &[ZoneMap]) -> u64 {
+    let struct_bytes = (zms.len() as u64).saturating_mul(std::mem::size_of::<ZoneMap>() as u64);
+    let mut string_bytes = 0u64;
+    for zm in zms {
+        for v in [&zm.min, &zm.max] {
+            if let Some(Value::String(s)) = v {
+                string_bytes = string_bytes.saturating_add(s.len() as u64);
+            }
+        }
+    }
+    struct_bytes.saturating_add(string_bytes)
+}
+
 /// One emitted column's directory + zone-map data.
 #[derive(Debug)]
 pub struct EmittedColumn {
@@ -148,6 +170,13 @@ pub struct ColumnEmissionResult {
     pub emitted_presence: bool,
     /// True when at least one column wrote a null companion record.
     pub emitted_null: bool,
+    /// R3 (MAJOR-2): RAII guards charging the retained `block_zone_maps`
+    /// (struct array + string-heap) against the shared enforcing ledger.
+    /// One guard per emitted column that produced zone maps. Held here until
+    /// the orchestrator drops them after `emit_all` consumes the zone maps via
+    /// `build_block_zone_maps`, so the charge spans the zone maps' whole life
+    /// and reconciles to zero before `verify_zero_charges`.
+    pub zone_map_guards: Vec<AnonReservation>,
 }
 
 /// Replays the occurrence run, emitting column bodies into `bodies_sink` and
@@ -173,6 +202,7 @@ pub(crate) fn emit_column_bodies(
     budget: &GenerationBudget,
     metrics: &mut GenerationMetrics,
     cancel: Option<&CancelToken>,
+    job_anon: &Arc<JobAnonLedger>,
 ) -> Result<ColumnEmissionResult, GenerationError> {
     let mut result = ColumnEmissionResult::default();
     let mut geo_iter = geometries.iter();
@@ -191,7 +221,8 @@ pub(crate) fn emit_column_bodies(
                  body_cursor: &mut u64,
                  bodies_sink: &mut dyn SegmentSink,
                  presence_sink: &mut dyn SegmentSink,
-                 null_sink: &mut dyn SegmentSink|
+                 null_sink: &mut dyn SegmentSink,
+                 job_anon: &Arc<JobAnonLedger>|
      -> Result<(), GenerationError> {
         let (Some(_g), Some(w)) = (geo, writer) else {
             return Ok(());
@@ -207,6 +238,23 @@ pub(crate) fn emit_column_bodies(
         let body_start = *body_cursor;
         let (body_len, codec_len, block_zms) = w.finish(bodies_sink)?;
         *body_cursor += body_len;
+        // R3 (MAJOR-2): charge the retained zone maps (struct array + string
+        // heap) against the shared enforcing ledger BEFORE storing them into
+        // the EmittedColumn. The guard is held on `result.zone_map_guards`
+        // until the orchestrator drops it after emit_all consumes the maps, so
+        // the charge spans the zone maps' whole lifetime and reconciles to zero
+        // before verify_zero_charges.
+        let zm_bytes = zone_map_charge_bytes(&block_zms);
+        if zm_bytes > 0 {
+            let guard = job_anon.reserve(zm_bytes).map_err(|_| {
+                GenerationError::BudgetExceeded {
+                    counter: "max_anon_bytes",
+                    requested: zm_bytes,
+                    limit: budget.max_anon_bytes,
+                }
+            })?;
+            result.zone_map_guards.push(guard);
+        }
         result.columns.push(EmittedColumn {
             column_index,
             table_id: _g.table_id,
@@ -263,6 +311,7 @@ pub(crate) fn emit_column_bodies(
                 bodies_sink,
                 presence_sink,
                 null_sink,
+                job_anon,
             )?;
             current_geo = geo_iter.next();
             let g = current_geo.ok_or_else(|| {
@@ -344,6 +393,7 @@ pub(crate) fn emit_column_bodies(
         bodies_sink,
         presence_sink,
         null_sink,
+        job_anon,
     )?;
     // Every Dict column's chunk must have been consumed by the column opens/flushes.
     dict_chunks.verify_drained()?;

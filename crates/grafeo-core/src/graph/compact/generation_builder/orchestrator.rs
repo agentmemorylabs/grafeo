@@ -116,10 +116,6 @@ pub struct BoundedGenerationBuilder {
     /// ledger (via `RunStore::job_anon_ledger`), so the whole-job peak
     /// reflects concurrently live arenas across all passes.
     job_anon: std::sync::Arc<JobAnonLedger>,
-    /// RAII guards for spool in-memory buffers. Each `make_sink` call
-    /// reserves `spool_buf_cap` and holds the guard here until the sink
-    /// is finished/dropped. Released on drop (end of build or unwind).
-    spool_guards: Vec<AnonReservation>,
 }
 
 impl BoundedGenerationBuilder {
@@ -132,7 +128,6 @@ impl BoundedGenerationBuilder {
             metrics: GenerationMetrics::default(),
             cancel: None,
             job_anon,
-            spool_guards: Vec::new(),
         }
     }
 
@@ -155,10 +150,13 @@ impl BoundedGenerationBuilder {
         alignment: u16,
         element_width: u32,
         file_id: &str,
+        spool_guards: &mut Vec<AnonReservation>,
     ) -> Result<SpoolSegmentSink, GenerationError> {
         // R2: charge the in-memory spool buffer against the enforcing
-        // whole-job ledger BEFORE allocation. The RAII guard is held in
-        // `spool_guards` until the build ends (or unwinds).
+        // whole-job ledger BEFORE allocation. The RAII guard is held in the
+        // caller's LOCAL `spool_guards` Vec (R3 MAJOR-3) until the build ends
+        // or unwinds — so the builder's own spool charges release on ANY exit
+        // from build() via RAII, reconciling the builder's contribution to zero.
         let buf_bytes = self.config.spool_buf_cap as u64;
         let guard =
             self.job_anon
@@ -168,7 +166,7 @@ impl BoundedGenerationBuilder {
                     requested: buf_bytes,
                     limit: self.config.budget.max_anon_bytes,
                 })?;
-        self.spool_guards.push(guard);
+        spool_guards.push(guard);
         // Mirror onto per-sink observational metrics.
         self.metrics
             .reserve_anon(buf_bytes, self.config.budget.max_anon_bytes)?;
@@ -236,6 +234,15 @@ impl BoundedGenerationBuilder {
         if let Some(store_ledger) = run_store.job_anon_ledger() {
             self.job_anon = std::sync::Arc::clone(store_ledger);
         }
+
+        // R3 (MAJOR-3): spool buffer guards are a LOCAL Vec, not a builder
+        // field. On ANY exit from build() — success, `?` early-return, or
+        // unwind — this Vec drops and releases every spool charge via RAII, so
+        // the builder's own contribution to the enforcing ledger reconciles to
+        // zero. We do NOT assert zero on the failure path: the caller-owned
+        // `run_store` may still hold sink arena charges until it is dropped.
+        // verify_zero_charges() runs only on the success path below.
+        let mut spool_guards: Vec<AnonReservation> = Vec::new();
 
         std::fs::create_dir_all(&self.config.temp_dir)
             .map_err(|e| GenerationError::Io(format!("create temp dir: {e}")))?;
@@ -364,11 +371,16 @@ impl BoundedGenerationBuilder {
 
         // ── 4. Global dictionary ─────────────────────────────────────
         let mut offsets_sink =
-            Box::new(self.make_sink(SegmentKind::StringOffsets, 8, 8, "stroff")?);
+            Box::new(self.make_sink(SegmentKind::StringOffsets, 8, 8, "stroff", &mut spool_guards)?);
         let mut bytes_sink =
-            Box::new(self.make_sink(SegmentKind::StringBytes, 1, 1, "strbytes")?);
-        let mut code_index_sink =
-            Box::new(self.make_sink(SegmentKind::DictionaryCodeIndex, 8, 16, "codeidx")?);
+            Box::new(self.make_sink(SegmentKind::StringBytes, 1, 1, "strbytes", &mut spool_guards)?);
+        let mut code_index_sink = Box::new(self.make_sink(
+            SegmentKind::DictionaryCodeIndex,
+            8,
+            16,
+            "codeidx",
+            &mut spool_guards,
+        )?);
         let mut remap_sink = run_store.sink("remap", &budget)?;
         let mut dict = StreamingDictionary::new(&budget, &mut self.metrics);
         dict.run(
@@ -445,17 +457,32 @@ impl BoundedGenerationBuilder {
         self.metrics
             .reserve_schema(geo_charge, budget.max_schema_bytes)?;
 
-        let mut bodies_sink =
-            Box::new(self.make_sink(SegmentKind::ColumnBodies, 1, 0, "colbodies")?);
-        let mut presence_sink =
-            Box::new(self.make_sink(SegmentKind::ColumnRowPresence, 1, 0, "colpres")?);
-        let mut null_sink =
-            Box::new(self.make_sink(SegmentKind::ColumnRowNull, 1, 0, "colnull")?);
+        let mut bodies_sink = Box::new(self.make_sink(
+            SegmentKind::ColumnBodies,
+            1,
+            0,
+            "colbodies",
+            &mut spool_guards,
+        )?);
+        let mut presence_sink = Box::new(self.make_sink(
+            SegmentKind::ColumnRowPresence,
+            1,
+            0,
+            "colpres",
+            &mut spool_guards,
+        )?);
+        let mut null_sink = Box::new(self.make_sink(
+            SegmentKind::ColumnRowNull,
+            1,
+            0,
+            "colnull",
+            &mut spool_guards,
+        )?);
         let mut chunk_catalog = DictChunkCatalog::open(&catalog_path, &self.config.temp_dir)
             .map_err(|e| {
                 GenerationError::Io(format!("open dict catalog {}: {e}", catalog_path.display()))
             })?;
-        let col_result = emit_column_bodies(
+        let mut col_result = emit_column_bodies(
             &occ_lease,
             run_store.merger("occ")?.as_mut(),
             &geometries,
@@ -466,33 +493,14 @@ impl BoundedGenerationBuilder {
             &budget,
             &mut self.metrics,
             self.cancel.as_ref(),
+            &self.job_anon,
         )?;
 
-        // R2: charge block_zone_maps retained in EmittedColumns. These are
-        // row/block-count-sized (one ZoneMap per block per column) and live
-        // until emit_all consumes them via build_block_zone_maps. Charge
-        // against the enforcing ledger with an RAII guard held until after
-        // emit_all returns.
-        let zm_bytes: u64 = col_result
-            .columns
-            .iter()
-            .map(|c| {
-                c.block_zone_maps.len() as u64
-                    * std::mem::size_of::<crate::graph::compact::zone_map::ZoneMap>() as u64
-            })
-            .sum();
-        let zm_guard =
-            if zm_bytes > 0 {
-                Some(self.job_anon.reserve(zm_bytes).map_err(|e| {
-                    GenerationError::BudgetExceeded {
-                        counter: "max_anon_bytes",
-                        requested: zm_bytes,
-                        limit: budget.max_anon_bytes,
-                    }
-                })?)
-            } else {
-                None
-            };
+        // R3 (MAJOR-2): block_zone_maps are now charged INSIDE
+        // emit_column_bodies (reserve-before-store), with the RAII guards held
+        // on `col_result.zone_map_guards`. Those guards are dropped after
+        // emit_all consumes the zone maps (see below), just before
+        // verify_zero_charges. No after-the-fact charging happens here.
 
         // ── 6. CSR three-stage chain ─────────────────────────────────
         let src_rows_of = |rel_id: u16| -> (u64, u64) {
@@ -510,10 +518,20 @@ impl BoundedGenerationBuilder {
                 dst_rows,
             }
         };
-        let mut fwd_off_sink =
-            Box::new(self.make_sink(SegmentKind::ForwardCsrOffsets, 4, 4, "fwdoff")?);
-        let mut fwd_tgt_sink =
-            Box::new(self.make_sink(SegmentKind::ForwardCsrTargets, 4, 4, "fwdtgt")?);
+        let mut fwd_off_sink = Box::new(self.make_sink(
+            SegmentKind::ForwardCsrOffsets,
+            4,
+            4,
+            "fwdoff",
+            &mut spool_guards,
+        )?);
+        let mut fwd_tgt_sink = Box::new(self.make_sink(
+            SegmentKind::ForwardCsrTargets,
+            4,
+            4,
+            "fwdtgt",
+            &mut spool_guards,
+        )?);
         let mut rev_sink = run_store.sink("rev-csr", &budget)?;
         csr_pass::stream_forward_csr(
             &fwd_lease,
@@ -527,12 +545,27 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let rev_lease = rev_sink.finish()?;
-        let mut rev_off_sink =
-            Box::new(self.make_sink(SegmentKind::ReverseCsrOffsets, 4, 4, "revoff")?);
-        let mut rev_tgt_sink =
-            Box::new(self.make_sink(SegmentKind::ReverseCsrTargets, 4, 4, "revtgt")?);
-        let mut pos_sink =
-            Box::new(self.make_sink(SegmentKind::ForwardPositions, 4, 4, "fwdpos")?);
+        let mut rev_off_sink = Box::new(self.make_sink(
+            SegmentKind::ReverseCsrOffsets,
+            4,
+            4,
+            "revoff",
+            &mut spool_guards,
+        )?);
+        let mut rev_tgt_sink = Box::new(self.make_sink(
+            SegmentKind::ReverseCsrTargets,
+            4,
+            4,
+            "revtgt",
+            &mut spool_guards,
+        )?);
+        let mut pos_sink = Box::new(self.make_sink(
+            SegmentKind::ForwardPositions,
+            4,
+            4,
+            "fwdpos",
+            &mut spool_guards,
+        )?);
         csr_pass::stream_reverse_csr(
             &rev_lease,
             run_store.merger("rev-csr")?.as_mut(),
@@ -576,16 +609,22 @@ impl BoundedGenerationBuilder {
             rev_tgt_sink,
             pos_sink,
             total_edges,
+            &mut spool_guards,
         )?;
         run_store.cleanup_job_artifacts()?;
 
-        // R2: release block_zone_maps charge (consumed by emit_all above).
-        drop(zm_guard);
+        // R3 (MAJOR-2): release the block_zone_maps charges now that emit_all
+        // has consumed the zone maps via build_block_zone_maps. Dropping the
+        // guards reconciles the zone-map charge to zero before the ledger is
+        // verified below.
+        col_result.zone_map_guards.clear();
 
-        // R2: release all spool buffer RAII guards and verify the enforcing
-        // ledger has zero current charges. Every sink arena was released on
-        // flush/cleanup; every spool buffer guard is dropped here.
-        self.spool_guards.clear();
+        // R3 (MAJOR-3): release all spool buffer RAII guards (local Vec) and
+        // verify the enforcing ledger has zero current charges. Every sink
+        // arena was released on flush/cleanup; every spool buffer guard is
+        // dropped here. (On a failure path above, `spool_guards` would instead
+        // drop via RAII at build() exit — no zero-assertion there.)
+        spool_guards.clear();
         self.verify_zero_charges()?;
 
         job_temp.disarm();
@@ -686,6 +725,7 @@ impl BoundedGenerationBuilder {
         rev_tgt_sink: Box<dyn SegmentSink>,
         pos_sink: Box<dyn SegmentSink>,
         total_edges: u64,
+        spool_guards: &mut Vec<AnonReservation>,
     ) -> Result<V5PayloadLease, GenerationError> {
         // Build metadata.
         let node_col_keys = build_node_col_keys(geometries, node_schema.labels.len());
@@ -777,11 +817,21 @@ impl BoundedGenerationBuilder {
         // resident vectors). Node lookup is index-order (already sorted by
         // original_id); the other three go through external sorts keyed by
         // their output order.
-        let mut node_lookup_sink =
-            Box::new(self.make_sink(SegmentKind::NodeIdLookup, 8, 24, "nodeidlk")?);
+        let mut node_lookup_sink = Box::new(self.make_sink(
+            SegmentKind::NodeIdLookup,
+            8,
+            24,
+            "nodeidlk",
+            spool_guards,
+        )?);
         build_node_id_lookup(id_index, node_lookup_sink.as_mut())?;
-        let mut node_orig_sink =
-            Box::new(self.make_sink(SegmentKind::NodeOriginalIds, 8, 8, "nodeorig")?);
+        let mut node_orig_sink = Box::new(self.make_sink(
+            SegmentKind::NodeOriginalIds,
+            8,
+            8,
+            "nodeorig",
+            spool_guards,
+        )?);
         build_node_original_ids(
             id_index,
             run_store,
@@ -790,8 +840,13 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
             node_orig_sink.as_mut(),
         )?;
-        let mut edge_lookup_sink =
-            Box::new(self.make_sink(SegmentKind::EdgeIdLookup, 8, 24, "edgeidlk")?);
+        let mut edge_lookup_sink = Box::new(self.make_sink(
+            SegmentKind::EdgeIdLookup,
+            8,
+            24,
+            "edgeidlk",
+            spool_guards,
+        )?);
         build_edge_id_lookup(
             fwd_lease,
             run_store.merger("fwd-csr")?.as_mut(),
@@ -801,8 +856,13 @@ impl BoundedGenerationBuilder {
             run_store,
             edge_lookup_sink.as_mut(),
         )?;
-        let mut edge_orig_sink =
-            Box::new(self.make_sink(SegmentKind::EdgeOriginalIds, 8, 8, "edgeorig")?);
+        let mut edge_orig_sink = Box::new(self.make_sink(
+            SegmentKind::EdgeOriginalIds,
+            8,
+            8,
+            "edgeorig",
+            spool_guards,
+        )?);
         build_edge_original_ids(
             fwd_lease,
             run_store.merger("fwd-csr")?.as_mut(),
@@ -899,8 +959,13 @@ impl BoundedGenerationBuilder {
         // spool sink; records are re-sorted by (table_id, offset, label_code)
         // via the external-sort infrastructure (bounded, no resident vector).
         if let Some(membership_lease) = membership_runs {
-            let mut membership_sink =
-                Box::new(self.make_sink(SegmentKind::NodeLabelMembership, 8, 16, "memb")?);
+            let mut membership_sink = Box::new(self.make_sink(
+                SegmentKind::NodeLabelMembership,
+                8,
+                16,
+                "memb",
+                spool_guards,
+            )?);
             crate::graph::compact::generation_builder::membership_pass::emit_membership_segment(
                 membership_lease,
                 run_store.merger("membership")?.as_mut(),

@@ -64,6 +64,18 @@ fn map_err(e: ExternalSortMetricsError) -> GenerationError {
     }
 }
 
+/// Clone a core [`SortRecord`] into a storage [`FramedRecord`].
+///
+/// # R3 (MAJOR-4): accepted bounded clone window
+///
+/// This clones `key`/`payload` into fresh `Vec`s (heap allocated) *before*
+/// `DiskRunSink::push` admits them. That is an accepted bounded window: the
+/// clone is ≤ `max_record_bytes` (8 MiB under the acceptance profile) and is
+/// admitted immediately in `DiskRunSink::push`, which computes
+/// `heap_delta = record.key.capacity() + record.payload.capacity()` and
+/// reserves it against the shared enforcing ledger **before** `arena.reserve(1)`
+/// (see external_sort.rs `push`). No second charge is added here — that would
+/// double-count. This is the same accepted class as MAJOR-1's read window.
 fn to_framed(r: &SortRecord) -> FramedRecord {
     FramedRecord::new(r.key.clone(), r.payload.clone())
 }
