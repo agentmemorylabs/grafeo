@@ -597,6 +597,89 @@ impl LayeredStore {
         self.deletions_dirty.store(false, Ordering::Release);
     }
 
+    /// Publish a newly-built whole-graph generation as the live base and reset
+    /// the overlay — G-EM0.5d (Milestone W).
+    ///
+    /// This is the bounded fast-path base swap for a **whole-live-graph**
+    /// generation built via `GrafeoDB::build_and_publish_generation` (streams the
+    /// whole base **and** overlay). Because `new_base` contains every accepted
+    /// write, the live overlay can be reset to empty: any retained post-freeze
+    /// (N+1) entity was created after the freeze and is not in `new_base`, so it
+    /// keeps resolving via base-miss → overlay fallthrough after the swap.
+    ///
+    /// The whole operation runs under the shared `merge_guard` writer barrier, so
+    /// a concurrent mutation serializes **either** entirely before the swap (it
+    /// lands in the old base/overlay and, if committed before the freeze, is
+    /// carried into `new_base`) **or** entirely after (it lands in the fresh
+    /// overlay). No writer observes the intermediate "base swapped, overlay not
+    /// yet reset" state.
+    ///
+    /// Returns the previous base `Arc` so callers can inspect refcounts or keep
+    /// it alive while in-flight readers drain.
+    #[cfg(feature = "lpg")]
+    pub fn swap_base_and_reset_overlay(&self, new_base: Arc<CompactStore>) -> Arc<CompactStore> {
+        let _barrier = self.merge_guard.write();
+        let old_base = self.base.swap(new_base);
+        // `reset_overlay` re-seeds id allocators from the *new* base and clears
+        // the dirty/deletion bookkeeping under the same barrier, so a freshly
+        // created post-swap id can never collide with a base id.
+        self.reset_overlay();
+        old_base
+    }
+
+    /// Publish a **handoff** generation (`old base + epoch-N frozen overlay`) as
+    /// the live base, repairing overlay bookkeeping — G-EM0.5d (Milestone W).
+    ///
+    /// Unlike [`Self::swap_base_and_reset_overlay`], the handoff build
+    /// (`complete_epoch_handoff`) produces a generation that contains the **old
+    /// base plus the frozen epoch-N snapshot** — it does *not* include the
+    /// post-freeze N+1 working set. So the overlay **cannot** be reset to empty.
+    ///
+    /// What makes a plain swap correct (and bounded enough for the proof) is the
+    /// read dispatch order shared by `get_node`/`get_edge` and the versioned
+    /// `is_*_visible_*` checks:
+    ///
+    /// 1. cleared-from-base tombstone → hidden;
+    /// 2. **dirty** → overlay;
+    /// 3. otherwise base, else overlay (base-miss fallthrough).
+    ///
+    /// This primitive, under the `merge_guard` writer barrier, swaps the base to
+    /// the handoff generation and clears `dirty_*` **entirely** (leaving the live
+    /// overlay physically intact). Clearing *all* dirty marks — not just the
+    /// frozen ones — is load-bearing for **repeat** handoff cycles:
+    ///
+    /// - **Absorbed epoch-N (frozen, present in the new base)** — with `dirty`
+    ///   cleared, dispatch takes the base-hit arm so the new base (frozen value)
+    ///   is served and the stale identical overlay copy is shadowed (no
+    ///   lost/resurrected read). Its bytes drop on the next whole-graph cycle.
+    /// - **Retained N+1, and any entity frozen into a later cycle that the base
+    ///   merge could not absorb** — an entity created *post-freeze* in cycle i
+    ///   is not in the (then-current) base, so the base-merge skips it in cycle
+    ///   i+1 too; it is frozen but never lands in any generation. With `dirty`
+    ///   cleared it has **no base copy**, so the base-miss arm falls through to
+    ///   the overlay and serves its **current** value. (Leaving it dirty would
+    ///   make a *repeat* handoff serve its *stale frozen* overlay value
+    ///   forever, shadowing the new base — the very trap this clears.)
+    ///
+    /// Tombstones (`deleted_from_base_*`) are preserved: a deletion is replayed
+    /// by the base-merge into the generation, so the entity is simply absent
+    /// from the new base while its tombstone keeps it hidden.
+    ///
+    /// Returns the previous base `Arc`.
+    #[cfg(feature = "lpg")]
+    pub fn swap_base_and_repair_overlay(&self, new_base: Arc<CompactStore>) -> Arc<CompactStore> {
+        let _barrier = self.merge_guard.write();
+        let old_base = self.base.swap(new_base);
+        // Clear ALL dirty bookkeeping. Overlay-in-only entities (no base copy)
+        // resolve via base-miss → overlay (current value); entities absorbed
+        // into the new base resolve via base (frozen value), shadowing their
+        // stale overlay copy. The overlay stays physically intact so retained
+        // N+1 and un-absorbable entities remain present.
+        self.dirty_node_ids.write().clear();
+        self.dirty_edge_ids.write().clear();
+        old_base
+    }
+
     /// Returns a snapshot of the base node ids the overlay has marked as
     /// deleted but not yet merged. Used by the persistence layer to write
     /// the [`OverlayDeletions`](grafeo_common::storage::section::SectionType::OverlayDeletions)
