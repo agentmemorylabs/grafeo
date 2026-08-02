@@ -603,19 +603,27 @@ impl LayeredStore {
     /// This is the bounded fast-path base swap for a **whole-live-graph**
     /// generation built via `GrafeoDB::build_and_publish_generation` (streams the
     /// whole base **and** overlay). Because `new_base` contains every accepted
-    /// write, the live overlay can be reset to empty: any retained post-freeze
-    /// (N+1) entity was created after the freeze and is not in `new_base`, so it
-    /// keeps resolving via base-miss → overlay fallthrough after the swap.
+    /// write *that the build's freeze captured*, the live overlay can be reset to
+    /// empty.
     ///
-    /// The whole operation runs under the shared `merge_guard` writer barrier, so
-    /// a concurrent mutation serializes **either** entirely before the swap (it
-    /// lands in the old base/overlay and, if committed before the freeze, is
-    /// carried into `new_base`) **or** entirely after (it lands in the fresh
-    /// overlay). No writer observes the intermediate "base swapped, overlay not
-    /// yet reset" state.
+    /// ## Concurrency truth (what `merge_guard` does and does NOT give you)
     ///
-    /// Returns the previous base `Arc` so callers can inspect refcounts or keep
-    /// it alive while in-flight readers drain.
+    /// The swap+reset is atomic **as a store operation**: under `merge_guard
+    /// .write()`, a concurrent `GraphStoreMut` mutation either (a) completes
+    /// entirely before this swap begins — it lands in the old base/overlay — or
+    /// (b) starts entirely after — it lands in the fresh reset overlay. No writer
+    /// observes an intermediate "base swapped, overlay not yet reset" state, and
+    /// readers never see a torn base (`base`/`overlay` are `ArcSwap`).
+    ///
+    /// **But it does NOT make a lost write impossible**: a mutation that commits
+    /// *between* the build's freeze capture (`generation_freeze_epoch`/`build()`
+    /// start — a different, earlier barrier) and this swap is present in the OLD
+    /// overlay, is absent from `new_base`, and is destroyed by `reset_overlay`.
+    /// The single-writer / handoff contract (`generation_build.rs`) forbids
+    /// mid-build mutations; 5c's freeze writer-linearization holds the overlay
+    /// steady from WAL-cut through `begin_epoch_handoff`. Callers MUST only swap
+    /// to a base that is a complete snapshot of the overlay at the freeze
+    /// instant, with no writes admitted between freeze and swap.
     #[cfg(feature = "lpg")]
     pub fn swap_base_and_reset_overlay(&self, new_base: Arc<CompactStore>) -> Arc<CompactStore> {
         let _barrier = self.merge_guard.write();
