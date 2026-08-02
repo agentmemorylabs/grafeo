@@ -510,6 +510,7 @@ impl TransactionManager {
     #[must_use]
     pub fn current_epoch(&self) -> EpochId {
         let epoch = self.current_epoch.load(Ordering::Acquire);
+        #[cfg(debug_assertions)]
         eprintln!(
             "[epoch-debug] TM::current_epoch: epoch={epoch} tm_ptr={:p}",
             self
