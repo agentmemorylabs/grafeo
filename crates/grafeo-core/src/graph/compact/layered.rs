@@ -633,50 +633,62 @@ impl LayeredStore {
     /// Unlike [`Self::swap_base_and_reset_overlay`], the handoff build
     /// (`complete_epoch_handoff`) produces a generation that contains the **old
     /// base plus the frozen epoch-N snapshot** — it does *not* include the
-    /// post-freeze N+1 working set. So the overlay **cannot** be reset to empty.
+    /// post-freeze N+1 modifications that re-wrote an already-dirty (base or
+    /// frozen) entity. So the dirty sets **cannot** be cleared wholesale.
     ///
-    /// What makes a plain swap correct (and bounded enough for the proof) is the
-    /// read dispatch order shared by `get_node`/`get_edge` and the versioned
-    /// `is_*_visible_*` checks:
+    /// Read dispatch order (`get_node`/`get_edge` + versioned `is_*_visible_*`):
     ///
     /// 1. cleared-from-base tombstone → hidden;
     /// 2. **dirty** → overlay;
     /// 3. otherwise base, else overlay (base-miss fallthrough).
     ///
-    /// This primitive, under the `merge_guard` writer barrier, swaps the base to
-    /// the handoff generation and clears `dirty_*` **entirely** (leaving the live
-    /// overlay physically intact). Clearing *all* dirty marks — not just the
-    /// frozen ones — is load-bearing for **repeat** handoff cycles:
+    /// `frozen_node_ids`/`frozen_edge_ids` are the **freeze identity** (every id
+    /// resident/dirtied in the overlay at freeze ⇒ absorbed into this generation).
+    /// This primitive, under the `merge_guard` writer barrier, swaps the base and
+    /// clears dirty **only for**:
     ///
-    /// - **Absorbed epoch-N (frozen, present in the new base)** — with `dirty`
-    ///   cleared, dispatch takes the base-hit arm so the new base (frozen value)
-    ///   is served and the stale identical overlay copy is shadowed (no
-    ///   lost/resurrected read). Its bytes drop on the next whole-graph cycle.
-    /// - **Retained N+1, and any entity frozen into a later cycle that the base
-    ///   merge could not absorb** — an entity created *post-freeze* in cycle i
-    ///   is not in the (then-current) base, so the base-merge skips it in cycle
-    ///   i+1 too; it is frozen but never lands in any generation. With `dirty`
-    ///   cleared it has **no base copy**, so the base-miss arm falls through to
-    ///   the overlay and serves its **current** value. (Leaving it dirty would
-    ///   make a *repeat* handoff serve its *stale frozen* overlay value
-    ///   forever, shadowing the new base — the very trap this clears.)
+    /// - any id in `frozen_*` (frozen-absorbed: the new base holds its committed
+    ///   value; clearing dirty lets the base shadow the stale overlay copy), AND
+    /// - any id the new base **does not contain** but that is dirty (skip-absorbed
+    ///   occupancy: an N+1 *create* whose creation was frozen but whose mutation
+    ///   was post-freeze — it physically landed in the new base, so the overlay
+    ///   copy is redundant and the new base shadows it).
     ///
-    /// Tombstones (`deleted_from_base_*`) are preserved: a deletion is replayed
-    /// by the base-merge into the generation, so the entity is simply absent
-    /// from the new base while its tombstone keeps it hidden.
+    /// It **retains** dirty for an id the new base *does not contain* **and** that
+    /// was re-mutated post-freeze: clearing such an id would make dispatch serve
+    /// the entity's *base-hit* frozen value (`v0`) and drop the un-absorbed
+    /// post-freeze modification (`v1`). Retaining dirty keeps dispatch on the
+    /// overlay → current value.
     ///
     /// Returns the previous base `Arc`.
     #[cfg(feature = "lpg")]
-    pub fn swap_base_and_repair_overlay(&self, new_base: Arc<CompactStore>) -> Arc<CompactStore> {
+    pub fn swap_base_and_repair_overlay(
+        &self,
+        new_base: Arc<CompactStore>,
+        frozen_node_ids: &FxHashSet<NodeId>,
+        frozen_edge_ids: &FxHashSet<EdgeId>,
+    ) -> Arc<CompactStore> {
         let _barrier = self.merge_guard.write();
         let old_base = self.base.swap(new_base);
-        // Clear ALL dirty bookkeeping. Overlay-in-only entities (no base copy)
-        // resolve via base-miss → overlay (current value); entities absorbed
-        // into the new base resolve via base (frozen value), shadowing their
-        // stale overlay copy. The overlay stays physically intact so retained
-        // N+1 and un-absorbable entities remain present.
-        self.dirty_node_ids.write().clear();
-        self.dirty_edge_ids.write().clear();
+        // Selective undirty: an absorbed id's committed value already lives in the
+        // new base, so its stale overlay copy may be shadowed by clearing dirty.
+        // Retain dirty for a retained N+1 *modification* of a base/resident entity
+        // that the base merge could NOT absorb (the entity is physically absent
+        // from the new base): clearing it would make dispatch serve the stale
+        // frozen value and drop the un-absorbed N+1 modification.
+        {
+            let mut dirty = self.dirty_node_ids.write();
+            dirty.retain(|id| {
+                // Keep dirty iff the entity was NOT frozen-absorbed AND is still
+                // resident in the (old) base — i.e. a base entity re-mutated
+                // post-freeze whose new value is not in the generation.
+                !frozen_node_ids.contains(id) && old_base.get_node(*id).is_some()
+            });
+        }
+        {
+            let mut dirty = self.dirty_edge_ids.write();
+            dirty.retain(|id| !frozen_edge_ids.contains(id) && old_base.get_edge(*id).is_some());
+        }
         old_base
     }
 

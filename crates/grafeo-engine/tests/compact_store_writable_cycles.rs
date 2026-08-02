@@ -38,7 +38,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use grafeo_common::storage::SectionType;
-use grafeo_common::types::{PropertyKey, Value};
+use grafeo_common::types::{NodeId, PropertyKey, Value};
+use grafeo_common::utils::hash::FxHashSet;
 use grafeo_core::graph::compact::CompactStore;
 use grafeo_core::graph::compact::overlay_budget::{
     OverlayAdmissionController, OverlayBudgetConfig,
@@ -53,6 +54,18 @@ use grafeo_storage::file::GrafeoFileManager;
 use grafeo_storage::file::generation_writer::GenerationFileOps;
 use grafeo_storage::generation::wal_cursor::validate_replayable;
 use tempfile::TempDir;
+
+/// Convert a freeze-identity node set (`u64` originals) to `NodeId`s.
+fn frozen_to_node_ids(ids: &FxHashSet<u64>) -> FxHashSet<NodeId> {
+    ids.iter().map(|raw| NodeId::new(*raw)).collect()
+}
+
+/// Convert a freeze-identity edge set (`u64` originals) to `EdgeId`s.
+fn frozen_to_edge_ids(ids: &FxHashSet<u64>) -> FxHashSet<grafeo_common::types::EdgeId> {
+    ids.iter()
+        .map(|raw| grafeo_common::types::EdgeId::new(*raw))
+        .collect()
+}
 
 /// Open a published generation container **fresh** (bytes path) and return its
 /// base store. Used to install the swap target that `swap_base*` serves.
@@ -224,6 +237,9 @@ fn handoff_build_repaired_swap_preserves_exact_once() {
 
     let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
     assert_eq!(db.epoch_handoff_phase(), EpochHandoffPhase::FreezeCaptured);
+    // Capture the freeze identity BEFORE the handle is consumed by complete.
+    let frozen_node_set = handle.freeze.overlay_node_ids.clone();
+    let frozen_edge_set = handle.freeze.overlay_edge_ids.clone();
 
     // Post-freeze N+1 (created, never frozen).
     let n1 = db.layered_store().unwrap().create_node(&["Person"]);
@@ -244,9 +260,11 @@ fn handoff_build_repaired_swap_preserves_exact_once() {
         .generation_abs_path
         .clone();
     let new_base = open_generation_base(&gen_abs);
-    db.layered_store()
-        .unwrap()
-        .swap_base_and_repair_overlay(new_base);
+    db.layered_store().unwrap().swap_base_and_repair_overlay(
+        new_base,
+        &frozen_to_node_ids(&frozen_node_set),
+        &frozen_to_edge_ids(&frozen_edge_set),
+    );
 
     // Exact-once parity: base epoch-N + frozen-N + retained N+1, each once.
     let expected: BTreeSet<String> = ["p-base", "frozen-n-a", "p-n1"]
@@ -258,6 +276,88 @@ fn handoff_build_repaired_swap_preserves_exact_once() {
     let gen_names = generation_person_names(&gen_abs);
     assert!(gen_names.contains(&"frozen-n-a".to_string()));
     assert!(!gen_names.contains(&"p-n1".to_string()));
+}
+
+/// M4 regression (review `deleg_21bd4e50`): an N+1 *modification* of a
+/// base-resident entity must survive `swap_base_and_repair_overlay`. The base
+/// merge cannot absorb it (`old base` holds the entity, but the freeze shadow
+/// set contains it as created-or-modified *at freeze*, which this entity was
+/// not), so the new base holds the *frozen* `v0`. With the OLD clear-everything
+/// repair, the N+1 `v1` was shadowed. With selective undirty the entity stays
+/// dirty → overlay (current `v1`) wins.
+#[test]
+fn repair_swap_keeps_post_freeze_modification_of_base_node_visible() {
+    if std::env::var(MEM_CHILD_ENV).is_ok() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    let mut db = GrafeoDB::new_in_memory();
+    // Base node present BEFORE compact → lands in the compact base (v0).
+    let base_id = db
+        .create_node_with_props(&["Person"], [("name", Value::from("base-v0"))])
+        .expect("base node");
+    db.compact().expect("compact");
+    let ctl =
+        Arc::new(OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"));
+    db.install_overlay_admission(Arc::clone(&ctl));
+
+    // Freeze epoch N. The base node is present in the base and NOT modified at
+    // freeze → it is NOT in the freeze shadow set → the handoff build keeps
+    // old-base v0 in the new generation.
+    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let frozen_node_set = handle.freeze.overlay_node_ids.clone();
+    let frozen_edge_set = handle.freeze.overlay_edge_ids.clone();
+    assert!(
+        !frozen_node_set.contains(&base_id.as_u64()),
+        "unmodified-at-freeze base node must NOT be in the freeze shadow set"
+    );
+
+    // Post-freeze N+1 modification of the SAME base-resident node: v0 → v1.
+    db.layered_store()
+        .unwrap()
+        .set_node_property(base_id, "name", Value::from("base-v1"));
+
+    let report = db
+        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "hand-modify"))
+        .expect("complete handoff");
+    assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
+
+    // The handoff generation still serves frozen v0 (the build only carries
+    // frozen payloads; it cannot see the post-freeze N+1 modify).
+    let gen_abs = report
+        .publication
+        .as_ref()
+        .expect("publication")
+        .generation_abs_path
+        .clone();
+    assert!(
+        generation_person_names(&gen_abs).contains(&"base-v0".to_string()),
+        "handoff generation must hold the frozen pre-N+1 value"
+    );
+    assert!(
+        !generation_person_names(&gen_abs).contains(&"base-v1".to_string()),
+        "handoff generation must NOT hold the post-freeze N+1 modify"
+    );
+
+    // 5d: swap + repair. The OLD repair cleared all dirty → would serve v0 and
+    // drop v1 (the regression). The selective-undirty repair keeps the entity
+    // dirty so the overlay (v1) wins.
+    let new_base = open_generation_base(&gen_abs);
+    db.layered_store().unwrap().swap_base_and_repair_overlay(
+        new_base,
+        &frozen_to_node_ids(&frozen_node_set),
+        &frozen_to_edge_ids(&frozen_edge_set),
+    );
+
+    // The N+1 modification MUST be visible exactly once in the live view.
+    assert_eq!(
+        live_person_names(&db),
+        vec!["base-v1".to_string()],
+        "post-freeze N+1 modify of base node must survive the repair swap"
+    );
 }
 
 // ── R1: sustained writable cycles with concurrent readers ────────────────────
@@ -367,6 +467,8 @@ fn repeated_cycles_with_concurrent_readers() {
             // ── normal handoff cycle: freeze → concurrent N+1 → complete ──
             let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
             assert!(db.epoch_handoff_active());
+            let frozen_node_set = handle.freeze.overlay_node_ids.clone();
+            let frozen_edge_set = handle.freeze.overlay_edge_ids.clone();
             // Post-freeze N+1 create (accepted working set that must survive).
             let n1_name = format!("c{cycle}-n1");
             let n1 = db.layered_store().unwrap().create_node(&["Person"]);
@@ -390,9 +492,11 @@ fn repeated_cycles_with_concurrent_readers() {
                 .generation_abs_path
                 .clone();
             let new_base = open_generation_base(&gen_abs);
-            db.layered_store()
-                .unwrap()
-                .swap_base_and_repair_overlay(new_base);
+            db.layered_store().unwrap().swap_base_and_repair_overlay(
+                new_base,
+                &frozen_to_node_ids(&frozen_node_set),
+                &frozen_to_edge_ids(&frozen_edge_set),
+            );
 
             model.insert(epoch_n);
             model.insert(n1_name);
