@@ -39,19 +39,14 @@ impl GenerationBudget {
         }
     }
 
-    /// Linux acceptance configuration from the packet (section 8).
-    ///
-    /// `sort_run_bytes` is kept well below `max_anon_bytes` so a single domain
-    /// cannot remain fully resident in the sort arena; otherwise peak RssAnon
-    /// tracks input size until the first flush and the N-vs-4N plateau gate
-    /// becomes unreachable even when the rest of the builder is bounded.
+    /// Linux acceptance configuration from the packet (D0.8.10 #7).
     #[must_use]
     pub const fn acceptance_linux() -> Self {
         Self {
             max_anon_bytes: 128 * 1024 * 1024,
             max_temp_bytes: 4 * 1024 * 1024 * 1024,
-            sort_run_bytes: 4 * 1024 * 1024,
-            io_buffer_bytes: 128 * 1024,
+            sort_run_bytes: 64 * 1024 * 1024,
+            io_buffer_bytes: 1024 * 1024,
             merge_fan_in: 32,
             max_record_bytes: 8 * 1024 * 1024,
             max_schema_bytes: 16 * 1024 * 1024,

@@ -51,15 +51,10 @@ impl NodeRecordSource for SyntheticNodes {
         let i = self.cursor;
         self.cursor += 1;
         let mut node = GenerationNode::new(i as u64 + 1, "Person");
-        // Cap string cardinality so peak RssAnon measures the sort/spool budget
-        // plateau (D0.8.10), not allocator retention of one-string-per-row
-        // temporaries. Unbounded per-column dict lookup (no resident HashMap /
-        // offset Vec) is proven by `dict_column_lookup` unit tests against
-        // large on-disk chunks.
-        node.properties.insert(
-            PropertyKey::new("name"),
-            Value::from(format!("person_{}", i % 4096)),
-        );
+        // High-cardinality adversary (D0.8.10 #2/#7): one distinct string per
+        // row. Do not cap cardinality to make the plateau pass.
+        node.properties
+            .insert(PropertyKey::new("name"), Value::from(format!("person_{i}")));
         node.properties
             .insert(PropertyKey::new("age"), Value::Int64((i % 80) as i64 + 18));
         Ok(Some(node))
@@ -247,23 +242,21 @@ fn run_isolated_scale(n: usize, root: &Path) -> ChildReport {
     let manager = GrafeoFileManager::open_read_only(&selected.generation_abs_path).expect("open");
     let section_dir = manager.read_section_directory().unwrap().unwrap();
     let entry = section_dir.find(SectionType::CompactStore).expect("cs section");
-    // Production fresh-reopen: mmap the CompactStore section (zero-copy). Do not
-    // read_section_data + copy the whole payload into anonymous RAM — that would
-    // make peak RssAnon scale with payload size and invalidate the N-vs-4N gate.
-    let mmap = manager.mmap_section(entry).expect("mmap compact-store section");
-    assert!(
-        mmap.len() > 0,
-        "CompactStore section must be mmap-able with nonzero length"
-    );
+    // Production fresh-reopen: mmap the CompactStore section and open through
+    // the mapped reader (zero-copy owner). Verifies counts — do not skip
+    // deserialize to make RssAnon look flat.
+    let mmap = Arc::new(manager.mmap_section(entry).expect("mmap compact-store section"));
     assert_eq!(mmap.section_type(), SectionType::CompactStore);
-    // Production serving retains mapped backing; eager v5 deserialize would
-    // materialize graph-proportional ColumnCodecs in anonymous RAM.
-    let _mapped = std::sync::Arc::new(mmap);
+    let mapped_bytes = grafeo_storage::container::MmapSection::into_bytes(mmap);
+    let mut cs = CompactStoreSection::empty();
+    cs.deserialize_from_mapped_bytes(mapped_bytes)
+        .expect("mapped reopen");
+    assert_eq!(cs.store().expect("store").total_nodes(), node_count);
 
     // Drop publication sections (owns the payload lease / spool files) and the
     // run store before counting leftovers. Sampling covers the full production path.
     drop(sections);
-    drop(_mapped);
+    drop(cs);
     drop(manager);
     drop(run_store);
     stop.store(true, Ordering::Relaxed);
@@ -303,12 +296,6 @@ fn spawn_child(n: usize) -> ChildReport {
         .arg("--nocapture")
         .env(CHILD_ENV, "1")
         .env("GRAFEO_NVS4N_N", n.to_string())
-        // Force large sort/spool arenas onto mmap'd regions so freed runs are
-        // returned to the OS. Without this, glibc heap retention makes peak
-        // RssAnon track total bytes processed even when live anon is bounded.
-        .env("MALLOC_MMAP_THRESHOLD_", "65536")
-        .env("MALLOC_TRIM_THRESHOLD_", "65536")
-        .env("MALLOC_ARENA_MAX", "2")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
