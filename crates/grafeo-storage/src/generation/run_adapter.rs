@@ -34,6 +34,7 @@ use super::records::FramedRecord;
 fn to_sort_budget(b: &GenerationBudget) -> ExternalSortBudget {
     ExternalSortBudget {
         max_temp_bytes: b.max_temp_bytes,
+        max_anon_bytes: b.max_anon_bytes,
         sort_run_bytes: b.sort_run_bytes,
         io_buffer_bytes: b.io_buffer_bytes as usize,
         merge_fan_in: b.merge_fan_in,
@@ -125,6 +126,7 @@ impl RunStore for DiskRunStore {
         Ok(Box::new(DiskSinkAdapter {
             inner: Some(sink),
             domain: domain.to_string(),
+            captured_anon_peak: 0,
         }))
     }
 
@@ -171,6 +173,10 @@ impl RunStore for DiskRunStore {
 struct DiskSinkAdapter {
     inner: Option<DiskRunSink>,
     domain: String,
+    /// Captured anon peak from the inner sink after `finish()` moves it
+    /// into the lease closure. Available via `anon_peak()` for the
+    /// orchestrator to fold into the job-level ledger.
+    captured_anon_peak: u64,
 }
 
 impl ExternalRunSink for DiskSinkAdapter {
@@ -187,6 +193,8 @@ impl ExternalRunSink for DiskSinkAdapter {
             .inner
             .take()
             .ok_or_else(|| GenerationError::InvalidInput("double finish".into()))?;
+        // Capture the anon peak BEFORE the sink moves into the lease closure.
+        self.captured_anon_peak = sink.anon_peak();
         let handles: Vec<ExternalRunHandle> = sink
             .finish()
             .map_err(map_err)?
@@ -207,6 +215,10 @@ impl ExternalRunSink for DiskSinkAdapter {
         if let Some(mut sink) = self.inner.take() {
             sink.cleanup();
         }
+    }
+
+    fn anon_peak(&self) -> u64 {
+        self.captured_anon_peak
     }
 }
 

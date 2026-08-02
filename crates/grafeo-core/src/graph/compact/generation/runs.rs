@@ -132,6 +132,13 @@ pub trait ExternalRunSink {
 
     /// Drop all unpublished runs for this sink (idempotent).
     fn cleanup(&mut self);
+
+    /// Peak anonymous (in-memory arena) bytes observed by this sink.
+    /// Callers fold this into the job-level anon ledger after `finish()`.
+    /// Default: 0 (in-memory sinks that don't track anon separately).
+    fn anon_peak(&self) -> u64 {
+        0
+    }
 }
 
 /// RAII ownership over one sort domain's flushed runs (G-EM0.5b D0.8.1).

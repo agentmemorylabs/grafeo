@@ -156,6 +156,22 @@ impl BoundedGenerationBuilder {
         ))
     }
 
+    /// Fold a finished `DiskRunStore` sink's peak anonymous arena bytes into
+    /// the authoritative job-level anon ledger. Call immediately after
+    /// `sink.finish()` so the peak is recorded before the sink is dropped.
+    /// The reserve/release pair updates `anon_bytes_peak` without leaving a
+    /// live charge (the arena is already flushed to disk).
+    fn fold_sink_anon(&mut self, sink: &dyn crate::graph::compact::generation::ExternalRunSink) {
+        let peak = sink.anon_peak();
+        if peak > 0 {
+            // reserve_anon updates peak; release_anon drops current back.
+            let _ = self
+                .metrics
+                .reserve_anon(peak, self.config.budget.max_anon_bytes);
+            self.metrics.release_anon(peak);
+        }
+    }
+
     /// Runs the full bounded build, returning a streaming payload lease.
     ///
     /// # Errors
@@ -196,6 +212,7 @@ impl BoundedGenerationBuilder {
             &mut self.metrics,
         )?;
         let id_index_lease = id_index_sink.finish()?;
+        self.fold_sink_anon(id_index_sink.as_ref());
         // Occurrence run stays open until edge properties are appended (D0.8.0).
         // Charge run-file temp for the job ledger (truthful nonzero counters).
         let id_run_temp: u64 = id_index_lease.handles.iter().map(|h| h.byte_len).sum();
@@ -257,6 +274,7 @@ impl BoundedGenerationBuilder {
             &self.config.rel_schemas,
         )?;
         let fwd_lease = fwd_sink.finish()?;
+        self.fold_sink_anon(fwd_sink.as_ref());
         edge_pass::explode_occurrences_from_forward(
             &fwd_lease,
             run_store.merger("fwd-csr")?.as_mut(),
@@ -266,6 +284,7 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let occ_lease = occ_sink.finish()?;
+        self.fold_sink_anon(occ_sink.as_ref());
         let occ_temp: u64 = occ_lease.handles.iter().map(|h| h.byte_len).sum();
         self.metrics.reserve_temp(occ_temp, budget.max_temp_bytes)?;
 
@@ -292,6 +311,7 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let str_occ_lease = str_occ_sink.finish()?;
+        self.fold_sink_anon(str_occ_sink.as_ref());
 
         // ── 4. Global dictionary ─────────────────────────────────────
         let mut offsets_sink = Box::new(self.make_sink(SegmentKind::StringOffsets, 8, 8, "stroff")?);
@@ -310,6 +330,7 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let remap_lease = remap_sink.finish()?;
+        self.fold_sink_anon(remap_sink.as_ref());
 
         // ── 4b. Consume the remap run (bounded) ───────────────────────
         // The dictionary pass re-emitted every string occurrence as a remap
@@ -432,6 +453,7 @@ impl BoundedGenerationBuilder {
             self.cancel.as_ref(),
         )?;
         let rev_lease = rev_sink.finish()?;
+        self.fold_sink_anon(rev_sink.as_ref());
         let mut rev_off_sink =
             Box::new(self.make_sink(SegmentKind::ReverseCsrOffsets, 4, 4, "revoff")?);
         let mut rev_tgt_sink =

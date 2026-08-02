@@ -19,6 +19,10 @@ pub struct ExternalSortMetrics {
     pub temp_bytes_peak: u64,
     /// Current temporary disk charge (live files).
     pub temp_bytes_current: u64,
+    /// Peak anonymous (in-memory sort arena) charge observed.
+    pub anon_bytes_peak: u64,
+    /// Current anonymous charge (live arena bytes).
+    pub anon_bytes_current: u64,
     /// Total sorted runs formed.
     pub run_count: u64,
     /// Maximum simultaneously open run readers.
@@ -54,6 +58,32 @@ impl ExternalSortMetrics {
     /// Release `bytes` from the temp-disk counter (saturating).
     pub fn release_temp(&mut self, bytes: u64) {
         self.temp_bytes_current = self.temp_bytes_current.saturating_sub(bytes);
+    }
+
+    /// Reserve `bytes` against the anonymous (in-memory arena) counter.
+    /// Updates peak. Fails before crossing `limit`.
+    ///
+    /// # Errors
+    /// Returns a budget-exceeded error if `current + bytes > limit`.
+    pub fn reserve_anon(&mut self, bytes: u64, limit: u64) -> Result<(), ExternalSortMetricsError> {
+        let next = self
+            .anon_bytes_current
+            .checked_add(bytes)
+            .ok_or(ExternalSortMetricsError::Overflow)?;
+        if next > limit {
+            return Err(ExternalSortMetricsError::BudgetExceeded {
+                requested: next,
+                limit,
+            });
+        }
+        self.anon_bytes_current = next;
+        self.anon_bytes_peak = self.anon_bytes_peak.max(next);
+        Ok(())
+    }
+
+    /// Release `bytes` from the anonymous counter (saturating).
+    pub fn release_anon(&mut self, bytes: u64) {
+        self.anon_bytes_current = self.anon_bytes_current.saturating_sub(bytes);
     }
 
     /// Update `max_open_runs` if `count` exceeds the current value.

@@ -68,6 +68,19 @@ impl FramedRecord {
         8 + self.key.len() as u64 + self.payload.len() as u64
     }
 
+    /// In-memory cost of holding this record in the sort arena: the
+    /// `FramedRecord` struct itself (two `Vec<u8>` = 48 bytes) plus the heap
+    /// allocations backing `key` and `payload`. The arena flush threshold must
+    /// use this — not `encoded_len` — so a `sort_run_bytes` budget reflects
+    /// real anonymous bytes. The old `encoded_len` accounting ignored the
+    /// ~48 B/record struct overhead and Vec growth headroom, so a 64 MiB
+    /// "encoded" arena of ~2 M small records ballooned to ~201 MiB resident
+    /// (the N-vs-4N peak RSS scaling the parent REJECTed).
+    #[must_use]
+    pub fn arena_len(&self) -> u64 {
+        (std::mem::size_of::<Self>() + self.key.capacity() + self.payload.capacity()) as u64
+    }
+
     /// Write this record to `w` using the standard framing.
     ///
     /// # Errors

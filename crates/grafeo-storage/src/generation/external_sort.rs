@@ -160,11 +160,20 @@ impl DiskRunSink {
                 limit: self.budget.max_record_bytes,
             });
         }
-        if self.arena_bytes > 0 && self.arena_bytes.saturating_add(enc) > self.budget.sort_run_bytes
+        // Bound the arena by its real in-memory footprint (struct + heap
+        // capacity), not the smaller on-disk encoded length, so the
+        // `sort_run_bytes` budget actually caps anonymous bytes.
+        let mem = record.arena_len();
+        if self.arena_bytes > 0 && self.arena_bytes.saturating_add(mem) > self.budget.sort_run_bytes
         {
             self.flush_run()?;
         }
-        self.arena_bytes = self.arena_bytes.saturating_add(enc);
+        // Charge the authoritative anon ledger for the in-memory footprint
+        // BEFORE growing the arena. If the job-level anon budget is exhausted,
+        // fail closed rather than silently exceeding it.
+        self.metrics
+            .reserve_anon(mem, self.budget.max_anon_bytes)?;
+        self.arena_bytes = self.arena_bytes.saturating_add(mem);
         self.metrics.record_count += 1;
         self.arena.push(record);
         Ok(())
@@ -175,6 +184,7 @@ impl DiskRunSink {
         if self.arena.is_empty() {
             return Ok(());
         }
+        let anon_to_release = self.arena_bytes;
         let mut run = std::mem::take(&mut self.arena);
         run.sort_unstable();
         // Truthful accounting (W0 §8): reserve run bytes against max_temp_bytes
@@ -197,6 +207,11 @@ impl DiskRunSink {
             w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
             Ok(())
         })();
+        // Release the anon charge: the arena data is about to be dropped
+        // (on success `run` drops at function exit; on error it drops when
+        // we return Err). Either way the memory is freed.
+        self.metrics.release_anon(anon_to_release);
+        self.arena_bytes = 0;
         if let Err(e) = write_result {
             self.metrics.release_temp(byte_len);
             let _ = fs::remove_file(&path);
@@ -208,7 +223,6 @@ impl DiskRunSink {
             record_count: run.len() as u64,
             byte_len,
         });
-        self.arena_bytes = 0;
         Ok(())
     }
 
@@ -220,6 +234,12 @@ impl DiskRunSink {
         self.check_cancel()?;
         self.flush_run()?;
         Ok(self.runs.clone())
+    }
+
+    /// Peak anonymous (in-memory arena) bytes observed across all flushes.
+    #[must_use]
+    pub fn anon_peak(&self) -> u64 {
+        self.metrics.anon_bytes_peak
     }
 
     /// Idempotent cleanup of all tracked run files.
