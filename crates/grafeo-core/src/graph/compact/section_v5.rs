@@ -121,6 +121,15 @@ pub fn serialize_v5_with_string_order(
                 }
             }
         }
+        // R3-B2: intern rel zone map strings.
+        for zm in rt.zone_maps().values() {
+            intern_zone_strings(zm, &mut intern);
+        }
+        for zms in rt.block_zone_maps().values() {
+            for zm in zms {
+                intern_zone_strings(zm, &mut intern);
+            }
+        }
     }
 
     if string_order == StringCodeOrder::Lexicographic {
@@ -592,19 +601,26 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
 
     // Zone maps (kinds 18–19); absent segments yield empty maps (legacy fallback).
     let table_count = meta.node_tables.len();
-    let table_zone_maps = match directory.get(SegmentKind::TableZoneMaps) {
+    let rel_count = meta.rel_tables.len();
+    let (table_zone_maps, rel_table_zone_maps) = match directory.get(SegmentKind::TableZoneMaps) {
         Some(entry) => {
             let bytes = slice_segment_checked(data_bytes, entry)?;
-            parse_table_zone_maps(bytes.as_ref(), &global_dict, table_count)?
+            parse_table_zone_maps(bytes.as_ref(), &global_dict, table_count, rel_count)?
         }
-        None => (0..table_count).map(|_| FxHashMap::default()).collect(),
+        None => (
+            (0..table_count).map(|_| FxHashMap::default()).collect(),
+            (0..rel_count).map(|_| FxHashMap::default()).collect(),
+        ),
     };
-    let block_zone_maps = match directory.get(SegmentKind::BlockZoneMaps) {
+    let (block_zone_maps, rel_block_zone_maps) = match directory.get(SegmentKind::BlockZoneMaps) {
         Some(entry) => {
             let bytes = slice_segment_checked(data_bytes, entry)?;
-            parse_block_zone_maps(bytes.as_ref(), &global_dict, table_count)?
+            parse_block_zone_maps(bytes.as_ref(), &global_dict, table_count, rel_count)?
         }
-        None => (0..table_count).map(|_| FxHashMap::default()).collect(),
+        None => (
+            (0..table_count).map(|_| FxHashMap::default()).collect(),
+            (0..rel_count).map(|_| FxHashMap::default()).collect(),
+        ),
     };
 
     // Build node tables
@@ -754,7 +770,11 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
             dst_label.as_str(),
             prop_defs,
         );
-        let table = RelTable::new(schema, fwd, bwd, properties, rec.src_tid, rec.dst_tid);
+        let rel_zm = rel_table_zone_maps.get(rid).cloned().unwrap_or_default();
+        let rel_bzm = rel_block_zone_maps.get(rid).cloned().unwrap_or_default();
+        let table = RelTable::with_zone_maps(
+            schema, fwd, bwd, properties, rec.src_tid, rec.dst_tid, rel_zm, rel_bzm,
+        );
         let et = ArcStr::from(rt_meta.edge_type.as_str());
         edge_type_to_rel_id
             .entry(et.clone())

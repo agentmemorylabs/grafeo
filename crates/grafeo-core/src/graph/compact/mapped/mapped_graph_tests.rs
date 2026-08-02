@@ -223,7 +223,7 @@ fn zone_map_segments_round_trip_and_reject_bad_reserved() {
     .unwrap();
     assert_eq!(seg.len(), ZONE_MAP_RECORD_LEN);
 
-    let parsed = parse_table_zone_maps(&seg, &dict, 1).unwrap();
+    let (parsed, _rel_parsed) = parse_table_zone_maps(&seg, &dict, 1, 0).unwrap();
     let got = parsed[0]
         .get(&grafeo_common::types::PropertyKey::new("age"))
         .expect("age zone map");
@@ -234,7 +234,7 @@ fn zone_map_segments_round_trip_and_reject_bad_reserved() {
     // Corrupt reserved field.
     let mut bad = seg.clone();
     bad[2] = 1;
-    let err = parse_table_zone_maps(&bad, &dict, 1).expect_err("reserved");
+    let err = parse_table_zone_maps(&bad, &dict, 1, 0).expect_err("reserved");
     assert!(err.contains("reserved"), "{err}");
 }
 

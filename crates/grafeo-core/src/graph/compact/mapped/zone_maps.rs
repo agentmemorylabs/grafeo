@@ -194,7 +194,10 @@ fn parse_records(data: &[u8], dict: &MappedStringDictionary) -> Result<Vec<RawZo
     Ok(out)
 }
 
-/// Parses kind-18 table zone maps into per-table maps.
+/// Parses kind-18 table zone maps into per-node-table maps and per-rel-table maps.
+///
+/// Relationship-tagged records (`table_id & 0x8000 != 0`) are installed into
+/// the returned `rel_tables` vector (indexed by `table_id & 0x7FFF`).
 ///
 /// # Errors
 ///
@@ -204,10 +207,19 @@ pub fn parse_table_zone_maps(
     data: &[u8],
     dict: &MappedStringDictionary,
     table_count: usize,
-) -> Result<Vec<FxHashMap<PropertyKey, ZoneMap>>, String> {
+    rel_count: usize,
+) -> Result<
+    (
+        Vec<FxHashMap<PropertyKey, ZoneMap>>,
+        Vec<FxHashMap<PropertyKey, ZoneMap>>,
+    ),
+    String,
+> {
     let records = parse_records(data, dict)?;
     let mut tables: Vec<FxHashMap<PropertyKey, ZoneMap>> =
         (0..table_count).map(|_| FxHashMap::default()).collect();
+    let mut rel_tables: Vec<FxHashMap<PropertyKey, ZoneMap>> =
+        (0..rel_count).map(|_| FxHashMap::default()).collect();
     for rec in records {
         if rec.block_index != TABLE_ZONE_BLOCK_SENTINEL {
             return Err(format!(
@@ -215,12 +227,17 @@ pub fn parse_table_zone_maps(
                 rec.block_index
             ));
         }
-        // Bounded generation tags relationship-table columns as
-        // `table_id = 0x8000 | rel_id`. Rel tables do not yet install zone
-        // maps on `RelTable`; skip those records rather than fail-closed on a
-        // node-table-only index. Pure node table_ids still fail closed when
-        // out of range.
+        // Relationship-tagged table_ids (0x8000 | rel_id) are installed on
+        // the corresponding rel table. Out-of-range rel ids fail closed.
         if rec.table_id & 0x8000 != 0 {
+            let rid = (rec.table_id & 0x7FFF) as usize;
+            if rid >= rel_count {
+                return Err(format!(
+                    "TableZoneMaps rel table_id {} out of range (rel_count {rel_count})",
+                    rec.table_id
+                ));
+            }
+            rel_tables[rid].insert(rec.column_key, rec.zone_map);
             continue;
         }
         let tid = rec.table_id as usize;
@@ -232,10 +249,13 @@ pub fn parse_table_zone_maps(
         }
         tables[tid].insert(rec.column_key, rec.zone_map);
     }
-    Ok(tables)
+    Ok((tables, rel_tables))
 }
 
-/// Parses kind-19 block zone maps into per-table column → Vec maps.
+/// Parses kind-19 block zone maps into per-node-table and per-rel-table column → Vec maps.
+///
+/// Relationship-tagged records (`table_id & 0x8000 != 0`) are installed into
+/// the returned `rel_tables` vector (indexed by `table_id & 0x7FFF`).
 ///
 /// # Errors
 ///
@@ -245,17 +265,38 @@ pub fn parse_block_zone_maps(
     data: &[u8],
     dict: &MappedStringDictionary,
     table_count: usize,
-) -> Result<Vec<FxHashMap<PropertyKey, Vec<ZoneMap>>>, String> {
+    rel_count: usize,
+) -> Result<
+    (
+        Vec<FxHashMap<PropertyKey, Vec<ZoneMap>>>,
+        Vec<FxHashMap<PropertyKey, Vec<ZoneMap>>>,
+    ),
+    String,
+> {
     let records = parse_records(data, dict)?;
     // Group: table → column → (block_index, ZoneMap)
     let mut staged: Vec<FxHashMap<PropertyKey, Vec<(u32, ZoneMap)>>> =
         (0..table_count).map(|_| FxHashMap::default()).collect();
+    let mut rel_staged: Vec<FxHashMap<PropertyKey, Vec<(u32, ZoneMap)>>> =
+        (0..rel_count).map(|_| FxHashMap::default()).collect();
     for rec in records {
         if rec.block_index == TABLE_ZONE_BLOCK_SENTINEL {
             return Err("BlockZoneMaps record has table-level sentinel block_index".into());
         }
-        // Same as table zone maps: skip rel-tagged table_ids (0x8000 | rid).
+        // Relationship-tagged table_ids (0x8000 | rel_id) are installed on
+        // the corresponding rel table. Out-of-range rel ids fail closed.
         if rec.table_id & 0x8000 != 0 {
+            let rid = (rec.table_id & 0x7FFF) as usize;
+            if rid >= rel_count {
+                return Err(format!(
+                    "BlockZoneMaps rel table_id {} out of range (rel_count {rel_count})",
+                    rec.table_id
+                ));
+            }
+            rel_staged[rid]
+                .entry(rec.column_key)
+                .or_default()
+                .push((rec.block_index, rec.zone_map));
             continue;
         }
         let tid = rec.table_id as usize;
@@ -270,8 +311,17 @@ pub fn parse_block_zone_maps(
             .or_default()
             .push((rec.block_index, rec.zone_map));
     }
+    let tables = finalize_block_maps(staged)?;
+    let rel_tables = finalize_block_maps(rel_staged)?;
+    Ok((tables, rel_tables))
+}
+
+/// Validates contiguous block indices and converts staged pairs to final maps.
+fn finalize_block_maps(
+    staged: Vec<FxHashMap<PropertyKey, Vec<(u32, ZoneMap)>>>,
+) -> Result<Vec<FxHashMap<PropertyKey, Vec<ZoneMap>>>, String> {
     let mut tables: Vec<FxHashMap<PropertyKey, Vec<ZoneMap>>> =
-        (0..table_count).map(|_| FxHashMap::default()).collect();
+        (0..staged.len()).map(|_| FxHashMap::default()).collect();
     for (tid, cols) in staged.into_iter().enumerate() {
         for (key, mut pairs) in cols {
             pairs.sort_by_key(|(idx, _)| *idx);
@@ -289,7 +339,11 @@ pub fn parse_block_zone_maps(
     Ok(tables)
 }
 
-/// Builds TableZoneMaps + BlockZoneMaps segment bodies for all node tables.
+/// Builds TableZoneMaps + BlockZoneMaps segment bodies for all node tables
+/// and relationship tables.
+///
+/// Relationship-table zone maps are tagged with `table_id = 0x8000 | rel_id`
+/// so the reader can install them on the correct `RelTable` (R3-B2).
 ///
 /// # Errors
 ///
@@ -334,6 +388,43 @@ pub fn build_zone_map_segments(
             for (block_idx, zm) in zms.iter().enumerate() {
                 let bi = u32::try_from(block_idx).map_err(|_| "block index overflow")?;
                 write_zone_map_record(&mut block_seg, table_id, code, bi, zm, string_index)?;
+            }
+        }
+    }
+    // R3-B2: emit relationship-table zone maps tagged with 0x8000 | rel_id.
+    for (rid, rt) in store.rel_tables_by_id.iter().enumerate() {
+        let tagged_id = 0x8000u16
+            | u16::try_from(rid).map_err(|_| "rel table id overflow for zone map tag")?;
+        let mut keys: Vec<_> = rt.zone_maps().keys().cloned().collect();
+        keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for key in &keys {
+            let Some(zm) = rt.zone_maps().get(key) else {
+                continue;
+            };
+            let code = *string_index
+                .get(key.as_str())
+                .ok_or_else(|| format!("rel zone map key not interned: {}", key.as_str()))?;
+            write_zone_map_record(
+                &mut table_seg,
+                tagged_id,
+                code,
+                TABLE_ZONE_BLOCK_SENTINEL,
+                zm,
+                string_index,
+            )?;
+        }
+        let mut bkeys: Vec<_> = rt.block_zone_maps().keys().cloned().collect();
+        bkeys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for key in &bkeys {
+            let Some(zms) = rt.block_zone_maps().get(key) else {
+                continue;
+            };
+            let code = *string_index
+                .get(key.as_str())
+                .ok_or_else(|| format!("rel block zone map key not interned: {}", key.as_str()))?;
+            for (block_idx, zm) in zms.iter().enumerate() {
+                let bi = u32::try_from(block_idx).map_err(|_| "rel block index overflow")?;
+                write_zone_map_record(&mut block_seg, tagged_id, code, bi, zm, string_index)?;
             }
         }
     }
