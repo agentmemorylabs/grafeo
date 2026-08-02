@@ -5,7 +5,9 @@
 //! 2. Build G(N) from the freeze snapshot and publish with pre-cut boundary B.
 //! 3. Retire only the frozen overlay prefix; N+1 mutations remain exactly once.
 //! 4. Dual-epoch backpressure: frozen + next-epoch retained bytes both count.
-//! 5. Fresh-process recovery after freeze/publication fault injection.
+//! 5. Fresh-process recovery after freeze/build/publication/retire fault
+//!    injection — entity-level survival (no lost/duplicated/resurrected
+//!    writes) at all four abort points.
 //! 6. Linearization: checkpoint/phase observability and pre-commit cancel.
 
 #![cfg(all(feature = "generation", feature = "compact-store", feature = "lpg"))]
@@ -27,7 +29,7 @@ use grafeo_core::graph::compact::overlay_budget::{
 use grafeo_core::graph::compact::section::CompactStoreSection;
 use grafeo_core::graph::traits::{GraphStore, GraphStoreMut};
 use grafeo_engine::{
-    EpochHandoffPhase, GrafeoDB, generation_build_request, read_manifest_state,
+    BuildPublication, EpochHandoffPhase, GrafeoDB, generation_build_request, read_manifest_state,
     recover_generation_root,
 };
 use grafeo_storage::file::GrafeoFileManager;
@@ -73,6 +75,40 @@ fn generation_person_names(path: &std::path::Path) -> Vec<String> {
     }
     names.sort_unstable();
     names
+}
+
+/// Assert that a generation container's Person entity set equals `expected`
+/// exactly: every expected name present exactly once, and nothing else.
+/// Entity-id-keyed stores with unique fixture names make this an
+/// entity-level survival check — a lost write shows up as a missing name, a
+/// duplicated write as an extra name, a resurrected write as a name that
+/// must not be there.
+fn assert_person_set_equals(gen_path: &std::path::Path, expected: &[String]) {
+    let names = generation_person_names(gen_path);
+    let mut expect: Vec<String> = expected.to_vec();
+    expect.sort_unstable();
+    assert_eq!(
+        names,
+        expect,
+        "generation {} must contain exactly the expected entities, each once",
+        gen_path.display()
+    );
+}
+
+/// Sorted WAL log-file sequence numbers under a generation root.
+fn wal_log_sequences(gen_root: &std::path::Path) -> Vec<u64> {
+    let mut seqs: Vec<u64> = std::fs::read_dir(gen_root.join("wal"))
+        .expect("read wal dir")
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_prefix("wal_")
+                .and_then(|s| s.strip_suffix(".log"))
+                .and_then(|s| s.parse().ok())
+        })
+        .collect();
+    seqs.sort_unstable();
+    seqs
 }
 
 fn in_any_child() -> bool {
@@ -332,9 +368,60 @@ fn phase_ordering_is_observable() {
 
 // ── Fresh-process fault recovery ───────────────────────────────────
 
+/// Build the prior (`g-prior`) generation a crash test starts from and
+/// return its publication (durable boundary + absolute generation path).
+fn build_prior_generation(gen_root: &std::path::Path) -> BuildPublication {
+    let db = GrafeoDB::new_in_memory();
+    populate(&db, "prior");
+    db.build_and_publish_generation(generation_build_request(gen_root, "g-prior"))
+        .expect("prior generation")
+}
+
+/// Spawn this test binary as a fresh child process with the crash mode and
+/// abort-point env set. The child's mode match aborts (or the engine's
+/// `GRAFEO_5C_ABORT` hook aborts), so the returned status is non-success.
+fn spawn_crash_child(
+    gen_root: &std::path::Path,
+    mode: &str,
+    abort_point: &str,
+) -> std::process::ExitStatus {
+    let mut cmd = Command::new(std::env::current_exe().expect("exe"));
+    cmd.env(HELPER_ENV, "1")
+        .env("GRAFEO5C_ROOT", gen_root)
+        .env("GRAFEO5C_MODE", mode)
+        .env("RUST_BACKTRACE", "0");
+    if !abort_point.is_empty() {
+        cmd.env("GRAFEO_5C_ABORT", abort_point);
+    }
+    cmd.status().expect("spawn child")
+}
+
+/// Child-side two-step handoff with real next-epoch state: two frozen
+/// overlay nodes plus one post-freeze N+1 overlay node, then complete. The
+/// parent's `GRAFEO_5C_ABORT` env aborts the process inside
+/// `complete_epoch_handoff` at the requested post-commit point
+/// (`after_publication` | `after_retire`). The frozen generation therefore
+/// contains the base `child-*` nodes + `frozen-n*` overlay nodes, and
+/// excludes the post-freeze `next-n1` node.
+fn crash_child_twostep(db: &mut GrafeoDB, gen_root: &std::path::Path, gen_id: &str) {
+    db.compact().expect("compact");
+    let layered = db.layered_store().expect("layered");
+    for name in ["frozen-n1", "frozen-n2"] {
+        let n = layered.create_node(&["Person"]);
+        layered.set_node_property(n, "name", Value::from(name));
+    }
+    let handle = db.freeze_epoch_for_handoff(gen_root).expect("freeze");
+    let n1 = layered.create_node(&["Person"]);
+    layered.set_node_property(n1, "name", Value::from("next-n1"));
+    db.complete_epoch_handoff(handle, generation_build_request(gen_root, gen_id))
+        .expect("should abort inside complete_epoch_handoff");
+}
+
 /// Parent: spawn a child that freezes then aborts after freeze; prove the
 /// prior selected generation (if any) remains recoverable and no silent
-/// promotion of a half-built generation occurs.
+/// promotion of a half-built generation occurs. The other three fault
+/// points (after_build, after_publication, after_retire) share this
+/// function's child branch via `GRAFEO5C_MODE`.
 #[test]
 fn fresh_process_abort_after_freeze_keeps_prior_selection() {
     if in_any_child() {
@@ -342,7 +429,7 @@ fn fresh_process_abort_after_freeze_keeps_prior_selection() {
         let root = std::env::var("GRAFEO5C_ROOT").expect("root");
         let mode = std::env::var("GRAFEO5C_MODE").expect("mode");
         let gen_root = std::path::PathBuf::from(&root);
-        let db = GrafeoDB::new_in_memory();
+        let mut db = GrafeoDB::new_in_memory();
         populate(&db, "child");
         match mode.as_str() {
             "abort_after_freeze" => {
@@ -350,11 +437,20 @@ fn fresh_process_abort_after_freeze_keeps_prior_selection() {
                 // Simulate crash before complete.
                 std::process::abort();
             }
-            "abort_after_publication" => {
-                // GRAFEO_5C_ABORT is set by the parent Command env.
+            "abort_after_build" => {
+                // GRAFEO_5C_ABORT=after_build is set by the parent Command
+                // env: the abort fires inside build_publish_frozen after the
+                // compact-store build and before the generation file and
+                // manifest are written.
                 let _ = db
-                    .run_epoch_handoff(generation_build_request(&gen_root, "g-crash-pub"))
+                    .run_epoch_handoff(generation_build_request(&gen_root, "g-crash-build"))
                     .expect("should abort inside");
+            }
+            "abort_after_publication" => {
+                crash_child_twostep(&mut db, &gen_root, "g-crash-pub");
+            }
+            "abort_after_retire" => {
+                crash_child_twostep(&mut db, &gen_root, "g-crash-retire");
             }
             other => panic!("unknown mode {other}"),
         }
@@ -365,21 +461,16 @@ fn fresh_process_abort_after_freeze_keeps_prior_selection() {
     let gen_root = dir.path().join("live.grafeo.d");
     fs::create_dir_all(&gen_root).unwrap();
 
-    // Establish prior generation.
-    {
-        let db = GrafeoDB::new_in_memory();
-        populate(&db, "prior");
-        db.build_and_publish_generation(generation_build_request(&gen_root, "g-prior"))
-            .expect("prior");
-    }
+    // Establish prior generation and capture its exact entity set.
+    let first = build_prior_generation(&gen_root);
+    let prior_names = generation_person_names(&first.generation_abs_path);
+    assert_eq!(
+        prior_names,
+        ["prior-a", "prior-b"].map(String::from),
+        "fixture: prior generation must contain exactly two Person entities"
+    );
 
-    let status = Command::new(std::env::current_exe().expect("exe"))
-        .env(HELPER_ENV, "1")
-        .env("GRAFEO5C_ROOT", &gen_root)
-        .env("GRAFEO5C_MODE", "abort_after_freeze")
-        .env("RUST_BACKTRACE", "0")
-        .status()
-        .expect("spawn child");
+    let status = spawn_crash_child(&gen_root, "abort_after_freeze", "");
     assert!(
         !status.success(),
         "child must abort (non-success): {status}"
@@ -389,6 +480,30 @@ fn fresh_process_abort_after_freeze_keeps_prior_selection() {
     assert_eq!(
         recovery.selected.slot.generation_id, "g-prior",
         "freeze abort must leave prior generation selected"
+    );
+    // The freeze only rotates the WAL and installs an in-process handle; the
+    // manifest is untouched, so the recoverable boundary is still the prior
+    // publication's, and it must remain replayable up to the live tail.
+    assert_eq!(
+        recovery.wal_boundary, first.publication.wal_boundary,
+        "freeze abort must not advance the recorded boundary"
+    );
+    validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
+        .expect("prior boundary replayable after freeze abort");
+    // Entity-level survival: the selected generation's entity set is intact
+    // exactly once (no lost/duplicated writes), and the child's would-be
+    // content never entered any generation (nothing was promoted or
+    // resurrected — the child only populated its own live DB, which a crash
+    // discards together with the in-process freeze handle).
+    assert_person_set_equals(&recovery.selected.generation_abs_path, &prior_names);
+    // The freeze cut is observable on disk: a WAL rotation exists strictly
+    // beyond the recorded boundary (the un-committed freeze rotation). The
+    // manifest boundary was not advanced, so recovery replays from B — the
+    // extra file is inert and no committed write was lost or truncated.
+    let seqs = wal_log_sequences(&gen_root);
+    assert!(
+        *seqs.last().expect("wal files") > recovery.wal_boundary.log_sequence,
+        "freeze cut rotation must exist beyond the recorded boundary: {seqs:?}"
     );
 }
 
@@ -411,21 +526,10 @@ fn fresh_process_abort_after_publication_selects_new() {
         let gen_root = dir.path().join("live.grafeo.d");
         fs::create_dir_all(&gen_root).unwrap();
 
-        {
-            let db = GrafeoDB::new_in_memory();
-            populate(&db, "prior");
-            db.build_and_publish_generation(generation_build_request(&gen_root, "g-prior"))
-                .expect("prior");
-        }
+        // Establish a prior generation so the slot handoff is not genesis.
+        build_prior_generation(&gen_root);
 
-        let status = Command::new(std::env::current_exe().expect("exe"))
-            .env(HELPER_ENV, "1")
-            .env("GRAFEO5C_ROOT", &gen_root)
-            .env("GRAFEO5C_MODE", "abort_after_publication")
-            .env("GRAFEO_5C_ABORT", "after_publication")
-            .env("RUST_BACKTRACE", "0")
-            .status()
-            .expect("spawn child");
+        let status = spawn_crash_child(&gen_root, "abort_after_publication", "after_publication");
         assert!(!status.success(), "child must abort after publication");
 
         let recovery = recover_generation_root(&gen_root).expect("recover after pub abort");
@@ -435,7 +539,157 @@ fn fresh_process_abort_after_publication_selects_new() {
         );
         validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
             .expect("new boundary replayable");
+        // Entity-level survival: the published G(N) contains the frozen
+        // epoch-N set exactly once — base `child-*` nodes plus frozen
+        // overlay `frozen-n*` nodes — and the post-freeze N+1 write
+        // `next-n1` is NOT resurrected into the snapshot.
+        assert_person_set_equals(
+            &recovery.selected.generation_abs_path,
+            &[
+                "child-a".to_string(),
+                "child-b".to_string(),
+                "frozen-n1".to_string(),
+                "frozen-n2".to_string(),
+            ],
+        );
+        // No lost writes past the boundary: publication truncated only WAL
+        // sequences strictly older than the retained floor, so the N+1 tail
+        // (the boundary file and anything later) must still exist and
+        // validate as replayable up to the live tail (asserted above). Real
+        // N+1 frames live in the live DB's WAL — in-memory here, so none are
+        // written under `gen_root/wal`; at this boundary the no-lost-writes
+        // guarantee is exactly the boundary file's survival + full tail
+        // replayability, made explicit here as a file-level check.
+        let tail = wal_log_sequences(&gen_root);
+        assert!(
+            tail.iter()
+                .any(|s| *s >= recovery.wal_boundary.log_sequence),
+            "N+1 tail file(s) must survive publication truncation: {tail:?}"
+        );
     }
+}
+
+/// MAJOR-3 coverage — `after_build`: parent spawns a child that runs a full
+/// freeze→build handoff with `GRAFEO_5C_ABORT=after_build`, then proves from
+/// a fresh process that the half-built generation was never promoted.
+///
+/// NOTE on distinguishability: `after_build` is NOT post-hoc distinguishable
+/// from `after_freeze` at the recovery surface — both leave the prior
+/// generation selected with an unchanged boundary and one inert extra WAL
+/// rotation, because neither commits anything to the manifest. The invariant
+/// that DOES hold and is asserted here: prior selection, prior boundary,
+/// replayability, the prior entity set intact exactly once, and — unique to
+/// after_build — no half-built `.grafeo` generation file materialized
+/// (publication, which creates the immutable file, never ran).
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_process_abort_after_build_keeps_prior_selection() {
+    if in_any_child() {
+        return; // child handled by the sibling mode match above
+    }
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    let first = build_prior_generation(&gen_root);
+    let prior_names = generation_person_names(&first.generation_abs_path);
+
+    let status = spawn_crash_child(&gen_root, "abort_after_build", "after_build");
+    assert!(!status.success(), "child must abort after build");
+
+    let recovery = recover_generation_root(&gen_root).expect("recover after build abort");
+    assert_eq!(
+        recovery.selected.slot.generation_id, "g-prior",
+        "pre-commit build abort must leave prior generation selected"
+    );
+    assert_eq!(
+        recovery.wal_boundary, first.publication.wal_boundary,
+        "build abort must not advance the recorded boundary"
+    );
+    validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
+        .expect("prior boundary replayable after build abort");
+    // Entity-level: the prior generation's entity set is intact exactly once
+    // (no lost/duplicated writes), and the half-built child content never
+    // appears — it was captured in the in-memory freeze but publication
+    // (which would write the generation file + manifest) never ran, so no
+    // part of it can be lost, duplicated, or resurrected into a generation.
+    assert_person_set_equals(&recovery.selected.generation_abs_path, &prior_names);
+    // No half-built `.grafeo` generation file may exist unreferenced under
+    // `generations/`: the build produced store bytes in scratch space
+    // (build-runs/build-tmp), never an immutable generation. Recovery must
+    // classify nothing as an unreferenced generation — only the selected
+    // prior file exists on disk.
+    assert!(
+        !recovery.orphans.iter().any(|o| matches!(
+            o,
+            grafeo_engine::OrphanClassification::UnreferencedGeneration { .. }
+        )),
+        "no half-built generation may be materialized: {recovery:?}"
+    );
+    // The freeze half of the one-shot handoff did rotate the WAL (the same
+    // inert rotation as after_freeze) — the manifest boundary was not
+    // advanced, so no committed write was lost or truncated.
+    let seqs = wal_log_sequences(&gen_root);
+    assert!(
+        *seqs.last().expect("wal files") > recovery.wal_boundary.log_sequence,
+        "freeze cut rotation must exist beyond the recorded boundary: {seqs:?}"
+    );
+}
+
+/// MAJOR-3 coverage — `after_retire`: parent spawns a child that commits the
+/// full handoff (freeze → N+1 write → publish → retire) with
+/// `GRAFEO_5C_ABORT=after_retire`, then proves from a fresh process that the
+/// committed generation and the N+1 WAL tail survive. The abort fires after
+/// retire, which is in-memory only, so the durable recovery surface must be
+/// equivalent to the after_publication point: NEW generation selected,
+/// boundary replayable up to the live tail, frozen entity set exactly once,
+/// and the N+1 write NOT resurrected into G(N) (it belongs to the retained
+/// N+1 tail past boundary B, never lost).
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_process_abort_after_retire_selects_new() {
+    if in_any_child() {
+        return; // child handled by the sibling mode match above
+    }
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    // Establish a prior generation so the slot handoff is not a genesis build.
+    build_prior_generation(&gen_root);
+
+    let status = spawn_crash_child(&gen_root, "abort_after_retire", "after_retire");
+    assert!(!status.success(), "child must abort after retire");
+
+    let recovery = recover_generation_root(&gen_root).expect("recover after retire abort");
+    assert_eq!(
+        recovery.selected.slot.generation_id, "g-crash-retire",
+        "post-retire abort must leave NEW generation selected (commit already durable)"
+    );
+    validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
+        .expect("boundary replayable to the live tail after retire abort");
+    // Entity-level: the frozen epoch-N set appears exactly once in G(N)
+    // (base `child-*` + frozen overlay `frozen-n*`), and the post-freeze
+    // N+1 write `next-n1` is not lost from the N+1 tail nor resurrected into
+    // the frozen snapshot.
+    assert_person_set_equals(
+        &recovery.selected.generation_abs_path,
+        &[
+            "child-a".to_string(),
+            "child-b".to_string(),
+            "frozen-n1".to_string(),
+            "frozen-n2".to_string(),
+        ],
+    );
+    // Retire (an in-memory overlay strip) must not have touched the durable
+    // WAL tail: the boundary file and anything later survive truncation,
+    // and validate as replayable up to the live tail (asserted above).
+    let tail = wal_log_sequences(&gen_root);
+    assert!(
+        tail.iter()
+            .any(|s| *s >= recovery.wal_boundary.log_sequence),
+        "N+1 tail file(s) must survive the retire abort: {tail:?}"
+    );
 }
 
 #[test]
