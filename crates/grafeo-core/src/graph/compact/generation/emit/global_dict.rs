@@ -207,25 +207,32 @@ impl<'a> StreamingDictionary<'a> {
                 code32
             };
 
-            // Re-emit remap record: key = use_kind || owner_key (the
-            // DictValue owner_key carries the column identity, so the
-            // remap stream is grouped by column), payload =
-            // str_len u32 LE || string || code u32 LE. Sorted later by the
-            // caller's remap sink.
-            let slen =
-                u32::try_from(string.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                    what: "remap_string_len",
-                    count: string.len() as u64,
-                    max: u64::from(u32::MAX),
-                })?;
-            let mut rkey = Vec::with_capacity(1 + owner_key.len());
+            // Re-emit remap record.
+            // DictValue: key = use_kind || owner_key || string so the remap
+            // external-sort yields per-column string order (no later O(N)
+            // resident re-sort). Payload = code u32 LE.
+            // Other kinds: key = use_kind || owner_key, payload =
+            // str_len u32 LE || string || code u32 LE.
+            let mut rkey = Vec::with_capacity(1 + owner_key.len() + string.len());
             rkey.push(use_kind as u8);
             rkey.extend_from_slice(owner_key);
-            let mut rpayload = Vec::with_capacity(4 + string.len() + 4);
-            rpayload.extend_from_slice(&slen.to_le_bytes());
-            rpayload.extend_from_slice(string);
-            rpayload.extend_from_slice(&code32.to_le_bytes());
-            remap_sink.push(SortRecord::new(rkey, rpayload))?;
+            if use_kind == StringUseKind::DictValue {
+                rkey.extend_from_slice(string);
+                remap_sink.push(SortRecord::new(rkey, code32.to_le_bytes().to_vec()))?;
+            } else {
+                let slen = u32::try_from(string.len()).map_err(|_| {
+                    GenerationError::WireWidthOverflow {
+                        what: "remap_string_len",
+                        count: string.len() as u64,
+                        max: u64::from(u32::MAX),
+                    }
+                })?;
+                let mut rpayload = Vec::with_capacity(4 + string.len() + 4);
+                rpayload.extend_from_slice(&slen.to_le_bytes());
+                rpayload.extend_from_slice(string);
+                rpayload.extend_from_slice(&code32.to_le_bytes());
+                remap_sink.push(SortRecord::new(rkey, rpayload))?;
+            }
             Ok(())
         };
 

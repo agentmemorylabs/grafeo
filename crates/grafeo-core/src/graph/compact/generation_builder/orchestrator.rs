@@ -172,6 +172,13 @@ impl BoundedGenerationBuilder {
             .map_err(|e| GenerationError::Io(format!("create temp dir: {e}")))?;
         let mut job_temp = JobTempGuard::new(self.config.temp_dir.clone());
         let budget = self.config.budget;
+        // Up to two sort arenas are live concurrently (e.g. node-rows + node-ids
+        // during staging, or occ + id-index during explode). Charge them on the
+        // job anon ledger before the first push.
+        self.metrics.reserve_anon(
+            budget.sort_run_bytes.saturating_mul(2),
+            budget.max_anon_bytes,
+        )?;
 
         // ── 1. Node pass ─────────────────────────────────────────────
         let npass = node_pass::NodePass::new(&budget, self.cancel.as_ref());
@@ -879,9 +886,18 @@ fn collect_string_occurrences(
             if b.len() >= 4 {
                 let len = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
                 if let Some(s) = b.get(4..4 + len) {
-                    let mut owner = Vec::with_capacity(2 + prop.len());
+                    let prop_b = prop.as_bytes();
+                    let prop_len = u16::try_from(prop_b.len()).map_err(|_| {
+                        GenerationError::WireWidthOverflow {
+                            what: "dict_value_owner_prop_len",
+                            count: prop_b.len() as u64,
+                            max: u64::from(u16::MAX),
+                        }
+                    })?;
+                    let mut owner = Vec::with_capacity(4 + prop_b.len());
                     owner.extend_from_slice(&tid.to_be_bytes());
-                    owner.extend_from_slice(prop.as_bytes());
+                    owner.extend_from_slice(&prop_len.to_be_bytes());
+                    owner.extend_from_slice(prop_b);
                     str_occ_sink.push(occurrence_record(s, StringUseKind::DictValue, &owner)?)?;
                 }
             }
@@ -937,31 +953,30 @@ fn consume_remap_run(
         let Some(&kind) = rec.key.first() else {
             return Err(GenerationError::Codec("empty remap key".into()));
         };
-        if rec.payload.len() < 8 {
-            return Err(GenerationError::Codec("remap payload too short".into()));
-        }
-        let slen = u32::from_le_bytes(rec.payload[0..4].try_into().unwrap()) as usize;
-        let string = rec
-            .payload
-            .get(4..4 + slen)
-            .ok_or_else(|| GenerationError::Codec("remap string truncated".into()))?;
-        let code_end = 4 + slen;
-        if code_end + 4 != rec.payload.len() {
-            return Err(GenerationError::Codec(
-                "remap payload trailing bytes".into(),
-            ));
-        }
-        let code = u32::from_le_bytes(rec.payload[code_end..code_end + 4].try_into().unwrap());
-
         match kind {
             k if k == StringUseKind::DictValue as u8 => {
-                if rec.key.len() < 3 {
+                // key = use_kind || tid u16 BE || prop_len u16 BE || prop || string
+                // payload = code u32 LE
+                if rec.key.len() < 5 {
                     return Err(GenerationError::Codec(
                         "dict remap owner key too short".into(),
                     ));
                 }
+                if rec.payload.len() != 4 {
+                    return Err(GenerationError::Codec(
+                        "dict remap code payload width".into(),
+                    ));
+                }
                 let tid = u16::from_be_bytes([rec.key[1], rec.key[2]]);
-                let prop = &rec.key[3..];
+                let prop_len = u16::from_be_bytes([rec.key[3], rec.key[4]]) as usize;
+                if rec.key.len() < 5 + prop_len {
+                    return Err(GenerationError::Codec(
+                        "dict remap prop truncated".into(),
+                    ));
+                }
+                let prop = &rec.key[5..5 + prop_len];
+                let string = &rec.key[5 + prop_len..];
+                let code = u32::from_le_bytes(rec.payload[0..4].try_into().unwrap());
                 let is_new_col = current
                     .as_ref()
                     .is_none_or(|c| c.tid != tid || c.prop.as_slice() != prop);
@@ -982,6 +997,22 @@ fn consume_remap_run(
                 || k == StringUseKind::EdgeType as u8
                 || k == StringUseKind::ZoneString as u8 =>
             {
+                if rec.payload.len() < 8 {
+                    return Err(GenerationError::Codec("remap payload too short".into()));
+                }
+                let slen = u32::from_le_bytes(rec.payload[0..4].try_into().unwrap()) as usize;
+                let string = rec
+                    .payload
+                    .get(4..4 + slen)
+                    .ok_or_else(|| GenerationError::Codec("remap string truncated".into()))?;
+                let code_end = 4 + slen;
+                if code_end + 4 != rec.payload.len() {
+                    return Err(GenerationError::Codec(
+                        "remap payload trailing bytes".into(),
+                    ));
+                }
+                let code =
+                    u32::from_le_bytes(rec.payload[code_end..code_end + 4].try_into().unwrap());
                 let s = std::str::from_utf8(string)
                     .map_err(|_| GenerationError::Codec("remap string not UTF-8".into()))?;
                 schema.insert(s.to_string(), code);
@@ -1118,67 +1149,52 @@ impl DictChunkStreamer {
                 count: self.prop.len() as u64,
                 max: u64::from(u16::MAX),
             })?;
-        let body_path = std::mem::take(&mut self.body_path);
-        let mut body = std::fs::File::open(&body_path).map_err(|e| {
-            GenerationError::Io(format!("reopen dict chunk body {}: {e}", body_path.display()))
-        })?;
-        // Remap merge order is by `(use_kind, owner_key)` — not string order within
-        // a column. Sort once per column here so binary search works; transient
-        // O(unique) for this column only, discarded before the body pass.
-        let mut entries: Vec<(Vec<u8>, u32)> = Vec::with_capacity(self.count as usize);
-        let mut scratch = [0u8; 65536];
-        for _ in 0..self.count {
-            let mut slen = [0u8; 4];
-            body.read_exact(&mut slen)
-                .map_err(|e| GenerationError::Io(format!("read dict chunk entry len: {e}")))?;
-            let sl = u32::from_le_bytes(slen) as usize;
-            if sl > scratch.len() {
-                return Err(GenerationError::Codec(format!(
-                    "dict chunk string too long: {sl}"
-                )));
-            }
-            body.read_exact(&mut scratch[..sl])
-                .map_err(|e| GenerationError::Io(format!("read dict chunk string: {e}")))?;
-            let mut code = [0u8; 4];
-            body.read_exact(&mut code)
-                .map_err(|e| GenerationError::Io(format!("read dict chunk code: {e}")))?;
-            entries.push((scratch[..sl].to_vec(), u32::from_le_bytes(code)));
-        }
-        let _ = std::fs::remove_file(&body_path);
-        let offsets_path = std::mem::take(&mut self.offsets_path);
-        let _ = std::fs::remove_file(&offsets_path);
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
         let dict_path = temp_dir.join(&self.dict_name);
         let mut out = std::fs::File::create(&dict_path).map_err(|e| {
             GenerationError::Io(format!("create dict chunk {}: {e}", dict_path.display()))
         })?;
-        let count = u32::try_from(entries.len()).map_err(|_| GenerationError::WireWidthOverflow {
-            what: "dict_chunk_entry_count",
-            count: entries.len() as u64,
-            max: u64::from(u32::MAX),
-        })?;
-        out.write_all(&count.to_le_bytes())
+        out.write_all(&self.count.to_le_bytes())
             .map_err(|e| GenerationError::Io(format!("write dict count: {e}")))?;
-        let mut body_bytes = Vec::new();
-        let mut offsets = Vec::with_capacity(entries.len());
-        for (s, code) in &entries {
-            offsets.push(body_bytes.len() as u64);
-            let slen = u32::try_from(s.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "dict_chunk_str_len",
-                count: s.len() as u64,
-                max: u64::from(u32::MAX),
+        {
+            let offsets_path = std::mem::take(&mut self.offsets_path);
+            let mut offsets = std::fs::File::open(&offsets_path).map_err(|e| {
+                GenerationError::Io(format!(
+                    "reopen dict chunk offsets {}: {e}",
+                    offsets_path.display()
+                ))
             })?;
-            body_bytes.extend_from_slice(&slen.to_le_bytes());
-            body_bytes.extend_from_slice(s);
-            body_bytes.extend_from_slice(&code.to_le_bytes());
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = offsets.read(&mut buf).map_err(|e| {
+                    GenerationError::Io(format!("read dict chunk offsets: {e}"))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n]).map_err(|e| {
+                    GenerationError::Io(format!("copy dict chunk offsets: {e}"))
+                })?;
+            }
+            let _ = std::fs::remove_file(&offsets_path);
         }
-        for off in &offsets {
-            out.write_all(&off.to_le_bytes())
-                .map_err(|e| GenerationError::Io(format!("write dict offset: {e}")))?;
+        {
+            let body_path = std::mem::take(&mut self.body_path);
+            let mut body = std::fs::File::open(&body_path).map_err(|e| {
+                GenerationError::Io(format!("reopen dict chunk body {}: {e}", body_path.display()))
+            })?;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = body
+                    .read(&mut buf)
+                    .map_err(|e| GenerationError::Io(format!("read dict chunk body: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])
+                    .map_err(|e| GenerationError::Io(format!("copy dict chunk body: {e}")))?;
+            }
+            let _ = std::fs::remove_file(&body_path);
         }
-        out.write_all(&body_bytes)
-            .map_err(|e| GenerationError::Io(format!("write dict chunk body: {e}")))?;
 
         let rel = self.dict_name.as_bytes();
         let rlen = u16::try_from(rel.len()).map_err(|_| GenerationError::WireWidthOverflow {
