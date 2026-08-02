@@ -23,11 +23,13 @@
 //! structures are schema-bounded (labels, rel tables, per-column geometry)
 //! and charged to `max_schema_bytes`.
 
+use crate::graph::compact::generation::emit::dict_column_lookup::DictChunkCatalog;
 use crate::graph::compact::generation::emit::global_dict::{
     StreamingDictionary, StringUseKind, occurrence_record,
 };
 use crate::graph::compact::generation::emit::payload_lease::V5PayloadLease;
 use crate::graph::compact::generation::emit::sink::{SegmentSink, SpoolSegmentSink};
+use crate::graph::compact::generation::ledger::{AnonReservation, JobAnonLedger};
 use crate::graph::compact::generation::{
     CancelToken, EdgeRecordSource, GenerationBudget, GenerationError, GenerationMetrics,
     NodeRecordSource, RelSchemaDecl, RunSetLease, RunStore,
@@ -37,7 +39,6 @@ use crate::graph::compact::generation_builder::column_pass::{
 };
 use crate::graph::compact::generation_builder::csr_pass::{self, RelTableGeometry};
 use crate::graph::compact::generation_builder::edge_pass::{self, RelTableKey};
-use crate::graph::compact::generation::emit::dict_column_lookup::DictChunkCatalog;
 use crate::graph::compact::generation_builder::emit_columns::{
     emit_column_bodies, write_directory_segments,
 };
@@ -46,8 +47,8 @@ use crate::graph::compact::generation_builder::emit_ids::{
     build_node_id_lookup, build_node_original_ids, build_table_zone_maps,
     count_edges_per_rel_table,
 };
-use crate::graph::compact::generation_builder::live_graph::LogicalLabelLookup;
 use crate::graph::compact::generation_builder::emit_meta::CodecKind;
+use crate::graph::compact::generation_builder::live_graph::LogicalLabelLookup;
 use crate::graph::compact::generation_builder::node_pass::{self, NodeSchema};
 use crate::graph::compact::generation_builder::staging;
 use crate::graph::compact::mapped::SegmentKind;
@@ -108,16 +109,30 @@ pub struct BoundedGenerationBuilder {
     config: BoundedBuildConfig,
     metrics: GenerationMetrics,
     cancel: Option<CancelToken>,
+    /// Shared enforcing anon ledger for the whole job (R2). Created from
+    /// `budget.max_anon_bytes` at construction. Spool buffers, block zone
+    /// maps, and any other orchestrator-owned anonymous allocations are
+    /// charged here via RAII guards. The run store's sinks charge the same
+    /// ledger (via `RunStore::job_anon_ledger`), so the whole-job peak
+    /// reflects concurrently live arenas across all passes.
+    job_anon: std::sync::Arc<JobAnonLedger>,
+    /// RAII guards for spool in-memory buffers. Each `make_sink` call
+    /// reserves `spool_buf_cap` and holds the guard here until the sink
+    /// is finished/dropped. Released on drop (end of build or unwind).
+    spool_guards: Vec<AnonReservation>,
 }
 
 impl BoundedGenerationBuilder {
     /// Creates a builder.
     #[must_use]
     pub fn new(config: BoundedBuildConfig) -> Self {
+        let job_anon = std::sync::Arc::new(JobAnonLedger::new(config.budget.max_anon_bytes));
         Self {
             config,
             metrics: GenerationMetrics::default(),
             cancel: None,
+            job_anon,
+            spool_guards: Vec::new(),
         }
     }
 
@@ -141,11 +156,22 @@ impl BoundedGenerationBuilder {
         element_width: u32,
         file_id: &str,
     ) -> Result<SpoolSegmentSink, GenerationError> {
-        // Charge the in-memory spool buffer before allocation (truthful anon ledger).
-        self.metrics.reserve_anon(
-            self.config.spool_buf_cap as u64,
-            self.config.budget.max_anon_bytes,
-        )?;
+        // R2: charge the in-memory spool buffer against the enforcing
+        // whole-job ledger BEFORE allocation. The RAII guard is held in
+        // `spool_guards` until the build ends (or unwinds).
+        let buf_bytes = self.config.spool_buf_cap as u64;
+        let guard =
+            self.job_anon
+                .reserve(buf_bytes)
+                .map_err(|e| GenerationError::BudgetExceeded {
+                    counter: "max_anon_bytes",
+                    requested: buf_bytes,
+                    limit: self.config.budget.max_anon_bytes,
+                })?;
+        self.spool_guards.push(guard);
+        // Mirror onto per-sink observational metrics.
+        self.metrics
+            .reserve_anon(buf_bytes, self.config.budget.max_anon_bytes)?;
         Ok(SpoolSegmentSink::new(
             kind,
             1,
@@ -175,6 +201,21 @@ impl BoundedGenerationBuilder {
         }
     }
 
+    /// R2: verify the enforcing ledger has zero current charges at build exit.
+    /// All RAII guards (spool buffers, block zone maps) must have been dropped.
+    /// The run store's sinks release via their own guards on flush/cleanup.
+    fn verify_zero_charges(&self) -> Result<(), GenerationError> {
+        let snap = self.job_anon.snapshot();
+        if snap.current != 0 {
+            return Err(GenerationError::BudgetExceeded {
+                counter: "max_anon_bytes",
+                requested: snap.current,
+                limit: 0, // zero expected
+            });
+        }
+        Ok(())
+    }
+
     /// Runs the full bounded build, returning a streaming payload lease.
     ///
     /// # Errors
@@ -187,6 +228,15 @@ impl BoundedGenerationBuilder {
         run_store: &mut dyn RunStore,
     ) -> Result<V5PayloadLease, GenerationError> {
         self.config.budget.validate()?;
+
+        // R2: unify the enforcing ledger. If the run store provides one
+        // (DiskRunStore does), adopt it so orchestrator spool charges and
+        // sink arena charges share ONE whole-job counter. In-memory stores
+        // return None; the builder keeps its own ledger.
+        if let Some(store_ledger) = run_store.job_anon_ledger() {
+            self.job_anon = std::sync::Arc::clone(store_ledger);
+        }
+
         std::fs::create_dir_all(&self.config.temp_dir)
             .map_err(|e| GenerationError::Io(format!("create temp dir: {e}")))?;
         let mut job_temp = JobTempGuard::new(self.config.temp_dir.clone());
@@ -313,8 +363,10 @@ impl BoundedGenerationBuilder {
         let str_occ_lease = str_occ_sink.finish()?;
 
         // ── 4. Global dictionary ─────────────────────────────────────
-        let mut offsets_sink = Box::new(self.make_sink(SegmentKind::StringOffsets, 8, 8, "stroff")?);
-        let mut bytes_sink = Box::new(self.make_sink(SegmentKind::StringBytes, 1, 1, "strbytes")?);
+        let mut offsets_sink =
+            Box::new(self.make_sink(SegmentKind::StringOffsets, 8, 8, "stroff")?);
+        let mut bytes_sink =
+            Box::new(self.make_sink(SegmentKind::StringBytes, 1, 1, "strbytes")?);
         let mut code_index_sink =
             Box::new(self.make_sink(SegmentKind::DictionaryCodeIndex, 8, 16, "codeidx")?);
         let mut remap_sink = run_store.sink("remap", &budget)?;
@@ -397,13 +449,11 @@ impl BoundedGenerationBuilder {
             Box::new(self.make_sink(SegmentKind::ColumnBodies, 1, 0, "colbodies")?);
         let mut presence_sink =
             Box::new(self.make_sink(SegmentKind::ColumnRowPresence, 1, 0, "colpres")?);
-        let mut null_sink = Box::new(self.make_sink(SegmentKind::ColumnRowNull, 1, 0, "colnull")?);
-        let mut chunk_catalog =
-            DictChunkCatalog::open(&catalog_path, &self.config.temp_dir).map_err(|e| {
-                GenerationError::Io(format!(
-                    "open dict catalog {}: {e}",
-                    catalog_path.display()
-                ))
+        let mut null_sink =
+            Box::new(self.make_sink(SegmentKind::ColumnRowNull, 1, 0, "colnull")?);
+        let mut chunk_catalog = DictChunkCatalog::open(&catalog_path, &self.config.temp_dir)
+            .map_err(|e| {
+                GenerationError::Io(format!("open dict catalog {}: {e}", catalog_path.display()))
             })?;
         let col_result = emit_column_bodies(
             &occ_lease,
@@ -417,6 +467,32 @@ impl BoundedGenerationBuilder {
             &mut self.metrics,
             self.cancel.as_ref(),
         )?;
+
+        // R2: charge block_zone_maps retained in EmittedColumns. These are
+        // row/block-count-sized (one ZoneMap per block per column) and live
+        // until emit_all consumes them via build_block_zone_maps. Charge
+        // against the enforcing ledger with an RAII guard held until after
+        // emit_all returns.
+        let zm_bytes: u64 = col_result
+            .columns
+            .iter()
+            .map(|c| {
+                c.block_zone_maps.len() as u64
+                    * std::mem::size_of::<crate::graph::compact::zone_map::ZoneMap>() as u64
+            })
+            .sum();
+        let zm_guard =
+            if zm_bytes > 0 {
+                Some(self.job_anon.reserve(zm_bytes).map_err(|e| {
+                    GenerationError::BudgetExceeded {
+                        counter: "max_anon_bytes",
+                        requested: zm_bytes,
+                        limit: budget.max_anon_bytes,
+                    }
+                })?)
+            } else {
+                None
+            };
 
         // ── 6. CSR three-stage chain ─────────────────────────────────
         let src_rows_of = |rel_id: u16| -> (u64, u64) {
@@ -455,7 +531,8 @@ impl BoundedGenerationBuilder {
             Box::new(self.make_sink(SegmentKind::ReverseCsrOffsets, 4, 4, "revoff")?);
         let mut rev_tgt_sink =
             Box::new(self.make_sink(SegmentKind::ReverseCsrTargets, 4, 4, "revtgt")?);
-        let mut pos_sink = Box::new(self.make_sink(SegmentKind::ForwardPositions, 4, 4, "fwdpos")?);
+        let mut pos_sink =
+            Box::new(self.make_sink(SegmentKind::ForwardPositions, 4, 4, "fwdpos")?);
         csr_pass::stream_reverse_csr(
             &rev_lease,
             run_store.merger("rev-csr")?.as_mut(),
@@ -501,6 +578,16 @@ impl BoundedGenerationBuilder {
             total_edges,
         )?;
         run_store.cleanup_job_artifacts()?;
+
+        // R2: release block_zone_maps charge (consumed by emit_all above).
+        drop(zm_guard);
+
+        // R2: release all spool buffer RAII guards and verify the enforcing
+        // ledger has zero current charges. Every sink arena was released on
+        // flush/cleanup; every spool buffer guard is dropped here.
+        self.spool_guards.clear();
+        self.verify_zero_charges()?;
+
         job_temp.disarm();
         Ok(lease)
     }
@@ -643,9 +730,9 @@ impl BoundedGenerationBuilder {
                     .iter()
                     .filter(|c| {
                         c.table_id == tid as u16
-                            && geometries.iter().any(|g| {
-                                g.table_id == tid as u16 && g.key == c.key
-                            })
+                            && geometries
+                                .iter()
+                                .any(|g| g.table_id == tid as u16 && g.key == c.key)
                     })
                     .map(|c| c.column_index)
                     .collect();
@@ -661,9 +748,9 @@ impl BoundedGenerationBuilder {
                     .iter()
                     .filter(|c| {
                         c.table_id == (0x8000 | rid as u16)
-                            && geometries.iter().any(|g| {
-                                g.table_id == (0x8000 | rid as u16) && g.key == c.key
-                            })
+                            && geometries
+                                .iter()
+                                .any(|g| g.table_id == (0x8000 | rid as u16) && g.key == c.key)
                     })
                     .map(|c| c.column_index)
                     .collect();
@@ -736,7 +823,12 @@ impl BoundedGenerationBuilder {
         };
         let block_zm = {
             let mut catalog = DictChunkCatalog::open(catalog_path, temp_dir)?;
-            build_block_zone_maps(&col_result.columns, geometries, schema_strings, &mut catalog)?
+            build_block_zone_maps(
+                &col_result.columns,
+                geometries,
+                schema_strings,
+                &mut catalog,
+            )?
         };
         // Catalog + per-column `.dict` files are intermediates; remove the
         // catalog now (`.dict` files are removed with the job temp dir).
@@ -965,7 +1057,10 @@ fn consume_remap_run(
 
     let mut schema: FxHashMap<String, u32> = FxHashMap::default();
     let file = std::fs::File::create(catalog_path).map_err(|e| {
-        GenerationError::Io(format!("create dict catalog {}: {e}", catalog_path.display()))
+        GenerationError::Io(format!(
+            "create dict catalog {}: {e}",
+            catalog_path.display()
+        ))
     })?;
     let mut catalog = std::io::BufWriter::with_capacity(64 * 1024, file);
 
@@ -992,9 +1087,7 @@ fn consume_remap_run(
                 let tid = u16::from_be_bytes([rec.key[1], rec.key[2]]);
                 let prop_len = u16::from_be_bytes([rec.key[3], rec.key[4]]) as usize;
                 if rec.key.len() < 5 + prop_len {
-                    return Err(GenerationError::Codec(
-                        "dict remap prop truncated".into(),
-                    ));
+                    return Err(GenerationError::Codec("dict remap prop truncated".into()));
                 }
                 let prop = &rec.key[5..5 + prop_len];
                 let string = &rec.key[5 + prop_len..];
@@ -1081,7 +1174,10 @@ impl DictChunkStreamer {
         let body_path = temp_dir.join(format!("dictchunk-{tid}-{hash}.body"));
         let offsets_path = temp_dir.join(format!("dictchunk-{tid}-{hash}.off"));
         let body_file = std::fs::File::create(&body_path).map_err(|e| {
-            GenerationError::Io(format!("create dict chunk body {}: {e}", body_path.display()))
+            GenerationError::Io(format!(
+                "create dict chunk body {}: {e}",
+                body_path.display()
+            ))
         })?;
         let off_file = std::fs::File::create(&offsets_path).map_err(|e| {
             GenerationError::Io(format!(
@@ -1130,14 +1226,13 @@ impl DictChunkStreamer {
             .and_then(|_| body.write_all(string))
             .and_then(|_| body.write_all(&code.to_le_bytes()))
             .map_err(|e| GenerationError::Io(format!("write dict chunk entry: {e}")))?;
-        self.body_bytes = self
-            .body_bytes
-            .checked_add(4 + u64::from(slen) + 4)
-            .ok_or(GenerationError::WireWidthOverflow {
+        self.body_bytes = self.body_bytes.checked_add(4 + u64::from(slen) + 4).ok_or(
+            GenerationError::WireWidthOverflow {
                 what: "dict_chunk_body_bytes",
                 count: u64::MAX,
                 max: u64::MAX,
-            })?;
+            },
+        )?;
         self.count = self
             .count
             .checked_add(1)
@@ -1187,22 +1282,24 @@ impl DictChunkStreamer {
             })?;
             let mut buf = [0u8; 64 * 1024];
             loop {
-                let n = offsets.read(&mut buf).map_err(|e| {
-                    GenerationError::Io(format!("read dict chunk offsets: {e}"))
-                })?;
+                let n = offsets
+                    .read(&mut buf)
+                    .map_err(|e| GenerationError::Io(format!("read dict chunk offsets: {e}")))?;
                 if n == 0 {
                     break;
                 }
-                out.write_all(&buf[..n]).map_err(|e| {
-                    GenerationError::Io(format!("copy dict chunk offsets: {e}"))
-                })?;
+                out.write_all(&buf[..n])
+                    .map_err(|e| GenerationError::Io(format!("copy dict chunk offsets: {e}")))?;
             }
             let _ = std::fs::remove_file(&offsets_path);
         }
         {
             let body_path = std::mem::take(&mut self.body_path);
             let mut body = std::fs::File::open(&body_path).map_err(|e| {
-                GenerationError::Io(format!("reopen dict chunk body {}: {e}", body_path.display()))
+                GenerationError::Io(format!(
+                    "reopen dict chunk body {}: {e}",
+                    body_path.display()
+                ))
             })?;
             let mut buf = [0u8; 64 * 1024];
             loop {

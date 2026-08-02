@@ -297,6 +297,13 @@ pub trait RunStore {
     fn job_anon_peak(&self) -> u64 {
         0
     }
+
+    /// Access the shared job-level enforcing anon ledger, if this store
+    /// tracks one. Disk-backed stores return `Some`; in-memory stores
+    /// default to `None` (R2).
+    fn job_anon_ledger(&self) -> Option<&std::sync::Arc<super::ledger::JobAnonLedger>> {
+        None
+    }
 }
 
 /// Shared run-body registry connecting in-memory sinks to in-memory mergers

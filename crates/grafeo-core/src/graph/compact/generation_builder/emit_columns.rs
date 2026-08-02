@@ -184,14 +184,14 @@ pub(crate) fn emit_column_bodies(
     let mut next_row: u64 = 0;
 
     let flush = |result: &mut ColumnEmissionResult,
-                     geo: Option<&ColumnGeometry>,
-                     writer: Option<StreamingBodyWriter>,
-                     presence_emitter: &mut Option<BitByteEmitter>,
-                     null_emitter: &mut Option<BitByteEmitter>,
-                     body_cursor: &mut u64,
-                     bodies_sink: &mut dyn SegmentSink,
-                     presence_sink: &mut dyn SegmentSink,
-                     null_sink: &mut dyn SegmentSink|
+                 geo: Option<&ColumnGeometry>,
+                 writer: Option<StreamingBodyWriter>,
+                 presence_emitter: &mut Option<BitByteEmitter>,
+                 null_emitter: &mut Option<BitByteEmitter>,
+                 body_cursor: &mut u64,
+                 bodies_sink: &mut dyn SegmentSink,
+                 presence_sink: &mut dyn SegmentSink,
+                 null_sink: &mut dyn SegmentSink|
      -> Result<(), GenerationError> {
         let (Some(_g), Some(w)) = (geo, writer) else {
             return Ok(());
@@ -217,10 +217,12 @@ pub(crate) fn emit_column_bodies(
                 count: body_len,
                 max: u64::from(u32::MAX),
             })?,
-            body_start: u32::try_from(body_start).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "col_body_offset",
-                count: body_start,
-                max: u64::from(u32::MAX),
+            body_start: u32::try_from(body_start).map_err(|_| {
+                GenerationError::WireWidthOverflow {
+                    what: "col_body_offset",
+                    count: body_start,
+                    max: u64::from(u32::MAX),
+                }
             })?,
             codec_len,
             block_zone_maps: block_zms,
@@ -357,7 +359,14 @@ fn begin_column_streams(
     null_sink: &mut dyn SegmentSink,
     tid: u16,
     prop: &str,
-) -> Result<(StreamingBodyWriter, Option<BitByteEmitter>, Option<BitByteEmitter>), GenerationError> {
+) -> Result<
+    (
+        StreamingBodyWriter,
+        Option<BitByteEmitter>,
+        Option<BitByteEmitter>,
+    ),
+    GenerationError,
+> {
     let dict_lookup = dict_chunks
         .lookup_for(g.table_id, &g.key)?
         .map(|lk| Box::new(lk) as Box<dyn DictCodeLookup>);

@@ -15,9 +15,9 @@ use crate::generation::records::FramedRecord;
 use std::sync::Arc;
 use tempfile::tempdir;
 
-/// Fresh shared job anon ledger for test sinks.
+/// Fresh shared job anon ledger for test sinks (64 MiB default limit).
 fn job_ledger() -> Arc<JobAnonLedger> {
-    Arc::new(JobAnonLedger::new())
+    Arc::new(JobAnonLedger::new(64 * 1024 * 1024))
 }
 
 /// Create a budget with small run size to force multiple runs.
@@ -34,7 +34,8 @@ fn small_budget(sort_run_bytes: u64, fan_in: u32) -> ExternalSortBudget {
 fn run_write_and_merge_basic() {
     let dir = tempdir().unwrap();
     let budget = small_budget(1024, 4);
-    let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "basic", job_ledger()).unwrap();
+    let mut sink =
+        DiskRunSink::new(dir.path().join("runs"), budget, "basic", job_ledger()).unwrap();
     for i in (0..20u32).rev() {
         sink.push(FramedRecord::new(
             format!("{i:04}").into_bytes(),
@@ -45,7 +46,8 @@ fn run_write_and_merge_basic() {
     let runs = sink.finish().unwrap();
     assert!(!runs.is_empty());
 
-    let mut merger = DiskRunMerger::new(dir.path().join("merge"), budget, "basic").unwrap();
+    let mut merger =
+        DiskRunMerger::new(dir.path().join("merge"), budget, "basic", job_ledger()).unwrap();
     let mut metrics = ExternalSortMetrics::default();
     let mut out = Vec::new();
     merge_runs_recursive(&mut merger, &runs, &mut metrics, None, &mut |r| {
@@ -85,7 +87,8 @@ fn recursive_fan_in_triggers_merge_passes() {
         runs.len()
     );
 
-    let mut merger = DiskRunMerger::new(dir.path().join("merge"), budget, "fan").unwrap();
+    let mut merger =
+        DiskRunMerger::new(dir.path().join("merge"), budget, "fan", job_ledger()).unwrap();
     let mut metrics = ExternalSortMetrics::default();
     let mut out = Vec::new();
     merge_runs_recursive(&mut merger, &runs, &mut metrics, None, &mut |r| {
@@ -125,7 +128,7 @@ fn cancel_mid_merge_leaves_no_temp_files() {
     let runs = sink.finish().unwrap();
 
     let token = CancelToken::new();
-    let mut merger = DiskRunMerger::new(merge_dir.clone(), budget, "cx").unwrap();
+    let mut merger = DiskRunMerger::new(merge_dir.clone(), budget, "cx", job_ledger()).unwrap();
     let mut metrics = ExternalSortMetrics::default();
 
     // Cancel immediately — should fail before or during the first emit.
@@ -232,7 +235,8 @@ fn deterministic_output_across_runs() {
     let make = || {
         let dir = tempdir().unwrap();
         let budget = small_budget(48, 4);
-        let mut sink = DiskRunSink::new(dir.path().join("runs"), budget, "det", job_ledger()).unwrap();
+        let mut sink =
+            DiskRunSink::new(dir.path().join("runs"), budget, "det", job_ledger()).unwrap();
         for i in (0..20u32).rev() {
             sink.push(FramedRecord::new(
                 format!("{i:04}").into_bytes(),
@@ -241,7 +245,8 @@ fn deterministic_output_across_runs() {
             .unwrap();
         }
         let runs = sink.finish().unwrap();
-        let mut merger = DiskRunMerger::new(dir.path().join("merge"), budget, "det").unwrap();
+        let mut merger =
+            DiskRunMerger::new(dir.path().join("merge"), budget, "det", job_ledger()).unwrap();
         let mut metrics = ExternalSortMetrics::default();
         let mut out = Vec::new();
         merge_runs_recursive(&mut merger, &runs, &mut metrics, None, &mut |r| {
@@ -285,7 +290,8 @@ fn merge_peak_includes_both_input_and_output() {
     assert!(runs.len() > 2, "need multiple runs");
     let input_bytes: u64 = runs.iter().map(|r| r.byte_len).sum();
 
-    let mut merger = DiskRunMerger::new(dir.path().join("merge"), budget, "pk").unwrap();
+    let mut merger =
+        DiskRunMerger::new(dir.path().join("merge"), budget, "pk", job_ledger()).unwrap();
     let mut metrics = ExternalSortMetrics::default();
     // Seed merger metrics with the sink's live input charge so peak reflects
     // concurrent input + output, matching the packet formula.
@@ -350,7 +356,8 @@ fn peak_temp_matches_measured_file_sizes() {
 fn empty_input_merges_cleanly() {
     let dir = tempdir().unwrap();
     let budget = small_budget(64, 4);
-    let mut merger = DiskRunMerger::new(dir.path().join("merge"), budget, "empty").unwrap();
+    let mut merger =
+        DiskRunMerger::new(dir.path().join("merge"), budget, "empty", job_ledger()).unwrap();
     let mut metrics = ExternalSortMetrics::default();
     let mut out = Vec::new();
     merge_runs_recursive(&mut merger, &[], &mut metrics, None, &mut |r| {
@@ -377,7 +384,8 @@ fn single_run_no_merge_needed() {
     let runs = sink.finish().unwrap();
     assert_eq!(runs.len(), 1, "expected single run");
 
-    let mut merger = DiskRunMerger::new(dir.path().join("merge"), budget, "one").unwrap();
+    let mut merger =
+        DiskRunMerger::new(dir.path().join("merge"), budget, "one", job_ledger()).unwrap();
     let mut metrics = ExternalSortMetrics::default();
     let mut out = Vec::new();
     merge_runs_recursive(&mut merger, &runs, &mut metrics, None, &mut |r| {

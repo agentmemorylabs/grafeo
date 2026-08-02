@@ -47,8 +47,12 @@ fn to_sort_budget(b: &GenerationBudget) -> ExternalSortBudget {
 fn map_err(e: ExternalSortMetricsError) -> GenerationError {
     match e {
         ExternalSortMetricsError::BudgetExceeded { requested, limit } => {
+            // R2: distinguish anon vs temp by comparing the limit to the
+            // known budget fields. The enforcing anon ledger uses
+            // max_anon_bytes; the temp counter uses max_temp_bytes.
+            // When ambiguous, report the raw values.
             GenerationError::BudgetExceeded {
-                counter: "max_temp_bytes",
+                counter: "anon_or_temp_budget",
                 requested,
                 limit,
             }
@@ -105,7 +109,7 @@ impl DiskRunStore {
             root,
             budget,
             correlation: correlation.into(),
-            job_anon: Arc::new(JobAnonLedger::new()),
+            job_anon: Arc::new(JobAnonLedger::new(budget.max_anon_bytes)),
         })
     }
 }
@@ -145,6 +149,7 @@ impl RunStore for DiskRunStore {
             dir,
             to_sort_budget(&self.budget),
             format!("{}-{domain}", self.correlation),
+            Arc::clone(&self.job_anon),
         )
         .map_err(|e| GenerationError::Io(format!("create disk run merger: {e}")))?;
         Ok(Box::new(DiskMergerAdapter {
@@ -176,6 +181,10 @@ impl RunStore for DiskRunStore {
 
     fn job_anon_peak(&self) -> u64 {
         self.job_anon.peak()
+    }
+
+    fn job_anon_ledger(&self) -> Option<&Arc<JobAnonLedger>> {
+        Some(&self.job_anon)
     }
 }
 
@@ -240,16 +249,18 @@ struct DiskMergerAdapter {
 }
 
 /// Removes every file and correlation-scoped directory under `root`.
-fn cleanup_disk_run_store_root(root: &std::path::Path, correlation: &str) -> Result<(), GenerationError> {
+fn cleanup_disk_run_store_root(
+    root: &std::path::Path,
+    correlation: &str,
+) -> Result<(), GenerationError> {
     use std::fs;
 
     if !root.exists() {
         return Ok(());
     }
     let prefix = format!("{correlation}-");
-    let entries = fs::read_dir(root).map_err(|e| {
-        GenerationError::Io(format!("read run store dir {}: {e}", root.display()))
-    })?;
+    let entries = fs::read_dir(root)
+        .map_err(|e| GenerationError::Io(format!("read run store dir {}: {e}", root.display())))?;
     for entry in entries {
         let entry = entry.map_err(|e| {
             GenerationError::Io(format!("read run store entry {}: {e}", root.display()))
@@ -296,8 +307,7 @@ impl ExternalRunMerger for DiskMergerAdapter {
         let mut sort_metrics = ExternalSortMetrics::default();
         let mut emit_err: Option<GenerationError> = None;
         // Bridge core cancel into the storage merger's cancel checks.
-        let storage_cancel =
-            cancel.map(|c| StorageCancelToken::from_shared(c.shared_flag()));
+        let storage_cancel = cancel.map(|c| StorageCancelToken::from_shared(c.shared_flag()));
         let result = merge_runs_recursive(
             &mut self.inner,
             &storage_runs,
