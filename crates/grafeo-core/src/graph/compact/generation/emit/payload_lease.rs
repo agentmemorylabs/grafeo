@@ -70,7 +70,10 @@ impl V5PayloadLease {
         metrics: GenerationMetrics,
         temp_dir: Option<PathBuf>,
     ) -> Self {
-        let assembler = V5PayloadAssembler::new(total_nodes, total_edges, preserves_ids);
+        let layout_flags =
+            V5PayloadAssembler::layout_flags_from_descriptors(&descriptors);
+        let assembler = V5PayloadAssembler::new(total_nodes, total_edges, preserves_ids)
+            .with_layout_flags(layout_flags);
         Self {
             assembler,
             descriptors,

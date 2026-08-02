@@ -13,7 +13,7 @@
 
 use super::descriptor::SegmentDescriptor;
 use crate::graph::compact::generation::error::GenerationError;
-use crate::graph::compact::mapped::{DIRECTORY_ENTRY_LEN, FORMAT_VERSION_V5, HEADER_LEN};
+use crate::graph::compact::mapped::{DIRECTORY_ENTRY_LEN, FORMAT_VERSION_V5, HEADER_LEN, SegmentKind, layout_flags};
 use crate::graph::compact::section_v5::align_up;
 
 const MAGIC: [u8; 4] = *b"GCST";
@@ -26,6 +26,7 @@ pub struct V5PayloadAssembler {
     total_nodes: u64,
     total_edges: u64,
     preserves_ids: bool,
+    layout_flags: u32,
 }
 
 impl V5PayloadAssembler {
@@ -36,7 +37,32 @@ impl V5PayloadAssembler {
             total_nodes,
             total_edges,
             preserves_ids,
+            layout_flags: 0,
         }
+    }
+
+    /// Sets the v5 header layout flags (D0.8.0 extended-payload contract).
+    #[must_use]
+    pub fn with_layout_flags(mut self, layout_flags: u32) -> Self {
+        self.layout_flags = layout_flags;
+        self
+    }
+
+    /// Computes layout flags from companion segment kinds in `descriptors`.
+    #[must_use]
+    pub fn layout_flags_from_descriptors(descriptors: &[SegmentDescriptor]) -> u32 {
+        let mut has_membership = false;
+        let mut has_presence = false;
+        let mut has_null = false;
+        for desc in descriptors {
+            match desc.kind {
+                SegmentKind::NodeLabelMembership => has_membership = true,
+                SegmentKind::ColumnRowPresence => has_presence = true,
+                SegmentKind::ColumnRowNull => has_null = true,
+                _ => {}
+            }
+        }
+        layout_flags::from_companion_segments(has_membership, has_presence, has_null)
     }
 
     /// Assembles the complete v5 payload byte vector.
@@ -161,7 +187,7 @@ impl V5PayloadAssembler {
         write_u16(&mut header, segment_count);
         #[allow(clippy::cast_possible_truncation)]
         write_u16(&mut header, DIRECTORY_ENTRY_LEN as u16);
-        write_u32(&mut header, 0); // layout_flags
+        write_u32(&mut header, self.layout_flags);
         #[allow(clippy::cast_possible_truncation)]
         write_u64(&mut header, HEADER_LEN as u64); // directory_offset
         write_u64(&mut header, directory_length);

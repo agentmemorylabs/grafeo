@@ -220,19 +220,28 @@ impl StreamingBodyWriter {
     /// dimensions are unknown.
     pub fn push_placeholder(&mut self, sink: &mut dyn SegmentSink) -> Result<(), GenerationError> {
         self.rows_written += 1;
-        let placeholder = match &self.family {
-            BodyFamily::Dict { .. } => Value::String("".into()),
-            BodyFamily::BitPacked { .. } => Value::Int64(0),
-            BodyFamily::Bitmap { .. } => Value::Bool(false),
-            BodyFamily::Float64 => Value::Float64(0.0),
-            BodyFamily::Float32Vector { dims } => {
-                Value::Vector(std::sync::Arc::from(vec![0.0f32; usize::from(*dims)]))
+        match &self.family {
+            // Absent/present-null dict rows use code 0 in the body; presence/null
+            // bitmaps carry the three-way distinction (D0.8.0).
+            BodyFamily::Dict { .. } => {
+                write_bytes(sink, &mut self.body_len, &0u32.to_le_bytes())?;
             }
-            BodyFamily::RawI64 => Value::Int64(0),
             BodyFamily::Empty => return Ok(()),
-        };
-        self.write_value(sink, &placeholder)?;
-        self.fold_zone(&placeholder);
+            other => {
+                let placeholder = match other {
+                    BodyFamily::BitPacked { .. } => Value::Int64(0),
+                    BodyFamily::Bitmap { .. } => Value::Bool(false),
+                    BodyFamily::Float64 => Value::Float64(0.0),
+                    BodyFamily::Float32Vector { dims } => {
+                        Value::Vector(std::sync::Arc::from(vec![0.0f32; usize::from(*dims)]))
+                    }
+                    BodyFamily::RawI64 => Value::Int64(0),
+                    BodyFamily::Dict { .. } | BodyFamily::Empty => unreachable!(),
+                };
+                self.write_value(sink, &placeholder)?;
+                self.fold_zone(&placeholder);
+            }
+        }
         Ok(())
     }
 

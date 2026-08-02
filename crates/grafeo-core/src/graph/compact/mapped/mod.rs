@@ -22,8 +22,8 @@ pub use accounting::{
 pub use code_index::{CODE_INDEX_RECORD_LEN, DictionaryCodeIndex, build_dictionary_code_index};
 pub use directory::{
     DIRECTORY_ENTRY_LEN, FORMAT_VERSION_V5, HEADER_LEN, SegmentDirectory, SegmentEntry,
-    SegmentKind, V5_HEADER_LEN, parse_segment_directory, parse_v5_header, slice_segment_checked,
-    validate_segment_range,
+    SegmentKind, V5_HEADER_LEN, layout_flags, parse_segment_directory, parse_v5_header,
+    slice_segment_checked, validate_segment_range,
 };
 pub use id_index::{
     ID_INDEX_RECORD_LEN, MappedNodeIdIndex, id_index_record_bytes, write_id_index_record,

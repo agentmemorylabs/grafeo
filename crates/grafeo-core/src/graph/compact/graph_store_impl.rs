@@ -33,10 +33,12 @@ impl GraphStore for CompactStore {
         for label in self.logical_labels_for_node(table_id, row_u32) {
             node.add_label(label);
         }
-        let props = nt.get_all_properties(row);
-        for (k, v) in props {
-            if let Some(filtered) = self.get_property_filtered(table_id, row_u32, &k, Some(v)) {
-                node.set_property(k, filtered);
+        for key in nt.columns().keys() {
+            let raw = nt.get_property(row, key);
+            if let Some(filtered) =
+                self.get_property_filtered(table_id, row_u32, key, raw)
+            {
+                node.set_property(key.clone(), filtered);
             }
         }
         Some(node)

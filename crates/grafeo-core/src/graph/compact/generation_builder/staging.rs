@@ -139,6 +139,9 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) -> Result<(), GenerationError> {
                 out.extend_from_slice(&f.to_le_bytes());
             }
         }
+        Value::Null => {
+            out.push(0); // present-null marker (D0.8.0 three-way)
+        }
         other => {
             return Err(GenerationError::UnsupportedValue {
                 kind: value_kind_name(other),
@@ -154,6 +157,7 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value, GenerationError>
         .first()
         .ok_or_else(|| GenerationError::Codec("truncated value tag".into()))?;
     Ok(match tag {
+        0 => Value::Null,
         1 => Value::Int64(i64::from_le_bytes(read_arr(bytes, pos)?)),
         2 => Value::Bool(read_slice(bytes, pos, 1)?[0] != 0),
         3 => {

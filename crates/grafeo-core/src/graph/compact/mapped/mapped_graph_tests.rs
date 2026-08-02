@@ -381,3 +381,17 @@ fn adversarial_many_block_zone_maps_round_trip() {
         0
     );
 }
+
+#[test]
+fn layout_flags_validate_known_bits_and_requirements() {
+    use super::layout_flags;
+
+    assert!(layout_flags::validate(0).is_ok());
+    let flags = layout_flags::from_companion_segments(true, false, false);
+    assert!(layout_flags::validate(flags).is_ok());
+    assert_ne!(flags & layout_flags::SOURCE_TRUE_EXTENDED, 0);
+    assert_ne!(flags & layout_flags::REQUIRES_LABEL_MEMBERSHIP, 0);
+
+    assert!(layout_flags::validate(0x0000_0010).is_err());
+    assert!(layout_flags::validate(layout_flags::SOURCE_TRUE_EXTENDED).is_err());
+}

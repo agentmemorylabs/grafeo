@@ -20,6 +20,94 @@ pub const V5_HEADER_LEN: usize = HEADER_LEN;
 /// Directory entry length in bytes.
 pub const DIRECTORY_ENTRY_LEN: usize = 48;
 
+/// v5 header `layout_flags` (u32 LE at offset 12) — D0.8.0 extended-payload contract.
+///
+/// When any companion requirement bit is set, [`SOURCE_TRUE_EXTENDED`] must also
+/// be set. Readers fail closed when a required companion segment is absent.
+pub mod layout_flags {
+    /// Payload uses source-true companion semantics.
+    pub const SOURCE_TRUE_EXTENDED: u32 = 0x0000_0001;
+    /// [`super::SegmentKind::NodeLabelMembership`] must be present.
+    pub const REQUIRES_LABEL_MEMBERSHIP: u32 = 0x0000_0002;
+    /// [`super::SegmentKind::ColumnRowPresence`] must be present.
+    pub const REQUIRES_COLUMN_PRESENCE: u32 = 0x0000_0004;
+    /// [`super::SegmentKind::ColumnRowNull`] must be present.
+    pub const REQUIRES_COLUMN_NULL: u32 = 0x0000_0008;
+
+    /// Union of all bits defined by this contract.
+    pub const KNOWN_MASK: u32 = SOURCE_TRUE_EXTENDED
+        | REQUIRES_LABEL_MEMBERSHIP
+        | REQUIRES_COLUMN_PRESENCE
+        | REQUIRES_COLUMN_NULL;
+
+    /// Computes layout flags from the companion segments present in a payload.
+    #[must_use]
+    pub fn from_companion_segments(
+        has_membership: bool,
+        has_presence: bool,
+        has_null: bool,
+    ) -> u32 {
+        let mut flags = 0u32;
+        if has_membership {
+            flags |= REQUIRES_LABEL_MEMBERSHIP;
+        }
+        if has_presence {
+            flags |= REQUIRES_COLUMN_PRESENCE;
+        }
+        if has_null {
+            flags |= REQUIRES_COLUMN_NULL;
+        }
+        if flags != 0 {
+            flags |= SOURCE_TRUE_EXTENDED;
+        }
+        flags
+    }
+
+    /// Validates known bits and extended-marker/requirement consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on unknown bits or `SOURCE_TRUE_EXTENDED` without
+    /// any companion requirement bit.
+    pub fn validate(flags: u32) -> Result<(), String> {
+        if flags & !KNOWN_MASK != 0 {
+            return Err(format!(
+                "v5 layout_flags unknown bits set: {flags:#010x}"
+            ));
+        }
+        if flags & SOURCE_TRUE_EXTENDED != 0 {
+            let requires =
+                flags & (REQUIRES_LABEL_MEMBERSHIP | REQUIRES_COLUMN_PRESENCE | REQUIRES_COLUMN_NULL);
+            if requires == 0 {
+                return Err(
+                    "v5 layout_flags SOURCE_TRUE_EXTENDED set without companion requirement bits"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail closed when `require_bit` is set but the companion segment is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the layout contract requires a segment that is missing.
+    pub fn require_companion(
+        flags: u32,
+        require_bit: u32,
+        kind: super::SegmentKind,
+        present: bool,
+    ) -> Result<(), String> {
+        if flags & require_bit != 0 && !present {
+            return Err(format!(
+                "v5 layout_flags require {kind:?} segment but it is absent"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Segment kind identifiers (ascending emission order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
@@ -182,6 +270,8 @@ pub struct V5Header {
     pub logical_edge_count: u64,
     /// CRC-32 over directory bytes.
     pub directory_crc32: u32,
+    /// Extended-payload companion contract (D0.8.0).
+    pub layout_flags: u32,
 }
 
 impl V5Header {
@@ -256,9 +346,7 @@ pub fn parse_v5_header(data: &[u8]) -> Result<V5Header, String> {
         ));
     }
     let layout_flags = read_u32_le(data, &mut pos).map_err(str::to_string)?;
-    if layout_flags != 0 {
-        return Err(format!("v5 layout_flags must be zero, got {layout_flags}"));
-    }
+    layout_flags::validate(layout_flags)?;
     let directory_offset = read_u64_le(data, &mut pos).map_err(str::to_string)?;
     if directory_offset != HEADER_LEN as u64 {
         return Err(format!(
@@ -301,6 +389,7 @@ pub fn parse_v5_header(data: &[u8]) -> Result<V5Header, String> {
         logical_node_count,
         logical_edge_count,
         directory_crc32,
+        layout_flags,
     })
 }
 

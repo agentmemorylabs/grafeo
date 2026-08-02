@@ -19,7 +19,7 @@ use super::mapped::{
     CompactMemoryAccounting, DIRECTORY_ENTRY_LEN, DictionaryCodeIndex, FORMAT_VERSION_V5,
     HEADER_LEN, MappedEdgeIdLookup, MappedNodeIdLookup, MappedStringDictionary,
     SCHEMA_OWNER_BUDGET_BYTES, SegmentKind, U32View, ZONE_MAP_RECORD_LEN,
-    build_dictionary_code_index, build_string_segments, build_zone_map_segments,
+    build_dictionary_code_index, build_string_segments, build_zone_map_segments, layout_flags,
     parse_block_zone_maps, parse_segment_directory, parse_table_zone_maps, slice_segment_checked,
     write_edge_id_record, write_node_id_record,
 };
@@ -160,7 +160,8 @@ pub fn serialize_v5_with_string_order(
             .sum::<usize>() as u64;
         let descriptors = emit_canonical_descriptors(store, &string_index, &str_refs)
             .map_err(|e| e.to_string())?;
-        let assembler = V5PayloadAssembler::new(total_nodes, total_edges, store.preserves_ids());
+        let assembler = V5PayloadAssembler::new(total_nodes, total_edges, store.preserves_ids())
+            .with_layout_flags(V5PayloadAssembler::layout_flags_from_descriptors(&descriptors));
         return assembler.assemble(&descriptors).map_err(|e| e.to_string());
     }
 
@@ -473,6 +474,12 @@ pub fn serialize_v5_with_string_order(
     }
     let directory_crc = crc32fast::hash(&dir_bytes);
 
+    let layout_flags = layout_flags::from_companion_segments(
+        segments.iter().any(|(k, ..)| *k == SegmentKind::NodeLabelMembership),
+        segments.iter().any(|(k, ..)| *k == SegmentKind::ColumnRowPresence),
+        segments.iter().any(|(k, ..)| *k == SegmentKind::ColumnRowNull),
+    );
+
     let mut out = Vec::with_capacity((data_offset as usize) + data_bytes.len() + 4);
     out.extend_from_slice(&MAGIC);
     out.push(FORMAT_VERSION_V5);
@@ -480,7 +487,7 @@ pub fn serialize_v5_with_string_order(
     write_u16(&mut out, HEADER_LEN as u16);
     write_u16(&mut out, segment_count);
     write_u16(&mut out, DIRECTORY_ENTRY_LEN as u16);
-    write_u32(&mut out, 0); // layout_flags
+    write_u32(&mut out, layout_flags);
     write_u64(&mut out, HEADER_LEN as u64); // directory_offset
     write_u64(&mut out, directory_length);
     write_u64(&mut out, data_offset);
@@ -862,10 +869,12 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
     store.set_memory_accounting(accounting);
     let _ = col_dir_bytes; // validated by existence; column geometry uses block index
 
-    // ── G-EM0.5b D0.8.0 source-true companions (optional, fail-closed) ──
-    // Presence of any companion segment is parsed and validated; a malformed
-    // companion fails the open rather than silently dropping labels, sparse
-    // absence, or stored nulls. Absence applies the old-v5 defaults.
+    // ── G-EM0.5b D0.8.0 source-true companions (fail-closed contract) ──
+    // `layout_flags` marks which companion segments are required; absence of a
+    // required segment fails the open. When no companions are present and
+    // layout_flags is zero, old-v5 defaults apply (one physical label per node,
+    // every encoded row present and non-null).
+    let header_layout_flags = directory.header.layout_flags;
     let membership_bytes = directory
         .get(SegmentKind::NodeLabelMembership)
         .map(|e| slice_segment_checked(data_bytes, e))
@@ -878,6 +887,24 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
         .get(SegmentKind::ColumnRowNull)
         .map(|e| slice_segment_checked(data_bytes, e))
         .transpose()?;
+    layout_flags::require_companion(
+        header_layout_flags,
+        layout_flags::REQUIRES_LABEL_MEMBERSHIP,
+        SegmentKind::NodeLabelMembership,
+        membership_bytes.is_some(),
+    )?;
+    layout_flags::require_companion(
+        header_layout_flags,
+        layout_flags::REQUIRES_COLUMN_PRESENCE,
+        SegmentKind::ColumnRowPresence,
+        presence_bytes.is_some(),
+    )?;
+    layout_flags::require_companion(
+        header_layout_flags,
+        layout_flags::REQUIRES_COLUMN_NULL,
+        SegmentKind::ColumnRowNull,
+        null_bytes.is_some(),
+    )?;
     if membership_bytes.is_some() || presence_bytes.is_some() || null_bytes.is_some() {
         let membership = membership_bytes
             .as_ref()
