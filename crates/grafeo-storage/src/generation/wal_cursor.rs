@@ -325,3 +325,7 @@ pub fn truncate_before(
 #[cfg(test)]
 #[path = "tests/wal_cursor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/wal_replay_stream_tests.rs"]
+mod replay_stream_tests;
