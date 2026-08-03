@@ -415,6 +415,29 @@ impl LayeredStore {
         }
     }
 
+    /// Batch variant of [`Self::mark_dirty_edge`]: ONE write-lock acquisition
+    /// on the dirty set plus (when a handoff is active) ONE on the handoff
+    /// bookkeeping, regardless of batch size. `batch_create_edges` uses this
+    /// so an N-edge batch costs constant lock acquisitions, not 2N
+    /// (G-EM0.5d hardening: per-element marking regressed the batch path to
+    /// O(N) write-lock acquisitions during an active handoff).
+    fn mark_dirty_edges(&self, ids: &[EdgeId]) {
+        if ids.is_empty() {
+            return;
+        }
+        {
+            let mut dirty = self.dirty_edge_ids.write();
+            for id in ids {
+                dirty.insert(*id);
+            }
+        }
+        if let Some(h) = self.handoff.write().as_mut() {
+            for id in ids {
+                h.post_freeze_edges.insert(id.as_u64());
+            }
+        }
+    }
+
     /// Records a post-freeze (epoch N+1) mutation of an entity that is
     /// ALREADY tracked (dirty or overlay-resident), so the dirty set is not
     /// re-inserted but the handoff's post-freeze identity must still see it.
@@ -1711,9 +1734,9 @@ impl GraphStoreMut for LayeredStore {
 
     fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId> {
         let _guard = self.merge_guard.read();
-        // Endpoint preparation: promote base-resident endpoints once each, and
-        // record the post-freeze identity of already-tracked endpoints so the
-        // repair swap retains dirty for them (G-EM0.5d hardening).
+        // Endpoint preparation, batched: promote base-resident endpoints once
+        // each, and record the post-freeze identity of already-tracked
+        // endpoints in ONE handoff lock acquisition (not one per endpoint).
         let mut endpoints: FxHashSet<NodeId> = FxHashSet::default();
         for &(src, dst, _) in edges {
             endpoints.insert(src);
@@ -1736,14 +1759,16 @@ impl GraphStoreMut for LayeredStore {
         }
 
         let ids = self.overlay.load().batch_create_edges(edges);
-        for &id in &ids {
-            self.mark_dirty_edge(id);
-        }
-        for &(_, _, edge_type) in edges {
-            self.charge_retained(
-                RetainedCategory::MutationPayload,
-                overlay_cost::edge_creation_retained_bytes(edge_type),
-            );
+        self.mark_dirty_edges(&ids);
+
+        // Charge the whole batch ONCE (one admission/handoff lock acquisition
+        // instead of one per edge).
+        let total: usize = edges
+            .iter()
+            .map(|(_, _, edge_type)| overlay_cost::edge_creation_retained_bytes(edge_type))
+            .sum();
+        if total > 0 {
+            self.charge_retained(RetainedCategory::MutationPayload, total);
         }
         ids
     }
