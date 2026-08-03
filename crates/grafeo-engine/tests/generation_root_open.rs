@@ -272,3 +272,68 @@ fn layered_session_query_writes_are_wal_logged() {
         "layered session auto-commit must log EpochAdvance to the root WAL"
     );
 }
+
+/// H-ADOPT.3 Phase C (constructor wiring): committed query writes on a
+/// writable generation root must survive a close/reopen cycle. The
+/// constructor must replay the post-boundary WAL into the fresh overlay
+/// before returning; without replay the reopened root serves only the
+/// immutable base.
+#[test]
+fn generation_root_reopen_retains_committed_query_writes() {
+    let dir = tempdir().expect("temp dir");
+    let root = dir.path().join("reopen-durable.grafeo.d");
+    std::fs::create_dir_all(&root).expect("create generation root");
+
+    // Publish a small non-empty base.
+    let source = GrafeoDB::new_in_memory();
+    source
+        .create_node_with_props(&["Person"], [("name", Value::from("Seed"))])
+        .expect("create Seed");
+    source
+        .build_and_publish_generation(generation_build_request(&root, "reopen-durable-g1"))
+        .expect("publish generation");
+    drop(source);
+
+    {
+        let db =
+            GrafeoDB::open_generation_root(&root, false).expect("open generation root writable");
+        db.session()
+            .execute("INSERT (:Person {name: 'Ada'})-[:KNOWS]->(:Person {name: 'Grace'})")
+            .expect("insert two nodes and one edge through layered session");
+    }
+
+    // Reopen: the constructor must replay the committed tail into the overlay.
+    let reopened = GrafeoDB::open_generation_root(&root, false)
+        .expect("reopen generation root after committed writes");
+
+    let result = reopened
+        .session()
+        .execute("MATCH (n:Person) RETURN n.name")
+        .expect("query reopened generation");
+    let mut names: Vec<String> = result
+        .rows()
+        .iter()
+        .map(|row| match &row[0] {
+            Value::String(value) => value.as_str().to_string(),
+            other => panic!("expected string name, got {other:?}"),
+        })
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["Ada", "Grace", "Seed"],
+        "replayed overlay writes plus the immutable base must all be visible"
+    );
+
+    let edges = reopened
+        .session()
+        .execute("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name")
+        .expect("query replayed edge");
+    assert_eq!(edges.row_count(), 1, "the replayed KNOWS edge must survive");
+    let row = &edges.rows()[0];
+    let (Value::String(src), Value::String(dst)) = (&row[0], &row[1]) else {
+        panic!("expected string endpoints, got {row:?}");
+    };
+    assert_eq!(src.as_str(), "Ada");
+    assert_eq!(dst.as_str(), "Grace");
+}
