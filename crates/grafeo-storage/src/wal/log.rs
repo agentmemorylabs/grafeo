@@ -745,6 +745,71 @@ impl WalManager {
     }
 }
 
+/// Truncates the active (highest-sequence) WAL log file in `wal_dir` to
+/// `stop_byte_offset` bytes, removing a torn tail after the last committed
+/// frame. Verifies the max-sequence file's sequence equals `stop_seq` and
+/// that the file is at least `stop_byte_offset` long; both fail closed
+/// (never extends, never touches a mismatched file). No-op when the file
+/// already ends exactly at `stop_byte_offset`. Syncs after truncation.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] if the directory has no log files, the
+/// max-sequence file is not `stop_seq`, or the file is shorter than
+/// `stop_byte_offset`. I/O failures propagate as [`Error::Io`].
+pub fn truncate_active_tail(wal_dir: &Path, stop_seq: u64, stop_byte_offset: u64) -> Result<()> {
+    // Discover WAL log files the same way WalManager::with_config does:
+    // parse `wal_%08u.log` names from the directory listing.
+    let mut files: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(wal_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "log") {
+            let Some(seq) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("wal_"))
+                .and_then(|s| s.parse().ok())
+            else {
+                continue;
+            };
+            files.push((seq, path));
+        }
+    }
+
+    // Fail closed: a TornTail implies the active file exists.
+    let (max_seq, active_path) = files.iter().max_by_key(|(seq, _)| *seq).ok_or_else(|| {
+        Error::Internal(format!(
+            "truncate_active_tail: no WAL log files in {wal_dir:?}"
+        ))
+    })?;
+
+    // Fail closed: never truncate a file whose sequence does not match the
+    // replay-reported torn tail.
+    if *max_seq != stop_seq {
+        return Err(Error::Internal(format!(
+            "truncate_active_tail: active WAL sequence {max_seq} != torn-tail sequence {stop_seq} in {wal_dir:?}"
+        )));
+    }
+
+    let current_len = fs::metadata(active_path)?.len();
+    if current_len == stop_byte_offset {
+        // Clean cut: nothing torn after the last committed frame.
+        return Ok(());
+    }
+
+    // Fail closed: never extend the file.
+    if current_len < stop_byte_offset {
+        return Err(Error::Internal(format!(
+            "truncate_active_tail: WAL file {active_path:?} is {current_len} bytes, shorter than stop offset {stop_byte_offset}"
+        )));
+    }
+
+    let file = File::options().write(true).open(active_path)?;
+    file.set_len(stop_byte_offset)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,10 +1012,7 @@ mod tests {
 
         // Simulate a torn tail: garbage appended after the last committed frame.
         append_garbage(&active_path, 37);
-        assert_eq!(
-            fs::metadata(&active_path).unwrap().len(),
-            stop_offset + 37
-        );
+        assert_eq!(fs::metadata(&active_path).unwrap().len(), stop_offset + 37);
 
         truncate_active_tail(dir.path(), seq, stop_offset).unwrap();
 
@@ -1015,6 +1077,6 @@ mod tests {
         // Empty directory: no log files exist (fail closed).
         assert!(truncate_active_tail(dir.path(), 0, 0).is_err());
         // Missing directory entirely (fail closed).
-        assert!(truncate_active_tail(dir.path().join("missing"), 0, 0).is_err());
+        assert!(truncate_active_tail(&dir.path().join("missing"), 0, 0).is_err());
     }
 }
