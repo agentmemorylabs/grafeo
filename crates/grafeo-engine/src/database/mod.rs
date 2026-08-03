@@ -900,7 +900,29 @@ impl GrafeoDB {
     /// opened / mapped / deserialized.
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store", feature = "mmap"))]
     pub fn open_generation_root(root: impl AsRef<Path>, read_only: bool) -> Result<Self> {
-        let root = root.as_ref();
+        let config = if read_only {
+            Config::read_only(root.as_ref())
+        } else {
+            Config::persistent(root.as_ref())
+        };
+        Self::open_generation_root_with_config(config)
+    }
+
+    /// Opens a generation root while preserving the caller's complete engine
+    /// configuration (memory budget, spill/tier policy, query settings, WAL
+    /// durability, CDC, and access mode).
+    ///
+    /// AMH production callers use this form so the single open funnel applies
+    /// the same resource policy to eager and generation-root databases.
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store", feature = "mmap"))]
+    pub fn open_generation_root_with_config(config: Config) -> Result<Self> {
+        config
+            .validate()
+            .map_err(|e| grafeo_common::utils::error::Error::Internal(e.to_string()))?;
+        let root = config.path.clone().ok_or_else(|| {
+            Error::Internal("generation-root open requires a database path".into())
+        })?;
+        let read_only = config.access_mode == crate::config::AccessMode::ReadOnly;
         let mode = if read_only {
             generation::OpenMode::ReadOnly
         } else {
@@ -908,7 +930,7 @@ impl GrafeoDB {
         };
 
         // Acquire the lock + validate + install the lease registry (mmap base).
-        let ownership = generation::GenerationRootOwnership::open(root, mode)?;
+        let ownership = generation::GenerationRootOwnership::open(&root, mode)?;
 
         // Fresh overlay + shared engine state (no single-file path is touched).
         let store = Arc::new(LpgStore::new()?);
@@ -916,20 +938,29 @@ impl GrafeoDB {
         let rdf_store = Arc::new(RdfStore::new());
         let transaction_manager = Arc::new(TransactionManager::new());
         let buffer_manager = BufferManager::new(BufferManagerConfig {
-            budget: BufferManagerConfig::detect_system_memory() as usize / 4 * 3,
-            spill_path: Some(root.join("spill")),
+            budget: config.memory_limit.unwrap_or_else(|| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let budget =
+                    (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize;
+                budget
+            }),
+            spill_path: config.spill_path.clone().or_else(|| {
+                let parent = root.parent()?;
+                let name = root.file_name()?.to_str()?;
+                Some(parent.join(format!("{name}.spill")))
+            }),
             ..BufferManagerConfig::default()
         });
         let catalog = Arc::new(Catalog::new());
         let query_cache = Arc::new(QueryCache::default());
 
         #[cfg(feature = "cdc")]
-        let cdc_enabled_val = false;
+        let cdc_enabled_val = config.cdc_enabled;
         #[cfg(feature = "cdc")]
-        let cdc_retention = crate::cdc::CdcRetentionConfig::default();
+        let cdc_retention = config.cdc_retention.clone();
 
         let mut db = Self {
-            config: Config::persistent(root),
+            config,
             #[cfg(feature = "lpg")]
             store: Some(store),
             catalog,
@@ -998,6 +1029,14 @@ impl GrafeoDB {
         db.generation_root = Some(ownership);
 
         db.register_section_consumers();
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        db.discard_stale_vector_spill_files();
+        db.apply_force_disk_overrides();
         Ok(db)
     }
 
