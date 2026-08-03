@@ -311,6 +311,15 @@ pub struct GrafeoDB {
         feature = "generation-streaming"
     ))]
     epoch_handoff: generation::EpochHandoffCoordinator,
+    /// Writable generation-root ownership (H-ADOPT.2).
+    ///
+    /// Present only when this `GrafeoDB` was opened as a generation root via
+    /// [`GrafeoDB::open_generation_root`]. Holds the exclusive `RootLock` (Option
+    /// S: owned for the DB lifetime) and the `GenerationLeaseRegistry` (owns the
+    /// selected mmap-backed base generation), so neither is released while the
+    /// database is open. `None` for legacy single-file and in-memory databases.
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    generation_root: Option<generation::GenerationRootOwnership>,
 }
 
 impl GrafeoDB {
@@ -779,6 +788,8 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
+            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            generation_root: None,
             #[cfg(all(
                 feature = "generation",
                 feature = "lpg",
@@ -945,6 +956,8 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
+            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            generation_root: None,
             #[cfg(all(
                 feature = "generation",
                 feature = "lpg",
@@ -1047,6 +1060,8 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
+            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            generation_root: None,
             #[cfg(all(
                 feature = "generation",
                 feature = "lpg",
