@@ -28,8 +28,8 @@ use crate::wal::WalManager;
 use super::lock::RootLock;
 use super::manifest::{self, ManifestSlot};
 use super::wal_cursor::{
-    WalCursorError, WalReplayCursor, cut_generation_boundary, earliest_retained_cursor,
-    truncate_before,
+    GenerationCut, WalCursorError, WalReplayCursor, cut_generation_boundary,
+    earliest_retained_cursor, truncate_before, validate_replayable,
 };
 
 /// Input to a generation publication.
@@ -44,6 +44,14 @@ pub struct PublicationInput<'a> {
     pub parent_generation_id: Option<String>,
     /// Parent publication sequence (None = derive from previous slot).
     pub parent_publication_sequence: Option<u64>,
+    /// Optional pre-cut WAL boundary from an earlier freeze (G-EM0.5c).
+    ///
+    /// When `Some`, publication **skips** the internal `cut_generation_boundary`
+    /// step and records this cursor in the manifest slot. The freeze path owns
+    /// the cut so concurrent next-epoch writes can land after boundary B while
+    /// generation G(N) is still building. When `None` (default for 3a/3b/3c),
+    /// publication cuts the WAL at step 0 exactly as before.
+    pub pre_cut_cursor: Option<WalReplayCursor>,
 }
 
 /// Result of a successful publication.
@@ -122,9 +130,24 @@ pub fn publish_generation(
     #[cfg(not(test))]
     let hook = |_name: &str| {};
 
-    // Step 0: cut the WAL generation boundary (sync + rotate). This freezes
-    // the replay input for the generation being published.
-    let cut = cut_generation_boundary(wal)?;
+    // Step 0: cut the WAL generation boundary (sync + rotate), unless the
+    // caller already froze boundary B at epoch-handoff freeze time (G-EM0.5c).
+    // A pre-cut cursor must remain replayable against the live WAL directory.
+    let cut = if let Some(cursor) = input.pre_cut_cursor {
+        validate_replayable(wal.dir(), &cursor).map_err(PublicationError::WalCut)?;
+        let retained_log_files = wal
+            .log_files()
+            .map_err(PublicationError::from)?
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        GenerationCut {
+            cursor,
+            retained_log_files,
+        }
+    } else {
+        cut_generation_boundary(wal)?
+    };
 
     let root = lock.canonical_root();
     let generations_dir = root.join("generations");

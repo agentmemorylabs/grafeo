@@ -405,6 +405,7 @@ impl GrafeoDB {
                 generation_id: generation_id.clone(),
                 parent_generation_id: parent_generation_id.clone(),
                 parent_publication_sequence,
+                pre_cut_cursor: None,
             },
             &wal,
             &OsGenerationFileOps,

@@ -1,6 +1,6 @@
-//! Engine-side manifest publication and WAL boundary surface (G-EM0.3b).
+//! Engine-side generation lifecycle surface (G-EM0.3b–G-EM0.5c).
 //!
-//! This module groups the G-EM0.3b publication contract:
+//! This module groups the publication/recovery/lease/handoff contracts:
 //!
 //! - [`manifest`]: a read-only typed view over the W0 dual-slot manifest,
 //!   exposing the selected/previous generation, publication sequence, durable
@@ -21,11 +21,22 @@
 //!   against the old immutable bytes. Compiled only when `mmap` is enabled
 //!   (the lease wraps [`crate::database::compact_tiered::CompactStoreTiered`]).
 //!
+//! - [`epoch_handoff`]: concurrent overlay epoch + WAL handoff (G-EM0.5c) —
+//!   freeze epoch N at WAL boundary B, admit bounded N+1 writes, build/publish
+//!   G(N) with the pre-cut boundary, retire only the frozen overlay/WAL prefix.
+//!
 //! Neither module re-implements the W0 manifest schema, the 11-step
 //! publication ordering, WAL-cursor mechanics, or recovery selection — those
 //! stay in `grafeo-storage` (W0). This module only re-exposes them at the
 //! engine boundary and adds the observability G-EM0.3a did not provide.
 
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming"
+))]
+pub mod epoch_handoff;
 #[cfg(feature = "mmap")]
 pub mod lease;
 pub mod manifest;
@@ -34,6 +45,15 @@ pub mod publication;
 pub mod recovery;
 pub mod retirement;
 
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming"
+))]
+pub use epoch_handoff::{
+    EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle,
+};
 #[cfg(feature = "mmap")]
 pub use lease::{
     BaseGeneration, GenerationLease, GenerationLeaseRegistry, GenerationLeaseStats,

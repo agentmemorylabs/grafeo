@@ -40,6 +40,7 @@ fn child_main() {
         generation_id: "g-crashed".to_string(),
         parent_generation_id: None,
         parent_publication_sequence: None,
+        pre_cut_cursor: None,
     };
     let hook = move |name: &str| {
         if name == point {
@@ -65,6 +66,7 @@ fn crash_child_at(point: &str) -> crate::generation::recovery::SelectedGeneratio
         generation_id: "g-prev".to_string(),
         parent_generation_id: None,
         parent_publication_sequence: None,
+        pre_cut_cursor: None,
     };
     publish_generation(&lock, input, &fixture.wal, &OsGenerationFileOps, None).expect("publish");
     drop(lock);

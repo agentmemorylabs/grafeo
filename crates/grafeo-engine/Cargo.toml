@@ -191,6 +191,16 @@ name = "compact_store_generation_retirement"
 path = "tests/compact_store_generation_retirement.rs"
 required-features = ["generation", "compact-store", "lpg", "mmap"]
 
+[[test]]
+name = "compact_store_epoch_handoff"
+path = "tests/compact_store_epoch_handoff.rs"
+required-features = ["generation", "compact-store", "lpg"]
+
+[[test]]
+name = "compact_store_writable_cycles"
+path = "tests/compact_store_writable_cycles.rs"
+required-features = ["generation", "compact-store", "lpg", "generation-streaming", "mmap"]
+
 [[bench]]
 name = "query_bench"
 harness = false

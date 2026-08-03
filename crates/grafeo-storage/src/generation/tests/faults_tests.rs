@@ -99,6 +99,7 @@ fn publish_real(lock: &RootLock, fixture: &RootFixture, id: &str) -> Publication
         generation_id: id.to_string(),
         parent_generation_id: None,
         parent_publication_sequence: None,
+        pre_cut_cursor: None,
     };
     publish_generation(lock, input, &fixture.wal, &OsGenerationFileOps, None).expect("publish")
 }
@@ -132,6 +133,7 @@ fn crash_at(point: &str) -> SelectedGeneration {
         generation_id: "g-new".to_string(),
         parent_generation_id: None,
         parent_publication_sequence: None,
+        pre_cut_cursor: None,
     };
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = publish_generation(&lock, input, &fixture.wal, &dops, Some(&hook));
@@ -211,6 +213,7 @@ fn fault_point_02_during_section_streaming() {
         generation_id: "g-new".to_string(),
         parent_generation_id: None,
         parent_publication_sequence: None,
+        pre_cut_cursor: None,
     };
     let _ = publish_generation(&lock, input, &fixture.wal, dops.as_ref(), Some(&|_name| {}));
     let selected = recover(&lock).expect("recovery must succeed");
@@ -304,6 +307,7 @@ fn fault_point_11_during_wal_cleanup() {
         generation_id: "g-new".to_string(),
         parent_generation_id: None,
         parent_publication_sequence: None,
+        pre_cut_cursor: None,
     };
     let _ = publish_generation(&lock, input, &fixture.wal, dops.as_ref(), Some(&hook));
     let selected = recover(&lock).expect("recovery must succeed");
