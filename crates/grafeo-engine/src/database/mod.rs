@@ -3327,6 +3327,18 @@ impl GrafeoDB {
                 transaction_id: commit_tx,
             })?;
 
+            // Pair the blanket commit with an EpochAdvance: generation-root
+            // replay (H-ADOPT.3) requires an EpochAdvance after EVERY
+            // TransactionCommit, and a second unpaired close-time commit
+            // otherwise poisons the stream (commit-while-awaiting-epoch =>
+            // NonRecoverable), making the root unopenable after two clean
+            // closes. Legacy directory-format recovery treats EpochAdvance as
+            // metadata pass-through (wal/recovery.rs), so this changes
+            // nothing for existing recovery behavior.
+            wal.log(&WalRecord::EpochAdvance {
+                epoch: self.transaction_manager.current_epoch(),
+            })?;
+
             wal.sync()?;
         }
 
