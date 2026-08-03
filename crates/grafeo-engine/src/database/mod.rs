@@ -63,7 +63,7 @@ pub(crate) mod wal_store;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use vector_read::IndexedVectorRead;
 
-use grafeo_common::{grafeo_error, grafeo_warn};
+use grafeo_common::{grafeo_error, grafeo_info, grafeo_warn};
 #[cfg(feature = "wal")]
 use std::path::Path;
 use std::sync::Arc;
@@ -899,20 +899,28 @@ impl GrafeoDB {
     /// Available with `all(generation, lpg, compact-store, mmap)`; the lease
     /// registry and zero-copy base require mmap.
     ///
-    /// # WAL-replay status (H-ADOPT.3)
+    /// # WAL-replay status (H-ADOPT.3 Phase C)
     ///
-    /// Durable WAL written **after** the selected boundary is **not yet
-    /// replayed** into the overlay on open (see
-    /// `generation::recovery`); the database opens at the selected boundary
-    /// with an empty overlay until H-ADOPT.3 lands. A marker is emitted here so
-    /// the account graph does not silently adopt this before replay exists.
+    /// Durable WAL written **after** the selected boundary **is replayed**
+    /// into the fresh overlay on open (see `generation::replay`): committed
+    /// query/schema writes are restored and the transaction manager's epoch /
+    /// transaction floor is restored before the database returns. A writable
+    /// open additionally truncates a torn tail left by a crash (so the freshly
+    /// installed WAL appends after the last committed frame) and installs the
+    /// root WAL with the configured durability, making post-open writes
+    /// durable. Read-only opens replay but install no WAL.
     ///
     /// # Errors
     ///
     /// Returns an error when the root cannot be exclusively locked, no valid
     /// generation exists, or the selected generation container cannot be
     /// opened / mapped / deserialized.
-    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store", feature = "mmap"))]
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
     pub fn open_generation_root(root: impl AsRef<Path>, read_only: bool) -> Result<Self> {
         let config = if read_only {
             Config::read_only(root.as_ref())
@@ -928,7 +936,20 @@ impl GrafeoDB {
     ///
     /// AMH production callers use this form so the single open funnel applies
     /// the same resource policy to eager and generation-root databases.
-    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store", feature = "mmap"))]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config is invalid, the root cannot be
+    /// exclusively locked, no valid generation exists, the selected container
+    /// cannot be opened / mapped / deserialized, the post-boundary WAL cannot
+    /// be replayed, or (writable mode) the torn tail cannot be truncated or
+    /// the root WAL cannot be installed.
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
     pub fn open_generation_root_with_config(config: Config) -> Result<Self> {
         config
             .validate()
@@ -954,8 +975,7 @@ impl GrafeoDB {
         let buffer_manager = BufferManager::new(BufferManagerConfig {
             budget: config.memory_limit.unwrap_or_else(|| {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let budget =
-                    (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize;
+                let budget = (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize;
                 budget
             }),
             spill_path: config.spill_path.clone().or_else(|| {
@@ -1033,18 +1053,89 @@ impl GrafeoDB {
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
         };
 
-        // H-ADOPT.3 marker: no post-boundary WAL replay yet. The overlay opens
-        // empty at the selected boundary; replay lands in its own packet.
-        grafeo_warn!(
-            "generation-root open at selected boundary with empty overlay: \
-             post-boundary WAL replay not yet implemented (H-ADOPT.3). \
-             Do not wire the account graph onto this path before replay lands."
-        );
-
         // Wire the layered store over the mmap base + fresh overlay, then retain
         // the ownership (lock + registry) on the database for its lifetime.
         let base = ownership.registry().snapshot().store();
         db.wire_generation_layered(base)?;
+
+        // H-ADOPT.3 Phase C: replay the post-boundary WAL into the fresh
+        // overlay before any writer sees the layered store. Replay restores
+        // committed query/schema writes and the TM epoch/transaction floor;
+        // it never mutates the WAL itself.
+        #[cfg(feature = "wal")]
+        let wal_dir = root.join("wal");
+        #[cfg(feature = "wal")]
+        let report = {
+            let layered = db.layered_store.as_ref().ok_or_else(|| {
+                Error::Internal(
+                    "open_generation_root: wire_generation_layered did not install the layered store".into(),
+                )
+            })?;
+            let target = generation::replay::ReplayTarget {
+                layered,
+                catalog: &db.catalog,
+                #[cfg(feature = "triple-store")]
+                rdf_store: Some(&db.rdf_store),
+                transaction_manager: &db.transaction_manager,
+            };
+            generation::replay::replay_generation_wal(
+                &wal_dir,
+                ownership.ownership().wal_boundary(),
+                &target,
+            )
+            .map_err(|e| Error::Internal(format!("generation WAL replay failed: {e}")))?
+        };
+        #[cfg(feature = "wal")]
+        {
+            let tail = match report.tail {
+                generation::replay::WalTailClass::Clean => "clean".to_string(),
+                generation::replay::WalTailClass::TornTail { seq, byte_offset } => {
+                    format!("torn-tail(seq={seq}, byte_offset={byte_offset})")
+                }
+            };
+            grafeo_info!(
+                "generation-root WAL replay: applied_records={} committed_transactions={} tail={} final_epoch={} max_transaction_id={}",
+                report.applied_records,
+                report.committed_transactions,
+                tail,
+                report.final_epoch.0,
+                report.max_transaction_id.0
+            );
+        }
+        // Writable mode only: truncate the torn tail left by a crash so the
+        // freshly installed WAL appends after the last committed frame.
+        #[cfg(feature = "wal")]
+        if !read_only
+            && let generation::replay::WalTailClass::TornTail { seq, byte_offset } = report.tail
+        {
+            grafeo_storage::wal::truncate_active_tail(&wal_dir, seq, byte_offset)?;
+        }
+        // Writable mode only: install the root WAL with the configured
+        // durability so post-open writes are durable (mirrors the normal-open
+        // durability mapping above).
+        #[cfg(feature = "wal")]
+        if !read_only && db.config.wal_enabled {
+            let wal_durability = match db.config.wal_durability {
+                crate::config::DurabilityMode::Sync => WalDurabilityMode::Sync,
+                crate::config::DurabilityMode::Batch {
+                    max_delay_ms,
+                    max_records,
+                } => WalDurabilityMode::Batch {
+                    max_delay_ms,
+                    max_records,
+                },
+                crate::config::DurabilityMode::Adaptive { target_interval_ms } => {
+                    WalDurabilityMode::Adaptive { target_interval_ms }
+                }
+                crate::config::DurabilityMode::NoSync => WalDurabilityMode::NoSync,
+            };
+            let wal_config = WalConfig {
+                durability: wal_durability,
+                ..WalConfig::default()
+            };
+            db.wal = Some(Arc::new(LpgWal::with_config(&wal_dir, wal_config)?));
+        }
+
         db.generation_root = Some(ownership);
 
         db.register_section_consumers();
@@ -1063,7 +1154,12 @@ impl GrafeoDB {
     /// fresh overlay, mirroring [`wire_layered_after_load`](Self::wire_layered_after_load)
     /// but sourcing the base from a lease snapshot (no on-disk deletion log —
     /// a generation root starts at the selected boundary).
-    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store", feature = "mmap"))]
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
     fn wire_generation_layered(
         &mut self,
         base: Arc<grafeo_core::graph::compact::CompactStore>,
@@ -2575,12 +2671,32 @@ impl GrafeoDB {
             let overlay = layered.overlay_store();
             let layered_arc = Arc::clone(layered);
             let mut session = Session::with_adaptive(overlay, session_cfg());
-            // Override graph_store/graph_store_mut to use the LayeredStore
-            // (which merges base + overlay), not just the overlay alone.
-            session.override_stores(
-                Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>,
-                Some(layered_arc as Arc<dyn GraphStoreMut>),
-            );
+            // Read store: the raw LayeredStore (merges base + overlay) — no
+            // wrapper overhead on reads.
+            let read_store = Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>;
+            // Write store: the LayeredStore, wrapped in a WalGraphStore when the
+            // database carries a WAL so query mutations reach the root's WAL
+            // (H-ADOPT.3 Phase C, D1).
+            #[cfg(feature = "wal")]
+            let write_store: Arc<dyn GraphStoreMut> = if let Some(ref wal) = self.wal {
+                let wal_store = Arc::new(crate::database::wal_store::WalGraphStore::new(
+                    layered_arc as Arc<dyn GraphStoreMut>,
+                    Arc::clone(wal),
+                    Arc::clone(&self.wal_graph_context),
+                ));
+                wal_store as Arc<dyn GraphStoreMut>
+            } else {
+                layered_arc as Arc<dyn GraphStoreMut>
+            };
+            #[cfg(not(feature = "wal"))]
+            let write_store: Arc<dyn GraphStoreMut> = layered_arc as Arc<dyn GraphStoreMut>;
+            session.override_stores(read_store, Some(write_store));
+            // Attach the WAL for TransactionCommit/EpochAdvance logging without
+            // re-wrapping the store (the write store above is already wrapped).
+            #[cfg(feature = "wal")]
+            if let Some(ref wal) = self.wal {
+                session.attach_wal(Arc::clone(wal), Arc::clone(&self.wal_graph_context));
+            }
             return session;
         }
 

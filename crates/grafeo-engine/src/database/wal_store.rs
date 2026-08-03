@@ -1,15 +1,16 @@
 //! WAL-aware graph store wrapper.
 //!
-//! Wraps an [`LpgStore`] and logs every mutation to the WAL so that
-//! query-engine mutations (INSERT, DELETE, SET via GQL/Cypher/etc.)
-//! survive a close/reopen cycle.
+//! Wraps an inner [`GraphStoreMut`] and logs every mutation to the WAL so
+//! that query-engine mutations (INSERT, DELETE, SET via GQL/Cypher/etc.)
+//! survive a close/reopen cycle. The inner store may be a plain [`LpgStore`]
+//! (normal open) or a layered generation-root store (H-ADOPT.3 Phase C).
 
 use std::sync::Arc;
 
 use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
-use grafeo_core::graph::lpg::{CompareOp, Edge, LpgStore, Node};
+use grafeo_core::graph::lpg::{CompareOp, Edge, Node};
 use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_core::statistics::Statistics;
 use grafeo_storage::wal::{LpgWal, WalRecord};
@@ -17,7 +18,7 @@ use grafeo_storage::wal::{LpgWal, WalRecord};
 use arcstr::ArcStr;
 
 /// A [`GraphStoreMut`] decorator that delegates every call to an inner
-/// [`LpgStore`] and additionally logs mutation operations to the WAL.
+/// [`GraphStoreMut`] and additionally logs mutation operations to the WAL.
 ///
 /// Read-only methods are forwarded without any WAL interaction.
 ///
@@ -26,7 +27,7 @@ use arcstr::ArcStr;
 /// `wal_graph_context` mutex ensures atomicity of context-switch + mutation
 /// pairs across concurrent sessions.
 pub(crate) struct WalGraphStore {
-    inner: Arc<LpgStore>,
+    inner: Arc<dyn GraphStoreMut>,
     wal: Arc<LpgWal>,
     /// Which named graph this store represents (`None` = default graph).
     graph_name: Option<String>,
@@ -38,7 +39,7 @@ pub(crate) struct WalGraphStore {
 impl WalGraphStore {
     /// Creates a new WAL-aware store wrapper for the default graph.
     pub fn new(
-        inner: Arc<LpgStore>,
+        inner: Arc<dyn GraphStoreMut>,
         wal: Arc<LpgWal>,
         wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
     ) -> Self {
@@ -52,7 +53,7 @@ impl WalGraphStore {
 
     /// Creates a new WAL-aware store wrapper for a named graph.
     pub fn new_for_graph(
-        inner: Arc<LpgStore>,
+        inner: Arc<dyn GraphStoreMut>,
         wal: Arc<LpgWal>,
         graph_name: String,
         wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
@@ -157,11 +158,11 @@ impl GraphStore for WalGraphStore {
     }
 
     fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
-        GraphStore::neighbors(self.inner.as_ref(), node, direction)
+        self.inner.neighbors(node, direction)
     }
 
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
-        GraphStore::edges_from(self.inner.as_ref(), node, direction)
+        self.inner.edges_from(node, direction)
     }
 
     fn out_degree(&self, node: NodeId) -> usize {
@@ -327,7 +328,7 @@ impl GraphStore for WalGraphStore {
 
 // Pure delegation: the WAL wrapper logs mutations but owns no index state,
 // so every text/vector lookup has to fall through to the underlying
-// `LpgStore`. A stub impl silently turns into "no index exists" at every
+// store. A stub impl silently turns into "no index exists" at every
 // call site (has_text_index → false, text_search → [], etc.), which
 // regressed hybrid queries on persistent DBs until it was caught by the
 // `_persistent` spec variants — see issue #308.
@@ -505,11 +506,13 @@ impl GraphStoreMut for WalGraphStore {
         let outgoing: Vec<EdgeId> = self
             .inner
             .edges_from(node_id, Direction::Outgoing)
+            .into_iter()
             .map(|(_, eid)| eid)
             .collect();
         let incoming: Vec<EdgeId> = self
             .inner
             .edges_from(node_id, Direction::Incoming)
+            .into_iter()
             .map(|(_, eid)| eid)
             .collect();
 
@@ -609,6 +612,7 @@ impl GraphStoreMut for WalGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grafeo_core::graph::lpg::LpgStore;
     use grafeo_storage::wal::TypedWal;
 
     fn setup() -> (WalGraphStore, Arc<LpgWal>) {

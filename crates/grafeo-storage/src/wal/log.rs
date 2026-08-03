@@ -779,7 +779,8 @@ pub fn truncate_active_tail(wal_dir: &Path, stop_seq: u64, stop_byte_offset: u64
     // Fail closed: a TornTail implies the active file exists.
     let (max_seq, active_path) = files.iter().max_by_key(|(seq, _)| *seq).ok_or_else(|| {
         Error::Internal(format!(
-            "truncate_active_tail: no WAL log files in {wal_dir:?}"
+            "truncate_active_tail: no WAL log files in {}",
+            wal_dir.display()
         ))
     })?;
 
@@ -787,7 +788,8 @@ pub fn truncate_active_tail(wal_dir: &Path, stop_seq: u64, stop_byte_offset: u64
     // replay-reported torn tail.
     if *max_seq != stop_seq {
         return Err(Error::Internal(format!(
-            "truncate_active_tail: active WAL sequence {max_seq} != torn-tail sequence {stop_seq} in {wal_dir:?}"
+            "truncate_active_tail: active WAL sequence {max_seq} != torn-tail sequence {stop_seq} in {}",
+            wal_dir.display()
         )));
     }
 
@@ -800,7 +802,8 @@ pub fn truncate_active_tail(wal_dir: &Path, stop_seq: u64, stop_byte_offset: u64
     // Fail closed: never extend the file.
     if current_len < stop_byte_offset {
         return Err(Error::Internal(format!(
-            "truncate_active_tail: WAL file {active_path:?} is {current_len} bytes, shorter than stop offset {stop_byte_offset}"
+            "truncate_active_tail: WAL file {} is {current_len} bytes, shorter than stop offset {stop_byte_offset}",
+            active_path.display()
         )));
     }
 

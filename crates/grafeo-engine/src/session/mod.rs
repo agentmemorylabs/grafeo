@@ -370,12 +370,24 @@ impl Session {
     ) {
         // Wrap the graph store so query-engine mutations are WAL-logged
         let wal_store = Arc::new(crate::database::wal_store::WalGraphStore::new(
-            Arc::clone(&self.store),
+            Arc::clone(&self.store) as Arc<dyn GraphStoreMut>,
             Arc::clone(&wal),
             Arc::clone(&wal_graph_context),
         ));
         self.graph_store = Arc::clone(&wal_store) as Arc<dyn GraphStoreSearch>;
         self.graph_store_mut = Some(wal_store as Arc<dyn GraphStoreMut>);
+        self.wal = Some(wal);
+        self.wal_graph_context = Some(wal_graph_context);
+    }
+
+    /// Attaches the WAL for commit/epoch logging without re-wrapping the store
+    /// (the layered session branch already holds a WAL-wrapped write store).
+    #[cfg(all(feature = "wal", feature = "lpg"))]
+    pub(crate) fn attach_wal(
+        &mut self,
+        wal: Arc<grafeo_storage::wal::LpgWal>,
+        wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
+    ) {
         self.wal = Some(wal);
         self.wal_graph_context = Some(wal_graph_context);
     }

@@ -69,9 +69,9 @@ pub use lease::{
 pub use manifest::{
     ManifestSelection, ManifestState, ManifestStateError, WalBoundary, read_manifest_state,
 };
-pub use ownership::{OpenMode, OwnershipError, RootLockOwnerState, RootOwnership};
 #[cfg(feature = "mmap")]
 pub use ownership::GenerationRootOwnership;
+pub use ownership::{OpenMode, OwnershipError, RootLockOwnerState, RootOwnership};
 pub use publication::{
     BuildPublication, PublicationPhase, PublicationPhaseError, PublishedGeneration,
 };

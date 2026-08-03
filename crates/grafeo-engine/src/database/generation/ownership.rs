@@ -302,7 +302,10 @@ impl GenerationRootOwnership {
             selected.generation_abs_path.clone(),
         )?;
 
-        Ok(Self { ownership, registry })
+        Ok(Self {
+            ownership,
+            registry,
+        })
     }
 
     /// The process ownership (root lock + validated selected generation).

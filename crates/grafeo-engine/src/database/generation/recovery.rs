@@ -23,8 +23,10 @@
 //!   W0's `#[cfg(test)]` fault hooks).
 //!
 //! WAL **replay** (applying frames from the selected boundary into a live
-//! overlay) is a later packet (G-EM0.5b/5c); this module stops at validated
-//! selection + exact replay boundary + orphan classification.
+//! overlay) is implemented in [`crate::database::generation::replay`]
+//! (H-ADOPT.3 Phase B), and wired into the generation-root constructor by
+//! Phase C; this module stops at validated selection + exact replay boundary
+//! + orphan classification.
 //!
 //! ## Fault-proof coverage map (auditable division of evidence)
 //!
