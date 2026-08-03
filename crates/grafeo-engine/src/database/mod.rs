@@ -304,7 +304,12 @@ pub struct GrafeoDB {
     overlay_admission:
         Option<Arc<grafeo_core::graph::compact::overlay_budget::OverlayAdmissionController>>,
     /// Dual-epoch handoff coordinator (G-EM0.5c).
-    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "generation-streaming"
+    ))]
     epoch_handoff: generation::EpochHandoffCoordinator,
 }
 
@@ -774,7 +779,12 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
-            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "generation-streaming"
+            ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
         };
 
@@ -935,7 +945,12 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
-            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "generation-streaming"
+            ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
         })
     }
@@ -1032,7 +1047,12 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
-            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "generation-streaming"
+            ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
         })
     }

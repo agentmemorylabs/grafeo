@@ -30,6 +30,12 @@
 //! stay in `grafeo-storage` (W0). This module only re-exposes them at the
 //! engine boundary and adds the observability G-EM0.3a did not provide.
 
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming"
+))]
 pub mod epoch_handoff;
 #[cfg(feature = "mmap")]
 pub mod lease;
@@ -39,6 +45,12 @@ pub mod publication;
 pub mod recovery;
 pub mod retirement;
 
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming"
+))]
 pub use epoch_handoff::{
     EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle,
 };
