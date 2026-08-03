@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use grafeo_common::types::{EdgeId, NodeId};
 use grafeo_common::utils::error::{Error, Result};
+use grafeo_common::utils::hash::FxHashSet;
 use grafeo_core::graph::compact::generation::{
     EdgeRecordSource, GenerationEdge, GenerationNode, NodeRecordSource,
 };
@@ -261,8 +262,14 @@ impl GrafeoDB {
         }
 
         // Retire frozen overlay prefix; N+1 remains.
-        let (absorbed_nodes, absorbed_edges, retained_n, retained_e) =
-            self.retire_frozen_prefix(&handle)?;
+        let (
+            absorbed_nodes,
+            absorbed_edges,
+            retained_n,
+            retained_e,
+            post_freeze_nodes,
+            post_freeze_edges,
+        ) = self.retire_frozen_prefix(&handle)?;
 
         maybe_abort("after_retire");
 
@@ -282,6 +289,10 @@ impl GrafeoDB {
             absorbed_edges,
             retained_next_epoch_nodes: retained_n,
             retained_next_epoch_edges: retained_e,
+            freeze_node_ids: handle.freeze.overlay_node_ids.clone(),
+            freeze_edge_ids: handle.freeze.overlay_edge_ids.clone(),
+            post_freeze_nodes,
+            post_freeze_edges,
         })
     }
 
@@ -568,7 +579,10 @@ impl GrafeoDB {
     }
 
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
-    fn retire_frozen_prefix(&self, handle: &FrozenEpochHandle) -> Result<(u64, u64, u64, u64)> {
+    fn retire_frozen_prefix(
+        &self,
+        handle: &FrozenEpochHandle,
+    ) -> Result<(u64, u64, u64, u64, FxHashSet<u64>, FxHashSet<u64>)> {
         if let Some(layered) = self.layered_store.as_ref() {
             let live = layered
                 .retire_frozen_overlay_prefix()
@@ -585,14 +599,22 @@ impl GrafeoDB {
                 .iter()
                 .filter(|id| !live.post_freeze_edges.contains(*id))
                 .count() as u64;
+            // Propagate the ACTUAL post-freeze identity (not just counts) so
+            // `swap_base_and_repair_overlay` can retain dirty for every N+1
+            // mutation of a frozen-absorbed entity (G-EM0.5d hardening
+            // 2026-08-02). `retire_frozen_overlay_prefix` never strips live
+            // overlay rows, so these ids remain authoritative in the overlay.
+            let post_nodes = live.post_freeze_nodes.clone();
+            let post_edges = live.post_freeze_edges.clone();
             return Ok((
                 absorbed_nodes,
                 absorbed_edges,
                 live.post_freeze_nodes.len() as u64,
                 live.post_freeze_edges.len() as u64,
+                post_nodes,
+                post_edges,
             ));
         }
-
         // Pure LPG / no layered: nothing to strip; N+1 writes are already on the store.
         if let Some(ctl) = self.overlay_admission() {
             for cat in [
@@ -613,6 +635,8 @@ impl GrafeoDB {
             handle.freeze.overlay_edge_ids.len() as u64,
             0,
             0,
+            FxHashSet::default(),
+            FxHashSet::default(),
         ))
     }
 }

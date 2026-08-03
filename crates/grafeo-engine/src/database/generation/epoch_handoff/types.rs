@@ -31,6 +31,7 @@
 //! `after_freeze`, `after_build`, `after_publication`, `after_retire` — the
 //! process aborts at that boundary so a fresh-process parent can prove recovery.
 
+use grafeo_common::utils::hash::FxHashSet;
 use grafeo_core::graph::compact::generation::{GenerationEdge, GenerationNode};
 use grafeo_core::graph::compact::generation_builder::FrozenOverlayEpoch;
 use grafeo_core::graph::compact::overlay_budget::RetainedCategory;
@@ -124,6 +125,22 @@ pub struct EpochHandoffReport {
     pub retained_next_epoch_nodes: u64,
     /// Count of post-freeze edge mutations retained in the overlay.
     pub retained_next_epoch_edges: u64,
+    /// Frozen-identity node ids: every overlay-resident/dirty node captured at
+    /// freeze, all absorbed into the published generation (G-EM0.5d repair
+    /// swap input).
+    pub freeze_node_ids: FxHashSet<u64>,
+    /// Frozen-identity edge ids (see [`Self::freeze_node_ids`]).
+    pub freeze_edge_ids: FxHashSet<u64>,
+    /// Node ids mutated AFTER the freeze (epoch N+1), as recorded by the
+    /// layered store's mutation paths during the handoff.
+    /// `swap_base_and_repair_overlay` retains dirty for exactly these so
+    /// N+1 writes and deletions survive the base swap (G-EM0.5d hardening
+    /// 2026-08-02: previously only the COUNT was propagated and the repair
+    /// predicate could not distinguish re-mutated frozen entities).
+    pub post_freeze_nodes: FxHashSet<u64>,
+    /// Edge ids mutated after the freeze (epoch N+1); see
+    /// [`Self::post_freeze_nodes`].
+    pub post_freeze_edges: FxHashSet<u64>,
 }
 
 /// In-process handoff coordinator state (at most one active handoff per DB).

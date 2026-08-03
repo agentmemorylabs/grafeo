@@ -415,6 +415,28 @@ impl LayeredStore {
         }
     }
 
+    /// Records a post-freeze (epoch N+1) mutation of an entity that is
+    /// ALREADY tracked (dirty or overlay-resident), so the dirty set is not
+    /// re-inserted but the handoff's post-freeze identity must still see it.
+    ///
+    /// Required by [`Self::swap_base_and_repair_overlay`]: a post-freeze
+    /// re-mutation of a FROZEN entity that never re-marks dirty would
+    /// otherwise be absent from `post_freeze_*`, and the repair swap would
+    /// clear its dirty flag and silently serve the stale frozen value baked
+    /// into the new base (or resurrect a post-freeze deletion).
+    fn record_post_freeze_node(&self, id: NodeId) {
+        if let Some(h) = self.handoff.write().as_mut() {
+            h.post_freeze_nodes.insert(id.as_u64());
+        }
+    }
+
+    /// Edge variant of [`Self::record_post_freeze_node`].
+    fn record_post_freeze_edge(&self, id: EdgeId) {
+        if let Some(h) = self.handoff.write().as_mut() {
+            h.post_freeze_edges.insert(id.as_u64());
+        }
+    }
+
     /// True when a dual-epoch handoff freeze is active.
     #[must_use]
     pub fn handoff_active(&self) -> bool {
@@ -641,32 +663,42 @@ impl LayeredStore {
     /// Unlike [`Self::swap_base_and_reset_overlay`], the handoff build
     /// (`complete_epoch_handoff`) produces a generation that contains the **old
     /// base plus the frozen epoch-N snapshot** — it does *not* include the
-    /// post-freeze N+1 modifications that re-wrote an already-dirty (base or
-    /// frozen) entity. So the dirty sets **cannot** be cleared wholesale.
+    /// post-freeze N+1 mutations. So the dirty sets **cannot** be cleared
+    /// wholesale.
     ///
-    /// Read dispatch order (`get_node`/`get_edge` + versioned `is_*_visible_*`):
+    /// Read dispatch order (`get_node`/`get_edge` + versioned variants):
     ///
     /// 1. cleared-from-base tombstone → hidden;
     /// 2. **dirty** → overlay;
     /// 3. otherwise base, else overlay (base-miss fallthrough).
     ///
     /// `frozen_node_ids`/`frozen_edge_ids` are the **freeze identity** (every id
-    /// resident/dirtied in the overlay at freeze ⇒ absorbed into this generation).
-    /// This primitive, under the `merge_guard` writer barrier, swaps the base and
-    /// clears dirty **only for**:
+    /// resident/dirtied in the overlay at freeze ⇒ absorbed into this
+    /// generation). `post_freeze_node_ids`/`post_freeze_edge_ids` are **every
+    /// id mutated after the freeze** (epoch N+1), as recorded by the mutation
+    /// paths on this store during the handoff. `complete_epoch_handoff`
+    /// propagates both sets on its report.
     ///
-    /// - any id in `frozen_*` (frozen-absorbed: the new base holds its committed
-    ///   value; clearing dirty lets the base shadow the stale overlay copy), AND
-    /// - any id the new base **does not contain** but that is dirty (skip-absorbed
-    ///   occupancy: an N+1 *create* whose creation was frozen but whose mutation
-    ///   was post-freeze — it physically landed in the new base, so the overlay
-    ///   copy is redundant and the new base shadows it).
+    /// Under the `merge_guard` writer barrier this swaps the base and retains
+    /// dirty for exactly two classes:
     ///
-    /// It **retains** dirty for an id the new base *does not contain* **and** that
-    /// was re-mutated post-freeze: clearing such an id would make dispatch serve
-    /// the entity's *base-hit* frozen value (`v0`) and drop the un-absorbed
-    /// post-freeze modification (`v1`). Retaining dirty keeps dispatch on the
-    /// overlay → current value.
+    /// - **post-freeze mutations** (`post_freeze_*`): the new base holds at
+    ///   most the entity's frozen value, so the overlay (or its absence, for a
+    ///   post-freeze deletion) must stay authoritative. Clearing dirty here
+    ///   would silently serve the stale frozen value or resurrect a deleted
+    ///   entity.
+    /// - **base-resident entities mutated post-freeze but not frozen** (not in
+    ///   `frozen_*`, present in the old base): the base merge could not absorb
+    ///   the new value; retaining dirty keeps dispatch on the overlay.
+    ///
+    /// Everything else (frozen-absorbed with no post-freeze mutation, and
+    /// post-freeze *creates* absent from the base) is cleared: absorbed
+    /// entities are shadowed by the new base, and post-freeze creates resolve
+    /// via base-miss → overlay fallthrough.
+    ///
+    /// Base-deletion tombstones (`deleted_from_base_*`) are intentionally left
+    /// intact: the handoff build may have absorbed an entity whose tombstone
+    /// postdates the freeze, and the tombstone is what keeps it hidden.
     ///
     /// Returns the previous base `Arc`.
     #[cfg(feature = "lpg")]
@@ -675,27 +707,28 @@ impl LayeredStore {
         new_base: Arc<CompactStore>,
         frozen_node_ids: &FxHashSet<NodeId>,
         frozen_edge_ids: &FxHashSet<EdgeId>,
+        post_freeze_node_ids: &FxHashSet<NodeId>,
+        post_freeze_edge_ids: &FxHashSet<EdgeId>,
     ) -> Arc<CompactStore> {
         let _barrier = self.merge_guard.write();
         let old_base = self.base.swap(new_base);
-        // Selective undirty: an absorbed id's committed value already lives in the
-        // new base, so its stale overlay copy may be shadowed by clearing dirty.
-        // Retain dirty for a retained N+1 *modification* of a base/resident entity
-        // that the base merge could NOT absorb (the entity is physically absent
-        // from the new base): clearing it would make dispatch serve the stale
-        // frozen value and drop the un-absorbed N+1 modification.
+        // Selective undirty (see method docs): retain dirty for every
+        // post-freeze mutation and for unfrozen base entities re-mutated
+        // post-freeze; clear it for absorbed (frozen, unmodified) entities and
+        // for post-freeze creates served by base-miss fallthrough.
         {
             let mut dirty = self.dirty_node_ids.write();
             dirty.retain(|id| {
-                // Keep dirty iff the entity was NOT frozen-absorbed AND is still
-                // resident in the (old) base — i.e. a base entity re-mutated
-                // post-freeze whose new value is not in the generation.
-                !frozen_node_ids.contains(id) && old_base.get_node(*id).is_some()
+                post_freeze_node_ids.contains(id)
+                    || (!frozen_node_ids.contains(id) && old_base.get_node(*id).is_some())
             });
         }
         {
             let mut dirty = self.dirty_edge_ids.write();
-            dirty.retain(|id| !frozen_edge_ids.contains(id) && old_base.get_edge(*id).is_some());
+            dirty.retain(|id| {
+                post_freeze_edge_ids.contains(id)
+                    || (!frozen_edge_ids.contains(id) && old_base.get_edge(*id).is_some())
+            });
         }
         old_base
     }
@@ -1678,10 +1711,30 @@ impl GraphStoreMut for LayeredStore {
 
     fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId> {
         let _guard = self.merge_guard.read();
+        // Endpoint preparation: promote base-resident endpoints once each, and
+        // record the post-freeze identity of already-tracked endpoints so the
+        // repair swap retains dirty for them (G-EM0.5d hardening).
+        let mut endpoints: FxHashSet<NodeId> = FxHashSet::default();
         for &(src, dst, _) in edges {
-            self.ensure_in_overlay(src);
-            self.ensure_in_overlay(dst);
+            endpoints.insert(src);
+            endpoints.insert(dst);
         }
+        let mut tracked: Vec<NodeId> = Vec::new();
+        for nid in endpoints {
+            if self.is_node_dirty(nid) {
+                tracked.push(nid);
+            } else {
+                self.ensure_in_overlay(nid);
+            }
+        }
+        if !tracked.is_empty() {
+            if let Some(h) = self.handoff.write().as_mut() {
+                for nid in &tracked {
+                    h.post_freeze_nodes.insert(nid.as_u64());
+                }
+            }
+        }
+
         let ids = self.overlay.load().batch_create_edges(edges);
         for &id in &ids {
             self.mark_dirty_edge(id);
@@ -1698,7 +1751,12 @@ impl GraphStoreMut for LayeredStore {
     fn delete_node(&self, id: NodeId) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_node_dirty(id) {
-            // Node is in the overlay: delete from overlay.
+            // Node is in the overlay: delete from overlay. Record the
+            // post-freeze deletion so `swap_base_and_repair_overlay` keeps
+            // the id out of the absorbed (undirty) class — otherwise a
+            // frozen entity deleted at N+1 would resurrect from the new
+            // base.
+            self.record_post_freeze_node(id);
             return self.overlay.load().delete_node(id);
         }
         if self.base.load().get_node(id).is_some() {
@@ -1722,6 +1780,8 @@ impl GraphStoreMut for LayeredStore {
     ) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_node_dirty(id) {
+            // See `delete_node`: record the N+1 deletion for the repair swap.
+            self.record_post_freeze_node(id);
             return self
                 .overlay
                 .load()
@@ -1744,7 +1804,22 @@ impl GraphStoreMut for LayeredStore {
         let _guard = self.merge_guard.read();
         // Delete overlay edges.
         if self.is_node_dirty(node_id) {
-            self.overlay.load().delete_node_edges(node_id);
+            let overlay = self.overlay.load();
+            // Record the incident overlay edges as post-freeze mutations
+            // BEFORE removing them: a frozen edge deleted at N+1 must not
+            // resurrect from the new base at the repair swap.
+            let incident: Vec<EdgeId> = overlay
+                .edges_from(node_id, Direction::Both)
+                .map(|(_, eid)| eid)
+                .collect();
+            if !incident.is_empty() {
+                if let Some(h) = self.handoff.write().as_mut() {
+                    for eid in &incident {
+                        h.post_freeze_edges.insert(eid.as_u64());
+                    }
+                }
+            }
+            overlay.delete_node_edges(node_id);
         }
         // Mark base edges as deleted.
         let mut newly_deleted = 0usize;
@@ -1767,6 +1842,8 @@ impl GraphStoreMut for LayeredStore {
     fn delete_edge(&self, id: EdgeId) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_edge_dirty(id) {
+            // See `delete_node`: record the N+1 deletion for the repair swap.
+            self.record_post_freeze_edge(id);
             return self.overlay.load().delete_edge(id);
         }
         if self.base.load().get_edge(id).is_some() {
@@ -1790,6 +1867,8 @@ impl GraphStoreMut for LayeredStore {
     ) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_edge_dirty(id) {
+            // See `delete_node`: record the N+1 deletion for the repair swap.
+            self.record_post_freeze_edge(id);
             return self
                 .overlay
                 .load()
@@ -1940,7 +2019,13 @@ impl LayeredStore {
     /// copies its labels and properties into the overlay and marks it dirty.
     fn ensure_in_overlay(&self, id: NodeId) {
         if self.is_node_dirty(id) {
-            return; // already in overlay
+            // Already overlay-tracked. During an active handoff this mutation
+            // is an epoch-N+1 write on an entity that may itself be frozen —
+            // record it so `swap_base_and_repair_overlay` can retain dirty
+            // for it (the dirty mark itself was set pre- or post-freeze and
+            // is not re-inserted here).
+            self.record_post_freeze_node(id);
+            return;
         }
         let Some(base_node) = self.base.load().get_node(id) else {
             return; // not in base either (new node case handled by caller)
@@ -1971,6 +2056,9 @@ impl LayeredStore {
     /// Ensures an edge exists in the overlay.
     fn ensure_edge_in_overlay(&self, id: EdgeId) {
         if self.is_edge_dirty(id) {
+            // Already overlay-tracked: see `ensure_in_overlay` — record the
+            // epoch-N+1 mutation for the repair swap.
+            self.record_post_freeze_edge(id);
             return;
         }
         let Some(base_edge) = self.base.load().get_edge(id) else {

@@ -247,9 +247,6 @@ fn handoff_build_repaired_swap_preserves_exact_once() {
 
     let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
     assert_eq!(db.epoch_handoff_phase(), EpochHandoffPhase::FreezeCaptured);
-    // Capture the freeze identity BEFORE the handle is consumed by complete.
-    let frozen_node_set = handle.freeze.overlay_node_ids.clone();
-    let frozen_edge_set = handle.freeze.overlay_edge_ids.clone();
 
     // Post-freeze N+1 (created, never frozen).
     let n1 = db.layered_store().unwrap().create_node(&["Person"]);
@@ -272,8 +269,10 @@ fn handoff_build_repaired_swap_preserves_exact_once() {
     let new_base = open_generation_base(&gen_abs);
     db.layered_store().unwrap().swap_base_and_repair_overlay(
         new_base,
-        &frozen_to_node_ids(&frozen_node_set),
-        &frozen_to_edge_ids(&frozen_edge_set),
+        &frozen_to_node_ids(&report.freeze_node_ids),
+        &frozen_to_edge_ids(&report.freeze_edge_ids),
+        &frozen_to_node_ids(&report.post_freeze_nodes),
+        &frozen_to_edge_ids(&report.post_freeze_edges),
     );
 
     // Exact-once parity: base epoch-N + frozen-N + retained N+1, each once.
@@ -318,10 +317,8 @@ fn repair_swap_keeps_post_freeze_modification_of_base_node_visible() {
     // freeze → it is NOT in the freeze shadow set → the handoff build keeps
     // old-base v0 in the new generation.
     let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
-    let frozen_node_set = handle.freeze.overlay_node_ids.clone();
-    let frozen_edge_set = handle.freeze.overlay_edge_ids.clone();
     assert!(
-        !frozen_node_set.contains(&base_id.as_u64()),
+        !handle.freeze.overlay_node_ids.contains(&base_id.as_u64()),
         "unmodified-at-freeze base node must NOT be in the freeze shadow set"
     );
 
@@ -358,8 +355,10 @@ fn repair_swap_keeps_post_freeze_modification_of_base_node_visible() {
     let new_base = open_generation_base(&gen_abs);
     db.layered_store().unwrap().swap_base_and_repair_overlay(
         new_base,
-        &frozen_to_node_ids(&frozen_node_set),
-        &frozen_to_edge_ids(&frozen_edge_set),
+        &frozen_to_node_ids(&report.freeze_node_ids),
+        &frozen_to_edge_ids(&report.freeze_edge_ids),
+        &frozen_to_node_ids(&report.post_freeze_nodes),
+        &frozen_to_edge_ids(&report.post_freeze_edges),
     );
 
     // The N+1 modification MUST be visible exactly once in the live view.
@@ -367,6 +366,175 @@ fn repair_swap_keeps_post_freeze_modification_of_base_node_visible() {
         live_person_names(&db),
         vec!["base-v1".to_string()],
         "post-freeze N+1 modify of base node must survive the repair swap"
+    );
+}
+
+// ── Bug 1 regression tests (2026-08-02: user-reported + independent review) ──
+//
+// `swap_base_and_repair_overlay` must preserve EVERY post-freeze N+1 mutation
+// class, including mutations of entities that were themselves frozen:
+//
+// - a frozen entity re-mutated post-freeze must serve the overlay's current
+//   value, not the frozen value baked into the new base;
+// - a frozen entity deleted post-freeze must stay hidden, not resurrect from
+//   the new base.
+//
+// Both require the repair swap to know the post-freeze mutation identity,
+// which `complete_epoch_handoff` must propagate (not just count).
+
+/// Bug 1 class A — a frozen overlay entity re-mutated post-freeze must survive
+/// the repair swap with its N+1 value (the new base holds the frozen v0).
+#[test]
+fn repair_swap_keeps_post_freeze_modification_of_frozen_node_visible() {
+    if std::env::var(MEM_CHILD_ENV).is_ok() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    let mut db = GrafeoDB::new_in_memory();
+    db.create_node_with_props(&["Person"], [("name", Value::from("p-base"))])
+        .expect("base node");
+    db.compact().expect("compact");
+    let ctl =
+        Arc::new(OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"));
+    db.install_overlay_admission(Arc::clone(&ctl));
+
+    // Epoch N overlay create: frozen at freeze, absorbed into G(N) as v0.
+    let fx = db.layered_store().unwrap().create_node(&["Person"]);
+    db.layered_store()
+        .unwrap()
+        .set_node_property(fx, "name", Value::from("frozen-v0"));
+
+    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    assert!(
+        handle.freeze.overlay_node_ids.contains(&fx.as_u64()),
+        "the overlay node must be part of the freeze identity"
+    );
+
+    // Post-freeze N+1 re-mutation of the SAME frozen entity: v0 → v1.
+    db.layered_store()
+        .unwrap()
+        .set_node_property(fx, "name", Value::from("frozen-v1"));
+
+    let report = db
+        .complete_epoch_handoff(
+            handle,
+            generation_build_request(&gen_root, "hand-frozen-mod"),
+        )
+        .expect("complete handoff");
+    assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
+    // The propagated identity MUST record the frozen entity's N+1 re-mutation
+    // — this is the exact set the repair predicate retains dirty for.
+    assert!(
+        report.post_freeze_nodes.contains(&fx.as_u64()),
+        "post-freeze re-mutation of an already-dirty frozen node must be recorded"
+    );
+    assert!(
+        report.freeze_node_ids.contains(&fx.as_u64()),
+        "the frozen identity must be propagated"
+    );
+
+    // The handoff generation holds the FROZEN payload only.
+    let gen_abs = report
+        .publication
+        .as_ref()
+        .expect("publication")
+        .generation_abs_path
+        .clone();
+    let gen_names = generation_person_names(&gen_abs);
+    assert!(gen_names.contains(&"frozen-v0".to_string()));
+    assert!(!gen_names.contains(&"frozen-v1".to_string()));
+
+    // 5d repair swap with the propagated post-freeze identity.
+    let new_base = open_generation_base(&gen_abs);
+    db.layered_store().unwrap().swap_base_and_repair_overlay(
+        new_base,
+        &frozen_to_node_ids(&report.freeze_node_ids),
+        &frozen_to_edge_ids(&report.freeze_edge_ids),
+        &frozen_to_node_ids(&report.post_freeze_nodes),
+        &frozen_to_edge_ids(&report.post_freeze_edges),
+    );
+
+    // The N+1 re-mutation MUST win: v1 exactly once, no stale v0.
+    let mut live = live_person_names(&db);
+    live.sort();
+    assert_eq!(
+        live,
+        vec!["frozen-v1".to_string(), "p-base".to_string()],
+        "post-freeze re-mutation of a FROZEN node must survive the repair swap"
+    );
+}
+
+/// Bug 1 class B — a frozen overlay entity deleted post-freeze must stay
+/// hidden after the repair swap (the new base still holds its frozen copy).
+#[test]
+fn repair_swap_hides_post_freeze_deletion_of_frozen_node() {
+    if std::env::var(MEM_CHILD_ENV).is_ok() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let gen_root = dir.path().join("live.grafeo.d");
+    fs::create_dir_all(&gen_root).unwrap();
+
+    let mut db = GrafeoDB::new_in_memory();
+    db.create_node_with_props(&["Person"], [("name", Value::from("p-base"))])
+        .expect("base node");
+    db.compact().expect("compact");
+    let ctl =
+        Arc::new(OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"));
+    db.install_overlay_admission(Arc::clone(&ctl));
+
+    // Epoch N overlay create, frozen at freeze.
+    let fx = db.layered_store().unwrap().create_node(&["Person"]);
+    db.layered_store()
+        .unwrap()
+        .set_node_property(fx, "name", Value::from("frozen-doomed"));
+
+    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    assert!(handle.freeze.overlay_node_ids.contains(&fx.as_u64()));
+
+    // Post-freeze N+1 deletion of the frozen entity.
+    assert!(
+        db.layered_store().unwrap().delete_node(fx),
+        "post-freeze delete of the frozen node"
+    );
+
+    let report = db
+        .complete_epoch_handoff(
+            handle,
+            generation_build_request(&gen_root, "hand-frozen-del"),
+        )
+        .expect("complete handoff");
+    // The propagated identity MUST record the frozen entity's N+1 deletion —
+    // the repair predicate relies on it to keep the entity hidden.
+    assert!(
+        report.post_freeze_nodes.contains(&fx.as_u64()),
+        "post-freeze deletion of an already-dirty frozen node must be recorded"
+    );
+    let gen_abs = report
+        .publication
+        .as_ref()
+        .expect("publication")
+        .generation_abs_path
+        .clone();
+    // The frozen payload is baked into G(N) — the swap must still hide it.
+    assert!(generation_person_names(&gen_abs).contains(&"frozen-doomed".to_string()));
+
+    let new_base = open_generation_base(&gen_abs);
+    db.layered_store().unwrap().swap_base_and_repair_overlay(
+        new_base,
+        &frozen_to_node_ids(&report.freeze_node_ids),
+        &frozen_to_edge_ids(&report.freeze_edge_ids),
+        &frozen_to_node_ids(&report.post_freeze_nodes),
+        &frozen_to_edge_ids(&report.post_freeze_edges),
+    );
+
+    assert_eq!(
+        live_person_names(&db),
+        vec!["p-base".to_string()],
+        "post-freeze deletion of a FROZEN node must not resurrect after the repair swap"
     );
 }
 
@@ -534,8 +702,6 @@ fn repeated_cycles_with_concurrent_readers() {
             let retry = db
                 .freeze_epoch_for_handoff(&gen_root)
                 .expect("re-freeze after failure");
-            let frozen_node_set = retry.freeze.overlay_node_ids.clone();
-            let frozen_edge_set = retry.freeze.overlay_edge_ids.clone();
             let n1_name = format!("c{cycle}-n1");
             let n1 = db.layered_store().unwrap().create_node(&["Person"]);
             db.layered_store()
@@ -557,8 +723,10 @@ fn repeated_cycles_with_concurrent_readers() {
             let new_base = open_generation_base(&gen_abs);
             db.layered_store().unwrap().swap_base_and_repair_overlay(
                 new_base,
-                &frozen_to_node_ids(&frozen_node_set),
-                &frozen_to_edge_ids(&frozen_edge_set),
+                &frozen_to_node_ids(&report.freeze_node_ids),
+                &frozen_to_edge_ids(&report.freeze_edge_ids),
+                &frozen_to_node_ids(&report.post_freeze_nodes),
+                &frozen_to_edge_ids(&report.post_freeze_edges),
             );
             assert_eq!(
                 live_person_names(&db),
@@ -606,8 +774,6 @@ fn repeated_cycles_with_concurrent_readers() {
             // base-miss path until the NEXT cycle absorbs it into the base.
             let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
             assert!(db.epoch_handoff_active());
-            let frozen_node_set = handle.freeze.overlay_node_ids.clone();
-            let frozen_edge_set = handle.freeze.overlay_edge_ids.clone();
             // Post-freeze N+1 create (accepted working set that must survive
             // the swap through the retained-N+1 base-miss path).
             let n1_name = format!("c{cycle}-n1");
@@ -635,8 +801,10 @@ fn repeated_cycles_with_concurrent_readers() {
             let new_base = open_generation_base(&gen_abs);
             db.layered_store().unwrap().swap_base_and_repair_overlay(
                 new_base,
-                &frozen_to_node_ids(&frozen_node_set),
-                &frozen_to_edge_ids(&frozen_edge_set),
+                &frozen_to_node_ids(&report.freeze_node_ids),
+                &frozen_to_edge_ids(&report.freeze_edge_ids),
+                &frozen_to_node_ids(&report.post_freeze_nodes),
+                &frozen_to_edge_ids(&report.post_freeze_edges),
             );
             assert_eq!(
                 live_person_names(&db),
