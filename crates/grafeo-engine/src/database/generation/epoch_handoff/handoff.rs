@@ -164,6 +164,12 @@ impl GrafeoDB {
             self.capture_frozen_overlay_payloads(frozen_epoch)?;
 
         // Snapshot frozen retained accounting (both frozen + next count later).
+        // NOTE(5d closeout): `frozen_retained_bytes` is write-only — it is
+        // computed here and propagated into `OverlayHandoffLive` and
+        // `FrozenEpochHandle`, but has zero readers in the workspace
+        // (grep -rn frozen_retained_bytes crates/ confirms). It is kept as a
+        // 5c observational hook (source logic, do not delete); candidate for
+        // a future packet to wire into reporting/diagnostics or remove.
         let mut frozen_category_bytes = [0u64; RetainedCategory::COUNT];
         let mut frozen_retained_bytes = 0u64;
         if let Some(ctl) = self.overlay_admission() {

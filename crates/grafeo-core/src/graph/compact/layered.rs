@@ -656,9 +656,29 @@ impl LayeredStore {
     /// The swap+reset is atomic **as a store operation**: under `merge_guard
     /// .write()`, a concurrent `GraphStoreMut` mutation either (a) completes
     /// entirely before this swap begins — it lands in the old base/overlay — or
-    /// (b) starts entirely after — it lands in the fresh reset overlay. No writer
-    /// observes an intermediate "base swapped, overlay not yet reset" state, and
-    /// readers never see a torn base (`base`/`overlay` are `ArcSwap`).
+    /// (b) starts entirely after — it lands in the fresh reset overlay. No
+    /// writer observes an intermediate "base swapped, overlay not yet reset"
+    /// state. Every *individual* reader load is likewise untorn
+    /// (`base`/`overlay` are `ArcSwap`) — but that is a weaker guarantee than
+    /// it sounds; see the reader-precision section below.
+    ///
+    /// ## Reader precision (what the atomic store op does NOT give readers)
+    ///
+    /// `base`, `overlay`, and the dirty/deletion bookkeeping are three
+    /// separate atomics, not one snapshot. A lock-free reader performing the
+    /// check-then-act sequence (read the dirty-set, then `overlay.load()`,
+    /// then the base) spans multiple independent loads, and a swap+reset may
+    /// land between them: the dirty-set load sees the pre-swap "dirty" mark,
+    /// `overlay.load()` picks up the post-reset EMPTY overlay, and the entity
+    /// — in fact resident in the new base — is reported in neither. Such a
+    /// reader can therefore observe a transient `None` for an entity the new
+    /// base does contain. The writer side remains atomic (mutators serialize
+    /// under `merge_guard`); only the reader's multi-load sequence races.
+    /// This is exactly why the concurrent-reader cycle test
+    /// (`repeated_cycles_with_concurrent_readers` in
+    /// tests/compact_store_writable_cycles.rs) asserts `min_observed <=
+    /// max_observed` over its in-flight reads and demands exactness only on
+    /// the single final stable read taken after the writer has quiesced.
     ///
     /// **But it does NOT make a lost write impossible**: a mutation that commits
     /// *between* the build's freeze capture (`generation_freeze_epoch`/`build()`
@@ -669,6 +689,14 @@ impl LayeredStore {
     /// steady from WAL-cut through `begin_epoch_handoff`. Callers MUST only swap
     /// to a base that is a complete snapshot of the overlay at the freeze
     /// instant, with no writes admitted between freeze and swap.
+    // Reader-precision note (G-EM0.5d closeout): the writer-side swap+reset is
+    // atomic as a store operation (mutators serialize under `merge_guard`), but
+    // base/overlay/dirty are three separate atomics, not one snapshot: a reader
+    // spanning them in a check-then-act sequence (dirty-set -> overlay.load()
+    // -> base) can observe a transient `None` for an entity that is in fact
+    // resident in the new base. See the doc above; the concurrent-reader cycle
+    // test asserts min<=max over in-flight reads and exactness only on the
+    // final stable read. No code change — documentation precision only.
     #[cfg(feature = "lpg")]
     pub fn swap_base_and_reset_overlay(&self, new_base: Arc<CompactStore>) -> Arc<CompactStore> {
         let _barrier = self.merge_guard.write();

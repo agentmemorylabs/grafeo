@@ -1010,6 +1010,22 @@ const MEM_CHILD_ENV: &str = "GRAFEO5D_MEM_CHILD";
 /// Uses the production streaming path (`build_and_publish_generation`), buffers
 /// the base pre-build (so baseline RssAnon is excluded), and starts the peak
 /// sampler after that buffer is dropped.
+///
+/// # Sampling bounds (G-EM0.5d closeout — MINOR-4 disclosure)
+///
+/// The gate is "sampled peak increment <= `max_anon_bytes` cap", anchored by
+/// the generation-bytes (4.03x) and base-floor (~4x) ratio asserts in
+/// `n_vs_4n_transient_build_boundedness` — it is NOT continuous
+/// instrumentation, and both measurement choices bias the increment DOWNWARD:
+///
+/// 1. `base_floor` is the MAX of 8 samples over a settle window, which biases
+///    `build_increment` DOWNWARD (floor too high -> increment too low).
+/// 2. The 8 ms sampler makes the captured `peak` a LOWER bound of the true
+///    transient RssAnon peak (a sub-8 ms spike can fall between samples).
+///
+/// So the reported increment is a lower-bound estimate of the true transient
+/// by construction in both directions; the ratio asserts are what keep the
+/// methodology honest. Gates intentionally unchanged.
 fn mem_build_child_direction(base_nodes: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1099,6 +1115,14 @@ fn mem_build_child_direction(base_nodes: usize) {
 /// Spawn one isolated child process per base scale so N and 4N never share a
 /// process (the same-process N-then-4N baseline-inflation artifact this lane
 /// burned; see `n_vs_4n_peak_memory.rs`). No allocator-trim, no `drop_caches`.
+//
+// Sampling-bound disclosure (G-EM0.5d closeout — MINOR-4): `base_floor` is
+// taken as the MAX of 8 samples, which biases `build_increment` DOWNWARD, and
+// the 8 ms sampler makes the captured peak a LOWER bound of the true transient
+// peak. The gate is therefore "sampled peak increment <= `max_anon_bytes`
+// cap", anchored by the generation-bytes (4.03x) and base-floor (~4x) ratio
+// asserts in `n_vs_4n_transient_build_boundedness` — NOT continuous
+// instrumentation. Gates kept as-is.
 fn spawn_mem_build_child(base_nodes: usize) -> BuildPeakReport {
     let exe = std::env::current_exe().expect("current exe");
     let output = std::process::Command::new(exe)
