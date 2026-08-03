@@ -43,6 +43,13 @@ pub mod manifest;
 pub mod ownership;
 pub mod publication;
 pub mod recovery;
+#[cfg(all(
+    feature = "wal",
+    feature = "lpg",
+    feature = "generation",
+    feature = "compact-store"
+))]
+pub mod replay;
 pub mod retirement;
 
 #[cfg(all(
