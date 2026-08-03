@@ -926,7 +926,7 @@ impl GrafeoDB {
         #[cfg(feature = "cdc")]
         let cdc_enabled_val = false;
         #[cfg(feature = "cdc")]
-        let cdc_retention = crate::config::CdcRetention::default();
+        let cdc_retention = crate::cdc::CdcRetentionConfig::default();
 
         let mut db = Self {
             config: Config::persistent(root),
