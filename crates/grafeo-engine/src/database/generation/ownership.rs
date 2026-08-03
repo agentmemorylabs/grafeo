@@ -249,3 +249,71 @@ impl RootOwnership {
         }
     }
 }
+
+/// Writable generation-root ownership for a live `GrafeoDB` (H-ADOPT.2).
+///
+/// Bundles the two things a live production database must retain for its
+/// entire open lifetime so nothing is released early:
+///
+/// - [`RootOwnership`]: the W0 Option-S exclusive root lock (`root.lock`) and
+///   the validated selected generation / WAL boundary. Held until drop.
+/// - [`GenerationLeaseRegistry`]: the in-process owner of the selected
+///   mmap-backed base generation. Retiring/leasing correctness depends on the
+///   registry (and thus the base mapping) outliving every reader.
+///
+/// A `GrafeoDB` opened as a generation root carries one of these in
+/// `GrafeoDB::generation_root`; legacy and in-memory databases carry `None`.
+/// Dropping it (with the database) releases the lock and lets the base mapping
+/// be unmapped once the last lease drains — exactly the W0 close contract.
+#[cfg(feature = "mmap")]
+#[derive(Debug)]
+pub struct GenerationRootOwnership {
+    /// Process ownership of the root (lock + validated selected generation).
+    ownership: RootOwnership,
+    /// The in-process lease registry holding the selected mmap-backed base.
+    registry: std::sync::Arc<super::lease::GenerationLeaseRegistry>,
+}
+
+#[cfg(feature = "mmap")]
+impl GenerationRootOwnership {
+    /// Open a generation root for a live database: acquire the exclusive lock,
+    /// validate the selected generation, then install the lease registry on it.
+    ///
+    /// `mode` controls observability only — both modes take the same exclusive
+    /// kernel lock (packet requirement 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OwnershipError`] when the root cannot be locked or no valid
+    /// generation exists; returns `grafeo_common::utils::error::Error` when the
+    /// selected generation container cannot be opened, mapped, or deserialized
+    /// (never serves a torn generation).
+    pub fn open(root: &Path, mode: OpenMode) -> Result<Self, grafeo_common::utils::error::Error> {
+        let ownership = match mode {
+            OpenMode::Writable => RootOwnership::open(root),
+            OpenMode::ReadOnly => RootOwnership::open_read_only(root),
+        }
+        .map_err(|e| grafeo_common::utils::error::Error::Internal(e.to_string()))?;
+
+        let selected = ownership.selected();
+        let registry = super::lease::GenerationLeaseRegistry::from_selected(
+            selected.slot.publication_sequence,
+            selected.slot.generation_id.clone(),
+            selected.generation_abs_path.clone(),
+        )?;
+
+        Ok(Self { ownership, registry })
+    }
+
+    /// The process ownership (root lock + validated selected generation).
+    #[must_use]
+    pub fn ownership(&self) -> &RootOwnership {
+        &self.ownership
+    }
+
+    /// The in-process lease registry holding the selected base.
+    #[must_use]
+    pub fn registry(&self) -> &std::sync::Arc<super::lease::GenerationLeaseRegistry> {
+        &self.registry
+    }
+}
