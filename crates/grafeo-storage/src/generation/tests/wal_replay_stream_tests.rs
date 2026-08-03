@@ -657,10 +657,22 @@ fn replay_stream_rotated_file_ending_tx_open_is_incomplete_transaction() {
     let dir = wal.dir().to_path_buf();
     let seq0 = wal.current_sequence() - 1;
     let mut stream = replay_stream_from(&dir, &cursor_at(seq0, 0)).expect("stream opens");
+    // The rotated file's uncommitted data frame is yielded first; the error
+    // arrives at the rotated file's EOF with a transaction still open.
+    match stream.next() {
+        Some(Ok(frame)) => {
+            assert_eq!(frame.log_sequence, seq0);
+            assert_eq!(frame.byte_offset, 0);
+        }
+        other => panic!("expected the rotated file's data frame first, got {other:?}"),
+    }
     match stream.next() {
         Some(Err(WalCursorError::IncompleteTransaction(seq))) => assert_eq!(seq, seq0),
         other => panic!("expected IncompleteTransaction, got {other:?}"),
     }
+    // Fused after error; no clean termination.
+    assert!(stream.next().is_none());
+    assert_eq!(stream.stopped_at(), None);
 }
 
 #[test]
