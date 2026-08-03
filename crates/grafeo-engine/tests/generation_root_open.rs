@@ -206,3 +206,69 @@ fn generation_root_empty_base_first_write_starts_at_zero() {
     assert_eq!(edge.src, a);
     assert_eq!(edge.dst, b);
 }
+
+/// H-ADOPT.3 Phase C (D1 + amendment 2): query writes made through a session
+/// on a writable generation root must reach the root's WAL. The layered
+/// session branch must carry a WAL-logging write store plus commit/epoch
+/// logging; without that wiring nothing is durable and a reopen cannot
+/// replay anything.
+#[test]
+fn layered_session_query_writes_are_wal_logged() {
+    use grafeo_storage::generation::manifest::read_manifest;
+    use grafeo_storage::generation::wal_cursor::{WalReplayCursor, replay_stream_from};
+    use grafeo_storage::wal::WalRecord;
+
+    let dir = tempdir().expect("temp dir");
+    let root = dir.path().join("wal-logged.grafeo.d");
+    std::fs::create_dir_all(&root).expect("create generation root");
+
+    let source = GrafeoDB::new_in_memory();
+    source
+        .build_and_publish_generation(generation_build_request(&root, "wal-logged-g1"))
+        .expect("publish empty generation");
+    drop(source);
+
+    {
+        let db =
+            GrafeoDB::open_generation_root(&root, false).expect("open generation root writable");
+        db.session()
+            .execute("INSERT (:Person {name: 'Ada'})")
+            .expect("insert through layered session");
+    }
+
+    // Scan the root WAL from the durable publication boundary: the session
+    // writes must appear as committed, epoch-advanced records.
+    let (_, slot) = read_manifest(&root.join("manifest.bin")).expect("read manifest");
+    let cursor = WalReplayCursor {
+        log_sequence: slot.wal_log_sequence,
+        byte_offset: slot.wal_byte_offset,
+        epoch: slot.overlay_epoch,
+        transaction_id: slot.transaction_id,
+    };
+    let stream = replay_stream_from(&root.join("wal"), &cursor).expect("stream from boundary");
+
+    let mut saw_create_node = false;
+    let mut saw_commit = false;
+    let mut saw_epoch_advance = false;
+    for frame in stream {
+        let frame = frame.expect("post-boundary frame decodes");
+        match frame.record {
+            WalRecord::CreateNode { .. } => saw_create_node = true,
+            WalRecord::TransactionCommit { .. } => saw_commit = true,
+            WalRecord::EpochAdvance { .. } => saw_epoch_advance = true,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_create_node,
+        "layered session INSERT must log CreateNode to the root WAL"
+    );
+    assert!(
+        saw_commit,
+        "layered session auto-commit must log TransactionCommit to the root WAL"
+    );
+    assert!(
+        saw_epoch_advance,
+        "layered session auto-commit must log EpochAdvance to the root WAL"
+    );
+}
