@@ -318,7 +318,16 @@ pub struct GrafeoDB {
     /// S: owned for the DB lifetime) and the `GenerationLeaseRegistry` (owns the
     /// selected mmap-backed base generation), so neither is released while the
     /// database is open. `None` for legacy single-file and in-memory databases.
-    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    ///
+    /// H-ADOPT.2 review M-2: the gate must include `mmap` — the constructor,
+    /// the re-export, and the `GenerationRootOwnership` type itself all
+    /// require `mmap` (the base generation is always mmap-backed).
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
     generation_root: Option<generation::GenerationRootOwnership>,
 }
 
@@ -788,7 +797,12 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
-            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
             generation_root: None,
             #[cfg(all(
                 feature = "generation",
@@ -1003,7 +1017,12 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
-            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
             generation_root: None,
             #[cfg(all(
                 feature = "generation",
@@ -1055,6 +1074,50 @@ impl GrafeoDB {
             .store
             .as_ref()
             .ok_or_else(|| Error::Internal("open_generation_root: no LpgStore overlay".into()))?;
+
+        // H-ADOPT.2 review M-1: this is a fresh overlay, unlike the
+        // deserialized overlay in wire_layered_after_load. Seed both ID
+        // allocators above the mapped base's preserved original-ID maxima
+        // before publishing the layered store to any writer.
+        //
+        // A generation base must preserve source IDs. Fail closed if a
+        // non-empty base lacks preserved-ID metadata or if the maximum has no
+        // valid successor (arithmetic overflow or the invalid-ID sentinel);
+        // wrapping either allocator would collide with base data.
+        let next_node_id = match base.max_preserved_node_id() {
+            Some(max) => max
+                .checked_add(1)
+                .filter(|next| *next != grafeo_common::types::NodeId::INVALID.as_u64())
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "open_generation_root: base node ID maximum {max} has no valid successor; cannot seed overlay allocator"
+                    ))
+                })?,
+            None if base.total_nodes() == 0 => 0,
+            None => {
+                return Err(Error::Internal(
+                    "open_generation_root: non-empty base has no preserved node IDs".into(),
+                ));
+            }
+        };
+        let next_edge_id = match base.max_preserved_edge_id() {
+            Some(max) => max
+                .checked_add(1)
+                .filter(|next| *next != grafeo_common::types::EdgeId::INVALID.as_u64())
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "open_generation_root: base edge ID maximum {max} has no valid successor; cannot seed overlay allocator"
+                    ))
+                })?,
+            None if base.total_edges() == 0 => 0,
+            None => {
+                return Err(Error::Internal(
+                    "open_generation_root: non-empty base has no preserved edge IDs".into(),
+                ));
+            }
+        };
+        overlay_store.set_next_node_id(next_node_id);
+        overlay_store.set_next_edge_id(next_edge_id);
 
         let layered = Arc::new(LayeredStore::with_overlay(base, Arc::clone(overlay_store)));
 
@@ -1181,7 +1244,12 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
-            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
             generation_root: None,
             #[cfg(all(
                 feature = "generation",
@@ -1285,7 +1353,12 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
-            #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
             generation_root: None,
             #[cfg(all(
                 feature = "generation",

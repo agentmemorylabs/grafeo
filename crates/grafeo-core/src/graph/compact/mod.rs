@@ -414,6 +414,36 @@ impl CompactStore {
         self.node_id_map.is_some() || self.mapped_node_id_lookup.is_some()
     }
 
+    /// The largest preserved original node ID in this store, if any.
+    ///
+    /// Heap-map form (in-memory build via [`from_graph_store_preserving_ids`])
+    /// scans the map keys; the mapped v5 form is sorted ascending by ID
+    /// (validated at load), so the last record is the maximum in O(1).
+    /// Returns `None` when the store preserves no node IDs.
+    ///
+    /// Used to seed overlay ID allocators above the base maxima before the
+    /// first overlay write (H-ADOPT.2 review M-1).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn max_preserved_node_id(&self) -> Option<u64> {
+        if let Some(ref map) = self.node_id_map {
+            return map.keys().map(|id| id.as_u64()).max();
+        }
+        self.mapped_node_id_lookup.as_ref()?.max_id()
+    }
+
+    /// The largest preserved original edge ID in this store, if any.
+    ///
+    /// Same semantics as [`max_preserved_node_id`](Self::max_preserved_node_id).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn max_preserved_edge_id(&self) -> Option<u64> {
+        if let Some(ref map) = self.edge_id_map {
+            return map.keys().map(|id| id.as_u64()).max();
+        }
+        self.mapped_edge_id_lookup.as_ref()?.max_id()
+    }
+
     /// Attaches ID maps to an already-built `CompactStore`.
     pub(crate) fn set_id_maps(
         &mut self,
