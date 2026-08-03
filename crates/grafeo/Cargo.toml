@@ -75,6 +75,8 @@ spill = ["grafeo-engine/spill"]
 mmap = ["grafeo-engine/mmap"]
 temporal = ["grafeo-engine/temporal"]  # Append-only versioned properties
 compact-store = ["grafeo-engine/compact-store"]  # CompactStore: columnar graph for read-only workloads
+generation = ["grafeo-engine/generation"]  # Immutable generation roots (W): container writer + lease/recovery
+generation-streaming = ["grafeo-engine/generation-streaming"]  # W bounded out-of-core generation build (G-EM0.5b)
 grafeo-file = ["grafeo-engine/grafeo-file"]  # Single-file .grafeo database format
 async-storage = ["grafeo-engine/async-storage"]  # Async WAL and storage backend
 
