@@ -1559,6 +1559,7 @@ dependencies = [
  "hashbrown 0.17.0",
  "hf-hub",
  "indexmap",
+ "libc",
  "md5",
  "memmap2",
  "ort",
