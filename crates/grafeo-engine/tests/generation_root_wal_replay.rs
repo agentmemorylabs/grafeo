@@ -378,6 +378,54 @@ fn sigkill_reopen_retains_committed() {
     assert_eq!(edge_count, 1, "edge count = base KNOWS edge only");
 }
 
+/// H-ADOPT.3 Phase D proof 2: repeated reopen is deterministic. Each open
+/// replays the same post-boundary WAL into a fresh overlay; with a clean tail
+/// no WAL mutation happens at open, so every cycle observes identical state.
+#[test]
+fn repeated_reopen_identical() {
+    let dir = tempdir().expect("temp dir");
+    let root = dir.path().join("reopen-determinism.grafeo.d");
+    std::fs::create_dir_all(&root).expect("create generation root");
+    publish_base(&root, "reopen-g1");
+
+    // Commit K nodes through a writable session, then close cleanly.
+    {
+        let db =
+            GrafeoDB::open_generation_root(&root, false).expect("open generation root writable");
+        let session = db.session();
+        for i in 0..REOPEN_COMMITTED {
+            session
+                .execute(&format!("INSERT (:Person {{name: 'reopen-{i}'}})"))
+                .unwrap_or_else(|e| panic!("insert reopen-{i} failed: {e}"));
+        }
+    }
+
+    let mut reference: Option<(Vec<String>, usize, usize)> = None;
+    for cycle in 0..REOPEN_CYCLES {
+        let db = GrafeoDB::open_generation_root(&root, false)
+            .unwrap_or_else(|e| panic!("reopen cycle {cycle} failed: {e}"));
+        let state = observable_state(&db);
+        match &reference {
+            None => reference = Some(state),
+            Some(first) => assert_eq!(
+                &state, first,
+                "reopen cycle {cycle} diverged from the first observable state"
+            ),
+        }
+        drop(db);
+    }
+
+    let (names, node_count, edge_count) = reference.expect("at least one cycle ran");
+    let mut expected: Vec<String> = vec!["Ada".to_string(), "Grace".to_string()];
+    for i in 0..REOPEN_COMMITTED {
+        expected.push(format!("reopen-{i}"));
+    }
+    expected.sort_unstable();
+    assert_eq!(names, expected, "every reopen serves the committed writes");
+    assert_eq!(node_count, 2 + REOPEN_COMMITTED);
+    assert_eq!(edge_count, 1);
+}
+
 /// Re-exec this test binary as a child that opens `root` writable (the
 /// constructor replays the WAL tail) and prints `RSS_ANON_KB=<n>`.
 fn spawn_replay_child(root: &std::path::Path) -> String {
