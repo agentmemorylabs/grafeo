@@ -311,6 +311,24 @@ pub struct GrafeoDB {
         feature = "generation-streaming"
     ))]
     epoch_handoff: generation::EpochHandoffCoordinator,
+    /// Writable generation-root ownership (H-ADOPT.2).
+    ///
+    /// Present only when this `GrafeoDB` was opened as a generation root via
+    /// [`GrafeoDB::open_generation_root`]. Holds the exclusive `RootLock` (Option
+    /// S: owned for the DB lifetime) and the `GenerationLeaseRegistry` (owns the
+    /// selected mmap-backed base generation), so neither is released while the
+    /// database is open. `None` for legacy single-file and in-memory databases.
+    ///
+    /// H-ADOPT.2 review M-2: the gate must include `mmap` — the constructor,
+    /// the re-export, and the `GenerationRootOwnership` type itself all
+    /// require `mmap` (the base generation is always mmap-backed).
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
+    generation_root: Option<generation::GenerationRootOwnership>,
 }
 
 impl GrafeoDB {
@@ -783,6 +801,13 @@ impl GrafeoDB {
                 feature = "generation",
                 feature = "lpg",
                 feature = "compact-store",
+                feature = "mmap"
+            ))]
+            generation_root: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
                 feature = "generation-streaming"
             ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
@@ -847,6 +872,280 @@ impl GrafeoDB {
         db.apply_force_disk_overrides();
 
         Ok(db)
+    }
+
+    /// Opens a database backed by an immutable **generation root** (W / H-ADOPT.2).
+    ///
+    /// Unlike [`with_config`](Self::with_config) (which opens a single-file
+    /// `.grafeo` as an eager `LpgStore`, or reconstructs a `LayeredStore` from a
+    /// compacted *section file*), this opens a **directory-format generation
+    /// root** (`<logical>.grafeo.d/`): acquires the exclusive W0 root lock,
+    /// validates the selected published generation via W0 triple-validation
+    /// recovery, mmaps its `CompactStore` section as the read-only base, and
+    /// serves reads through a fresh `LayeredStore` (base + empty overlay).
+    ///
+    /// The layered store is installed as the external read **and** write store,
+    /// so production queries and CRUD route through the layered path (base +
+    /// overlay) rather than a raw `LpgStore`. The `RootLock` and
+    /// `GenerationLeaseRegistry` are retained on the database for its entire
+    /// open lifetime — neither the lock nor the base mapping is released early.
+    ///
+    /// **Fail closed:** any lock / recovery / container-open / decode error is
+    /// returned; it never silently falls back to an eager LPG open when asked
+    /// for a generation root.
+    ///
+    /// # Feature gate
+    ///
+    /// Available with `all(generation, lpg, compact-store, mmap)`; the lease
+    /// registry and zero-copy base require mmap.
+    ///
+    /// # WAL-replay status (H-ADOPT.3)
+    ///
+    /// Durable WAL written **after** the selected boundary is **not yet
+    /// replayed** into the overlay on open (see
+    /// `generation::recovery`); the database opens at the selected boundary
+    /// with an empty overlay until H-ADOPT.3 lands. A marker is emitted here so
+    /// the account graph does not silently adopt this before replay exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root cannot be exclusively locked, no valid
+    /// generation exists, or the selected generation container cannot be
+    /// opened / mapped / deserialized.
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store", feature = "mmap"))]
+    pub fn open_generation_root(root: impl AsRef<Path>, read_only: bool) -> Result<Self> {
+        let config = if read_only {
+            Config::read_only(root.as_ref())
+        } else {
+            Config::persistent(root.as_ref())
+        };
+        Self::open_generation_root_with_config(config)
+    }
+
+    /// Opens a generation root while preserving the caller's complete engine
+    /// configuration (memory budget, spill/tier policy, query settings, WAL
+    /// durability, CDC, and access mode).
+    ///
+    /// AMH production callers use this form so the single open funnel applies
+    /// the same resource policy to eager and generation-root databases.
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store", feature = "mmap"))]
+    pub fn open_generation_root_with_config(config: Config) -> Result<Self> {
+        config
+            .validate()
+            .map_err(|e| grafeo_common::utils::error::Error::Internal(e.to_string()))?;
+        let root = config.path.clone().ok_or_else(|| {
+            Error::Internal("generation-root open requires a database path".into())
+        })?;
+        let read_only = config.access_mode == crate::config::AccessMode::ReadOnly;
+        let mode = if read_only {
+            generation::OpenMode::ReadOnly
+        } else {
+            generation::OpenMode::Writable
+        };
+
+        // Acquire the lock + validate + install the lease registry (mmap base).
+        let ownership = generation::GenerationRootOwnership::open(&root, mode)?;
+
+        // Fresh overlay + shared engine state (no single-file path is touched).
+        let store = Arc::new(LpgStore::new()?);
+        #[cfg(feature = "triple-store")]
+        let rdf_store = Arc::new(RdfStore::new());
+        let transaction_manager = Arc::new(TransactionManager::new());
+        let buffer_manager = BufferManager::new(BufferManagerConfig {
+            budget: config.memory_limit.unwrap_or_else(|| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let budget =
+                    (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize;
+                budget
+            }),
+            spill_path: config.spill_path.clone().or_else(|| {
+                let parent = root.parent()?;
+                let name = root.file_name()?.to_str()?;
+                Some(parent.join(format!("{name}.spill")))
+            }),
+            ..BufferManagerConfig::default()
+        });
+        let catalog = Arc::new(Catalog::new());
+        let query_cache = Arc::new(QueryCache::default());
+
+        #[cfg(feature = "cdc")]
+        let cdc_enabled_val = config.cdc_enabled;
+        #[cfg(feature = "cdc")]
+        let cdc_retention = config.cdc_retention.clone();
+
+        let mut db = Self {
+            config,
+            #[cfg(feature = "lpg")]
+            store: Some(store),
+            catalog,
+            #[cfg(feature = "triple-store")]
+            rdf_store,
+            transaction_manager,
+            buffer_manager,
+            #[cfg(feature = "wal")]
+            wal: None,
+            #[cfg(feature = "wal")]
+            wal_graph_context: Arc::new(parking_lot::Mutex::new(None)),
+            query_cache,
+            commit_counter: Arc::new(AtomicUsize::new(0)),
+            is_open: RwLock::new(true),
+            #[cfg(feature = "cdc")]
+            cdc_log: Arc::new(crate::cdc::CdcLog::with_retention(cdc_retention)),
+            #[cfg(feature = "cdc")]
+            cdc_enabled: std::sync::atomic::AtomicBool::new(cdc_enabled_val),
+            #[cfg(feature = "embed")]
+            embedding_models: RwLock::new(hashbrown::HashMap::new()),
+            #[cfg(feature = "grafeo-file")]
+            file_manager: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
+            checkpoint_timer: parking_lot::Mutex::new(None),
+            #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+            vector_spill_storages: None,
+            external_read_store: None,
+            external_write_store: None,
+            #[cfg(feature = "metrics")]
+            metrics: Some(Arc::new(crate::metrics::MetricsRegistry::new())),
+            current_graph: RwLock::new(None),
+            current_schema: RwLock::new(None),
+            read_only,
+            projections: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+            compact_backing: None,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            overlay_admission: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
+            generation_root: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "generation-streaming"
+            ))]
+            epoch_handoff: generation::EpochHandoffCoordinator::new(),
+        };
+
+        // H-ADOPT.3 marker: no post-boundary WAL replay yet. The overlay opens
+        // empty at the selected boundary; replay lands in its own packet.
+        grafeo_warn!(
+            "generation-root open at selected boundary with empty overlay: \
+             post-boundary WAL replay not yet implemented (H-ADOPT.3). \
+             Do not wire the account graph onto this path before replay lands."
+        );
+
+        // Wire the layered store over the mmap base + fresh overlay, then retain
+        // the ownership (lock + registry) on the database for its lifetime.
+        let base = ownership.registry().snapshot().store();
+        db.wire_generation_layered(base)?;
+        db.generation_root = Some(ownership);
+
+        db.register_section_consumers();
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        db.discard_stale_vector_spill_files();
+        db.apply_force_disk_overrides();
+        Ok(db)
+    }
+
+    /// Installs the `LayeredStore` over a generation base + this database's
+    /// fresh overlay, mirroring [`wire_layered_after_load`](Self::wire_layered_after_load)
+    /// but sourcing the base from a lease snapshot (no on-disk deletion log —
+    /// a generation root starts at the selected boundary).
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store", feature = "mmap"))]
+    fn wire_generation_layered(
+        &mut self,
+        base: Arc<grafeo_core::graph::compact::CompactStore>,
+    ) -> Result<()> {
+        use grafeo_core::graph::compact::layered::LayeredStore;
+
+        let overlay_store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| Error::Internal("open_generation_root: no LpgStore overlay".into()))?;
+
+        // H-ADOPT.2 review M-1: this is a fresh overlay, unlike the
+        // deserialized overlay in wire_layered_after_load. Seed both ID
+        // allocators above the mapped base's preserved original-ID maxima
+        // before publishing the layered store to any writer.
+        //
+        // A generation base must preserve source IDs. Fail closed if a
+        // non-empty base lacks preserved-ID metadata or if the maximum has no
+        // valid successor (arithmetic overflow or the invalid-ID sentinel);
+        // wrapping either allocator would collide with base data.
+        let next_node_id = match base.max_preserved_node_id() {
+            Some(max) => max
+                .checked_add(1)
+                .filter(|next| *next != grafeo_common::types::NodeId::INVALID.as_u64())
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "open_generation_root: base node ID maximum {max} has no valid successor; cannot seed overlay allocator"
+                    ))
+                })?,
+            None if base.total_nodes() == 0 => 0,
+            None => {
+                return Err(Error::Internal(
+                    "open_generation_root: non-empty base has no preserved node IDs".into(),
+                ));
+            }
+        };
+        let next_edge_id = match base.max_preserved_edge_id() {
+            Some(max) => max
+                .checked_add(1)
+                .filter(|next| *next != grafeo_common::types::EdgeId::INVALID.as_u64())
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "open_generation_root: base edge ID maximum {max} has no valid successor; cannot seed overlay allocator"
+                    ))
+                })?,
+            None if base.total_edges() == 0 => 0,
+            None => {
+                return Err(Error::Internal(
+                    "open_generation_root: non-empty base has no preserved edge IDs".into(),
+                ));
+            }
+        };
+        overlay_store.set_next_node_id(next_node_id);
+        overlay_store.set_next_edge_id(next_edge_id);
+
+        let layered = Arc::new(LayeredStore::with_overlay(base, Arc::clone(overlay_store)));
+
+        // Sync overlay epoch with the transaction manager (mirrors
+        // wire_layered_after_load) so writes land at the engine's epoch.
+        let current_epoch = self.transaction_manager.current_epoch();
+        layered.overlay_store().sync_epoch(current_epoch);
+
+        self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
+        self.external_write_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreMut>);
+
+        // Install the tier wrapper + consumers (mirror of wire_layered_after_load).
+        {
+            let tiered = Arc::new(compact_tiered::CompactStoreTiered::new_in_memory(
+                layered.base_store_arc(),
+            ));
+            let spill_path = self.buffer_manager.config().spill_path.clone();
+            let consumer = Arc::new(section_consumer::CompactStoreConsumer::new(
+                &tiered, &layered, spill_path,
+            ));
+            self.buffer_manager.register_consumer(consumer);
+            self.compact_tiered = Some(tiered);
+        }
+        let overlay_consumer = Arc::new(section_consumer::OverlayConsumer::new(&layered));
+        self.buffer_manager.register_consumer(overlay_consumer);
+
+        self.layered_store = Some(layered);
+        Ok(())
     }
 
     /// Creates a database backed by a custom [`GraphStoreMut`] implementation.
@@ -949,6 +1248,13 @@ impl GrafeoDB {
                 feature = "generation",
                 feature = "lpg",
                 feature = "compact-store",
+                feature = "mmap"
+            ))]
+            generation_root: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
                 feature = "generation-streaming"
             ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
@@ -1047,6 +1353,13 @@ impl GrafeoDB {
             compact_backing: None,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             overlay_admission: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
+            generation_root: None,
             #[cfg(all(
                 feature = "generation",
                 feature = "lpg",

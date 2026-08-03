@@ -105,6 +105,21 @@ impl MappedNodeIdLookup {
         }
         None
     }
+
+    /// The largest preserved original node ID in the mapped lookup.
+    ///
+    /// Records are validated as sorted ascending by ID in
+    /// [`MappedNodeIdLookup::new`], so the last record is the maximum —
+    /// O(1). `None` for an empty lookup. Used to seed overlay ID
+    /// allocators above the base maxima (H-ADOPT.2 review M-1).
+    #[must_use]
+    pub(crate) fn max_id(&self) -> Option<u64> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(read_id(&self.bytes, (self.len - 1) * NODE_RECORD_LEN))
+        }
+    }
 }
 
 /// Sorted `EdgeIdLookup` records: `(id:u64, rel_table:u16, pad:u16, pad:u32, csr_pos:u64)`.
@@ -204,6 +219,21 @@ impl MappedEdgeIdLookup {
         }
         None
     }
+
+    /// The largest preserved original edge ID in the mapped lookup.
+    ///
+    /// Records are validated as sorted ascending by ID in
+    /// [`MappedEdgeIdLookup::new`], so the last record is the maximum —
+    /// O(1). `None` for an empty lookup. Used to seed overlay ID
+    /// allocators above the base maxima (H-ADOPT.2 review M-1).
+    #[must_use]
+    pub(crate) fn max_id(&self) -> Option<u64> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(read_id(&self.bytes, (self.len - 1) * EDGE_RECORD_LEN))
+        }
+    }
 }
 
 /// Reverse original-ID array view (O(1) internal→original).
@@ -286,4 +316,29 @@ pub fn write_edge_id_record(buf: &mut Vec<u8>, id: u64, rel_table: u16, csr_posi
     buf.extend_from_slice(&0u16.to_le_bytes()); // reserved_a
     buf.extend_from_slice(&0u32.to_le_bytes()); // reserved_b
     buf.extend_from_slice(&csr_position.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapped_lookup_max_ids_follow_sorted_source_truth() {
+        let empty_nodes = MappedNodeIdLookup::new(Bytes::new()).unwrap();
+        let empty_edges = MappedEdgeIdLookup::new(Bytes::new()).unwrap();
+        assert_eq!(empty_nodes.max_id(), None);
+        assert_eq!(empty_edges.max_id(), None);
+
+        let mut node_records = Vec::new();
+        write_node_id_record(&mut node_records, 7, 0, 0);
+        write_node_id_record(&mut node_records, u64::MAX, 0, 1);
+        let nodes = MappedNodeIdLookup::new(Bytes::from(node_records)).unwrap();
+        assert_eq!(nodes.max_id(), Some(u64::MAX));
+
+        let mut edge_records = Vec::new();
+        write_edge_id_record(&mut edge_records, 11, 0, 0);
+        write_edge_id_record(&mut edge_records, u64::MAX - 1, 0, 1);
+        let edges = MappedEdgeIdLookup::new(Bytes::from(edge_records)).unwrap();
+        assert_eq!(edges.max_id(), Some(u64::MAX - 1));
+    }
 }
