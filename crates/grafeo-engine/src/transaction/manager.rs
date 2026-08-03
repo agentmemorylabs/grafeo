@@ -527,6 +527,15 @@ impl TransactionManager {
             .fetch_max(epoch.as_u64(), Ordering::SeqCst);
     }
 
+    /// Restores the recovery floor for transaction allocation.
+    ///
+    /// The next [`Self::begin`] returns an ID strictly greater than the maximum
+    /// transaction ID seen in the replayed WAL or generation boundary.
+    pub fn restore_transaction_floor(&self, max_seen: TransactionId) {
+        self.next_transaction_id
+            .fetch_max(max_seen.0 + 1, Ordering::SeqCst);
+    }
+
     /// Returns the minimum epoch that must be preserved for active transactions.
     ///
     /// This is used for garbage collection - versions visible at this epoch

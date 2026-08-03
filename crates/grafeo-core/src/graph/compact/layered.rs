@@ -271,6 +271,59 @@ impl LayeredStore {
         self.overlay.load_full()
     }
 
+    /// Recovery-only: creates an overlay node at the exact ID recorded in the
+    /// WAL, marks it dirty, and charges the same retained bytes as
+    /// [`GraphStoreMut::create_node`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`grafeo_common::memory::AllocError`] if the overlay cannot
+    /// allocate the recovered node.
+    pub fn replay_create_node_with_id(
+        &self,
+        id: NodeId,
+        labels: &[&str],
+    ) -> Result<(), grafeo_common::memory::AllocError> {
+        let _guard = self.merge_guard.read();
+        self.overlay.load().create_node_with_id(id, labels)?;
+        self.mark_dirty_node(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::node_creation_retained_bytes(labels),
+        );
+        Ok(())
+    }
+
+    /// Recovery-only: creates an overlay edge at the exact ID recorded in the
+    /// WAL. Base-only endpoints are promoted exactly as in
+    /// [`GraphStoreMut::create_edge`]; the edge is marked dirty and charged the
+    /// same retained bytes as a live mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`grafeo_common::memory::AllocError`] if the overlay cannot
+    /// allocate the recovered edge.
+    pub fn replay_create_edge_with_id(
+        &self,
+        id: EdgeId,
+        src: NodeId,
+        dst: NodeId,
+        edge_type: &str,
+    ) -> Result<(), grafeo_common::memory::AllocError> {
+        let _guard = self.merge_guard.read();
+        self.ensure_in_overlay(src);
+        self.ensure_in_overlay(dst);
+        self.overlay
+            .load()
+            .create_edge_with_id(id, src, dst, edge_type)?;
+        self.mark_dirty_edge(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::edge_creation_retained_bytes(edge_type),
+        );
+        Ok(())
+    }
+
     /// Captures overlay mutation sets for a generation freeze (schema-bounded).
     ///
     /// Includes every entity currently resident in the overlay (created or
