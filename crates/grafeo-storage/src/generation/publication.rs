@@ -333,6 +333,12 @@ fn read_publication_state(
 
 /// Fresh-open a container through the production reader and prove the
 /// CompactStore section is present and mmap-able with nonzero length.
+///
+/// H-ADOPT.6 decision 7: when a Catalog section is present, validate it too
+/// (readable + nonzero). The four index sections stay `required:false` in the
+/// SectionType metadata — they remain optional but are CRC-validated by the
+/// writer and by [`GrafeoFileManager::read_section_data`] / `mmap_section`
+/// at open.
 fn validate_container(path: &std::path::Path) -> std::result::Result<(), String> {
     let manager =
         GrafeoFileManager::open_read_only(path).map_err(|e| format!("open_read_only: {e}"))?;
@@ -348,6 +354,14 @@ fn validate_container(path: &std::path::Path) -> std::result::Result<(), String>
         .map_err(|e| format!("mmap_section: {e}"))?;
     if mapped.is_empty() {
         return Err("CompactStore section mapped with zero length".to_string());
+    }
+    if let Some(catalog_entry) = dir.find(SectionType::Catalog) {
+        let data = manager
+            .read_section_data(catalog_entry)
+            .map_err(|e| format!("catalog section read: {e}"))?;
+        if data.is_empty() {
+            return Err("Catalog section present but zero length".to_string());
+        }
     }
     Ok(())
 }

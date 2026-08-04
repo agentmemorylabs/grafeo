@@ -1053,10 +1053,21 @@ impl GrafeoDB {
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
         };
 
+        // H-ADOPT.6 decision 5: restore the Catalog BEFORE the layered wiring
+        // and WAL replay — replay applies the post-boundary schema delta on
+        // top of the restored catalog (its register calls are idempotent).
+        let lease = ownership.registry().snapshot();
+        db.restore_generation_catalog(&lease)?;
+
         // Wire the layered store over the mmap base + fresh overlay, then retain
         // the ownership (lock + registry) on the database for its lifetime.
-        let base = ownership.registry().snapshot().store();
+        let base = lease.store();
         db.wire_generation_layered(base)?;
+
+        // H-ADOPT.6 decision 5: restore the derived index sections AFTER the
+        // layered wiring and BEFORE WAL replay, so replayed post-boundary
+        // writes land on the restored postings/topology.
+        db.restore_generation_indexes(read_only, &lease)?;
 
         // H-ADOPT.3 Phase C: replay the post-boundary WAL into the fresh
         // overlay before any writer sees the layered store. Replay restores

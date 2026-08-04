@@ -61,6 +61,7 @@ pub use registry::{GenerationLeaseRegistry, GenerationLeaseStats, TransitionRepo
 use std::path::Path;
 use std::sync::{Arc, Weak};
 
+use bytes::Bytes;
 use grafeo_common::utils::error::Error;
 use grafeo_core::graph::compact::CompactStore;
 
@@ -117,6 +118,30 @@ impl GenerationLease {
     #[must_use]
     pub fn store(&self) -> Arc<CompactStore> {
         self.base.store()
+    }
+
+    /// Catalog section bytes (H-ADOPT.6); `None` for legacy publications.
+    #[must_use]
+    pub fn catalog_bytes(&self) -> Option<Bytes> {
+        self.base.catalog_bytes()
+    }
+
+    /// VectorStore section bytes (H-ADOPT.6), mmap-backed.
+    #[must_use]
+    pub fn vector_section_bytes(&self) -> Option<Bytes> {
+        self.base.vector_section_bytes()
+    }
+
+    /// PropertyIndex section bytes (H-ADOPT.6), mmap-backed.
+    #[must_use]
+    pub fn property_index_bytes(&self) -> Option<Bytes> {
+        self.base.property_index_bytes()
+    }
+
+    /// TextIndex section bytes (H-ADOPT.6), mmap-backed.
+    #[must_use]
+    pub fn text_index_bytes(&self) -> Option<Bytes> {
+        self.base.text_index_bytes()
     }
 
     /// Manifest publication sequence of the leased base.

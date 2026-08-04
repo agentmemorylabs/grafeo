@@ -76,14 +76,17 @@ fn build_source(
         .session()
         .execute("CREATE NODE TYPE Doc (title STRING)")
         .expect("schema DDL");
-    for i in 0..64 {
+    for i in 0u64..64 {
         source
             .create_node_with_props(
                 &[LABEL],
                 [
                     (TITLE, Value::from(format!("doc-{i}"))),
-                    (PROP, Value::Vector(seeded_vector(i as u64, DIMS).into())),
-                    ("rank", Value::Int64(i as i64)),
+                    (PROP, Value::Vector(seeded_vector(i, DIMS).into())),
+                    (
+                        "rank",
+                        Value::Int64(i64::try_from(i).expect("rank value fits i64")),
+                    ),
                 ],
             )
             .expect("create node");
@@ -310,10 +313,9 @@ fn corrupt_vector_store_section_fails_closed_on_open() {
         manifest_file.sync_all().expect("sync manifest");
     }
 
-    let err = match GrafeoDB::open_generation_root(&root, false) {
-        Ok(_) => panic!("corrupt VectorStore section must fail closed"),
-        Err(e) => e,
-    };
+    let err = GrafeoDB::open_generation_root(&root, false)
+        .err()
+        .expect("corrupt VectorStore section must fail closed");
     let msg = format!("{err}");
     assert!(
         msg.contains("Vector Store")

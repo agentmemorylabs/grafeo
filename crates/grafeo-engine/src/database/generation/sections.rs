@@ -325,3 +325,151 @@ fn capture_property_index(
         version: section.version(),
     }))
 }
+
+// ── Open-side restoration (H-ADOPT.6 item 3, locked decision 5) ─────────
+
+impl GrafeoDB {
+    /// Restore the Catalog section into the fresh overlay + catalog BEFORE the
+    /// layered wiring and WAL replay (locked decision 5): replay applies the
+    /// post-boundary schema delta on top of the restored catalog — replay's
+    /// register calls are idempotent, so the overlay is safe.
+    ///
+    /// A legacy publication without a Catalog section leaves the fresh catalog
+    /// in place (backward-compat path).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Catalog bytes fail to deserialize (corrupt
+    /// section → fail closed) or no overlay LpgStore exists.
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
+    pub(crate) fn restore_generation_catalog(
+        &self,
+        lease: &crate::database::generation::lease::GenerationLease,
+    ) -> Result<()> {
+        let Some(bytes) = lease.catalog_bytes() else {
+            // Legacy publication without sections: the fresh catalog stays.
+            return Ok(());
+        };
+        let store = self.store.as_ref().ok_or_else(|| {
+            Error::Internal("no overlay LpgStore for generation Catalog restore".into())
+        })?;
+        let mut section = crate::database::catalog_section::CatalogSection::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(store),
+            {
+                let tm = Arc::clone(&self.transaction_manager);
+                move || tm.current_epoch().as_u64()
+            },
+        );
+        section.deserialize(&bytes)?;
+        Ok(())
+    }
+
+    /// Restore the derived index sections (VectorStore, PropertyIndex,
+    /// TextIndex) AFTER `wire_generation_layered` and BEFORE WAL replay
+    /// (locked decision 5): replayed post-boundary writes land on the
+    /// restored postings/topology.
+    ///
+    /// Mirrors `load_from_sections`'s per-section semantics: read-only opens
+    /// keep the index sections mmap-backed (zero-copy), writable opens
+    /// hydrate heap topologies/postings. A registered-but-absent VectorStore
+    /// section, or a corrupt present section, fails closed — never a silent
+    /// fallback-to-rebuild.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a present section fails to decode or when the
+    /// Catalog registered vector shells without a VectorStore section.
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
+    pub(crate) fn restore_generation_indexes(
+        &self,
+        read_only: bool,
+        lease: &crate::database::generation::lease::GenerationLease,
+    ) -> Result<()> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            Error::Internal("no overlay LpgStore for generation index restore".into())
+        })?;
+
+        // VectorStore: rehydrate HNSW topology into the catalog-registered
+        // shells (mmap-backed on read-only opens, heap on writable opens).
+        #[cfg(feature = "vector-index")]
+        {
+            let indexes = store.vector_index_entries();
+            if !indexes.is_empty() {
+                let Some(bytes) = lease.vector_section_bytes() else {
+                    return Err(Error::Serialization(
+                        "Catalog registers vector indexes but the generation has no VectorStore section (fail-closed)".into(),
+                    ));
+                };
+                let mut section = grafeo_core::index::vector::VectorStoreSection::new(indexes);
+                if read_only {
+                    section.restore_from_mapped_bytes(bytes)?;
+                } else {
+                    section.deserialize(&bytes)?;
+                }
+            }
+        }
+
+        // PropertyIndex: install postings (mapped set; heap copy on writable
+        // opens, matching load_from_sections).
+        if let Some(bytes) = lease.property_index_bytes() {
+            let mapped_set = if read_only {
+                grafeo_core::index::property::parse_property_index_section(bytes)?
+            } else {
+                let mut section = PropertyIndexSection::empty();
+                section.deserialize(&bytes)?;
+                section.take_mapped().ok_or_else(|| {
+                    Error::Serialization(
+                        "PropertyIndex section deserialized without mapped set".into(),
+                    )
+                })?
+            };
+            for idx in mapped_set.indexes() {
+                store.install_mapped_property_index(Arc::new(idx.clone()));
+            }
+            let _ = mapped_set.accounting();
+        }
+
+        // TextIndex: v2 mapped payloads stay file-backed on read-only opens;
+        // legacy v1 hydrates the catalog-registered heap shells.
+        #[cfg(feature = "text-index")]
+        if let Some(bytes) = lease.text_index_bytes() {
+            use grafeo_core::index::text::{
+                TextIndexSection, is_mapped_text_payload, parse_text_index_section,
+            };
+            let indexes = store.text_index_entries();
+            if read_only {
+                if is_mapped_text_payload(&bytes) {
+                    let mapped_set = parse_text_index_section(bytes)?;
+                    for idx in mapped_set.indexes() {
+                        store.install_mapped_text_index(Arc::new(idx.clone()));
+                    }
+                } else {
+                    // Legacy v1 over a mapped region: copy into section decode.
+                    let mut section = TextIndexSection::new(indexes);
+                    section.deserialize(&bytes)?;
+                }
+            } else {
+                let mut section = TextIndexSection::new(indexes);
+                section.deserialize(&bytes)?;
+                if let Some(mapped_set) = section.take_mapped() {
+                    for idx in mapped_set.indexes() {
+                        store.install_mapped_text_index(Arc::new(idx.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
