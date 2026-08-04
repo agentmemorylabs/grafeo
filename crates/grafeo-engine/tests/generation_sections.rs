@@ -245,6 +245,34 @@ fn repeated_reopen_is_deterministic_with_sections() {
             "round {round}: open after drop must succeed"
         );
     }
+
+    // Read-only reopen: the VectorStore section must restore zero-copy
+    // (mmap-backed topology) and still serve the pre-boundary neighbors.
+    let ro = GrafeoDB::open_generation_root(&root, true).expect("read-only reopen");
+    assert!(ro.has_vector_index(LABEL, PROP));
+    let diags = ro.vector_backing_diagnostics();
+    assert_eq!(diags.len(), 1, "one vector index after read-only restore");
+    match &diags[0].topology {
+        VectorTopologyBacking::Mmap { topology_bytes } => {
+            assert!(
+                *topology_bytes > 0,
+                "read-only restore must keep topology file-backed"
+            );
+        }
+        VectorTopologyBacking::Heap { .. } => {
+            panic!("read-only generation open must not heap-restore the topology");
+        }
+    }
+    for (qi, q) in [seeded_vector(7, DIMS), seeded_vector(42, DIMS)]
+        .iter()
+        .enumerate()
+    {
+        let hits = ro
+            .vector_search(LABEL, PROP, q, K, None, None)
+            .expect("read-only search");
+        assert_eq!(hits, frozen[qi], "read-only neighbor parity query {qi}");
+    }
+    drop(ro);
 }
 
 /// (d) Corrupt VectorStore section bytes → open fails closed (typed error).
