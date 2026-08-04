@@ -704,4 +704,296 @@ mod tests {
             other => panic!("unexpected error variant: {other:?}"),
         }
     }
+
+    // ── H-ADOPT.6 item 0B RED tests ────────────────────────────────
+
+    use crate::index::vector::{QuantizationType, QuantizedHnswIndex};
+
+    /// Mixed-shape section: multi-level Hnsw, single-node Hnsw, empty
+    /// topology, and a Quantized index (covers both `VectorIndexKind`
+    /// arms and the empty-topology directory entry).
+    fn make_mixed_section() -> VectorStoreSection {
+        let cfg_a = HnswConfig::new(4, DistanceMetric::Cosine);
+        let idx_a = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(cfg_a)));
+        idx_a.restore_topology(
+            Some(NodeId::new(10)),
+            2,
+            vec![
+                (
+                    NodeId::new(10),
+                    vec![
+                        vec![NodeId::new(20), NodeId::new(30)],
+                        vec![NodeId::new(30)],
+                        vec![],
+                    ],
+                ),
+                (NodeId::new(20), vec![vec![NodeId::new(10)]]),
+                (
+                    NodeId::new(30),
+                    vec![
+                        vec![NodeId::new(10), NodeId::new(20)],
+                        vec![NodeId::new(10)],
+                    ],
+                ),
+            ],
+        );
+
+        let cfg_b = HnswConfig::new(8, DistanceMetric::Euclidean);
+        let idx_b = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(cfg_b)));
+        idx_b.restore_topology(
+            Some(NodeId::new(100)),
+            0,
+            vec![(NodeId::new(100), vec![vec![]])],
+        );
+
+        // Empty topology: catalog-registered before first insert.
+        let cfg_c = HnswConfig::new(16, DistanceMetric::Cosine);
+        let idx_c = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(cfg_c)));
+
+        // Quantized arm delegates topology to an inner HnswIndex.
+        let cfg_d = HnswConfig::new(4, DistanceMetric::DotProduct);
+        let idx_d = Arc::new(VectorIndexKind::Quantized(QuantizedHnswIndex::new(
+            cfg_d,
+            QuantizationType::Scalar,
+        )));
+        idx_d.restore_topology(
+            Some(NodeId::new(7)),
+            1,
+            vec![
+                (NodeId::new(7), vec![vec![NodeId::new(8)], vec![]]),
+                (NodeId::new(8), vec![vec![NodeId::new(7)]]),
+            ],
+        );
+
+        VectorStoreSection::new(vec![
+            ("Doc:embedding".to_string(), Arc::clone(&idx_a)),
+            ("User:embedding".to_string(), Arc::clone(&idx_b)),
+            ("SessionSummary:embedding".to_string(), Arc::clone(&idx_c)),
+            ("CodeChunk:embedding".to_string(), Arc::clone(&idx_d)),
+        ])
+    }
+
+    /// (b) Byte-parity: `stream_to` output MUST equal legacy
+    /// `serialize()` byte-for-byte on a mixed multi-index section.
+    #[test]
+    fn h_adopt6_stream_to_byte_parity_with_serialize() {
+        let section = make_mixed_section();
+        let legacy = section.serialize().expect("legacy serialize");
+
+        let mut streamed: Vec<u8> = Vec::new();
+        let reported_len = section.stream_to(&mut streamed).expect("stream_to");
+
+        assert_eq!(
+            streamed, legacy,
+            "stream_to output must be byte-identical to serialize_v2"
+        );
+        assert_eq!(
+            reported_len as usize,
+            legacy.len(),
+            "stream_to must report the exact total section length"
+        );
+    }
+
+    /// (d) ExactSectionSource contract: the reported length MUST equal
+    /// the bytes actually written to the sink. The generation writer
+    /// fails closed on mismatch, so this is the trap that catches
+    /// length-pass bugs. Uses a counting sink that is NOT a Vec to prove
+    /// the encoder works against a generic `std::io::Write`.
+    #[test]
+    fn h_adopt6_stream_to_exact_len_matches_bytes_written() {
+        struct CountingSink {
+            count: usize,
+        }
+        impl std::io::Write for CountingSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.count += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let section = make_mixed_section();
+        let mut sink = CountingSink { count: 0 };
+        let reported_len = section.stream_to(&mut sink).expect("stream_to");
+        assert_eq!(
+            reported_len as usize, sink.count,
+            "reported exact_len must equal bytes actually written (writer fails closed on mismatch)"
+        );
+        assert_eq!(sink.count, section.serialize().expect("serialize").len());
+    }
+
+    /// Empty section (zero indexes) streams the bare v2 header and
+    /// reports its exact length.
+    #[test]
+    fn h_adopt6_stream_to_empty_section() {
+        let section = VectorStoreSection::new(Vec::new());
+        let legacy = section.serialize().expect("legacy serialize");
+        let mut streamed: Vec<u8> = Vec::new();
+        let reported_len = section.stream_to(&mut streamed).expect("stream_to");
+        assert_eq!(streamed, legacy);
+        assert_eq!(reported_len as usize, legacy.len());
+    }
+
+    /// RssAnon from /proc/self/status in KiB (Linux). Anonymous memory
+    /// is the encoder-heap figure: it excludes file-backed section bytes
+    /// and is unaffected by page-cache churn.
+    fn rss_anon_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("RssAnon:") {
+                return rest.trim().trim_end_matches(" kB").trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    /// Build a synthetic 1M-node topology (dim-independent: topology
+    /// only, ~16 neighbors at level 0). Matches the Phase-0 probe shape
+    /// (145 MiB serialized output at 1M).
+    fn build_1m_topology_index() -> (String, Arc<VectorIndexKind>) {
+        const N: u64 = 1_000_000;
+        let config = HnswConfig::new(384, DistanceMetric::Cosine);
+        let index = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config)));
+        let mut state: u64 = 0x5EED_0B;
+        let mut rng = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let nodes: Vec<(NodeId, Vec<Vec<NodeId>>)> = (1..=N)
+            .map(|i| {
+                let count = 12 + (rng() % 9) as usize; // 12..20 neighbors
+                let layer0: Vec<NodeId> = (0..count).map(|_| NodeId::new(1 + rng() % N)).collect();
+                (NodeId::new(i), vec![layer0])
+            })
+            .collect();
+        index.restore_topology(Some(NodeId::new(1)), 0, nodes);
+        ("Large:embedding".to_string(), index)
+    }
+
+    /// Byte-parity for the zero-copy path: a section restored via
+    /// `restore_from_mapped_bytes` (mmap backend) must stream
+    /// byte-identical to the original `serialize()` output.
+    #[test]
+    fn h_adopt6_stream_to_byte_parity_mmap_backend() {
+        let section = make_mixed_section();
+        let original = section.serialize().expect("legacy serialize");
+
+        // Fresh section with identical catalog keys + configs adopts the
+        // mapped topologies zero-copy.
+        let mut restored = VectorStoreSection::new(vec![
+            (
+                "Doc:embedding".to_string(),
+                Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(HnswConfig::new(
+                    4,
+                    DistanceMetric::Cosine,
+                )))),
+            ),
+            (
+                "User:embedding".to_string(),
+                Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(HnswConfig::new(
+                    8,
+                    DistanceMetric::Euclidean,
+                )))),
+            ),
+            (
+                "SessionSummary:embedding".to_string(),
+                Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(HnswConfig::new(
+                    16,
+                    DistanceMetric::Cosine,
+                )))),
+            ),
+            (
+                "CodeChunk:embedding".to_string(),
+                Arc::new(VectorIndexKind::Quantized(QuantizedHnswIndex::new(
+                    HnswConfig::new(4, DistanceMetric::DotProduct),
+                    QuantizationType::Scalar,
+                ))),
+            ),
+        ]);
+        restored
+            .restore_from_mapped_bytes(Bytes::from(original.clone()))
+            .expect("mmap restore");
+
+        let mut streamed: Vec<u8> = Vec::new();
+        let reported = restored.stream_to(&mut streamed).expect("stream_to");
+        assert_eq!(
+            streamed, original,
+            "mmap-backed stream_to must be byte-identical to the original section"
+        );
+        assert_eq!(reported as usize, original.len());
+    }
+
+    /// Pass-1 length only: `stream_len` must equal the serialized
+    /// length without streaming any bytes.
+    #[test]
+    fn h_adopt6_stream_len_matches_serialize() {
+        let section = make_mixed_section();
+        let len = section.stream_len().expect("stream_len");
+        assert_eq!(len as usize, section.serialize().expect("serialize").len());
+    }
+
+    /// (c) Heap gate — LEGACY comparison figure. `serialize()` at 1M
+    /// vectors (dim 384): records the RssAnon delta the streaming
+    /// encoder must beat. Run with `--ignored` (builds 1M nodes).
+    #[test]
+    #[ignore = "heap gate: heavy 1M-node fixture; run explicitly with --ignored"]
+    fn h_adopt6_heap_gate_legacy_serialize_1m() {
+        let (key, index) = build_1m_topology_index();
+        let section = VectorStoreSection::new(vec![(key, index)]);
+
+        let before = rss_anon_kb().expect("RssAnon readable on Linux");
+        let bytes = section.serialize().expect("legacy serialize");
+        let after = rss_anon_kb().expect("RssAnon readable on Linux");
+
+        let delta_mib = (after.saturating_sub(before)) as f64 / 1024.0;
+        eprintln!(
+            "HEAP-GATE legacy serialize(): output={} bytes ({:.1} MiB), RssAnon delta={delta_mib:.1} MiB",
+            bytes.len(),
+            bytes.len() as f64 / (1024.0 * 1024.0),
+        );
+        // No assertion: informational baseline for the stream_to gate.
+    }
+
+    /// (c) Heap gate — STREAMING figure. `stream_to` peak anon-RAM
+    /// delta MUST stay ≤ 256 MiB at 1M synthetic vectors (dim 384).
+    /// Target ≤ output bytes + ~10%. Run with `--ignored`.
+    #[test]
+    #[ignore = "heap gate: heavy 1M-node fixture; run explicitly with --ignored"]
+    fn h_adopt6_heap_gate_stream_to_1m() {
+        let (key, index) = build_1m_topology_index();
+        let section = VectorStoreSection::new(vec![(key, index)]);
+
+        // Discarding sink: we measure encoder heap, not I/O buffering.
+        struct DiscardSink(usize);
+        impl std::io::Write for DiscardSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let before = rss_anon_kb().expect("RssAnon readable on Linux");
+        let mut sink = DiscardSink(0);
+        let reported = section.stream_to(&mut sink).expect("stream_to");
+        let after = rss_anon_kb().expect("RssAnon readable on Linux");
+
+        let delta_mib = (after.saturating_sub(before)) as f64 / 1024.0;
+        let out_mib = sink.0 as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "HEAP-GATE stream_to(): output={} bytes ({out_mib:.1} MiB), reported_len={reported}, RssAnon delta={delta_mib:.1} MiB",
+            sink.0,
+        );
+        assert_eq!(reported as usize, sink.0, "exact_len contract");
+        assert!(
+            delta_mib <= 256.0,
+            "stream_to peak anon-RAM delta {delta_mib:.1} MiB exceeds the 256 MiB gate at 1M vectors"
+        );
+    }
 }

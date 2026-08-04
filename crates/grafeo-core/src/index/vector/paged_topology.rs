@@ -873,6 +873,104 @@ mod tests {
         assert_eq!(err, PagedTopologyError::TruncatedHeader);
     }
 
+    // ── H-ADOPT.6 item 0B RED tests ────────────────────────────────
+    //
+    // Byte-parity oracle (PRECEDENCE RULE): `write_topology` MUST be
+    // byte-identical to `serialize_topology` for identical input, and
+    // `serialize_topology_len` MUST equal the serialized length. The v2
+    // byte layout never changes.
+
+    fn make_multi_level_nodes() -> Vec<(NodeId, Vec<Vec<NodeId>>)> {
+        vec![
+            (
+                NodeId::new(2),
+                vec![vec![NodeId::new(1), NodeId::new(3)], vec![NodeId::new(5)]],
+            ),
+            (NodeId::new(3), vec![vec![NodeId::new(2)]]),
+            (
+                NodeId::new(5),
+                vec![
+                    vec![],
+                    vec![NodeId::new(2)],
+                    vec![NodeId::new(5), NodeId::new(3), NodeId::new(2)],
+                ],
+            ),
+            (NodeId::new(7), vec![vec![NodeId::new(3), NodeId::new(2)]]),
+        ]
+    }
+
+    fn make_random_nodes(seed: u64, n: usize) -> Vec<(NodeId, Vec<Vec<NodeId>>)> {
+        let mut state = seed;
+        let mut rng = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        (1..=n as u64)
+            .map(|i| {
+                let n_layers = 1 + (rng() % 3) as usize;
+                let layers: Vec<Vec<NodeId>> = (0..n_layers)
+                    .map(|_| {
+                        let count = (rng() % 6) as usize;
+                        (0..count)
+                            .map(|_| NodeId::new(1 + rng() % (n as u64)))
+                            .collect()
+                    })
+                    .collect();
+                (NodeId::new(i), layers)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn h_adopt6_write_topology_parity_empty() {
+        let legacy = serialize_topology(None, 0, &[]);
+        let mut streamed: Vec<u8> = Vec::new();
+        write_topology(None, 0, &[], &mut streamed).expect("write_topology");
+        assert_eq!(streamed, legacy, "empty topology must be byte-identical");
+        assert_eq!(serialize_topology_len(None, 0, &[]) as usize, legacy.len());
+    }
+
+    #[test]
+    fn h_adopt6_write_topology_parity_single_node() {
+        let nodes = vec![(NodeId::new(42), vec![vec![]])];
+        let legacy = serialize_topology(Some(NodeId::new(42)), 0, &nodes);
+        let mut streamed: Vec<u8> = Vec::new();
+        write_topology(Some(NodeId::new(42)), 0, &nodes, &mut streamed).expect("write_topology");
+        assert_eq!(streamed, legacy, "single node must be byte-identical");
+        assert_eq!(
+            serialize_topology_len(Some(NodeId::new(42)), 0, &nodes) as usize,
+            legacy.len()
+        );
+    }
+
+    #[test]
+    fn h_adopt6_write_topology_parity_multi_level() {
+        let nodes = make_multi_level_nodes();
+        let legacy = serialize_topology(Some(NodeId::new(5)), 2, &nodes);
+        let mut streamed: Vec<u8> = Vec::new();
+        write_topology(Some(NodeId::new(5)), 2, &nodes, &mut streamed).expect("write_topology");
+        assert_eq!(streamed, legacy, "multi-level must be byte-identical");
+        assert_eq!(
+            serialize_topology_len(Some(NodeId::new(5)), 2, &nodes) as usize,
+            legacy.len()
+        );
+    }
+
+    #[test]
+    fn h_adopt6_write_topology_parity_random_10k() {
+        let nodes = make_random_nodes(0xDEAD_BEEF, 10_000);
+        let legacy = serialize_topology(Some(NodeId::new(1)), 2, &nodes);
+        let mut streamed: Vec<u8> = Vec::new();
+        write_topology(Some(NodeId::new(1)), 2, &nodes, &mut streamed).expect("write_topology");
+        assert_eq!(streamed, legacy, "10k random must be byte-identical");
+        assert_eq!(
+            serialize_topology_len(Some(NodeId::new(1)), 2, &nodes) as usize,
+            legacy.len()
+        );
+    }
+
     #[test]
     fn django_unsupported_version_rejected() {
         let mut bytes = serialize_topology(None, 0, &[]);
