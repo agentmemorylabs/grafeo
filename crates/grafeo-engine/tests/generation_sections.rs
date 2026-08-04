@@ -33,7 +33,7 @@ use grafeo_common::types::Value;
 use grafeo_engine::{Config, GrafeoDB, VectorTopologyBacking, generation_build_request};
 use grafeo_storage::file::GrafeoFileManager;
 use grafeo_storage::file::generation_writer::{
-    ExactSectionSource, GenerationContainerHeader, OsGenerationFileOps,
+    ExactSectionSource, GenerationContainerHeader, GenerationFileOps, OsGenerationFileOps,
 };
 use grafeo_storage::generation::lock::RootLock;
 use grafeo_storage::generation::publication::{PublicationInput, publish_generation};
@@ -245,6 +245,12 @@ fn repeated_reopen_is_deterministic_with_sections() {
 }
 
 /// (d) Corrupt VectorStore section bytes → open fails closed (typed error).
+///
+/// The corruption is applied to the container AND the manifest slot's
+/// `generation_sha256` is re-derived for the modified bytes, so the open gets
+/// past the whole-file recovery SHA gate and fails at the SECTION boundary
+/// (VectorStore mmap CRC / decode) — proving the section restore path itself
+/// fails closed, never a silent fallback-to-rebuild.
 #[test]
 fn corrupt_vector_store_section_fails_closed_on_open() {
     let dir = TempDir::new().expect("temp dir");
@@ -265,6 +271,44 @@ fn corrupt_vector_store_section_fails_closed_on_open() {
         .expect("published container must contain the GVST VectorStore section");
     bytes[pos] = b'X';
     std::fs::write(&container, &bytes).expect("write corrupt container");
+
+    // Re-derive the manifest slot's SHA-256 for the modified file so the open
+    // passes recovery and fails at the section boundary.
+    let corrupt_sha = OsGenerationFileOps
+        .sha256(&container)
+        .expect("sha of corrupt container");
+    let manifest_path = root.join("manifest.bin");
+    let [slot0, slot1] =
+        grafeo_storage::generation::manifest::read_both_slots(&manifest_path).expect("read slots");
+    let (active_index, mut active) = match (slot0, slot1) {
+        (Ok(a), Ok(b)) if b.publication_sequence > a.publication_sequence => (1, b),
+        (Ok(a), _) => (0, a),
+        (Err(_), Ok(b)) => (1, b),
+        (Err(e0), Err(e1)) => panic!("no valid manifest slot: {e0} / {e1}"),
+    };
+    assert_eq!(
+        active.publication_sequence, 1,
+        "fixture must publish exactly one generation"
+    );
+    active.generation_sha256 = corrupt_sha;
+    let slot_bytes =
+        grafeo_storage::generation::manifest::encode_slot_bytes(&active).expect("encode slot");
+    {
+        use std::io::{Seek, SeekFrom, Write as _};
+        let mut manifest_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .expect("open manifest");
+        let offset = u64::try_from(active_index * grafeo_storage::generation::manifest::SLOT_SIZE)
+            .expect("slot offset fits u64");
+        manifest_file
+            .seek(SeekFrom::Start(offset))
+            .expect("seek slot");
+        manifest_file
+            .write_all(&slot_bytes)
+            .expect("write patched slot");
+        manifest_file.sync_all().expect("sync manifest");
+    }
 
     let err = match GrafeoDB::open_generation_root(&root, false) {
         Ok(_) => panic!("corrupt VectorStore section must fail closed"),

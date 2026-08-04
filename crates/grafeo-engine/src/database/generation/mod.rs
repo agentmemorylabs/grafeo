@@ -51,6 +51,8 @@ pub mod recovery;
 ))]
 pub mod replay;
 pub mod retirement;
+#[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+pub mod sections;
 
 #[cfg(all(
     feature = "generation",

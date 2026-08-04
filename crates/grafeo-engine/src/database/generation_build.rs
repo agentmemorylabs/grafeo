@@ -298,6 +298,12 @@ impl GrafeoDB {
             cursor: 0,
         };
 
+        // H-ADOPT.6 decision 3: capture catalog + index section state at the
+        // SAME instant as the payload source — right after the live-graph
+        // freeze above, inside the quiesced build window. Emission happens
+        // before publication from this captured state.
+        let section_capture = self.capture_generation_sections()?;
+
         // ── Generation build + section source ─────────────────────────────
         // With `generation-streaming` the engine drives the bounded
         // out-of-core orchestrator and streams a payload lease; otherwise it
@@ -396,7 +402,8 @@ impl GrafeoDB {
         let parent_publication_sequence = request.parent_publication_sequence;
         let generation_id = request.generation_id.clone();
 
-        let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![section];
+        let mut sections = super::generation::sections::generation_section_sources(section_capture);
+        sections.insert(0, section);
         let result = publish_generation(
             &lock,
             PublicationInput {

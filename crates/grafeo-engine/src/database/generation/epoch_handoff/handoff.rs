@@ -187,6 +187,12 @@ impl GrafeoDB {
         let (freeze, frozen_nodes, frozen_edges) =
             self.capture_frozen_overlay_payloads(frozen_epoch)?;
 
+        // H-ADOPT.6 decision 3: capture catalog + index section state at the
+        // SAME instant as the payload source — inside the writer barrier,
+        // immediately after the frozen payload capture above. The build emits
+        // the generation's index sections from this captured state.
+        let section_capture = self.capture_generation_sections()?;
+
         // Snapshot frozen retained accounting (both frozen + next count later).
         // NOTE(5d closeout): `frozen_retained_bytes` is write-only — it is
         // computed here and propagated into `OverlayHandoffLive` and
@@ -241,6 +247,7 @@ impl GrafeoDB {
             base_identity: None,
             frozen_category_bytes,
             frozen_retained_bytes,
+            section_capture,
         };
 
         slot.phase = EpochHandoffPhase::FreezeCaptured;
@@ -610,7 +617,10 @@ impl GrafeoDB {
         let parent_publication_sequence = request.parent_publication_sequence;
         let generation_id = request.generation_id.clone();
 
-        let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![section];
+        let mut sections = crate::database::generation::sections::generation_section_sources(
+            handle.section_capture.clone(),
+        );
+        sections.insert(0, section);
         let result = publish_generation(
             lock.as_ref(),
             PublicationInput {

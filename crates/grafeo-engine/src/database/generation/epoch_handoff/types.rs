@@ -102,6 +102,11 @@ pub struct FrozenEpochHandle {
     pub frozen_category_bytes: [u64; RetainedCategory::COUNT],
     /// Aggregate frozen retained bytes.
     pub frozen_retained_bytes: u64,
+    /// H-ADOPT.6: catalog + index section state captured at the freeze
+    /// consistency point (inside the writer barrier). The build emits the
+    /// generation's Catalog/VectorStore/TextIndex/PropertyIndex sections
+    /// from this captured state.
+    pub section_capture: crate::database::generation::sections::GenerationSectionCapture,
 }
 
 /// Result of a complete freeze → build → publish → retire cycle.
