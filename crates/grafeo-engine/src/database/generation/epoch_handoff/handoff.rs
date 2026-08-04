@@ -72,6 +72,31 @@ fn maybe_stall_before_capture() {
 #[cfg(not(debug_assertions))]
 fn maybe_stall_before_capture() {}
 
+/// Root-lock handle for a handoff freeze/build (see
+/// [`GrafeoDB::handoff_root_lock`]).
+///
+/// A generation-root database holds the exclusive `root.lock` for its whole
+/// lifetime; the handoff reuses it instead of failing to re-acquire (`flock`
+/// is per open-file-description, so the same process cannot lock the same
+/// file twice through independent descriptors).
+enum HandoffRootLock<'a> {
+    /// The DB-lifetime lock already held by the generation-root ownership.
+    Owned(&'a RootLock),
+    /// A freshly acquired short-lived lock (non-generation-root databases).
+    Acquired(RootLock),
+}
+
+impl HandoffRootLock<'_> {
+    /// The underlying root lock (publication derives the canonical root from
+    /// it; the exclusion itself is already in force in both variants).
+    fn as_ref(&self) -> &RootLock {
+        match self {
+            Self::Owned(lock) => lock,
+            Self::Acquired(lock) => lock,
+        }
+    }
+}
+
 impl GrafeoDB {
     /// Freeze epoch N at WAL boundary B and open bounded epoch N+1 for writes.
     ///
@@ -124,8 +149,7 @@ impl GrafeoDB {
             .map(|l| l.freeze_write_barrier());
 
         let wal_boundary = {
-            let _lock = RootLock::try_acquire(&generation_root)
-                .map_err(|e| Error::Internal(format!("generation root lock: {e}")))?;
+            let _lock = self.handoff_root_lock(&generation_root)?;
             let wal_dir = generation_root.join("wal");
             std::fs::create_dir_all(&wal_dir)?;
             let wal = WalManager::open(&wal_dir)?;
@@ -344,6 +368,35 @@ impl GrafeoDB {
         slot.handle = None;
     }
 
+    /// The exclusive root lock under which a handoff freeze/build runs
+    /// (H-ADOPT.2 item 4).
+    ///
+    /// When this database was opened as a writable generation root
+    /// ([`GrafeoDB::open_generation_root`]), the exclusive `root.lock` is
+    /// already held by the generation-root ownership for the DB lifetime — a
+    /// second flock on a fresh descriptor would fail (`flock` is per
+    /// open-file-description, so the same process cannot re-acquire it), and
+    /// `run_epoch_handoff` on a generation-root database would error instead
+    /// of running. The DB-lifetime lock is reused: it satisfies the
+    /// freeze/build exclusion intent strictly (no other process can hold the
+    /// root at all while the DB is open). Otherwise a short-lived lock is
+    /// acquired exactly as before.
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    fn handoff_root_lock(&self, root: &Path) -> Result<HandoffRootLock<'_>> {
+        #[cfg(feature = "mmap")]
+        {
+            if let Some(ownership) = self.generation_root.as_ref()
+                && ownership.ownership().canonical_root() == root
+            {
+                return Ok(HandoffRootLock::Owned(ownership.ownership().lock()));
+            }
+        }
+        Ok(HandoffRootLock::Acquired(
+            RootLock::try_acquire(root)
+                .map_err(|e| Error::Internal(format!("generation root lock: {e}")))?,
+        ))
+    }
+
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
     fn capture_frozen_overlay_payloads(
         &self,
@@ -427,8 +480,7 @@ impl GrafeoDB {
         let root_buf = std::fs::canonicalize(&request.generation_root)
             .map_err(|e| Error::Internal(format!("canonicalize generation root: {e}")))?;
         let root = root_buf.as_path();
-        let lock = RootLock::try_acquire(root)
-            .map_err(|e| Error::Internal(format!("generation root lock: {e}")))?;
+        let lock = self.handoff_root_lock(root)?;
 
         let wal_dir = root.join("wal");
         std::fs::create_dir_all(&wal_dir)?;
@@ -560,7 +612,7 @@ impl GrafeoDB {
 
         let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![section];
         let result = publish_generation(
-            &lock,
+            lock.as_ref(),
             PublicationInput {
                 header,
                 sections: &mut sections,

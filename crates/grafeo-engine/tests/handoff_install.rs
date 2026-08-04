@@ -64,10 +64,12 @@ fn live_person_names(layered: &LayeredStore) -> Vec<String> {
         .into_iter()
         .filter_map(|id| layered.get_node(id))
         .filter_map(|n| {
-            n.properties.get(&PropertyKey::new("name")).and_then(|v| match v {
-                Value::String(s) => Some(s.as_str().to_string()),
-                _ => None,
-            })
+            n.properties
+                .get(&PropertyKey::new("name"))
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.as_str().to_string()),
+                    _ => None,
+                })
         })
         .collect();
     names.sort_unstable();
@@ -85,8 +87,13 @@ fn publish_and_install_handoff_happy_path() {
 
     // Open the writable generation root: layered store over the base +
     // registry selected on the base generation.
-    let db = GrafeoDB::open_generation_root(&gen_root, false).expect("open writable generation root");
-    let old_base_nodes = db.layered_store().expect("layered store").base_store_arc().total_nodes();
+    let db =
+        GrafeoDB::open_generation_root(&gen_root, false).expect("open writable generation root");
+    let old_base_nodes = db
+        .layered_store()
+        .expect("layered store")
+        .base_store_arc()
+        .total_nodes();
     assert_eq!(old_base_nodes, 2, "registry base = Ada + Grace");
 
     // Epoch-N overlay writes through the layered store (frozen into G(1)).
@@ -109,14 +116,21 @@ fn publish_and_install_handoff_happy_path() {
         .publish_and_install_handoff(report.clone())
         .expect("publish and install handoff");
     let publication = report.publication.expect("publication present");
-    assert_eq!(install.publication_sequence, publication.publication.publication_sequence);
+    assert_eq!(
+        install.publication_sequence,
+        publication.publication.publication_sequence
+    );
     assert_eq!(install.generation_id, "g-hand-1");
     assert_eq!(install.generation_abs_path, publication.generation_abs_path);
 
     // The layered base now serves the NEW generation container: the frozen
     // snapshot absorbed into G(1) is base-resident (Ada, Grace + epoch-n-one).
     let base = db.layered_store().expect("layered store").base_store_arc();
-    assert_eq!(base.total_nodes(), 3, "swapped base must hold base + frozen epoch-N nodes");
+    assert_eq!(
+        base.total_nodes(),
+        3,
+        "swapped base must hold base + frozen epoch-N nodes"
+    );
     assert_eq!(base.total_nodes(), install.base_node_count);
     assert_eq!(base.total_edges(), install.base_edge_count);
 
@@ -127,7 +141,10 @@ fn publish_and_install_handoff_happy_path() {
 
     // Post-freeze bookkeeping clean: retire cleared the live handoff slot.
     assert!(
-        db.layered_store().expect("layered store").handoff_live().is_none(),
+        db.layered_store()
+            .expect("layered store")
+            .handoff_live()
+            .is_none(),
         "no live handoff bookkeeping may survive the install"
     );
 }
@@ -141,14 +158,37 @@ fn publish_and_install_fails_closed_on_writes_during_window() {
     fs::create_dir_all(&gen_root).expect("create generation root");
     publish_base_generation(&gen_root);
 
-    let db = GrafeoDB::open_generation_root(&gen_root, false).expect("open writable generation root");
-    let old_base_nodes = db.layered_store().expect("layered store").base_store_arc().total_nodes();
+    let db =
+        GrafeoDB::open_generation_root(&gen_root, false).expect("open writable generation root");
+    let old_base_nodes = db
+        .layered_store()
+        .expect("layered store")
+        .base_store_arc()
+        .total_nodes();
+    assert_eq!(old_base_nodes, 2, "registry base = Ada + Grace");
+
+    // Epoch-N overlay write FIRST, so G(1) would absorb it: if the install
+    // wrongly published+swapped despite the assertion failure, the layered
+    // base node count would change from 2 to 3 and this test would catch the
+    // redirect.
+    let n0 = db
+        .layered_store()
+        .expect("layered store")
+        .create_node(&["Person"]);
+    db.layered_store()
+        .expect("layered store")
+        .set_node_property(n0, "name", Value::from("epoch-n-absorbed"));
 
     // Two-step handoff with a REAL post-freeze write: freeze epoch N, then a
     // layered write lands in epoch N+1 and records post-freeze identity under
     // the handoff lock, then build/publish/retire captures it on the report.
-    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze epoch N");
-    let n1 = db.layered_store().expect("layered store").create_node(&["Person"]);
+    let handle = db
+        .freeze_epoch_for_handoff(&gen_root)
+        .expect("freeze epoch N");
+    let n1 = db
+        .layered_store()
+        .expect("layered store")
+        .create_node(&["Person"]);
     db.layered_store()
         .expect("layered store")
         .set_node_property(n1, "name", Value::from("post-freeze-write"));
@@ -174,7 +214,11 @@ fn publish_and_install_fails_closed_on_writes_during_window() {
     // Registry NOT redirected: the layered base still serves the OLD
     // generation container (no partial application on assertion failure).
     let base = db.layered_store().expect("layered store").base_store_arc();
-    assert_eq!(base.total_nodes(), old_base_nodes, "base must be unchanged after failed install");
+    assert_eq!(
+        base.total_nodes(),
+        old_base_nodes,
+        "base must be unchanged after failed install"
+    );
 }
 
 // ── Fail-closed: no generation root ────────────────────────────────

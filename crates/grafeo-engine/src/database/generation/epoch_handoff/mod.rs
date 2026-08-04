@@ -32,6 +32,7 @@
 //! process aborts at that boundary so a fresh-process parent can prove recovery.
 
 mod handoff;
+mod handoff_install;
 mod records;
 mod types;
 
@@ -42,3 +43,14 @@ pub use handoff::{FREEZE_STALL_BEFORE_CAPTURE, FREEZE_STALL_ENTERED};
 pub use types::{
     EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle,
 };
+
+// The install surface additionally requires `mmap` (it reaches the
+// `GrafeoDB::generation_root` field and the lease registry).
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming",
+    feature = "mmap"
+))]
+pub use handoff_install::{HandoffInstallError, HandoffInstallReport};

@@ -61,6 +61,14 @@ pub mod retirement;
 pub use epoch_handoff::{
     EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle,
 };
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming",
+    feature = "mmap"
+))]
+pub use epoch_handoff::{HandoffInstallError, HandoffInstallReport};
 #[cfg(feature = "mmap")]
 pub use lease::{
     BaseGeneration, GenerationLease, GenerationLeaseRegistry, GenerationLeaseStats,

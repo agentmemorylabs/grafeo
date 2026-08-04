@@ -99,6 +99,14 @@ pub use database::generation::{
 pub use database::generation::{
     EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle,
 };
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming",
+    feature = "mmap"
+))]
+pub use database::generation::{HandoffInstallError, HandoffInstallReport};
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation_build::{
     GenerationBuildRequest, PublishedGenerationDescriptor, generation_build_request,
