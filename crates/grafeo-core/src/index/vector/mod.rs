@@ -332,6 +332,17 @@ impl VectorIndexKind {
         }
     }
 
+    /// Streaming view over this index's topology (H-ADOPT.6 item 0B).
+    /// See [`crate::index::vector::hnsw::TopologyView`] for the
+    /// lock-hold contract.
+    #[must_use]
+    pub(crate) fn topology_view(&self) -> crate::index::vector::hnsw::TopologyView<'_> {
+        match self {
+            Self::Hnsw(idx) => idx.topology_view(),
+            Self::Quantized(idx) => idx.topology_view(),
+        }
+    }
+
     /// Restore topology from a snapshot.
     pub fn restore_topology(
         &self,

@@ -763,6 +763,14 @@ impl QuantizedHnswIndex {
         self.hnsw.snapshot_topology()
     }
 
+    /// Streaming view over the underlying HNSW topology (H-ADOPT.6
+    /// item 0B). See [`super::hnsw::TopologyView`] for the lock-hold
+    /// contract.
+    #[must_use]
+    pub(crate) fn topology_view(&self) -> super::hnsw::TopologyView<'_> {
+        self.hnsw.topology_view()
+    }
+
     /// Restore topology from a snapshot. Replaces all current data.
     pub fn restore_topology(
         &self,

@@ -53,13 +53,17 @@
 
 use super::VectorAccessor;
 use super::compute_distance;
-use super::paged_topology::{MmapTopology, NeighborsIter as MmapNeighborsIter};
+use super::paged_topology::{
+    MmapTopology, NeighborsIter as MmapNeighborsIter, topology_envelope_len,
+    topology_node_payload_len, topology_pairs_len, write_topology_nodes,
+};
 use crate::index::vector::HnswConfig;
 use grafeo_common::types::NodeId;
 use ordered_float::OrderedFloat;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use rand::{RngExt, SeedableRng};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::io::Write;
 use std::sync::Arc;
 
 /// A neighbor entry in the HNSW graph.
@@ -130,6 +134,73 @@ struct HnswNode {
     /// Neighbors at each layer (layer 0 is the bottom).
     /// The node's max layer is `neighbors.len() - 1`.
     neighbors: Vec<Vec<NodeId>>,
+}
+
+/// Streaming view over one index's topology (H-ADOPT.6 item 0B).
+///
+/// Holds the topology read lock for the view's lifetime. The section
+/// encoder keeps one view per index across BOTH passes (length pass,
+/// then emission pass), so neighbor data is never re-snapshotted or
+/// cloned. Publication runs in a quiesced window; the extended
+/// read-lock hold is deliberate and documented here per the packet.
+///
+/// Byte contract: [`TopologyView::write_to`] emits exactly the bytes
+/// `serialize_topology(snapshot_topology())` would produce for this
+/// index. The mmap arm re-emits the verbatim section blob; the heap
+/// arm walks borrowed references in sorted page-index order.
+pub(crate) struct TopologyView<'a> {
+    backend: RwLockReadGuard<'a, TopologyBackend>,
+    entry_point: Option<NodeId>,
+    max_level: usize,
+}
+
+impl TopologyView<'_> {
+    /// Exact GTOP byte length (encoder pass 1). Arithmetic walk for
+    /// the heap arm (no allocation), O(1) for the mmap arm.
+    #[must_use]
+    pub(crate) fn exact_len(&self) -> u64 {
+        match &*self.backend {
+            TopologyBackend::Heap(map) => {
+                topology_envelope_len(map.len())
+                    + map
+                        .values()
+                        .map(|node| topology_node_payload_len(&node.neighbors))
+                        .sum::<u64>()
+            }
+            TopologyBackend::Mmap(topo) => topo.mapped_bytes() as u64,
+        }
+    }
+
+    /// Emit this index's GTOP bytes to `sink` (encoder pass 2).
+    /// Returns the number of bytes written — always equal to
+    /// [`TopologyView::exact_len`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any sink I/O error.
+    pub(crate) fn write_to<W: Write + ?Sized>(&self, sink: &mut W) -> std::io::Result<u64> {
+        match &*self.backend {
+            TopologyBackend::Heap(map) => {
+                // Borrowed-reference pairs sorted by NodeId (page-index
+                // order): pointers only, never clones neighbor Vecs.
+                // Transient 24 B/node, released after this index emits.
+                let mut pairs: Vec<(NodeId, &Vec<Vec<NodeId>>)> = map
+                    .iter()
+                    .map(|(id, node)| (*id, &node.neighbors))
+                    .collect();
+                pairs.sort_unstable_by_key(|(id, _)| *id);
+                write_topology_nodes(self.entry_point, self.max_level, &pairs, sink)?;
+                Ok(topology_pairs_len(&pairs))
+            }
+            TopologyBackend::Mmap(topo) => {
+                // Verbatim re-emission of the adopted GTOP blob —
+                // byte-identical by construction, zero walk.
+                let blob = topo.raw_bytes();
+                sink.write_all(blob)?;
+                Ok(blob.len() as u64)
+            }
+        }
+    }
 }
 
 /// Topology storage backend for [`HnswIndex`].
@@ -396,6 +467,20 @@ impl HnswIndex {
         match &*self.nodes.read() {
             TopologyBackend::Mmap(topo) => Some(topo.mapped_bytes()),
             TopologyBackend::Heap(_) => None,
+        }
+    }
+
+    /// Streaming view over this index's topology (H-ADOPT.6 item 0B).
+    ///
+    /// The returned view holds the topology read lock until dropped.
+    /// The section encoder keeps views alive across both passes (length
+    /// + emission); see [`TopologyView`] for the lock-hold contract.
+    #[must_use]
+    pub(crate) fn topology_view(&self) -> TopologyView<'_> {
+        TopologyView {
+            backend: self.nodes.read(),
+            entry_point: *self.entry_point.read(),
+            max_level: *self.max_level.read(),
         }
     }
 

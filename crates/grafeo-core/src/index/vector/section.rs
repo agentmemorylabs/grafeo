@@ -23,6 +23,7 @@
 //! On the next checkpoint after a v1→v2 read, the section serializes
 //! the in-memory topologies as v2, completing the migration.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,6 +34,7 @@ use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::types::NodeId;
 use grafeo_common::utils::error::{Error, Result};
 
+use super::hnsw::TopologyView;
 use super::paged_topology::{MmapTopology, deserialize_topology, serialize_topology};
 use super::{DistanceMetric, VectorIndexKind};
 
@@ -138,6 +140,138 @@ impl VectorStoreSection {
             // Legacy v1 is always heap-restored; mmap topology is v2-only.
             deserialize_v1(data.as_ref(), &mut self.indexes)
         }
+    }
+
+    /// Exact total section byte length (H-ADOPT.6 item 0B, pass 1 only).
+    ///
+    /// Arithmetic pass over the same v2 layout [`Self::serialize`]
+    /// produces: meta blobs are bincode-encoded (small, per index) and
+    /// topology lengths are computed without materializing any topology
+    /// bytes. Cheap enough to run ahead of container emission so the
+    /// generation writer knows the section length before streaming.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error if meta encoding fails.
+    pub fn stream_len(&self) -> Result<u64> {
+        let views: Vec<TopologyView<'_>> = self
+            .indexes
+            .iter()
+            .map(|(_, index)| index.topology_view())
+            .collect();
+        let (meta_blobs, topology_lens) = self.plan_stream(&views)?;
+
+        let mut total = (V2_HEADER_SIZE + self.indexes.len() * V2_DIR_ENTRY_SIZE) as u64;
+        total += meta_blobs.iter().map(Vec::len).sum::<usize>() as u64;
+        total += topology_lens.iter().sum::<u64>();
+        Ok(total)
+    }
+
+    /// Stream the entire v2 section envelope to `sink` and return the
+    /// exact total number of bytes written (H-ADOPT.6 item 0B).
+    ///
+    /// Byte-identical to [`Self::serialize`] (the `serialize_v2`
+    /// layout: header → directory → ALL meta blobs → ALL topology
+    /// blobs, in index order) but bounded: no full section buffer, no
+    /// per-index GTOP blob materialization, no neighbor cloning.
+    ///
+    /// GLOBAL two-pass over the section:
+    ///
+    /// 1. **Length pass** — bincode-encode each meta blob (kept;
+    ///    small) and compute each topology length arithmetically over a
+    ///    no-clone backend walk. Directory offsets are computed exactly
+    ///    as `serialize_v2` does (metas first, then topologies).
+    /// 2. **Emission pass** — stream header + directory + meta blobs,
+    ///    then each topology in the same index order.
+    ///
+    /// # Lock hold
+    ///
+    /// One [`TopologyView`] per index holds its topology read lock
+    /// across both passes; publication runs in a quiesced window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error on meta-encoding failure; propagates
+    /// sink I/O errors.
+    pub fn stream_to<W: Write + ?Sized>(&self, sink: &mut W) -> Result<u64> {
+        let views: Vec<TopologyView<'_>> = self
+            .indexes
+            .iter()
+            .map(|(_, index)| index.topology_view())
+            .collect();
+        let (meta_blobs, topology_lens) = self.plan_stream(&views)?;
+
+        let n = self.indexes.len();
+        let body_start = V2_HEADER_SIZE + n * V2_DIR_ENTRY_SIZE;
+
+        // Directory offsets — exactly the serialize_v2 computation
+        // (all meta blobs first, then all topology blobs).
+        let mut meta_offsets: Vec<u64> = Vec::with_capacity(n);
+        let mut topology_offsets: Vec<u64> = Vec::with_capacity(n);
+        let mut cursor = body_start as u64;
+        for blob in &meta_blobs {
+            meta_offsets.push(cursor);
+            cursor += blob.len() as u64;
+        }
+        for len in &topology_lens {
+            topology_offsets.push(cursor);
+            cursor += len;
+        }
+        let total = cursor;
+
+        // Header.
+        let mut header = [0u8; V2_HEADER_SIZE];
+        header[0..4].copy_from_slice(V2_MAGIC);
+        header[4] = VECTOR_SECTION_VERSION;
+        header[8..16].copy_from_slice(&(n as u64).to_le_bytes());
+        sink.write_all(&header)?;
+
+        // Directory.
+        for i in 0..n {
+            let mut entry = [0u8; V2_DIR_ENTRY_SIZE];
+            entry[0..8].copy_from_slice(&meta_offsets[i].to_le_bytes());
+            entry[8..16].copy_from_slice(&(meta_blobs[i].len() as u64).to_le_bytes());
+            entry[16..24].copy_from_slice(&topology_offsets[i].to_le_bytes());
+            entry[24..32].copy_from_slice(&topology_lens[i].to_le_bytes());
+            sink.write_all(&entry)?;
+        }
+
+        // All meta blobs, in index order.
+        for blob in &meta_blobs {
+            sink.write_all(blob)?;
+        }
+
+        // All topology blobs, in index order — bounded walk per index.
+        for view in &views {
+            view.write_to(sink)?;
+        }
+
+        Ok(total)
+    }
+
+    /// Pass-1 artifacts shared by [`Self::stream_len`] and
+    /// [`Self::stream_to`]: per-index bincode meta blobs and exact
+    /// topology lengths (arithmetic walk, no topology bytes).
+    fn plan_stream(&self, views: &[TopologyView<'_>]) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
+        let bincode_config = bincode::config::standard();
+        let mut meta_blobs: Vec<Vec<u8>> = Vec::with_capacity(self.indexes.len());
+        let mut topology_lens: Vec<u64> = Vec::with_capacity(self.indexes.len());
+        for ((key, index), view) in self.indexes.iter().zip(views) {
+            let config = index.config();
+            let meta = IndexMetaV2 {
+                key: key.clone(),
+                dimensions: config.dimensions,
+                metric: config.metric,
+                m: config.m,
+                ef_construction: config.ef_construction,
+            };
+            let meta_bytes = bincode::serde::encode_to_vec(&meta, bincode_config).map_err(|e| {
+                Error::Internal(format!("Vector Store v2 meta serialization failed: {e}"))
+            })?;
+            meta_blobs.push(meta_bytes);
+            topology_lens.push(view.exact_len());
+        }
+        Ok((meta_blobs, topology_lens))
     }
 }
 
