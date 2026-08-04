@@ -4,16 +4,22 @@
 //! explicit-transaction-required batch mutation on [`Session`]. These methods
 //! are **not** a loop over the row-oriented `create_node_with_props` /
 //! `create_edge_with_props`; they delegate to a single storage-level batch
-//! primitive ([`LpgStore::create_nodes_batch_versioned`] /
-//! [`create_edges_batch_versioned`]) that hoists every per-row lock to once per
-//! batch and allocates the ID range with one atomic.
+//! primitive ([`grafeo_core::graph::GraphStoreMut::create_nodes_batch_versioned`]
+//! / [`create_edges_batch_versioned`]) that hoists every per-row lock to once
+//! per batch and allocates the ID range with one atomic.
 //!
 //! Locked contracts honored here:
 //! - fail if no explicit transaction is active;
 //! - prevalidate every property size before the first mutation;
 //! - version every row under the active transaction ID (PENDING visibility);
 //! - register every node and edge write with transaction management;
-//! - preserve WAL records (identical record stream to the row path);
+//! - route through the session's routed write store (`active_write_store`)
+//!   so layered sessions run batch writes through LayeredStore's
+//!   dirty/post-freeze/admission bookkeeping (H-ADOPT.2 item 3 — the old
+//!   `active_lpg_store()` bypass silently served stale frozen values after a
+//!   handoff swap); the WAL stream is emitted by the WAL-wrapped write store
+//!   and stays identical to the row path (CreateNode + SetNodeProperty per
+//!   node, CreateEdge + SetEdgeProperty per edge);
 //! - buffer vector-index intents until commit;
 //! - preserve returned ID order;
 //! - never call the offline/unindexed bulk loaders.
@@ -142,7 +148,11 @@ impl Session {
             })
             .collect();
 
-        let store = self.active_lpg_store();
+        let store = self.active_write_store().ok_or_else(|| {
+            Error::Transaction(TransactionError::InvalidState(
+                "transactional batch mutation requires a writable store".to_string(),
+            ))
+        })?;
         let ids = store.create_nodes_batch_versioned(&storage_nodes, epoch, transaction_id);
 
         // Register every node write with transaction management (one lock).
@@ -154,21 +164,11 @@ impl Session {
         self.transaction_manager
             .record_writes(transaction_id, &entities)?;
 
-        // WAL: identical record stream to the row path (CreateNode + SetNodeProperty*).
-        #[cfg(feature = "wal")]
-        for (node, &id) in nodes.iter().zip(ids.iter()) {
-            self.log_wal_record(&grafeo_storage::wal::WalRecord::CreateNode {
-                id,
-                labels: node.labels.clone(),
-            });
-            for (key, value) in &node.properties {
-                self.log_wal_record(&grafeo_storage::wal::WalRecord::SetNodeProperty {
-                    id,
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-            }
-        }
+        // WAL: the write store handles it. When the session routes through a
+        // WAL-wrapped store (WalGraphStore), the batch impl logs the identical
+        // record stream to the row path (CreateNode + SetNodeProperty per
+        // node). When the write store is a raw LpgStore/LayeredStore there is
+        // no WAL to write to, matching the row path exactly.
 
         // Vector intents: buffer until commit, exactly like the row path.
         #[cfg(feature = "vector-index")]
@@ -225,7 +225,11 @@ impl Session {
             })
             .collect();
 
-        let store = self.active_lpg_store();
+        let store = self.active_write_store().ok_or_else(|| {
+            Error::Transaction(TransactionError::InvalidState(
+                "transactional batch mutation requires a writable store".to_string(),
+            ))
+        })?;
         let ids = store.create_edges_batch_versioned(&storage_edges, epoch, transaction_id);
 
         let entities: Vec<crate::transaction::EntityId> = ids
@@ -235,23 +239,6 @@ impl Session {
             .collect();
         self.transaction_manager
             .record_writes(transaction_id, &entities)?;
-
-        #[cfg(feature = "wal")]
-        for (edge, &id) in edges.iter().zip(ids.iter()) {
-            self.log_wal_record(&grafeo_storage::wal::WalRecord::CreateEdge {
-                id,
-                src: edge.source,
-                dst: edge.target,
-                edge_type: edge.edge_type.clone(),
-            });
-            for (key, value) in &edge.properties {
-                self.log_wal_record(&grafeo_storage::wal::WalRecord::SetEdgeProperty {
-                    id,
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-            }
-        }
 
         Ok(ids)
     }

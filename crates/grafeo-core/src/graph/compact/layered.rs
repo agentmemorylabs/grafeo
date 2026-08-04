@@ -20,7 +20,7 @@ use super::CompactStore;
 use super::overlay_budget::{OverlayAdmissionController, RetainedCategory};
 use super::overlay_cost;
 use crate::graph::Direction;
-use crate::graph::lpg::{CompareOp, Edge, LpgStore, Node};
+use crate::graph::lpg::{BatchEdgeCreate, BatchNodeCreate, CompareOp, Edge, LpgStore, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
@@ -456,6 +456,28 @@ impl LayeredStore {
         self.dirty_node_ids.write().insert(id);
         if let Some(h) = self.handoff.write().as_mut() {
             h.post_freeze_nodes.insert(id.as_u64());
+        }
+    }
+
+    /// Batch variant of [`Self::mark_dirty_node`]: ONE write-lock acquisition
+    /// on the dirty set plus (when a handoff is active) ONE on the handoff
+    /// bookkeeping, regardless of batch size. The versioned batch node create
+    /// uses this so an N-node batch costs constant lock acquisitions, mirroring
+    /// [`Self::mark_dirty_edges`].
+    fn mark_dirty_nodes(&self, ids: &[NodeId]) {
+        if ids.is_empty() {
+            return;
+        }
+        {
+            let mut dirty = self.dirty_node_ids.write();
+            for id in ids {
+                dirty.insert(*id);
+            }
+        }
+        if let Some(h) = self.handoff.write().as_mut() {
+            for id in ids {
+                h.post_freeze_nodes.insert(id.as_u64());
+            }
         }
     }
 
@@ -1847,6 +1869,81 @@ impl GraphStoreMut for LayeredStore {
         let total: usize = edges
             .iter()
             .map(|(_, _, edge_type)| overlay_cost::edge_creation_retained_bytes(edge_type))
+            .sum();
+        if total > 0 {
+            self.charge_retained(RetainedCategory::MutationPayload, total);
+        }
+        ids
+    }
+
+    fn create_nodes_batch_versioned(
+        &self,
+        nodes: &[BatchNodeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        let _guard = self.merge_guard.read();
+        let ids = self
+            .overlay
+            .load()
+            .create_nodes_batch_versioned(nodes, epoch, transaction_id);
+        // One dirty-set write lock + (during a handoff) one handoff lock for
+        // the whole batch, mirroring `mark_dirty_edges`.
+        self.mark_dirty_nodes(&ids);
+
+        // Charge the whole batch ONCE.
+        let total: usize = nodes
+            .iter()
+            .map(|n| overlay_cost::node_creation_retained_bytes(n.labels))
+            .sum();
+        if total > 0 {
+            self.charge_retained(RetainedCategory::MutationPayload, total);
+        }
+        ids
+    }
+
+    fn create_edges_batch_versioned(
+        &self,
+        edges: &[BatchEdgeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<EdgeId> {
+        let _guard = self.merge_guard.read();
+        // Endpoint preparation, batched exactly like `batch_create_edges`:
+        // promote base-resident endpoints once each, and record the
+        // post-freeze identity of already-tracked endpoints in ONE handoff
+        // lock acquisition.
+        let mut endpoints: FxHashSet<NodeId> = FxHashSet::default();
+        for e in edges {
+            endpoints.insert(e.source);
+            endpoints.insert(e.target);
+        }
+        let mut tracked: Vec<NodeId> = Vec::new();
+        for nid in endpoints {
+            if self.is_node_dirty(nid) {
+                tracked.push(nid);
+            } else {
+                self.ensure_in_overlay(nid);
+            }
+        }
+        if !tracked.is_empty()
+            && let Some(h) = self.handoff.write().as_mut()
+        {
+            for nid in &tracked {
+                h.post_freeze_nodes.insert(nid.as_u64());
+            }
+        }
+
+        let ids = self
+            .overlay
+            .load()
+            .create_edges_batch_versioned(edges, epoch, transaction_id);
+        self.mark_dirty_edges(&ids);
+
+        // Charge the whole batch ONCE.
+        let total: usize = edges
+            .iter()
+            .map(|e| overlay_cost::edge_creation_retained_bytes(e.edge_type))
             .sum();
         if total > 0 {
             self.charge_retained(RetainedCategory::MutationPayload, total);

@@ -22,8 +22,8 @@ use grafeo_core::graph::compact::layered::OverlayHandoffLive;
 use grafeo_core::graph::compact::overlay_budget::{
     OverlayAdmissionController, OverlayBudgetConfig,
 };
-use grafeo_engine::session::{TransactionalEdgeCreate, TransactionalNodeCreate};
 use grafeo_engine::GrafeoDB;
+use grafeo_engine::session::{TransactionalEdgeCreate, TransactionalNodeCreate};
 
 /// Batch node+edge creates through a layered SESSION must mark the created
 /// entities dirty in the overlay, record their post-freeze identity during an

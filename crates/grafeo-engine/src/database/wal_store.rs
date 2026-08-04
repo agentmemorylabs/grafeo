@@ -10,7 +10,7 @@ use std::sync::Arc;
 use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
-use grafeo_core::graph::lpg::{CompareOp, Edge, Node};
+use grafeo_core::graph::lpg::{BatchEdgeCreate, BatchNodeCreate, CompareOp, Edge, Node};
 use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_core::statistics::Statistics;
 use grafeo_storage::wal::{LpgWal, WalRecord};
@@ -480,6 +480,63 @@ impl GraphStoreMut for WalGraphStore {
         ids
     }
 
+    fn create_nodes_batch_versioned(
+        &self,
+        nodes: &[BatchNodeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        let ids = self
+            .inner
+            .create_nodes_batch_versioned(nodes, epoch, transaction_id);
+        // One WAL record per row plus one per property, mirroring the row path
+        // (create_node_versioned + set_node_property_versioned) so the record
+        // stream stays identical: CreateNode, then SetNodeProperty per prop.
+        for (node, &id) in nodes.iter().zip(ids.iter()) {
+            self.log_with_context(&WalRecord::CreateNode {
+                id,
+                labels: node.labels.iter().map(|s| (*s).to_string()).collect(),
+            });
+            for (key, value) in &node.properties {
+                self.log_with_context(&WalRecord::SetNodeProperty {
+                    id,
+                    key: key.as_str().to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+        ids
+    }
+
+    fn create_edges_batch_versioned(
+        &self,
+        edges: &[BatchEdgeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<EdgeId> {
+        let ids = self
+            .inner
+            .create_edges_batch_versioned(edges, epoch, transaction_id);
+        // One WAL record per row plus one per property, mirroring the row path
+        // (create_edge_versioned + set_edge_property_versioned).
+        for (edge, &id) in edges.iter().zip(ids.iter()) {
+            self.log_with_context(&WalRecord::CreateEdge {
+                id,
+                src: edge.source,
+                dst: edge.target,
+                edge_type: edge.edge_type.to_string(),
+            });
+            for (key, value) in &edge.properties {
+                self.log_with_context(&WalRecord::SetEdgeProperty {
+                    id,
+                    key: key.as_str().to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+        ids
+    }
+
     fn delete_node(&self, id: NodeId) -> bool {
         let deleted = self.inner.delete_node(id);
         if deleted {
@@ -772,6 +829,58 @@ mod tests {
         assert_eq!(ws.edge_count(), 2);
         // One WAL record per edge
         assert_eq!(wal.record_count(), 5);
+    }
+
+    #[test]
+    fn create_nodes_batch_versioned_logs_create_and_props() {
+        let (ws, wal) = setup();
+        let nodes = [
+            BatchNodeCreate {
+                labels: &["Person"],
+                properties: vec![
+                    (PropertyKey::new("name".to_string()), Value::from("A")),
+                    (PropertyKey::new("age".to_string()), Value::from(1i64)),
+                ],
+            },
+            BatchNodeCreate {
+                labels: &["Robot"],
+                properties: vec![],
+            },
+        ];
+        let ids = ws.create_nodes_batch_versioned(&nodes, EpochId::new(0), TransactionId::SYSTEM);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ws.node_count(), 2);
+        // CreateNode per row (2) + SetNodeProperty per prop (2) = 4 records.
+        assert_eq!(wal.record_count(), 4);
+    }
+
+    #[test]
+    fn create_edges_batch_versioned_logs_create_and_props() {
+        let (ws, wal) = setup();
+        let a = ws.create_node(&["Node"]);
+        let b = ws.create_node(&["Node"]);
+        let c = ws.create_node(&["Node"]);
+        let before = wal.record_count();
+
+        let edges = [
+            BatchEdgeCreate {
+                source: a,
+                target: b,
+                edge_type: "X",
+                properties: vec![(PropertyKey::new("w".to_string()), Value::from(1i64))],
+            },
+            BatchEdgeCreate {
+                source: b,
+                target: c,
+                edge_type: "Y",
+                properties: vec![],
+            },
+        ];
+        let ids = ws.create_edges_batch_versioned(&edges, EpochId::new(0), TransactionId::SYSTEM);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ws.edge_count(), 2);
+        // CreateEdge per row (2) + SetEdgeProperty per prop (1) = 3 records.
+        assert_eq!(wal.record_count(), before + 3);
     }
 
     #[test]

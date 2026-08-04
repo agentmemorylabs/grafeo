@@ -7,7 +7,7 @@
 use super::LpgStore;
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
-use crate::graph::lpg::{Edge, Node};
+use crate::graph::lpg::{BatchEdgeCreate, BatchNodeCreate, Edge, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
 #[cfg(feature = "vector-index")]
 use crate::index::vector::{
@@ -444,6 +444,24 @@ impl GraphStoreMut for LpgStore {
 
     fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId> {
         LpgStore::batch_create_edges(self, edges)
+    }
+
+    fn create_nodes_batch_versioned(
+        &self,
+        nodes: &[BatchNodeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        LpgStore::create_nodes_batch_versioned(self, nodes, epoch, transaction_id)
+    }
+
+    fn create_edges_batch_versioned(
+        &self,
+        edges: &[BatchEdgeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<EdgeId> {
+        LpgStore::create_edges_batch_versioned(self, edges, epoch, transaction_id)
     }
 
     fn delete_node(&self, id: NodeId) -> bool {
