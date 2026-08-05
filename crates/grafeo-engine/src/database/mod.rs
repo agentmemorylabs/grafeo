@@ -45,6 +45,7 @@ pub mod generation_build;
 mod import;
 #[cfg(feature = "lpg")]
 mod index;
+pub mod index_build_control;
 #[cfg(feature = "lpg")]
 mod persistence;
 mod query;

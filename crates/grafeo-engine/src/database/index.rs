@@ -7,7 +7,9 @@ use std::sync::Arc;
 #[cfg(feature = "text-index")]
 use parking_lot::RwLock;
 
-use grafeo_common::utils::error::Result;
+use grafeo_common::utils::error::{Error, Result};
+
+use super::index_build_control::IndexBuildControl;
 
 impl super::GrafeoDB {
     // =========================================================================
@@ -138,6 +140,39 @@ impl super::GrafeoDB {
         ef_construction: Option<usize>,
         quantization: Option<&str>,
     ) -> Result<()> {
+        self.create_vector_index_with_control(
+            label,
+            property,
+            dimensions,
+            metric,
+            m,
+            ef_construction,
+            quantization,
+            None,
+        )
+    }
+
+    /// [`Self::create_vector_index`] with an optional [`IndexBuildControl`]
+    /// (G-OBS.1): cancel polled every 256 loop iterations, progress every 1024
+    /// plus once at completion; a cancelled build returns `Error::Cancelled`
+    /// before the index is registered. `None` preserves legacy behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metric is invalid, no vectors are found,
+    /// dimensions don't match, or the build is cancelled via `control`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_vector_index_with_control(
+        &self,
+        label: &str,
+        property: &str,
+        dimensions: Option<usize>,
+        metric: Option<&str>,
+        m: Option<usize>,
+        ef_construction: Option<usize>,
+        quantization: Option<&str>,
+        control: Option<&IndexBuildControl>,
+    ) -> Result<()> {
         use grafeo_common::types::{PropertyKey, Value};
         use grafeo_core::index::vector::DistanceMetric;
 
@@ -162,7 +197,14 @@ impl super::GrafeoDB {
         let mut vector_count = 0usize;
 
         let graph = self.graph_store();
-        for node_id in graph.nodes_by_label(label) {
+        for (iteration, node_id) in graph.nodes_by_label(label).into_iter().enumerate() {
+            if let Some(control) = control
+                && control.maybe_cancel(iteration as u64)
+            {
+                return Err(Error::Cancelled {
+                    operation: format!("create_vector_index dim scan :{label}({property})"),
+                });
+            }
             if let Some(Value::Vector(v)) = graph.get_node_property(node_id, &prop_key) {
                 if let Some(expected) = found_dims {
                     if v.len() != expected {
@@ -230,11 +272,24 @@ impl super::GrafeoDB {
                     let graph = self.graph_store();
                     let accessor =
                         grafeo_core::index::vector::PropertyVectorAccessor::new(&*graph, property);
-                    for node_id in graph.nodes_by_label(label) {
+                    let mut inserted: u64 = 0;
+                    for (iteration, node_id) in graph.nodes_by_label(label).into_iter().enumerate()
+                    {
+                        if let Some(control) = control {
+                            if control.maybe_cancel(iteration as u64) {
+                                return Err(Error::Cancelled {
+                                    operation: format!(
+                                        "create_vector_index build :{label}({property})"
+                                    ),
+                                });
+                            }
+                            control.maybe_progress(iteration as u64, inserted, vector_count as u64);
+                        }
                         if let Some(Value::Vector(vector)) =
                             graph.get_node_property(node_id, &prop_key)
                         {
                             index.insert(node_id, &vector, &accessor);
+                            inserted += 1;
                         }
                     }
                 }
@@ -242,11 +297,24 @@ impl super::GrafeoDB {
                     let graph = self.graph_store();
                     let accessor =
                         grafeo_core::index::vector::PropertyVectorAccessor::new(&*graph, property);
-                    for node_id in graph.nodes_by_label(label) {
+                    let mut inserted: u64 = 0;
+                    for (iteration, node_id) in graph.nodes_by_label(label).into_iter().enumerate()
+                    {
+                        if let Some(control) = control {
+                            if control.maybe_cancel(iteration as u64) {
+                                return Err(Error::Cancelled {
+                                    operation: format!(
+                                        "create_vector_index build :{label}({property})"
+                                    ),
+                                });
+                            }
+                            control.maybe_progress(iteration as u64, inserted, vector_count as u64);
+                        }
                         if let Some(Value::Vector(vector)) =
                             graph.get_node_property(node_id, &prop_key)
                         {
                             q_idx.insert(node_id, &vector, &accessor);
+                            inserted += 1;
                         }
                     }
                     // Scalar search currently uses LPG accessor distances, not the
@@ -259,6 +327,10 @@ impl super::GrafeoDB {
                         q_idx.release_quantized_payloads();
                     }
                 }
+            }
+
+            if let Some(control) = control {
+                control.finish_progress(vector_count as u64);
             }
 
             self.lpg_store()
@@ -419,6 +491,24 @@ impl super::GrafeoDB {
     /// and no dimensions can be inferred).
     #[cfg(feature = "vector-index")]
     pub fn rebuild_vector_index(&self, label: &str, property: &str) -> Result<()> {
+        self.rebuild_vector_index_with_control(label, property, None)
+    }
+
+    /// [`Self::rebuild_vector_index`] with an optional [`IndexBuildControl`]
+    /// (G-OBS.1); cancellation and progress are forwarded to the underlying
+    /// controlled `create_vector_index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rebuild fails (e.g., no matching vectors found
+    /// and no dimensions can be inferred, or the build is cancelled).
+    #[cfg(feature = "vector-index")]
+    pub fn rebuild_vector_index_with_control(
+        &self,
+        label: &str,
+        property: &str,
+        control: Option<&IndexBuildControl>,
+    ) -> Result<()> {
         // Preserve config and quantization type from existing index if available
         let existing = self.lpg_store().get_vector_index(label, property);
 
@@ -439,7 +529,7 @@ impl super::GrafeoDB {
         self.lpg_store().remove_vector_index(label, property);
 
         if let Some(config) = config {
-            self.create_vector_index(
+            self.create_vector_index_with_control(
                 label,
                 property,
                 Some(config.dimensions),
@@ -447,10 +537,13 @@ impl super::GrafeoDB {
                 Some(config.m),
                 Some(config.ef_construction),
                 quantization_name,
+                control,
             )
         } else {
             // Index was already dropped: infer dimensions from data
-            self.create_vector_index(label, property, None, None, None, None, None)
+            self.create_vector_index_with_control(
+                label, property, None, None, None, None, None, control,
+            )
         }
     }
 
@@ -470,6 +563,25 @@ impl super::GrafeoDB {
     /// Returns an error if the label has no nodes or the property contains no text values.
     #[cfg(feature = "text-index")]
     pub fn create_text_index(&self, label: &str, property: &str) -> Result<()> {
+        self.create_text_index_with_control(label, property, None)
+    }
+
+    /// [`Self::create_text_index`] with an optional [`IndexBuildControl`]
+    /// (G-OBS.1): cancel polled every 256 loop iterations, progress every 1024
+    /// plus once at completion; a cancelled build returns `Error::Cancelled`
+    /// before the index is registered. `None` preserves legacy behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the label has no nodes, the property contains no
+    /// text values, or the build is cancelled via `control`.
+    #[cfg(feature = "text-index")]
+    pub fn create_text_index_with_control(
+        &self,
+        label: &str,
+        property: &str,
+        control: Option<&IndexBuildControl>,
+    ) -> Result<()> {
         use grafeo_common::types::{PropertyKey, Value};
         use grafeo_core::index::text::{BM25Config, InvertedIndex};
 
@@ -479,10 +591,26 @@ impl super::GrafeoDB {
         // Index all existing nodes with this label + property
         let graph = self.graph_store();
         let nodes = graph.nodes_by_label(label);
-        for node_id in nodes {
+        // The text path does not pre-count matching rows; report progress
+        // against the label's node count as the total (G-OBS.1).
+        let total = nodes.len() as u64;
+        let mut inserted: u64 = 0;
+        for (iteration, node_id) in nodes.into_iter().enumerate() {
+            if let Some(control) = control {
+                if control.maybe_cancel(iteration as u64) {
+                    return Err(Error::Cancelled {
+                        operation: format!("create_text_index build :{label}({property})"),
+                    });
+                }
+                control.maybe_progress(iteration as u64, inserted, total);
+            }
             if let Some(Value::String(text)) = graph.get_node_property(node_id, &prop_key) {
                 index.insert(node_id, text.as_str());
+                inserted += 1;
             }
+        }
+        if let Some(control) = control {
+            control.finish_progress(total);
         }
 
         self.lpg_store()

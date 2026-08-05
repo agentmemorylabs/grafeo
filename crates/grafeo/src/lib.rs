@@ -73,6 +73,13 @@ pub use grafeo_engine::{
     StatementKind, VERSION,
 };
 
+// Re-export the index-build control surface (G-OBS.1): cancellation check,
+// progress callback, and the optional control struct passed to the
+// `*_with_control` index-build entry points.
+pub use grafeo_engine::database::index_build_control::{
+    IndexBuildCancelCheck, IndexBuildControl, IndexBuildProgress,
+};
+
 // Re-export submodules for qualified access (e.g. grafeo::auth::Identity)
 pub use grafeo_engine::admin;
 pub use grafeo_engine::auth;
