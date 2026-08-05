@@ -94,6 +94,8 @@ pub enum ErrorCode {
     SerializationError,
     /// I/O error.
     IoError,
+    /// Operation cancelled by caller control surface.
+    Cancelled,
 }
 
 impl ErrorCode {
@@ -132,6 +134,7 @@ impl ErrorCode {
             Self::Internal => "GRAFEO-X001",
             Self::SerializationError => "GRAFEO-X002",
             Self::IoError => "GRAFEO-X003",
+            Self::Cancelled => "GRAFEO-X004",
         }
     }
 
@@ -209,6 +212,12 @@ pub enum Error {
     /// (oversized, shutdown, or cancelled) and will not succeed on retry.
     AdmissionRejected(String),
 
+    /// A long-running build operation was cancelled by its control surface.
+    Cancelled {
+        /// Human-readable description of the cancelled operation.
+        operation: String,
+    },
+
     /// Internal error (should not happen in normal operation).
     Internal(String),
 }
@@ -231,6 +240,7 @@ impl Error {
             Error::Io(_) => ErrorCode::IoError,
             Error::AdmissionRetryable(_) => ErrorCode::AdmissionRetryable,
             Error::AdmissionRejected(_) => ErrorCode::AdmissionRejected,
+            Error::Cancelled { .. } => ErrorCode::Cancelled,
             Error::Internal(_) => ErrorCode::Internal,
         }
     }
@@ -258,6 +268,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "{code}: I/O error: {e}"),
             Error::AdmissionRetryable(msg) => write!(f, "{code}: Admission retryable: {msg}"),
             Error::AdmissionRejected(msg) => write!(f, "{code}: Admission rejected: {msg}"),
+            Error::Cancelled { operation } => write!(f, "{code}: Cancelled: {operation}"),
             Error::Internal(msg) => write!(f, "{code}: Internal error: {msg}"),
         }
     }

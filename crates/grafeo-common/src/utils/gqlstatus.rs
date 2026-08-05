@@ -233,6 +233,7 @@ impl From<&super::error::Error> for GqlStatus {
             // condition; terminal rejection maps to a data exception.
             Error::AdmissionRetryable(_) => GqlStatus::TX_ROLLBACK,
             Error::AdmissionRejected(_) => GqlStatus::DATA_EXCEPTION,
+            Error::Cancelled { .. } => GqlStatus::DATA_EXCEPTION,
             Error::Internal(_) => GqlStatus::DATA_EXCEPTION,
         }
     }
