@@ -240,6 +240,12 @@ impl super::GrafeoDB {
                         .add_vector_index(label, property, Arc::new(index));
                 }
 
+                // G-OBS.1 MINOR-1: an empty build has no loop, but progress
+                // consumers still expect the completion event.
+                if let Some(control) = control {
+                    control.finish_progress(0);
+                }
+
                 let _ = (m, ef_construction);
                 grafeo_info!(
                     "Empty vector index created: :{label}({property}) - 0 vectors, {d} dimensions, metric={metric_name}",

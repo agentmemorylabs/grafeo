@@ -220,3 +220,107 @@ fn none_control_matches_legacy_behavior() {
         .expect("search on legacy-built index");
     assert_eq!(results.len(), 3);
 }
+
+/// G-OBS.1 MINOR-2 (review): with >1024 vectors the 256/1024 cadence must
+/// actually fire mid-build — progress events at iteration 0 and multiples of
+/// 1024, plus a mid-stream cancel stop within one 256-iteration window.
+#[test]
+fn cadence_fires_mid_build_and_cancel_stops_within_window() {
+    let db = GrafeoDB::new_in_memory();
+    build_vector_graph(&db, 2048);
+
+    // Progress fires at iteration 0 and every 1024 iterations (+ finish).
+    let progress_events: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::clone(&progress_events);
+    let control = IndexBuildControl::new().with_progress(Arc::new(move |done, total| {
+        events.lock().unwrap().push((done, total));
+    }) as IndexBuildProgress);
+    db.create_vector_index_with_control(
+        "Doc",
+        "emb",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+        Some(&control),
+    )
+    .expect("large build completes");
+    let events = progress_events.lock().unwrap().clone();
+    // iteration 0 (done=0), iteration 1024 (done=1024), finish (done=2048)
+    assert!(
+        events.iter().any(|(done, _)| *done == 1024),
+        "a mid-build progress event must fire at the 1024 cadence, got {events:?}"
+    );
+    assert_eq!(
+        events.last().copied(),
+        Some((2048, 2048)),
+        "final progress event must be (total, total), got {events:?}"
+    );
+    for (done, total) in &events {
+        assert!(done <= total, "done {done} must never exceed total {total}");
+    }
+
+    // Cancel armed to trip after 512 inserts must stop mid-stream (not at
+    // iteration 0): the error is typed Cancelled and the index is unregistered.
+    let db2 = GrafeoDB::new_in_memory();
+    build_vector_graph(&db2, 2048);
+    let flips: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let flips_clone = Arc::clone(&flips);
+    let cancel = IndexBuildControl::new().with_cancel_check(Arc::new(move || {
+        flips_clone.fetch_add(1, Ordering::SeqCst) >= 3
+    }));
+    let err = db2
+        .create_vector_index_with_control(
+            "Doc",
+            "emb",
+            Some(3),
+            Some("cosine"),
+            None,
+            None,
+            None,
+            Some(&cancel),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Cancelled { .. }), "got: {err}");
+    assert!(
+        !db2.has_vector_index("Doc", "emb"),
+        "cancelled build must not register"
+    );
+    // The probe was polled at least 3 times (iteration 0, 256, 512) before
+    // tripping — proof the cancel check runs mid-build, not just pre-flight.
+    assert!(
+        flips.load(Ordering::SeqCst) >= 3,
+        "cancel probe must be polled across multiple cadence ticks"
+    );
+}
+
+/// G-OBS.1 MINOR-1 (review): the empty-index path (no vectors + explicit dims)
+/// has no build loop but must still emit the completion progress event.
+#[test]
+fn empty_index_build_emits_completion_progress() {
+    let db = GrafeoDB::new_in_memory();
+    // No nodes with vectors at all.
+    let events: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = Arc::clone(&events);
+    let control = IndexBuildControl::new().with_progress(Arc::new(move |done, total| {
+        events_clone.lock().unwrap().push((done, total));
+    }) as IndexBuildProgress);
+    db.create_vector_index_with_control(
+        "Doc",
+        "emb",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+        Some(&control),
+    )
+    .expect("empty index with explicit dims succeeds");
+    assert!(db.has_vector_index("Doc", "emb"));
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &[(0, 0)],
+        "empty build must emit exactly the (0,0) completion event"
+    );
+}
