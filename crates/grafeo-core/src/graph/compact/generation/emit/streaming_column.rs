@@ -181,6 +181,16 @@ impl StreamingBodyWriter {
             BodyFamily::Empty
         };
 
+        // Fail fast (G-GEM0.PUB1): a Dict column needs its interned chunk
+        // lookup. Reject at column-open — before any body header is written —
+        // with the column identity, instead of failing per-value deep in the
+        // body stream with an unattributable error.
+        if matches!(family, BodyFamily::Dict { empty: false }) && dict_lookup.is_none() {
+            return Err(GenerationError::Codec(format!(
+                "dict column {context} has string values but no dictionary chunk was interned"
+            )));
+        }
+
         let body_len = write_body_header(sink, &family, row_count)?;
 
         let dict_lookup = match &family {
@@ -368,13 +378,15 @@ impl StreamingBodyWriter {
     }
 
     fn dict_code(&mut self, s: &str) -> Result<u32, GenerationError> {
-        let lookup = self
-            .dict_lookup
-            .as_mut()
-            .ok_or_else(|| GenerationError::Codec("dict lookup missing".into()))?;
-        lookup
-            .code_of(s.as_bytes())
-            .ok_or_else(|| GenerationError::Codec(format!("dict string not interned: {s}")))
+        let lookup = self.dict_lookup.as_mut().ok_or_else(|| {
+            GenerationError::Codec(format!("dict lookup missing for {}", self.context))
+        })?;
+        lookup.code_of(s.as_bytes()).ok_or_else(|| {
+            GenerationError::Codec(format!(
+                "dict string not interned: {s} (column {})",
+                self.context
+            ))
+        })
     }
 
     fn fold_zone(&mut self, value: &Value) {

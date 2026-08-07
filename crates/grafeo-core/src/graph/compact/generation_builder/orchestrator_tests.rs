@@ -106,6 +106,69 @@ fn orchestrator_sparse_columns() {
     assert_eq!(n2.get_property("age"), None); // sparse
 }
 
+/// G-GEM0.PUB1 RED repro: the dict chunk catalog must be written in
+/// occurrence order `(table_id, prop)` — the order the column-body and
+/// zone-map passes request columns — NOT in remap order, where the owner
+/// key embeds `prop_len` and therefore sorts `(tid, prop_len, prop)`.
+///
+/// With two string columns in one table whose byte order disagrees with
+/// their length order (`"name"` < `"zip"` byte-wise, but `"zip"` is
+/// shorter), a length-ordered catalog makes the forward-only catalog
+/// cursor return `None` for the first requested column, the Dict column
+/// opens without a lookup, and the first string value fails fail-closed
+/// with "dict lookup missing". Toy fixtures with one string column per
+/// table can never trip this; the frontier graph (12 labels, 15 edge
+/// types, mixed-length string props on nodes AND edges) always does.
+#[test]
+fn dict_catalog_order_mismatch_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    // Node table: byte order "name" < "zip"; length order "zip" (3) < "name" (4).
+    // Edge table: byte order "evidence" < "provenance"; length order
+    // "evidence" (8) < "provenance" (10) matches — add a third edge prop
+    // "src" (3) that is byte-greater but length-smaller than both.
+    let input = GenerationInput::new()
+        .node(
+            GenerationNode::new(1u64, "Person")
+                .with_prop("name", "Ada")
+                .with_prop("zip", "94107"),
+        )
+        .node(
+            GenerationNode::new(2u64, "Person")
+                .with_prop("name", "Bob")
+                .with_prop("zip", "10001"),
+        )
+        .edge(
+            GenerationEdge::new(10u64, 1u64, 2u64, "KNOWS")
+                .with_prop("provenance", "capture")
+                .with_prop("evidence", "session-1")
+                .with_prop("src", "import"),
+        );
+
+    let mut store = InMemoryRunStore::new();
+    let mut builder = BoundedGenerationBuilder::new(config(tmp.path()));
+    let mut lease = builder
+        .build(
+            &mut input.node_source(),
+            &mut input.edge_source(),
+            &mut store,
+        )
+        .expect("build must survive mixed length/byte-order string columns");
+
+    let mut payload = Vec::new();
+    lease.stream_to(&mut payload).expect("stream_to");
+    let bytes = bytes::Bytes::from(payload);
+    let compact = deserialize_v5(&bytes).expect("deserialize_v5");
+
+    assert_eq!(compact.total_nodes(), 2);
+    assert_eq!(compact.total_edges(), 1);
+    let n1 = compact.get_node(NodeId::new(1)).unwrap();
+    let n2 = compact.get_node(NodeId::new(2)).unwrap();
+    assert_eq!(n1.get_property("name"), Some(&Value::String("Ada".into())));
+    assert_eq!(n1.get_property("zip"), Some(&Value::String("94107".into())));
+    assert_eq!(n2.get_property("name"), Some(&Value::String("Bob".into())));
+    assert_eq!(n2.get_property("zip"), Some(&Value::String("10001".into())));
+}
+
 /// B6 (bounded writer): a multi-label node must round-trip through the bounded
 /// orchestrator + production reader with ALL logical labels visible, while the
 /// node is stored exactly once. Exercises the NodeLabelMembership companion

@@ -124,6 +124,14 @@ pub(crate) fn collect_string_occurrences(
 /// Catalog layout (LE, repeated until EOF):
 /// `[tid u16][prop_len u16][prop][path_len u16][relative .dict path]`
 ///
+/// The catalog is written in **`(table_id, prop_key)` order** (occurrence
+/// order), which is the order both consumers (`emit_column_bodies` and the
+/// zone-map passes) request columns through the forward-only
+/// [`DictChunkCatalog`] cursor. The remap merge itself delivers columns in
+/// `(tid, prop_len, prop)` order because the DictValue owner key embeds
+/// `prop_len`, so finished chunks are collected and sorted before the
+/// catalog is written (G-GEM0.PUB1).
+///
 /// # Errors
 ///
 /// Codec, I/O, or budget failure.
@@ -150,6 +158,7 @@ pub(crate) fn consume_remap_run(
     let mut catalog = std::io::BufWriter::with_capacity(64 * 1024, file);
 
     let mut current: Option<DictChunkStreamer> = None;
+    let mut finished: Vec<FinishedDictChunk> = Vec::new();
 
     merger.merge_all(&remap_lease.handles, budget, metrics, cancel, &mut |rec| {
         let Some(&kind) = rec.key.first() else {
@@ -182,7 +191,7 @@ pub(crate) fn consume_remap_run(
                     .is_none_or(|c| c.tid != tid || c.prop.as_slice() != prop);
                 if is_new_col {
                     if let Some(prev) = current.take() {
-                        prev.finish_into(&mut catalog, temp_dir)?;
+                        finished.push(prev.finish(temp_dir)?);
                     }
                     current = Some(DictChunkStreamer::open(tid, prop, temp_dir)?);
                 }
@@ -224,12 +233,73 @@ pub(crate) fn consume_remap_run(
         }
     })?;
     if let Some(prev) = current.take() {
-        prev.finish_into(&mut catalog, temp_dir)?;
+        finished.push(prev.finish(temp_dir)?);
+    }
+
+    // G-GEM0.PUB1: the remap merge delivers Dict columns in
+    // `(tid, prop_len, prop)` order because the DictValue owner key embeds
+    // `prop_len`, but every catalog consumer requests columns in occurrence
+    // order `(tid, prop)` through the forward-only `DictChunkCatalog`
+    // cursor. Sort the finished chunks into occurrence order before writing
+    // the catalog. This buffer is schema-bounded (one entry per Dict
+    // column), so it is charged against the schema ledger like its
+    // siblings, not against anon retention.
+    finished.sort_unstable_by(|a, b| (a.tid, a.prop.as_slice()).cmp(&(b.tid, b.prop.as_slice())));
+    let catalog_charge: u64 = finished
+        .iter()
+        .map(|c| 8 + c.prop.len() as u64 + 4 + c.dict_name.len() as u64)
+        .sum();
+    metrics.reserve_schema(catalog_charge, budget.max_schema_bytes)?;
+    for chunk in &finished {
+        chunk.write_catalog_entry(&mut catalog)?;
     }
     catalog
         .flush()
         .map_err(|e| GenerationError::Io(format!("flush dict catalog: {e}")))?;
+    metrics.release_schema(catalog_charge);
     Ok(schema)
+}
+
+/// One finished Dict column chunk awaiting catalog registration.
+///
+/// Produced by [`DictChunkStreamer::finish`]; the `.dict` file is already
+/// durable in `temp_dir` and the spool files are removed. Entries are
+/// collected and sorted into `(tid, prop)` order before the catalog is
+/// written (G-GEM0.PUB1).
+struct FinishedDictChunk {
+    tid: u16,
+    prop: Vec<u8>,
+    dict_name: String,
+}
+
+impl FinishedDictChunk {
+    /// Writes one catalog entry: `[tid u16][prop_len u16][prop][path_len u16][relative path]`.
+    fn write_catalog_entry(
+        &self,
+        catalog: &mut std::io::BufWriter<std::fs::File>,
+    ) -> Result<(), GenerationError> {
+        use std::io::Write;
+        let prop_len =
+            u16::try_from(self.prop.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "dict_chunk_prop_len",
+                count: self.prop.len() as u64,
+                max: u64::from(u16::MAX),
+            })?;
+        let rel = self.dict_name.as_bytes();
+        let rlen = u16::try_from(rel.len()).map_err(|_| GenerationError::WireWidthOverflow {
+            what: "dict_catalog_path_len",
+            count: rel.len() as u64,
+            max: u64::from(u16::MAX),
+        })?;
+        catalog
+            .write_all(&self.tid.to_le_bytes())
+            .and_then(|_| catalog.write_all(&prop_len.to_le_bytes()))
+            .and_then(|_| catalog.write_all(&self.prop))
+            .and_then(|_| catalog.write_all(&rlen.to_le_bytes()))
+            .and_then(|_| catalog.write_all(rel))
+            .map_err(|e| GenerationError::Io(format!("write dict catalog entry: {e}")))?;
+        Ok(())
+    }
 }
 
 /// Streams one Dict column's distinct (string, code) pairs to a body spool,
@@ -330,11 +400,9 @@ impl DictChunkStreamer {
         Ok(())
     }
 
-    fn finish_into(
-        mut self,
-        catalog: &mut std::io::BufWriter<std::fs::File>,
-        temp_dir: &std::path::Path,
-    ) -> Result<(), GenerationError> {
+    /// Flushes the spool files into the final `.dict` chunk file and returns
+    /// the finished-chunk descriptor for sorted catalog registration.
+    fn finish(mut self, temp_dir: &std::path::Path) -> Result<FinishedDictChunk, GenerationError> {
         use std::io::{Read, Write};
         if let Some(mut body) = self.body.take() {
             body.flush()
@@ -345,12 +413,6 @@ impl DictChunkStreamer {
                 .flush()
                 .map_err(|e| GenerationError::Io(format!("flush dict chunk offsets: {e}")))?;
         }
-        let prop_len =
-            u16::try_from(self.prop.len()).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "dict_chunk_prop_len",
-                count: self.prop.len() as u64,
-                max: u64::from(u16::MAX),
-            })?;
         let dict_path = temp_dir.join(&self.dict_name);
         let mut out = std::fs::File::create(&dict_path).map_err(|e| {
             GenerationError::Io(format!("create dict chunk {}: {e}", dict_path.display()))
@@ -400,20 +462,11 @@ impl DictChunkStreamer {
             let _ = std::fs::remove_file(&body_path);
         }
 
-        let rel = self.dict_name.as_bytes();
-        let rlen = u16::try_from(rel.len()).map_err(|_| GenerationError::WireWidthOverflow {
-            what: "dict_catalog_path_len",
-            count: rel.len() as u64,
-            max: u64::from(u16::MAX),
-        })?;
-        catalog
-            .write_all(&self.tid.to_le_bytes())
-            .and_then(|_| catalog.write_all(&prop_len.to_le_bytes()))
-            .and_then(|_| catalog.write_all(&self.prop))
-            .and_then(|_| catalog.write_all(&rlen.to_le_bytes()))
-            .and_then(|_| catalog.write_all(rel))
-            .map_err(|e| GenerationError::Io(format!("write dict catalog entry: {e}")))?;
-        Ok(())
+        Ok(FinishedDictChunk {
+            tid: self.tid,
+            prop: std::mem::take(&mut self.prop),
+            dict_name: std::mem::take(&mut self.dict_name),
+        })
     }
 }
 
