@@ -3,6 +3,8 @@
 #[cfg(any(feature = "wal", feature = "vector-index"))]
 use grafeo_common::grafeo_warn;
 use grafeo_common::utils::error::Result;
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+use grafeo_core::graph::GraphStore;
 #[cfg(feature = "wal")]
 use grafeo_storage::wal::WalRecord;
 
@@ -149,11 +151,24 @@ impl super::GrafeoDB {
     }
 
     /// Gets a node by ID.
+    ///
+    /// Serves the complete visible graph. When a layered store (compact base
+    /// + overlay) is installed, the merged view is consulted so
+    /// base-published nodes remain visible after compact → close → reopen
+    /// and after generation-root reopen (G-GEM0.SRV1 Gap B: the overlay-only
+    /// path silently returned `None` for every base node, which made
+    /// property-sampling health probes report `dims=None` on published
+    /// generation roots). Falls back to the overlay LpgStore when no compact
+    /// base exists (plain in-memory / non-compacted databases).
     #[must_use]
     pub fn get_node(
         &self,
         id: grafeo_common::types::NodeId,
     ) -> Option<grafeo_core::graph::lpg::Node> {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.get_node(id);
+        }
         self.lpg_store().get_node(id)
     }
 

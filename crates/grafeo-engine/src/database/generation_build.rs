@@ -283,6 +283,43 @@ impl GrafeoDB {
 
         #[cfg(feature = "generation-streaming")]
         let mut live_sources = self.live_graph_sources_bounded(request.budget.max_record_bytes)?;
+
+        // G-GEM0.SRV1 Gap B (publish side): materialize ForceDisk-spilled
+        // vectors back into the property store BEFORE the freeze, mirroring
+        // `checkpoint_to_file`. Spill sidecars are derived runtime state and
+        // are NOT part of the generation container — freezing a drained
+        // source would publish a base whose embedding columns are missing,
+        // so the reopened RO index could never serve vectors.
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        let vector_was_on_disk =
+            self.buffer_manager
+                .snapshot_consumer_tiers()
+                .iter()
+                .any(|(name, tier)| {
+                    name == "section:VectorStore"
+                        && *tier == grafeo_common::memory::StorageTier::OnDisk
+                });
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        if vector_was_on_disk {
+            self.buffer_manager
+                .reload_consumer_by_name("section:VectorStore")
+                .map_err(|error| {
+                    Error::Internal(format!(
+                        "failed to reload spilled vectors before generation publish: {error}"
+                    ))
+                })?;
+        }
+
         #[cfg(not(feature = "generation-streaming"))]
         let store = self.live_graph_store()?;
         #[cfg(not(feature = "generation-streaming"))]
@@ -418,6 +455,30 @@ impl GrafeoDB {
             &OsGenerationFileOps,
         )
         .map_err(map_publication_error)?;
+
+        // G-GEM0.SRV1 Gap B (publish side): the reload above restored the
+        // complete embedding columns into the source's property store for
+        // the freeze. Re-spill now to preserve the ForceDisk memory profile
+        // (mirror checkpoint_to_file's post-serialization re-spill).
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        {
+            let vector_force_disk = self
+                .config
+                .section_configs
+                .get(&grafeo_common::storage::SectionType::VectorStore)
+                .is_some_and(|config| {
+                    config.tier == grafeo_common::storage::TierOverride::ForceDisk
+                });
+            if vector_was_on_disk || vector_force_disk {
+                self.buffer_manager
+                    .spill_consumer_by_name("section:VectorStore");
+            }
+        }
 
         // Post-commit crash point (3c): manifest fsync durable → select NEW.
         // Same `debug_assertions` gate as the pre-commit point above.
