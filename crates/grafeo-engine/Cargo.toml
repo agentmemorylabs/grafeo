@@ -230,3 +230,7 @@ harness = false
 [[bench]]
 name = "transactional_batch_bench"
 harness = false
+
+[[bench]]
+name = "offline_bulk_bench"
+harness = false

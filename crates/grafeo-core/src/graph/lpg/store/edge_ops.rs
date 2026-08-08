@@ -2,6 +2,7 @@ use super::LpgStore;
 use crate::graph::lpg::{Edge, EdgeRecord};
 use arcstr::ArcStr;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::Ordering;
 
 #[cfg(not(feature = "tiered-storage"))]
@@ -919,5 +920,167 @@ impl LpgStore {
                     .is_some_and(|r| !r.is_deleted())
             })
         })
+    }
+
+    /// Appends property-carrying edges to a fresh store without per-edge lock
+    /// acquisition, WAL, CDC, or secondary-index maintenance.
+    ///
+    /// Mirrors
+    /// [`bulk_create_nodes_with_props_unindexed`](Self::bulk_create_nodes_with_props_unindexed)
+    /// for edges. Distinct edge-type names in the batch are pre-resolved to
+    /// type IDs under one registry lock set (read → write on miss), then the
+    /// per-edge loop maps lock-free through a local hash map. This removes
+    /// per-edge `get_or_create_edge_type_id` read-lock traffic when millions
+    /// of rows share a handful of distinct types.
+    ///
+    /// This is deliberately an offline-loader primitive. It is valid only
+    /// before property, text, or vector indexes are installed and before the
+    /// store becomes visible to concurrent readers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any property, vector, or text index is already
+    /// present, or if bulk property assignment fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics only on an internal invariant violation (an edge-type name in
+    /// the batch missing from the pre-resolution map); this cannot happen in
+    /// practice because every distinct batch type is inserted into the map
+    /// before record creation begins.
+    #[cfg(not(any(feature = "tiered-storage", feature = "temporal")))]
+    pub fn bulk_create_edges_with_props_unindexed(
+        &self,
+        edges: &[(NodeId, NodeId, &str, FxHashMap<PropertyKey, Value>)],
+    ) -> Result<Vec<EdgeId>, &'static str> {
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fail-closed index guards (checked first, matching node loader).
+        if !self.property_indexes.read().is_empty() {
+            return Err("bulk edge load requires no property indexes");
+        }
+        #[cfg(feature = "vector-index")]
+        if !self.vector_indexes.read().is_empty() {
+            return Err("bulk edge load requires no vector indexes");
+        }
+        #[cfg(feature = "text-index")]
+        if !self.text_indexes.read().is_empty() {
+            return Err("bulk edge load requires no text indexes");
+        }
+
+        // Pre-resolve distinct edge-type names to IDs. Acquire the read lock
+        // first to find misses; then take write+id_to locks once to create new
+        // entries — avoiding a per-edge read/write lock pair.
+        let mut type_map: FxHashMap<ArcStr, u32> = FxHashMap::default();
+        {
+            let type_to_id = self.edge_type_to_id.read();
+            for &(_, _, edge_type, _) in edges {
+                let key: ArcStr = edge_type.into();
+                if let Some(&id) = type_to_id.get(edge_type) {
+                    type_map.entry(key).or_insert(id);
+                }
+            }
+        }
+        // Create any missing type entries under one write lock set.
+        let missing: Vec<ArcStr> = {
+            let type_to_id = self.edge_type_to_id.read();
+            let mut seen = FxHashSet::default();
+            let mut missing = Vec::new();
+            for &(_, _, edge_type, _) in edges {
+                let key: ArcStr = edge_type.into();
+                if !type_to_id.contains_key(edge_type) && seen.insert(key.clone()) {
+                    missing.push(key);
+                }
+            }
+            missing
+        };
+        if !missing.is_empty() {
+            let mut type_to_id = self.edge_type_to_id.write();
+            let mut id_to_type = self.id_to_edge_type.write();
+            let mut counts = self.edge_type_live_counts.write();
+            for key in missing {
+                // Double-check inside write lock.
+                if let Some(&id) = type_to_id.get(key.as_str()) {
+                    type_map.entry(key).or_insert(id);
+                    continue;
+                }
+                // reason: edge type registry size bounded by practical limits, fits u32
+                #[allow(clippy::cast_possible_truncation)]
+                let id = id_to_type.len() as u32;
+                type_to_id.insert(key.clone(), id);
+                id_to_type.push(key.clone());
+                while counts.len() <= id as usize {
+                    counts.push(0);
+                }
+                type_map.insert(key, id);
+            }
+        }
+
+        let count = edges.len();
+        let base_id = self.next_edge_id.fetch_add(count as u64, Ordering::Relaxed);
+        let epoch = self.current_epoch();
+
+        let mut ids = Vec::with_capacity(count);
+        let mut forward_batch = Vec::with_capacity(count);
+        let mut backward_batch = Vec::with_capacity(count);
+        let mut type_increments: FxHashMap<u32, i64> = FxHashMap::default();
+        let mut property_rows = Vec::with_capacity(count);
+
+        // Create all edge records under a single edges write lock.
+        {
+            let mut edge_map = self.edges.write();
+            for (i, &(src, dst, edge_type, ref properties)) in edges.iter().enumerate() {
+                let id = EdgeId::new(base_id + i as u64);
+                let key: ArcStr = edge_type.into();
+                let type_id = *type_map
+                    .get(&key)
+                    .expect("pre-resolved edge type must exist");
+
+                let record = EdgeRecord::new(id, src, dst, type_id, epoch);
+                let chain = VersionChain::with_initial(record, epoch, TransactionId::SYSTEM);
+                edge_map.insert(id, chain);
+
+                forward_batch.push((src, dst, id));
+                if self.backward_adj.is_some() {
+                    backward_batch.push((dst, src, id));
+                }
+                *type_increments.entry(type_id).or_default() += 1;
+
+                ids.push(id);
+                if !properties.is_empty() {
+                    property_rows.push((id, properties.clone()));
+                }
+            }
+        }
+
+        // Batch adjacency updates (single lock per direction).
+        self.forward_adj.batch_add_edges(&forward_batch);
+        if let Some(ref backward) = self.backward_adj {
+            backward.batch_add_edges(&backward_batch);
+        }
+
+        // Bulk property write under one column-map lock.
+        self.edge_properties.set_bulk_unindexed(property_rows);
+
+        // Update live counters.
+        // reason: edge batch size fits i64 for practical sizes
+        #[allow(clippy::cast_possible_wrap)]
+        let edge_count_i64 = count as i64;
+        self.live_edge_count
+            .fetch_add(edge_count_i64, Ordering::Relaxed);
+        {
+            let mut counts = self.edge_type_live_counts.write();
+            for (type_id, increment) in type_increments {
+                let idx = type_id as usize;
+                if counts.len() <= idx {
+                    counts.resize(idx + 1, 0);
+                }
+                counts[idx] += increment;
+            }
+        }
+
+        Ok(ids)
     }
 }

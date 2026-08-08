@@ -785,6 +785,63 @@ impl super::GrafeoDB {
         self.lpg_store().batch_create_edges(edges)
     }
 
+    /// Appends property-carrying edges to a fresh offline graph without WAL,
+    /// CDC, or per-edge index maintenance. Each tuple is
+    /// `(src, dst, edge_type, properties)`.
+    ///
+    /// This is the edge counterpart of
+    /// [`bulk_load_nodes_with_props_unindexed`](Self::bulk_load_nodes_with_props_unindexed):
+    /// it bypasses WAL/CDC entirely and is fail-closed once any secondary
+    /// index exists. Callers must checkpoint the fully built unpublished
+    /// database before exposing it to readers.
+    ///
+    /// Available only without `temporal` and without `tiered-storage`,
+    /// matching the underlying
+    /// `LpgStore::bulk_create_edges_with_props_unindexed` primitive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any property, vector, or text index already exists.
+    #[cfg(not(feature = "temporal"))]
+    pub fn bulk_load_edges_with_props_unindexed(
+        &self,
+        edges: &[(
+            grafeo_common::types::NodeId,
+            grafeo_common::types::NodeId,
+            &str,
+            std::collections::HashMap<
+                grafeo_common::types::PropertyKey,
+                grafeo_common::types::Value,
+            >,
+        )],
+    ) -> grafeo_common::utils::error::Result<Vec<grafeo_common::types::EdgeId>> {
+        use grafeo_common::utils::hash::FxHashMap;
+
+        let rows: Vec<(
+            grafeo_common::types::NodeId,
+            grafeo_common::types::NodeId,
+            &str,
+            FxHashMap<grafeo_common::types::PropertyKey, grafeo_common::types::Value>,
+        )> = edges
+            .iter()
+            .map(|&(src, dst, edge_type, ref properties)| {
+                (
+                    src,
+                    dst,
+                    edge_type,
+                    properties
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        self.lpg_store()
+            .bulk_create_edges_with_props_unindexed(&rows)
+            .map_err(|message| grafeo_common::utils::error::Error::Internal(message.to_owned()))
+    }
+
     /// Gets an edge by ID.
     #[must_use]
     pub fn get_edge(
