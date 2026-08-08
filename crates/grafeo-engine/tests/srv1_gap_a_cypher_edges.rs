@@ -21,10 +21,15 @@
 //!     edges); every one of the 4.7M edges sources at CodeSymbol/
 //!     RetrievalUnit → zero edges servable. G1 parity cannot pass.
 //!
-//! The suspect surface is the generation build's rel-table directory /
-//! CSR emission (`generation_builder::write_directory_segments` rel_tables
-//! and `csr_pass`), which must emit one rel table per edge type with
-//! correct (src_table_id, dst_table_id) pairs for ALL source tables.
+//! The TRUE root defect (proven by run-7 frontier probe): anonymous
+//! (label-less) node scans over a published base return ~nothing because
+//! `CompactStore::node_ids()` emits PHYSICAL `(table_id<<48|offset)` IDs in
+//! its no-`node_id_map` branch, while every lookup/visibility API resolves
+//! LOGICAL IDs. `MATCH ()-[r]->()` routes through that anonymous scan, so
+//! un-anchored edge patterns collapse. The "table-0 edge rule" was the
+//! single physical ID (`NodeId(0)`) that also parses as a valid logical ID
+//! — always a table-0 node. Labeled scans (`nodes_by_label` → logical IDs)
+//! never hit the bug.
 
 #![cfg(all(
     feature = "generation",
@@ -127,5 +132,46 @@ fn publish_serves_same_type_from_multiple_source_tables() {
     assert_eq!(
         links, 2,
         "both LINKS edges must survive regardless of source table"
+    );
+}
+
+/// ROOT DEFECT: the anonymous (label-less) full-node scan over a published
+/// base must enumerate every node in LOGICAL id space. Pre-fix it returns
+/// ~0 (the compact store's no-map `node_ids()` branch emits physical
+/// `(table_id<<48|offset)` IDs that no lookup resolves), which collapses
+/// every un-anchored `()-[r]->()` pattern.
+#[test]
+fn anonymous_node_scan_serves_all_base_nodes() {
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().join("srv1-red-anonscan.grafeo.d");
+    std::fs::create_dir_all(&root).expect("create generation root");
+
+    let source = GrafeoDB::new_in_memory();
+    // Two node tables so the physical-vs-logical divergence is observable.
+    source
+        .create_node_with_props(&["Doc"], [("p", Value::from("x"))])
+        .expect("doc");
+    source
+        .create_node_with_props(&["Sym"], [("n", Value::from("f1"))])
+        .expect("sym1");
+    source
+        .create_node_with_props(&["Sym"], [("n", Value::from("f2"))])
+        .expect("sym2");
+    source
+        .build_and_publish_generation(generation_build_request(&root, "srv1-red-anonscan-g1"))
+        .expect("publish generation");
+    drop(source);
+
+    // node_count() ground truth comes from table row counts (correct).
+    let db = GrafeoDB::open_generation_root(&root, true).expect("open RO");
+    let expected = i64::try_from(db.graph_store().node_count()).expect("node count fits i64");
+    drop(db);
+    assert_eq!(expected, 3, "base has 3 nodes");
+
+    let scanned = open_ro_and_count(&root, "MATCH (n) RETURN count(n)");
+    assert_eq!(
+        scanned, expected,
+        "anonymous node scan must enumerate ALL base nodes (node_ids() \
+         must stay in the store's LOGICAL id space)"
     );
 }

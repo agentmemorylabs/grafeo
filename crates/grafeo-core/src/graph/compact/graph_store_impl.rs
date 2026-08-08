@@ -233,6 +233,21 @@ impl GraphStore for CompactStore {
             for nt in &self.node_tables_by_id {
                 ids.extend(nt.node_ids());
             }
+            // ID-preserving stores (mapped v5 base from a generation-root
+            // open, or any store with an original-id mapping) expose the
+            // store's LOGICAL id space to every lookup API; the raw table
+            // enumeration above yields PHYSICAL (table_id<<48|offset) ids
+            // that no lookup resolves. Map through the same translation the
+            // labeled-scan and property-scan paths already use
+            // (`nodes_by_label`, `find_nodes_by_property`). Without this,
+            // anonymous scans (MATCH (n), un-anchored ()-[r]->()) collapse:
+            // G-GEM0.SRV1 Gap A.
+            if self.preserves_ids() {
+                ids = ids
+                    .into_iter()
+                    .map(|cid| self.to_original_node_id(cid))
+                    .collect();
+            }
             ids.sort_unstable();
             ids
         }
