@@ -15,7 +15,7 @@ use grafeo_common::types::{EdgeId, NodeId};
 use grafeo_common::utils::error::{Error, Result};
 use grafeo_common::utils::hash::FxHashSet;
 use grafeo_core::graph::compact::generation::{
-    EdgeRecordSource, GenerationEdge, GenerationNode, NodeRecordSource,
+    EdgeRecordSource, GenerationBudgetPeaks, GenerationEdge, GenerationNode, NodeRecordSource,
 };
 use grafeo_core::graph::compact::generation_builder::FrozenOverlayEpoch;
 use grafeo_core::graph::compact::layered::OverlayHandoffLive;
@@ -643,6 +643,9 @@ impl GrafeoDB {
             parent_generation_id,
             parent_publication_sequence,
             handle.frozen_epoch,
+            // The handoff path never owns a live `V5PayloadLease`; report
+            // zeros rather than fabricating peaks (G-FRZ.1).
+            GenerationBudgetPeaks::default(),
         ))
     }
 

@@ -20,8 +20,8 @@ use grafeo_core::graph::compact::generation::generate_compact_store;
 #[cfg(not(feature = "generation-streaming"))]
 use grafeo_core::graph::compact::generation::{EdgeRecordSource, NodeRecordSource};
 use grafeo_core::graph::compact::generation::{
-    GenerationBudget, GenerationEdge, GenerationError, GenerationNode, OriginalEdgeId,
-    OriginalNodeId, RelSchemaDecl,
+    GenerationBudget, GenerationBudgetPeaks, GenerationEdge, GenerationError, GenerationNode,
+    OriginalEdgeId, OriginalNodeId, RelSchemaDecl,
 };
 #[cfg(not(feature = "generation-streaming"))]
 use grafeo_storage::file::generation_writer::CompactStoreSectionSource;
@@ -348,7 +348,7 @@ impl GrafeoDB {
         // accepted 3a commit/rollback/lease/publication state machine below
         // is verbatim in both cases.
         #[cfg(feature = "generation-streaming")]
-        let (section, node_count, edge_count) = {
+        let (section, node_count, edge_count, budget_peaks) = {
             use grafeo_core::graph::compact::generation_builder::orchestrator::{
                 BoundedBuildConfig, BoundedGenerationBuilder,
             };
@@ -387,13 +387,17 @@ impl GrafeoDB {
                 .map_err(map_generation_error)?;
             let node_count = lease.total_nodes();
             let edge_count = lease.total_edges();
+            // G-FRZ.1: snapshot the lease's final metrics BEFORE the lease is
+            // moved into the streaming source — after this point the tally
+            // becomes unreachable downstream.
+            let budget_peaks = GenerationBudgetPeaks::from(lease.metrics());
             let section: Box<dyn ExactSectionSource> =
                 Box::new(StreamingPayloadSectionSource::new(lease));
-            (section, node_count, edge_count)
+            (section, node_count, edge_count, budget_peaks)
         };
 
         #[cfg(not(feature = "generation-streaming"))]
-        let (section, node_count, edge_count) = {
+        let (section, node_count, edge_count, budget_peaks) = {
             let generated = generate_compact_store(
                 &mut nodes,
                 &mut edges,
@@ -407,7 +411,14 @@ impl GrafeoDB {
                 CompactStoreSectionSource::new(generated.store, generated.global_strings)
                     .map_err(map_section_error)?,
             );
-            (section, node_count, edge_count)
+            // The eager fallback owns no live metrics tally; report zeros
+            // rather than fabricating peaks (G-FRZ.1).
+            (
+                section,
+                node_count,
+                edge_count,
+                GenerationBudgetPeaks::default(),
+            )
         };
 
         // `#[doc(hidden)]` test-only fault seam (G-EM0.3c crash matrix): in
@@ -501,6 +512,7 @@ impl GrafeoDB {
             parent_generation_id,
             parent_publication_sequence,
             overlay_epoch,
+            budget_peaks,
         ))
     }
 

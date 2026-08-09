@@ -229,3 +229,50 @@ impl GenerationMetrics {
         self.mapped_bytes_current = self.mapped_bytes_current.saturating_sub(bytes);
     }
 }
+
+/// Peak budget charges observed during a generation build (G-FRZ.1).
+///
+/// Surfaces the final high-water marks of a [`GenerationMetrics`] tally so
+/// callers outside the build (e.g. the engine publication surface) can report
+/// what the build actually cost against each budget axis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenerationBudgetPeaks {
+    /// Peak anonymous working-set bytes charged.
+    pub anon_bytes_peak: u64,
+    /// Peak temporary disk bytes charged.
+    pub temp_bytes_peak: u64,
+}
+
+impl From<&GenerationMetrics> for GenerationBudgetPeaks {
+    fn from(metrics: &GenerationMetrics) -> Self {
+        Self {
+            anon_bytes_peak: metrics.anon_bytes_peak,
+            temp_bytes_peak: metrics.temp_bytes_peak,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GenerationBudgetPeaks, GenerationMetrics};
+
+    #[test]
+    fn peaks_copy_metrics_high_water_marks() {
+        let mut metrics = GenerationMetrics::default();
+        metrics
+            .reserve_temp(7, 64)
+            .expect("temp reservation within budget");
+        metrics
+            .reserve_anon(40, 64)
+            .expect("anon reservation within budget");
+        let peaks = GenerationBudgetPeaks::from(&metrics);
+        assert_eq!(peaks.anon_bytes_peak, 40);
+        assert_eq!(peaks.temp_bytes_peak, 7);
+    }
+
+    #[test]
+    fn default_peaks_are_zero() {
+        assert_eq!(GenerationBudgetPeaks::default().anon_bytes_peak, 0);
+        assert_eq!(GenerationBudgetPeaks::default().temp_bytes_peak, 0);
+    }
+}

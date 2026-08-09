@@ -203,6 +203,11 @@ path = "tests/compact_store_writable_cycles.rs"
 required-features = ["generation", "compact-store", "lpg", "generation-streaming", "mmap"]
 
 [[test]]
+name = "generation_budget_peaks"
+path = "tests/generation_budget_peaks.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap"]
+
+[[test]]
 name = "generation_sections"
 path = "tests/generation_sections.rs"
 required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index", "text-index"]

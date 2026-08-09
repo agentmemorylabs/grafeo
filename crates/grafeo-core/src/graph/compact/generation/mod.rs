@@ -20,7 +20,7 @@ mod v5_emitter;
 #[cfg(test)]
 mod tests;
 
-pub use budget::{GenerationBudget, GenerationMetrics};
+pub use budget::{GenerationBudget, GenerationBudgetPeaks, GenerationMetrics};
 #[cfg(test)]
 pub use build::generate_v5_payload;
 pub use ledger::{AnonLedgerError, AnonReservation, JobAnonLedger, JobAnonSnapshot};

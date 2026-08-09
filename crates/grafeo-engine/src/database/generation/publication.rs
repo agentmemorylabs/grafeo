@@ -22,6 +22,7 @@
 //! recovery) and does not advance/truncate the WAL before the manifest
 //! selection is durable.
 
+use grafeo_core::graph::compact::generation::GenerationBudgetPeaks;
 use grafeo_storage::generation::publication::PublicationError;
 use grafeo_storage::generation::wal_cursor::WalReplayCursor;
 
@@ -265,6 +266,12 @@ pub struct BuildPublication {
     pub publication: PublishedGeneration,
     /// Absolute path to the immutable generation container.
     pub generation_abs_path: std::path::PathBuf,
+    /// Peak budget charges observed during the build (G-FRZ.1).
+    ///
+    /// The streaming path reports the live lease's measured high-water marks;
+    /// paths that do not own a live metrics tally (non-streaming fallback and
+    /// epoch handoff) report both zeros.
+    pub budget_peaks: GenerationBudgetPeaks,
 }
 
 /// Assemble a [`BuildPublication`] from a successful W0 publication, reading
@@ -279,7 +286,9 @@ pub struct BuildPublication {
 ///
 /// `overlay_epoch` is the engine epoch captured at build time (used only when
 /// the read-back fails); `parent_generation_id`/`parent_publication_sequence`
-/// are the caller-supplied fallbacks.
+/// are the caller-supplied fallbacks. `budget_peaks` are the peak budget
+/// charges measured during the build (or both zeros when the caller's path
+/// owns no live metrics tally).
 #[must_use]
 pub fn assemble_build_publication(
     root: &std::path::Path,
@@ -288,6 +297,7 @@ pub fn assemble_build_publication(
     parent_generation_id: Option<String>,
     parent_publication_sequence: Option<u64>,
     overlay_epoch: u64,
+    budget_peaks: GenerationBudgetPeaks,
 ) -> BuildPublication {
     let recorded = super::manifest::read_manifest_state(root);
     if let Err(ref downgrade) = recorded {
@@ -330,5 +340,6 @@ pub fn assemble_build_publication(
     BuildPublication {
         publication,
         generation_abs_path: root.join(&result.generation_path),
+        budget_peaks,
     }
 }
