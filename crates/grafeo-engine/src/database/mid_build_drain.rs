@@ -338,8 +338,12 @@ impl GrafeoDB {
         SEQ.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Non-gated helper for tests: current overlay memory bytes (for R5 / anon assertions).
-    #[cfg(any(test, feature = "generation"))]
+    /// Live overlay anon heap bytes for the LayeredStore attached to this DB.
+    ///
+    /// Used by the AMH midflush monitor (`may⁠be_midflush` cadence reed) and
+    /// by R5/test anon assertions. Returns `None` when the database has no
+    /// layered store (e.g. a bare LPG open without `compact()`).
+    #[must_use]
     pub fn mid_flush_overlay_bytes(&self) -> Option<usize> {
         self.layered_store
             .as_ref()
