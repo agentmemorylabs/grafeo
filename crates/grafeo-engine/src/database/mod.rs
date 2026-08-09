@@ -46,6 +46,14 @@ mod import;
 #[cfg(feature = "lpg")]
 mod index;
 pub mod index_build_control;
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "mmap",
+    feature = "generation-streaming"
+))]
+pub mod mid_build_drain;
 #[cfg(feature = "lpg")]
 mod persistence;
 mod query;
