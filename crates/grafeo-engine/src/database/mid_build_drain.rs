@@ -219,6 +219,47 @@ impl GrafeoDB {
             ))
         })?;
 
+        // ── GC superseded drain generation files (bounded transient disk) ──
+        // Every prior drain left its ~graph-sized generation file under
+        // `<root>/generations/` (publication.rs:210 `generations/g-….grafeo`),
+        // mmap-held as the current base. On Linux unlinking a mapped file is
+        // safe: existing mappings stay valid until the last Arc drops (the old
+        // base frees when this drain's swap releases it); only new opens would
+        // fail, and this root is drain-private. Without this, N drains cost
+        // N full-graph files (~48 GB at frontier scale). Best effort — a
+        // cleanup miss must not fail the drain; the next drain retries.
+        let generations_dir = transient_root.join("generations");
+        match std::fs::read_dir(&generations_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let is_generation_file =
+                        path.extension().map(|e| e == "grafeo").unwrap_or(false);
+                    if is_generation_file {
+                        if let Err(_e) = std::fs::remove_file(&path) {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %_e,
+                                "mid-build drain: failed to unlink superseded generation file"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(_e) => {
+                // First drain: generations/ does not exist yet — expected.
+                #[cfg(feature = "tracing")]
+                if generations_dir.exists() {
+                    tracing::warn!(
+                        root = %generations_dir.display(),
+                        error = %_e,
+                        "mid-build drain: generations dir read_dir failed; skipping GC"
+                    );
+                }
+            }
+        }
+
         // Drain seq for correlation + monotonic report.
         let seq = self.next_drain_seq();
         let generation_id = next_drain_id(&correlation_id, seq);
