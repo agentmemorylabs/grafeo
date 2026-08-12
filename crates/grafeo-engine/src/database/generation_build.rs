@@ -571,57 +571,15 @@ impl GrafeoDB {
                             tiers, overlay.clone(),
                         ),
                     );
-                    // Unified chain: build a freeze that covers chain+overlay gap.
-                    // Tiers are disjoint contiguous ranges, so we union their ids.
-                    let mut overlay_node_ids: FxHashSet<u64> = FxHashSet::default();
-                    let mut overlay_edge_ids: FxHashSet<u64> = FxHashSet::default();
-                    // Overlay dirty ids become the bounded overlay cursor; tiers
-                    // are scanned row-by-row via the chain's node_ids.
-                    let freeze = layered.generation_freeze_epoch();
-                    overlay_node_ids.extend(freeze.overlay_node_ids.iter().copied());
-                    overlay_edge_ids.extend(freeze.overlay_edge_ids.iter().copied());
-                    // Also include any overlay nodes not yet in dirty (pure creates).
-                    for nid in overlay.all_node_ids() {
-                        overlay_node_ids.insert(nid.as_u64());
-                    }
-                    for edge in overlay.all_edges() {
-                        overlay_edge_ids.insert(edge.id.as_u64());
-                    }
-                    let unified_freeze = FrozenOverlayEpoch {
-                        epoch: self.transaction_manager.current_epoch().0,
-                        overlay_node_ids,
-                        overlay_edge_ids,
-                        deleted_base_node_ids: freeze.deleted_base_node_ids,
-                        deleted_base_edge_ids: freeze.deleted_base_edge_ids,
-                    };
-                    // Single chain store as the bounded source base — overlay is None
-                    // because the chain already includes it. The chain's node_ids()
-                    // walks tiers+overlay; the merged source's base cursor walks the
-                    // chain's CompactStore-like rows.
-                    // Fallback: use the standard path with the tier chain as base.
-                    // The simplest faithful path: treat chain as a GraphStore and
-                    // build sources via the generic helper that walks it.
-                    // For M2 we reuse live_graph_sources_bounded with chain as base
-                    // and no separate overlay — the chain is self-contained.
-                    // Build a temporary facade: create sources from the chain directly.
-                    // We synthesize by collecting chain ids and building cursors.
-                    // Simpler: directly construct sources from the chain's ids.
-                    let chain_nodes: Vec<u64> = chain.node_ids().into_iter().map(|id| id.as_u64()).collect();
-                    // Use a direct ChainNodeSource instead of going through base+overlay split.
-                    // Minimal: return sources built from the chain store via from_graph_store-style scan.
-                    // For correctness we can just delegate to a chain-aware builder that
-                    // enumerates the chain and feeds the BoundedGenerationBuilder's external sort.
-                    // The external sort in NodePass::stage restores (label,id) order, so
-                    // enumeration order does not need to be sorted.
-                    //
-                    // Implement inline: build a Chain-backed NodeRecordSource that walks
-                    // chain.node_ids() and fetches each node from the chain.
+                    // Chain sources are self-contained: ChainNodeSource walks
+                    // chain.node_ids() (tiers row-by-row + overlay) and fetches
+                    // each node through the chain view; the external merge sort
+                    // in NodePass::stage restores canonical (label,id) order, so
+                    // enumeration order need not be pre-sorted.
                     let chain_clone = std::sync::Arc::clone(&chain) as std::sync::Arc<dyn grafeo_core::graph::traits::GraphStore>;
                     let edge_chain_clone = std::sync::Arc::clone(&chain) as std::sync::Arc<dyn grafeo_core::graph::traits::GraphStore>;
                     let mr_nodes = crate::database::tier_chain_sources::ChainNodeSource::new(chain_clone, max_record_bytes);
                     let mr_edges = crate::database::tier_chain_sources::ChainEdgeSource::new(edge_chain_clone, max_record_bytes);
-                    // Suppress unused unified_freeze — chain sources are self-contained.
-                    let _ = unified_freeze;
                     return Ok(grafeo_core::graph::compact::generation_builder::live_graph::LiveGraphSources {
                         nodes: Box::new(mr_nodes),
                         edges: Box::new(mr_edges),
