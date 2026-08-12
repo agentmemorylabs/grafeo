@@ -62,6 +62,7 @@ fn r1_byte_parity_no_drain_vs_two_drains() {
     let gen_b = dir_b.path().join("gen-b.grafeo.d");
     fs::create_dir_all(&gen_a).unwrap();
     fs::create_dir_all(&gen_b).unwrap();
+    let tier_root_b = dir_b.path().join("tiers");
 
     let budget = normal_budget();
 
@@ -106,7 +107,7 @@ fn r1_byte_parity_no_drain_vs_two_drains() {
         }
     }
     let d1 = db_b
-        .drain_overlay_to_base(budget, "r1-drain1".into())
+        .drain_overlay_to_tier(&tier_root_b, "r1-drain1")
         .expect("drain1");
     assert!(d1.rows_drained > 0, "first drain should have rows");
 
@@ -125,7 +126,7 @@ fn r1_byte_parity_no_drain_vs_two_drains() {
         }
     }
     let d2 = db_b
-        .drain_overlay_to_base(budget, "r1-drain2".into())
+        .drain_overlay_to_tier(&tier_root_b, "r1-drain2")
         .expect("drain2");
     assert!(d2.rows_drained > 0, "second drain should have rows");
     let pub_b = db_b
@@ -148,6 +149,8 @@ fn r1_byte_parity_no_drain_vs_two_drains() {
 
 #[test]
 fn r2_three_drains_one_store_no_already_active() {
+    let dir = TempDir::new().unwrap();
+    let tier_root_b = dir.path().join("tiers");
     let budget = normal_budget();
     let mut db = GrafeoDB::new_in_memory();
     db.compact().expect("compact");
@@ -172,7 +175,7 @@ fn r2_three_drains_one_store_no_already_active() {
         }
 
         let r = db
-            .drain_overlay_to_base(budget, format!("r2-cycle{cycle}"))
+            .drain_overlay_to_tier(&tier_root_b, &format!("r2-cycle{cycle}"))
             .expect("drain should not fail with already active");
         assert!(r.rows_drained > 0, "cycle {cycle} should drain rows");
         assert!(
@@ -198,6 +201,7 @@ fn r3_drain_chain_then_final_publish_and_reopen() {
     let dir = TempDir::new().unwrap();
     let gen_root = dir.path().join("r3.grafeo.d");
     fs::create_dir_all(&gen_root).unwrap();
+    let tier_root_b = dir.path().join("tiers");
     let budget = normal_budget();
 
     let mut db = GrafeoDB::new_in_memory();
@@ -218,7 +222,7 @@ fn r3_drain_chain_then_final_publish_and_reopen() {
         }
     }
     let d = db
-        .drain_overlay_to_base(budget, "r3-drain".into())
+        .drain_overlay_to_tier(&tier_root_b, "r3-drain")
         .expect("drain");
     assert!(d.rows_drained > 0);
 
@@ -240,10 +244,12 @@ fn r3_drain_chain_then_final_publish_and_reopen() {
     assert_eq!(live, 9, "r3 live count after drain+publish: got {live}");
 }
 
-// ── R4: BudgetExceeded fail-closed ───────────────────────────────────
+// ── R4: boundedness (fresh overlay + sha256 report) ─────────────────
 
 #[test]
-fn r4_budget_breach_is_typed_and_overlay_intact() {
+fn r4_drain_bounds_overlay_and_reports_sha256() {
+    let dir = TempDir::new().unwrap();
+    let tier_root = dir.path().join("tiers");
     let mut db = GrafeoDB::new_in_memory();
     db.compact().expect("compact");
 
@@ -258,39 +264,31 @@ fn r4_budget_breach_is_typed_and_overlay_intact() {
     }
 
     let before = count_nodes(&db);
+    assert_eq!(before, 16, "16 nodes before drain");
 
-    let tiny = {
-        let mut b = GenerationBudget::for_tests();
-        b.max_temp_bytes = 1;
-        b.max_anon_bytes = 1024;
-        b
-    };
-    let err = db
-        .drain_overlay_to_base(tiny, "r4-tiny".into())
-        .expect_err("tiny budget should fail");
-    let msg = err.to_string().to_lowercase();
+    let report = db
+        .drain_overlay_to_tier(&tier_root, "r4-drain")
+        .expect("drain");
+    assert!(report.tier_sha256.is_some(), "tier sha256 must be recorded");
     assert!(
-        msg.contains("budget"),
-        "R4 should be typed BudgetExceeded, got: {msg}"
+        report.anon_kb_before > report.anon_kb_after,
+        "anon after drain ({}) should be lower than before ({})",
+        report.anon_kb_after,
+        report.anon_kb_before
     );
 
+    // The overlay was swapped for a fresh empty one — live view keeps the
+    // drained rows visible through the tier chain (read-through).
     let after = count_nodes(&db);
-    assert_eq!(
-        before, after,
-        "R4 overlay intact: before {before} vs after {after}"
-    );
-
-    let ok = db.drain_overlay_to_base(normal_budget(), "r4-resume".into());
-    assert!(
-        ok.is_ok(),
-        "resume after budget breach should succeed: {ok:?}"
-    );
+    assert_eq!(before, after, "R4 read-through: {before} vs {after}");
 }
 
 // ── R5: zero WAL growth ──────────────────────────────────────────────
 
 #[test]
 fn r5_zero_wal_growth_final_checkpoint_stays_ms() {
+    let dir = TempDir::new().unwrap();
+    let tier_root_b = dir.path().join("tiers");
     let budget = normal_budget();
 
     let mut db = GrafeoDB::new_in_memory();
@@ -306,12 +304,12 @@ fn r5_zero_wal_growth_final_checkpoint_stays_ms() {
         let _ = db.create_edge(n, m, "OWNS");
         if i == 3 {
             let _ = db
-                .drain_overlay_to_base(budget, "r5-drain1".into())
+                .drain_overlay_to_tier(&tier_root_b, "r5-drain1")
                 .expect("drain1");
         }
     }
     let _ = db
-        .drain_overlay_to_base(budget, "r5-drain2".into())
+        .drain_overlay_to_tier(&tier_root_b, "r5-drain2")
         .expect("drain2");
 
     let start = Instant::now();

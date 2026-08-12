@@ -327,58 +327,6 @@ impl GrafeoDB {
         })
     }
 
-    /// Legacy M1 entry point — kept for compat with the existing AMH wire-up
-    /// and R1-R5 tests until the packet's drain_overlay_to_tier replaces it.
-    /// Delegates to `drain_overlay_to_tier` via a sibling tier dir when
-    /// possible, otherwise retains the O(graph) behavior behind the
-    /// generation budget. New code should call `drain_overlay_to_tier`.
-    #[cfg(all(
-        feature = "generation",
-        feature = "lpg",
-        feature = "compact-store",
-        feature = "mmap",
-        feature = "generation-streaming"
-    ))]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn drain_overlay_to_base(
-        &mut self,
-        budget: grafeo_core::graph::compact::generation::GenerationBudget,
-        correlation_id: String,
-    ) -> Result<MidBuildDrainReport> {
-        // M1 compat: budget == tiny (max_temp_bytes == 1) must fail with budget exceeded (R4).
-        // M2 tier write is O(window) and doesn't need the budget, but R4's tiny budget
-        // is the regression guard for M1's O(graph) budget breach.
-        if budget.max_temp_bytes == 1 {
-            return Err(Error::Internal("mid-build drain budget exceeded: tiny budget".into()));
-        }
-        // Derive a tier root sibling to the DB path and delegate to the tier primitive.
-        let tier_root = if let Some(ref p) = self.config.path {
-            let parent = p.parent().unwrap_or_else(|| Path::new("/tmp"));
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("grafeo-midflush");
-            parent.join(format!("{name}-midflush-tiers"))
-        } else {
-            std::env::temp_dir().join(format!(
-                "grafeo-midflush-tiers-{}",
-                correlation_id
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                    .collect::<String>()
-            ))
-        };
-        // Ensure tier dir exists; drain_overlay_to_tier will create it.
-        let _ = std::fs::create_dir_all(&tier_root);
-        // Delegate to the tier primitive — O(window), not O(graph).
-        let mut report = self.drain_overlay_to_tier(&tier_root, &correlation_id)?;
-        // Keep generation_sha256 populated for callers that check it.
-        if report.generation_sha256.is_none() {
-            report.generation_sha256 = report.tier_sha256;
-        }
-        Ok(report)
-    }
-
     #[cfg(all(
         feature = "generation",
         feature = "lpg",
