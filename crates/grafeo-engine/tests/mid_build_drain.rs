@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use grafeo_common::types::Value;
 use grafeo_core::graph::compact::generation::GenerationBudget;
-use grafeo_engine::{GrafeoDB, generation_build_request};
+use grafeo_engine::{generation_build_request, GrafeoDB};
 use tempfile::TempDir;
 
 fn normal_budget() -> GenerationBudget {
@@ -128,7 +128,6 @@ fn r1_byte_parity_no_drain_vs_two_drains() {
         .drain_overlay_to_base(budget, "r1-drain2".into())
         .expect("drain2");
     assert!(d2.rows_drained > 0, "second drain should have rows");
-
     let pub_b = db_b
         .build_and_publish_generation(generation_build_request(&gen_b, "r1-parity"))
         .expect("publish b")
@@ -171,6 +170,7 @@ fn r2_three_drains_one_store_no_already_active() {
                 let _ = db.create_edge(n, m, "OWNS");
             }
         }
+
         let r = db
             .drain_overlay_to_base(budget, format!("r2-cycle{cycle}"))
             .expect("drain should not fail with already active");
@@ -322,4 +322,190 @@ fn r5_zero_wal_growth_final_checkpoint_stays_ms() {
         elapsed_ms < 2000,
         "R5 final wal_checkpoint should stay ~ms, took {elapsed_ms} ms"
     );
+}
+
+// ── R6: O(window) cost guard (the anti-M1 test) ─────────────────────
+
+/// R6: the tier file written by one drain must be sized by the WINDOW
+/// (rows drained in that drain), not by the total rows imported so far.
+/// M1's drain_overlay_to_base re-streamed the whole merged graph — a
+/// window drain after a large base would produce a file proportional to
+/// base+window. This test writes a large first window, drains it, then a
+/// SMALL second window and asserts the second tier file is small.
+#[test]
+fn r6_tier_file_is_o_window_not_o_graph() {
+    let dir = TempDir::new().unwrap();
+    let tier_root = dir.path().join("tiers");
+
+    let mut db = GrafeoDB::new_in_memory();
+    db.compact().expect("compact");
+
+    // Window 1: many nodes (large base after drain).
+    for i in 0..200usize {
+        let _ = db
+            .create_node_with_props(
+                &["Person"],
+                [("name", Value::from(format!("r6-big-{i:03}")))],
+            )
+            .unwrap();
+    }
+    let d1 = db
+        .drain_overlay_to_tier(&tier_root, "r6-drain1")
+        .expect("drain1");
+    assert!(d1.tier_node_count == 200, "drain1 should capture 200 nodes");
+
+    // Window 2: few nodes.
+    for i in 0..5usize {
+        let _ = db
+            .create_node_with_props(
+                &["Person"],
+                [("name", Value::from(format!("r6-small-{i:03}")))],
+            )
+            .unwrap();
+    }
+    let d2 = db
+        .drain_overlay_to_tier(&tier_root, "r6-drain2")
+        .expect("drain2");
+    assert!(d2.tier_node_count == 5, "drain2 should capture 5 nodes");
+
+    // Tier files on disk.
+    let tiers: Vec<std::path::PathBuf> = fs::read_dir(&tier_root)
+        .expect("tier dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("grafeo"))
+        .collect();
+    assert_eq!(tiers.len(), 2, "two tier files expected, got {tiers:?}");
+
+    // Compare CompactStore SECTION payload sizes, not whole files: the
+    // container header is a fixed ~16 KiB per file and would dominate tiny
+    // fixtures, hiding the O(window) signal.
+    let cs_section_len = |p: &std::path::Path| -> u64 {
+        use grafeo_common::storage::SectionType;
+        use grafeo_storage::file::GrafeoFileManager;
+        let m = GrafeoFileManager::open_read_only(p).expect("open tier");
+        let dir = m.read_section_directory().expect("dir").expect("some dir");
+        let e = dir.find(SectionType::CompactStore).expect("cs section");
+        e.length
+    };
+    let (len_big, len_small) = {
+        let l0 = cs_section_len(&tiers[0]);
+        let l1 = cs_section_len(&tiers[1]);
+        if l0 > l1 { (l0, l1) } else { (l1, l0) }
+    };
+
+    // The small window's section payload must be strictly smaller than the
+    // big window's. Under M1 (full re-stream per drain), the second drain's
+    // output would be >= the first (205 rows > 200 rows), so this
+    // discriminates O(window) from O(graph).
+    assert!(
+        len_small < len_big,
+        "R6 O(window) guard failed: small window section {} bytes >= big window section {} bytes",
+        len_small,
+        len_big
+    );
+    // And it must be proportionally small (<= 25% of the big one — 5 rows
+    // vs 200 rows; generous margin for dictionary/zone-map fixed cost).
+    assert!(
+        len_small * 4 <= len_big,
+        "R6 O(window) guard failed: small section {} not proportionally small vs big section {}",
+        len_small,
+        len_big
+    );
+}
+
+// ── R7: edge-phase hazard (the anti-data-loss test) ─────────────────
+
+/// R7: an edge created AFTER a drain (edge phase) whose endpoints live in
+/// the drained tier must survive to the final generation. The node-phase-
+/// ZERO-edges guardrail is what makes this safe; this test trips if any
+/// future change re-introduces node-phase edge writes before a drain and
+/// from_graph_store_preserving_ids silently drops the cross-window edge
+/// (builder.rs:1182-1188).
+#[test]
+fn r7_cross_drain_edge_survives_and_parity_holds() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let gen_a = dir_a.path().join("gen-a.grafeo.d");
+    let gen_b = dir_b.path().join("gen-b.grafeo.d");
+    fs::create_dir_all(&gen_a).unwrap();
+    fs::create_dir_all(&gen_b).unwrap();
+
+    // Path A: no drain — nodes then edges then publish.
+    let mut db_a = GrafeoDB::new_in_memory();
+    db_a.compact().expect("compact a");
+    let mut ids_a = Vec::new();
+    for i in 0..6usize {
+        let n = db_a
+            .create_node_with_props(&["Person"], [("name", Value::from(format!("r7-a-{i:02}")))])
+            .unwrap();
+        ids_a.push(n);
+    }
+    // Edges all created after all nodes (edge phase).
+    for w in ids_a.windows(2) {
+        let _ = db_a.create_edge(w[0], w[1], "NEXT");
+    }
+    let pub_a = db_a
+        .build_and_publish_generation(generation_build_request(&gen_a, "r7-parity"))
+        .expect("publish a")
+        .publication;
+    let file_a = gen_a.join(&pub_a.generation_path);
+
+    // Path B: drain between node windows, then edges, then publish.
+    let mut db_b = GrafeoDB::new_in_memory();
+    db_b.compact().expect("compact b");
+    let tier_root_b = dir_b.path().join("tiers");
+    let mut ids_b = Vec::new();
+    for i in 0..3usize {
+        let n = db_b
+            .create_node_with_props(&["Person"], [("name", Value::from(format!("r7-a-{i:02}")))])
+            .unwrap();
+        ids_b.push(n);
+    }
+    let d1 = db_b
+        .drain_overlay_to_tier(&tier_root_b, "r7-drain1")
+        .expect("drain1");
+    assert!(d1.rows_drained > 0, "drain1 should have rows");
+    for i in 3..6usize {
+        let n = db_b
+            .create_node_with_props(&["Person"], [("name", Value::from(format!("r7-a-{i:02}")))])
+            .unwrap();
+        ids_b.push(n);
+    }
+    // Cross-window edges: nodes 0-2 live in the tier, nodes 3-5 in the
+    // overlay; the edge 2->3 spans the drain boundary.
+    for w in ids_b.windows(2) {
+        let _ = db_b.create_edge(w[0], w[1], "NEXT");
+    }
+    let pub_b = db_b
+        .build_and_publish_generation(generation_build_request(&gen_b, "r7-parity"))
+        .expect("publish b")
+        .publication;
+    let file_b = gen_b.join(&pub_b.generation_path);
+
+    // Byte parity with the no-drain build AND exact edge count (5 edges).
+    assert!(
+        file_bytes_equal(&file_a, &file_b),
+        "R7 byte-parity failed: cross-drain edge changed the final generation"
+    );
+    let edge_count = count_edges_from_generation(&file_b);
+    assert_eq!(
+        edge_count, 5,
+        "R7 edge loss: expected 5 NEXT edges, found {edge_count}"
+    );
+}
+
+fn count_edges_from_generation(path: &std::path::Path) -> usize {
+    use bytes::Bytes;
+    use grafeo_common::storage::SectionType;
+    use grafeo_core::graph::compact::section::CompactStoreSection;
+    use grafeo_storage::file::GrafeoFileManager;
+    let m = GrafeoFileManager::open_read_only(path).expect("open gen");
+    let dir = m.read_section_directory().expect("dir").expect("some dir");
+    let e = dir.find(SectionType::CompactStore).expect("cs section");
+    let sec = m.mmap_section(e).expect("mmap");
+    let bytes: Bytes = std::sync::Arc::new(sec).into_bytes();
+    let mut cs_sec = CompactStoreSection::empty();
+    cs_sec.deserialize_from_mapped_bytes(bytes).expect("deser");
+    let store = cs_sec.store().expect("store");
+    store.total_edges() as usize
 }

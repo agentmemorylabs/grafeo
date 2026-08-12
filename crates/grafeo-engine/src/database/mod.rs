@@ -54,6 +54,14 @@ pub mod index_build_control;
     feature = "generation-streaming"
 ))]
 pub mod mid_build_drain;
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "mmap",
+    feature = "generation-streaming"
+))]
+pub(crate) mod tier_chain_sources;
 #[cfg(feature = "lpg")]
 mod persistence;
 mod query;
@@ -320,6 +328,13 @@ pub struct GrafeoDB {
         feature = "generation-streaming"
     ))]
     epoch_handoff: generation::EpochHandoffCoordinator,
+    /// Builder-scoped mid-build tiers (G-MIDFLUSH.1 M2).
+    ///
+    /// Empty in normal serving; non-empty during builder mid-build drains.
+    /// `graph_store()` returns a `TierChainView` when this is non-empty.
+    #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+    mid_build_tiers:
+        parking_lot::RwLock<Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>>>,
     /// Writable generation-root ownership (H-ADOPT.2).
     ///
     /// Present only when this `GrafeoDB` was opened as a generation root via
@@ -820,6 +835,8 @@ impl GrafeoDB {
                 feature = "generation-streaming"
             ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
         };
 
         // Register storage sections as memory consumers for pressure tracking
@@ -1060,6 +1077,8 @@ impl GrafeoDB {
                 feature = "generation-streaming"
             ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
         };
 
         // H-ADOPT.6 decision 5: restore the Catalog BEFORE the layered wiring
@@ -1374,6 +1393,8 @@ impl GrafeoDB {
                 feature = "generation-streaming"
             ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
         })
     }
 
@@ -1483,6 +1504,8 @@ impl GrafeoDB {
                 feature = "generation-streaming"
             ))]
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
         })
     }
 
@@ -2691,8 +2714,19 @@ impl GrafeoDB {
             let overlay = layered.overlay_store();
             let layered_arc = Arc::clone(layered);
             let mut session = Session::with_adaptive(overlay, session_cfg());
-            // Read store: the raw LayeredStore (merges base + overlay) — no
-            // wrapper overhead on reads.
+            // Read store: when mid_build_tiers is non-empty, use TierChainView
+            // (tiers + overlay) so queries see drained tiers; otherwise the
+            // raw LayeredStore (merges base + overlay).
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            let read_store: Arc<dyn GraphStoreSearch> = if !self.mid_build_tiers.read().is_empty() {
+                let tiers = self.mid_build_tiers.read().clone();
+                let ov = layered.overlay_store();
+                let view = grafeo_core::graph::compact::tier_chain::TierChainView::new(tiers, ov);
+                Arc::new(view) as Arc<dyn GraphStoreSearch>
+            } else {
+                Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>
+            };
+            #[cfg(not(all(feature = "compact-store", feature = "mmap", feature = "lpg")))]
             let read_store = Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>;
             // Write store: the LayeredStore, wrapped in a WalGraphStore when the
             // database carries a WAL so query mutations reach the root's WAL
@@ -3041,6 +3075,19 @@ impl GrafeoDB {
     /// operations. For write access, use [`graph_store_mut()`](Self::graph_store_mut).
     #[must_use]
     pub fn graph_store(&self) -> Arc<dyn GraphStoreSearch> {
+        #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+        {
+            if !self.mid_build_tiers.read().is_empty() {
+                if let Some(layered) = self.layered_store.as_ref() {
+                    let tiers = self.mid_build_tiers.read().clone();
+                    let overlay = layered.overlay_store();
+                    let view = grafeo_core::graph::compact::tier_chain::TierChainView::new(
+                        tiers, overlay,
+                    );
+                    return Arc::new(view) as Arc<dyn GraphStoreSearch>;
+                }
+            }
+        }
         if let Some(ref ext_read) = self.external_read_store {
             Arc::clone(ext_read)
         } else {
@@ -3051,6 +3098,13 @@ impl GrafeoDB {
             #[cfg(not(feature = "lpg"))]
             unreachable!("no graph store available: enable the `lpg` feature or use with_store()")
         }
+    }
+
+    /// Returns a clone of the current mid-build tier list (G-MIDFLUSH.1 M2).
+    #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+    #[must_use]
+    pub fn mid_build_tiers(&self) -> Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>> {
+        self.mid_build_tiers.read().clone()
     }
 
     /// Returns the writable graph store, if available.

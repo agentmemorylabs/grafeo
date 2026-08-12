@@ -693,8 +693,9 @@ impl LayeredStore {
     /// store so this is a fatal condition rather than a recoverable
     /// error.
     pub fn reset_overlay(&self) {
-        let fresh = Arc::new(LpgStore::new().expect("LpgStore allocation"));
-        // Seed allocators from the base so new ids don't collide.
+        // Compute the current scanned watermark, then delegate to the explicit
+        // watermark swap (no behavior change for existing callers like
+        // swap_base_and_reset_overlay at :776).
         let base = self.base.load();
         let max_nid = base
             .all_node_ids()
@@ -702,13 +703,22 @@ impl LayeredStore {
             .map(|id| id.as_u64())
             .max()
             .unwrap_or(0);
-        // Edge ids are not directly enumerable from CompactStore; use
-        // the current overlay's allocator as a conservative lower bound.
         let current_overlay = self.overlay.load();
         let max_eid = current_overlay.next_edge_id().saturating_sub(1);
-        fresh.set_next_node_id(max_nid + 1);
-        fresh.set_next_edge_id(max_eid + 1);
+        let next_node_id = max_nid + 1;
+        let next_edge_id = max_eid + 1;
+        drop(base);
+        drop(current_overlay);
+        self.reset_overlay_with_watermark(next_node_id, next_edge_id);
+    }
 
+    /// Seeds a FRESH overlay from an explicit watermark instead of scanning the
+    /// base (O(N)) and conservatively under-seeding edges. For mid-build drains
+    /// where the drained overlay's next counters ARE the global watermark.
+    pub fn reset_overlay_with_watermark(&self, next_node_id: u64, next_edge_id: u64) {
+        let fresh = Arc::new(LpgStore::new().expect("LpgStore allocation"));
+        fresh.set_next_node_id(next_node_id);
+        fresh.set_next_edge_id(next_edge_id);
         self.overlay.store(fresh);
         self.dirty_node_ids.write().clear();
         self.dirty_edge_ids.write().clear();

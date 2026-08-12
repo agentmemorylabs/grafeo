@@ -25,6 +25,9 @@ pub mod id;
 /// Two-layer store: columnar base + mutable LPG overlay.
 #[cfg(feature = "lpg")]
 pub mod layered;
+/// Builder-scoped tier chain view (G-MIDFLUSH.1).
+#[cfg(feature = "lpg")]
+pub mod tier_chain;
 /// Mapped CompactStore v5 views and accounting (G-EM0.2).
 pub mod mapped;
 /// Per-label node tables with columnar property storage.
