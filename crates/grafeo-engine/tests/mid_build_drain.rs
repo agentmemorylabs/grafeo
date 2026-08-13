@@ -544,6 +544,31 @@ fn drain_fail_closed_on_tier_root_not_a_directory() {
     );
 }
 
+/// G-MIDFLUSH.1: overlay_memory_bytes must weigh Vector payloads so the
+/// 1024 MiB drain trigger sees embeddings, not just the Value enum slot.
+#[test]
+fn overlay_bytes_count_vector_payload() {
+    let mut db = GrafeoDB::new_in_memory();
+    db.compact().expect("compact");
+    let before = db.mid_flush_overlay_bytes().expect("layered");
+    let dims = 4096usize;
+    db.create_node_with_props(
+        &["RetrievalUnit"],
+        [(
+            "embedding",
+            Value::Vector(std::sync::Arc::from(vec![0.25f32; dims])),
+        )],
+    )
+    .unwrap();
+    let after = db.mid_flush_overlay_bytes().expect("layered");
+    let payload = dims * std::mem::size_of::<f32>();
+    let delta = after.saturating_sub(before);
+    assert!(
+        delta >= payload,
+        "overlay grew by {delta} bytes; expected at least {payload} for one 4096-d vector"
+    );
+}
+
 fn count_edges_from_generation(path: &std::path::Path) -> usize {
     use bytes::Bytes;
     use grafeo_common::storage::SectionType;

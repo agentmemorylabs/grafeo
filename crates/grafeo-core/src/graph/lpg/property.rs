@@ -1194,17 +1194,25 @@ impl<Id: EntityId> PropertyColumn<Id> {
 
     /// Returns estimated heap memory for this column.
     ///
-    /// Includes the hot buffer hash map capacity, zone map, and any
-    /// compressed data.
+    /// Includes the hot-buffer hash-map capacity, each value's payload
+    /// (`Value::estimated_size_bytes` — Vector/String/List heaps), and any
+    /// compressed data. Slot-only accounting (`size_of::<Value>()`) is not
+    /// enough: a 4096-d `Value::Vector` is ~16 KiB on the heap behind a
+    /// ~pointer-sized enum. Midflush's 1024 MiB overlay trigger reads this
+    /// through `LpgStore::memory_breakdown` → `overlay_memory_bytes`.
     #[must_use]
     pub fn heap_memory_bytes(&self) -> usize {
         // Hot buffer: FxHashMap<Id, Value> capacity
         let hot_bytes =
             self.values.capacity() * (std::mem::size_of::<Id>() + std::mem::size_of::<Value>() + 1);
+        let payload_bytes: usize = self
+            .values
+            .values()
+            .map(Value::estimated_size_bytes)
+            .sum();
         // Compressed data
         let compressed_bytes = self.compressed.as_ref().map_or(0, |c| c.memory_usage());
-        // ZoneMapEntry is inline (no heap), so just hot + compressed
-        hot_bytes + compressed_bytes
+        hot_bytes + payload_bytes + compressed_bytes
     }
 
     /// Returns whether the column has compressed data.
@@ -2660,5 +2668,28 @@ mod tests {
         assert_eq!(blocks[0].null_count, 0, "NaN is not null");
         assert_eq!(blocks[0].min, Some(Value::Float64(0.0)));
         assert_eq!(blocks[0].max, Some(Value::Float64(49.0)));
+    }
+
+    #[test]
+    fn heap_memory_bytes_counts_vector_payload_not_just_enum_slot() {
+        // G-MIDFLUSH.1: 4096-d embeddings must weigh ~16 KiB, not size_of::<Value>().
+        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
+        let dims = 4096usize;
+        col.set(
+            NodeId::new(1),
+            Value::Vector(std::sync::Arc::from(vec![0.5f32; dims])),
+        );
+        let bytes = col.heap_memory_bytes();
+        let payload = dims * std::mem::size_of::<f32>();
+        assert!(
+            bytes >= payload,
+            "heap_memory_bytes={bytes} must include {payload}-byte Vector payload"
+        );
+        // Slot-only accounting is ~tens of bytes per cell; this guard fails
+        // if someone reverts to capacity * size_of::<Value>() alone.
+        assert!(
+            bytes > 1024,
+            "heap_memory_bytes={bytes} looks like slot-only accounting"
+        );
     }
 }
