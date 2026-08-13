@@ -335,6 +335,17 @@ pub struct GrafeoDB {
     #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
     mid_build_tiers:
         parking_lot::RwLock<Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>>>,
+    /// 1-based count of *committed* mid-build drains for this database.
+    /// Incremented only after write + reopen + overlay reset + tier push.
+    /// Process-wide statics are forbidden (two DBs / two tests must not share a counter).
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap",
+        feature = "generation-streaming"
+    ))]
+    mid_build_drain_seq: u64,
     /// Writable generation-root ownership (H-ADOPT.2).
     ///
     /// Present only when this `GrafeoDB` was opened as a generation root via
@@ -837,6 +848,16 @@ impl GrafeoDB {
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
+            // Committed mid-build drain sequence (0 = none). Incremented only
+            // after a drain is fully committed — never a process-wide static.
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap",
+                feature = "generation-streaming"
+            ))]
+            mid_build_drain_seq: 0,
         };
 
         // Register storage sections as memory consumers for pressure tracking
@@ -1079,6 +1100,16 @@ impl GrafeoDB {
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
+            // Committed mid-build drain sequence (0 = none). Incremented only
+            // after a drain is fully committed — never a process-wide static.
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap",
+                feature = "generation-streaming"
+            ))]
+            mid_build_drain_seq: 0,
         };
 
         // H-ADOPT.6 decision 5: restore the Catalog BEFORE the layered wiring
@@ -1395,6 +1426,16 @@ impl GrafeoDB {
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
+            // Committed mid-build drain sequence (0 = none). Incremented only
+            // after a drain is fully committed — never a process-wide static.
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap",
+                feature = "generation-streaming"
+            ))]
+            mid_build_drain_seq: 0,
         })
     }
 
@@ -1506,6 +1547,16 @@ impl GrafeoDB {
             epoch_handoff: generation::EpochHandoffCoordinator::new(),
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
+            // Committed mid-build drain sequence (0 = none). Incremented only
+            // after a drain is fully committed — never a process-wide static.
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap",
+                feature = "generation-streaming"
+            ))]
+            mid_build_drain_seq: 0,
         })
     }
 

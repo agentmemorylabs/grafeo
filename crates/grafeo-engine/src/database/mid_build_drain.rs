@@ -101,7 +101,14 @@ impl GrafeoDB {
     /// `build_and_publish_generation` / `publish_generation` /
     /// `live_graph_sources_bounded` / `BaseGeneration::open`.
     ///
-    /// Fail-closed: any error leaves the overlay and tier list intact.
+    /// Fail-closed: any error after a new tier file is created unlinks that
+    /// file and leaves overlay + `mid_build_tiers` as they were on entry.
+    /// Commit order: write → reopen (fail ⇒ unlink) → reset overlay + sync
+    /// `self.store` → push reopened store → assign `drain_seq`.
+    ///
+    /// Crash window: a crash after overlay reset / push and before the
+    /// builder acknowledges the drain is not recovered. The builder never
+    /// resumes a half-drain; `TransientStoreGuard` deletes the attempt.
     #[cfg(all(
         feature = "generation",
         feature = "lpg",
@@ -151,10 +158,10 @@ impl GrafeoDB {
             && overlay_node_count == 0
             && overlay_edge_count == 0;
         if is_empty {
-            let seq = self.next_drain_seq();
+            // No-op: do not burn a sequence number.
             let anon_after = layered.overlay_memory_bytes() as u64;
             return Ok(MidBuildDrainReport {
-                drain_seq: seq,
+                drain_seq: self.mid_build_drain_seq,
                 rows_drained: 0,
                 anon_kb_before: anon_before / 1024,
                 anon_kb_after: anon_after / 1024,
@@ -170,10 +177,10 @@ impl GrafeoDB {
         // Also early-return when the freeze says empty but there are nodes
         // (should not happen, but handle: treat as empty).
         if frozen.overlay_node_ids.is_empty() && overlay_node_count == 0 {
-            let seq = self.next_drain_seq();
+            // No-op: do not burn a sequence number.
             let anon_after = layered.overlay_memory_bytes() as u64;
             return Ok(MidBuildDrainReport {
-                drain_seq: seq,
+                drain_seq: self.mid_build_drain_seq,
                 rows_drained: 0,
                 anon_kb_before: anon_before / 1024,
                 anon_kb_after: anon_after / 1024,
@@ -215,7 +222,10 @@ impl GrafeoDB {
             ))
         })?;
 
-        let seq = self.next_drain_seq();
+        // Prospective seq for the filename only. The field is assigned after
+        // commit so a failed write/reopen does not burn a number or share a
+        // process-wide counter.
+        let seq = self.mid_build_drain_seq.saturating_add(1);
         let tier_id = next_drain_id(correlation_id, seq);
         let tier_path = tier_root.join(format!("tier-{seq:020}-{tier_id}.grafeo"));
 
@@ -281,7 +291,10 @@ impl GrafeoDB {
             let mut sections: Vec<Box<dyn grafeo_storage::file::generation_writer::ExactSectionSource>> =
                 vec![Box::new(section)];
             create_versioned_sections_streaming(&tier_path, &header, &mut sections, &OsGenerationFileOps)
-                .map_err(|e| Error::Internal(format!("tier write failed: {e}")))?;
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&tier_path);
+                    Error::Internal(format!("tier write failed: {e}"))
+                })?;
         }
 
         // Compute tier SHA-256 (diagnostics) — streaming, bounded.
@@ -290,16 +303,19 @@ impl GrafeoDB {
             OsGenerationFileOps.sha256(&tier_path).ok()
         };
 
-        // ── mmap reopen + push onto tier list ───────────────────────────
-        let reopened = open_compact_store_from_generation_file(&tier_path).map_err(|e| {
-            Error::Internal(format!(
-                "mid-build drain reopen failed for {}: {e}",
-                tier_path.display()
-            ))
-        })?;
-        self.mid_build_tiers.write().push(Arc::clone(&reopened));
+        // ── mmap reopen; fail ⇒ unlink, overlay + tiers unchanged ────────
+        let reopened = match open_compact_store_from_generation_file(&tier_path) {
+            Ok(store) => store,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tier_path);
+                return Err(Error::Internal(format!(
+                    "mid-build drain reopen failed for {}: {e}",
+                    tier_path.display()
+                )));
+            }
+        };
 
-        // ── Watermark swap ──────────────────────────────────────────────
+        // ── Commit: reset overlay + sync store → push (infallible) → seq ─
         layered.reset_overlay_with_watermark(next_node, next_edge);
         // Keep GrafeoDB::store in sync with the fresh overlay (GrafeoDB::lpg_store()
         // returns `self.store`, not `layered.overlay_store()`; after compact they alias
@@ -308,6 +324,8 @@ impl GrafeoDB {
         {
             self.store = Some(layered.overlay_store());
         }
+        self.mid_build_tiers.write().push(Arc::clone(&reopened));
+        self.mid_build_drain_seq = seq;
 
         let anon_after = layered.overlay_memory_bytes() as u64;
         let wall_ms = wall_start.elapsed().as_millis() as u64;
@@ -325,19 +343,6 @@ impl GrafeoDB {
             base_node_count: tier_node_count,
             base_edge_count: tier_edge_count,
         })
-    }
-
-    #[cfg(all(
-        feature = "generation",
-        feature = "lpg",
-        feature = "compact-store",
-        feature = "mmap",
-        feature = "generation-streaming"
-    ))]
-    fn next_drain_seq(&self) -> u64 {
-        use std::sync::atomic::Ordering;
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        SEQ.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Live overlay anon heap bytes for the LayeredStore attached to this DB.

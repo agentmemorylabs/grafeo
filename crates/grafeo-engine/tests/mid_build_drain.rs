@@ -492,6 +492,58 @@ fn r7_cross_drain_edge_survives_and_parity_holds() {
     );
 }
 
+/// F2: a write/reopen failure (tier_root is a file, not a directory) must
+/// leave overlay + mid_build_tiers as they were and create no leftover
+/// `tier-*.grafeo`.
+#[test]
+fn drain_fail_closed_on_tier_root_not_a_directory() {
+    let dir = TempDir::new().unwrap();
+    let not_a_dir = dir.path().join("not-a-dir");
+    fs::write(&not_a_dir, b"not a directory").unwrap();
+
+    let mut db = GrafeoDB::new_in_memory();
+    db.compact().expect("compact");
+    for i in 0..20usize {
+        db.create_node_with_props(&["Person"], [("name", Value::from(format!("f2-{i:02}")))])
+            .unwrap();
+    }
+    let before = db
+        .mid_flush_overlay_bytes()
+        .expect("layered overlay bytes after compact");
+    assert!(before > 0, "overlay must hold the just-created nodes");
+
+    let err = db
+        .drain_overlay_to_tier(&not_a_dir, "f2-fail-closed")
+        .expect_err("drain must fail when tier_root is a file");
+    let _ = err;
+
+    let after = db
+        .mid_flush_overlay_bytes()
+        .expect("overlay still attached");
+    assert!(
+        after >= before,
+        "failed drain must not reset the overlay (before={before} after={after})"
+    );
+    assert!(
+        db.mid_build_tiers().is_empty(),
+        "failed drain must not push a tier"
+    );
+
+    let leftovers: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("tier-")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "failed drain must not leave tier-*.grafeo: {leftovers:?}"
+    );
+}
+
 fn count_edges_from_generation(path: &std::path::Path) -> usize {
     use bytes::Bytes;
     use grafeo_common::storage::SectionType;
