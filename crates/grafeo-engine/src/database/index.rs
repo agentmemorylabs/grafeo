@@ -191,12 +191,23 @@ impl super::GrafeoDB {
         #[cfg(not(feature = "vector-index"))]
         let _ = quantization;
 
-        // Scan nodes to validate vectors exist and check dimensions
+        // Scan nodes to validate vectors exist and check dimensions.
+        //
+        // G-VECBUILD.1 E2: read through the spill-aware build accessor. After
+        // `spill_vector_column_to_disk` (E1) the drained column's
+        // `get_node_property` returns `None`, so a property-only scan would
+        // count zero vectors and silently create an empty index (the
+        // skip-every-node trap). The accessor sees overlay/tier/base vectors
+        // plus the spilled mmap fallback.
         let prop_key = PropertyKey::new(property);
         let mut found_dims: Option<usize> = dimensions;
         let mut vector_count = 0usize;
 
         let graph = self.graph_store();
+        #[cfg(feature = "vector-index")]
+        let dim_accessor = self.build_vector_accessor(&graph, label, property);
+        #[cfg(feature = "vector-index")]
+        use grafeo_core::index::vector::VectorAccessor as _;
         for (iteration, node_id) in graph.nodes_by_label(label).into_iter().enumerate() {
             if let Some(control) = control
                 && control.maybe_cancel(iteration as u64)
@@ -205,7 +216,17 @@ impl super::GrafeoDB {
                     operation: format!("create_vector_index dim scan :{label}({property})"),
                 });
             }
-            if let Some(Value::Vector(v)) = graph.get_node_property(node_id, &prop_key) {
+            #[cfg(feature = "vector-index")]
+            let found_vector = dim_accessor.get_vector(node_id);
+            #[cfg(not(feature = "vector-index"))]
+            let found_vector = graph.get_node_property(node_id, &prop_key).and_then(|v| {
+                if let Value::Vector(vec) = v {
+                    Some(vec)
+                } else {
+                    None
+                }
+            });
+            if let Some(v) = found_vector {
                 if let Some(expected) = found_dims {
                     if v.len() != expected {
                         return Err(grafeo_common::utils::error::Error::Internal(format!(
@@ -264,6 +285,26 @@ impl super::GrafeoDB {
         {
             use grafeo_core::index::vector::VectorIndexKind;
 
+            // G-VECBUILD.1 E2 fail-closed guard: the Quantized build branch
+            // still reads through the heap-property guard (untouched per the
+            // packet's A1 hard rule), so a column drained to disk by E1 would
+            // pass the accessor-based dim scan but insert ZERO vectors here.
+            // The builder path passes `quantization=None`; anything else on a
+            // spilled column is a wiring bug — fail closed, never build an
+            // empty quantized index.
+            #[cfg(all(feature = "mmap", not(feature = "temporal")))]
+            if !matches!(
+                quantization_type,
+                grafeo_core::index::vector::QuantizationType::None
+            ) && self.vector_column_is_spilled(label, property)
+            {
+                return Err(Error::Internal(format!(
+                    "create_vector_index :{label}({property}): quantized construction over a \
+                     spilled vector column is unsupported (the build branch reads the heap \
+                     property guard and would insert nothing)"
+                )));
+            }
+
             let index = Self::build_vector_index(
                 dims,
                 metric,
@@ -275,9 +316,15 @@ impl super::GrafeoDB {
 
             match &index {
                 VectorIndexKind::Hnsw(_) => {
+                    use grafeo_core::index::vector::VectorAccessor as _;
                     let graph = self.graph_store();
-                    let accessor =
-                        grafeo_core::index::vector::PropertyVectorAccessor::new(&*graph, property);
+                    // G-VECBUILD.1 E2: read each node's own vector through the
+                    // spill-aware build accessor (overlay/tier/base property
+                    // reads first, E1 spill fallback second) instead of the
+                    // heap-property-only guard. The insert descent's neighbor
+                    // reads go through the same accessor, so the working set
+                    // is the pages actually touched, not the full f32 corpus.
+                    let accessor = self.build_vector_accessor(&graph, label, property);
                     let mut inserted: u64 = 0;
                     for (iteration, node_id) in graph.nodes_by_label(label).into_iter().enumerate()
                     {
@@ -291,12 +338,17 @@ impl super::GrafeoDB {
                             }
                             control.maybe_progress(iteration as u64, inserted, vector_count as u64);
                         }
-                        if let Some(Value::Vector(vector)) =
-                            graph.get_node_property(node_id, &prop_key)
-                        {
+                        if let Some(vector) = accessor.get_vector(node_id) {
                             index.insert(node_id, &vector, &accessor);
                             inserted += 1;
                         }
+                    }
+                    if inserted != vector_count as u64 {
+                        return Err(Error::Internal(format!(
+                            "create_vector_index build :{label}({property}): inserted \
+                             {inserted} of {vector_count} vectors (skip-every-node trap: \
+                             the build accessor lost sight of the vector sources)"
+                        )));
                     }
                 }
                 VectorIndexKind::Quantized(q_idx) => {

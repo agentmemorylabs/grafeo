@@ -288,6 +288,25 @@ impl VectorIndexConsumer {
         }
     }
 
+    /// Creates a consumer bound to `store` that adopts an EXISTING spill
+    /// registry (G-VECBUILD.1 E1).
+    ///
+    /// `GrafeoDB::compact()` swaps the LPG store, so a consumer registered at
+    /// `with_config` time keeps a dead weak reference; re-registering through
+    /// this constructor rebinds the consumer to the live store while keeping
+    /// the `SpillableVectorAccessor` registry intact.
+    pub fn with_spilled_registry(
+        store: &Arc<grafeo_core::graph::lpg::LpgStore>,
+        spill_path: Option<PathBuf>,
+        spilled: Arc<RwLock<HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>>>,
+    ) -> Self {
+        Self {
+            store: Arc::downgrade(store),
+            spill_path,
+            spilled,
+        }
+    }
+
     /// Returns the shared spill registry for the search path.
     #[must_use]
     pub fn spilled_storages(

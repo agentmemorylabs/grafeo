@@ -74,6 +74,13 @@ pub(crate) mod section_consumer;
 mod vector_access;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 mod vector_read;
+#[cfg(all(
+    feature = "lpg",
+    feature = "vector-index",
+    feature = "mmap",
+    not(feature = "temporal")
+))]
+pub mod vector_spill_build;
 #[cfg(all(feature = "wal", feature = "lpg"))]
 pub(crate) mod wal_store;
 

@@ -212,6 +212,11 @@ name = "generation_sections"
 path = "tests/generation_sections.rs"
 required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index", "text-index"]
 
+[[test]]
+name = "vecbuild_b1_spill_build"
+path = "tests/vecbuild_b1_spill_build.rs"
+required-features = ["lpg", "vector-index", "mmap", "compact-store", "generation", "generation-streaming", "grafeo-file"]
+
 [[bench]]
 name = "query_bench"
 harness = false
