@@ -217,6 +217,11 @@ name = "vecbuild_b1_spill_build"
 path = "tests/vecbuild_b1_spill_build.rs"
 required-features = ["lpg", "vector-index", "mmap", "compact-store", "generation", "generation-streaming", "grafeo-file"]
 
+[[test]]
+name = "vecbuild_reopen_probe"
+path = "tests/vecbuild_reopen_probe.rs"
+required-features = ["lpg", "vector-index", "mmap", "compact-store", "generation", "generation-streaming", "grafeo-file"]
+
 [[bench]]
 name = "query_bench"
 harness = false
