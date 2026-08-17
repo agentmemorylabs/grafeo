@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use grafeo_common::types::{PropertyKey, Value};
 use grafeo_common::utils::hash::FxHashMap;
+use grafeo_core::graph::Direction;
 use grafeo_core::graph::compact::generation::{
     EdgeRecordSource, GenerationEdge, GenerationError, GenerationNode, NodeRecordSource,
     OriginalEdgeId, OriginalNodeId,
 };
 use grafeo_core::graph::traits::GraphStore;
-use grafeo_core::graph::Direction;
 
 /// Walks a `GraphStore` (the `TierChainView`) row-by-row.
 pub struct ChainNodeSource {

@@ -55,6 +55,11 @@ mod imp {
         /// Drains the named `label:property` vector column from the live
         /// property store into an `MmapStorage` spill file (G-VECBUILD.1 E1).
         ///
+        /// Label-scoped: the property store drains by `PropertyKey` (global
+        /// across labels), so this call partitions the drained values — only
+        /// vectors on nodes carrying `label` are spilled to the
+        /// `label:property` file; every other value is restored bit-exact.
+        ///
         /// After this call, `get_node_property` returns `None` for the
         /// drained column and spill-aware accessors serve the vectors from
         /// mmap. The drain covers the **live store only** (post-`compact()`
@@ -132,56 +137,88 @@ mod imp {
                 });
             }
 
-            let mut dimensions: Option<usize> = None;
-            let mut vectors: Vec<(NodeId, Arc<[f32]>)> = Vec::with_capacity(drained.len());
-            let mut non_vector: Vec<(NodeId, Value)> = Vec::new();
+            // Label scoping: the property store drains by `PropertyKey`,
+            // which is GLOBAL across labels. Only vectors whose node carries
+            // `label` belong in the `label:property`-keyed spill file; every
+            // other value (foreign label or non-vector) is restored so other
+            // labels' columns are never stolen by this call.
+            let label_nodes: std::collections::HashSet<NodeId> = self
+                .graph_store()
+                .nodes_by_label(label)
+                .into_iter()
+                .collect();
+
+            // Partition exhaustively (every drained value lands in exactly
+            // one bucket) so ANY later error path can restore the full
+            // column bit-exact — no un-iterated tail can be dropped.
+            let mut vectors: Vec<(NodeId, Arc<[f32]>)> = Vec::new();
+            let mut restored: Vec<(NodeId, Value)> = Vec::new();
             for (id, value) in drained {
                 match value {
-                    Value::Vector(v) => {
-                        if let Some(expected) = dimensions {
-                            if v.len() != expected {
-                                let restore = vectors
-                                    .into_iter()
-                                    .map(|(id, vec)| (id, Value::Vector(vec)))
-                                    .chain(non_vector);
-                                store.restore_node_property_column(&prop_key, restore);
-                                return Err(Error::Internal(format!(
-                                    "spill_vector_column_to_disk {key}: dimension mismatch \
-                                     (expected {expected}, found {} on node {})",
-                                    v.len(),
-                                    id.0
-                                )));
-                            }
-                        } else {
-                            dimensions = Some(v.len());
-                        }
-                        vectors.push((id, v));
-                    }
-                    other => non_vector.push((id, other)),
+                    Value::Vector(v) if label_nodes.contains(&id) => vectors.push((id, v)),
+                    other => restored.push((id, other)),
                 }
             }
-            let Some(dims) = dimensions else {
-                store.restore_node_property_column(&prop_key, non_vector.into_iter());
-                return Err(Error::Internal(format!(
-                    "spill_vector_column_to_disk {key}: column holds no vectors"
-                )));
-            };
 
-            // Restore helper for every fallible step below: put the drained
-            // vectors + non-vector values back, then unlink any partial file.
+            // Restore helper for every fallible step below: put all drained
+            // values back (target vectors + everything else), then unlink
+            // any partial spill file at the call site.
             let restore = |store: &Arc<grafeo_core::graph::lpg::LpgStore>,
                            vectors: &[(NodeId, Arc<[f32]>)],
-                           non_vector: &[(NodeId, Value)]| {
+                           restored: &[(NodeId, Value)]| {
                 let values = vectors
                     .iter()
                     .cloned()
                     .map(|(id, vec)| (id, Value::Vector(vec)))
-                    .chain(non_vector.iter().cloned());
+                    .chain(restored.iter().cloned());
                 store.restore_node_property_column(&prop_key, values);
             };
 
+            // Dimension validation AFTER the exhaustive partition: a
+            // mismatch restores the COMPLETE column (target vectors
+            // included), never a prefix.
+            let mut dimensions: Option<usize> = None;
+            for (id, v) in &vectors {
+                if let Some(expected) = dimensions {
+                    if v.len() != expected {
+                        restore(store, &vectors, &restored);
+                        return Err(Error::Internal(format!(
+                            "spill_vector_column_to_disk {key}: dimension mismatch \
+                             (expected {expected}, found {} on node {})",
+                            v.len(),
+                            id.0
+                        )));
+                    }
+                } else {
+                    dimensions = Some(v.len());
+                }
+            }
+
+            // No vectors for this label at all. If the drained values were
+            // all non-vector this is a mixed-type data bug — fail closed
+            // (restore everything first). Otherwise (foreign-label vectors
+            // only) it is a legitimate no-op: restore, no file, no registry
+            // entry.
+            if vectors.is_empty() {
+                restore(store, &vectors, &restored);
+                if restored.iter().any(|(_, v)| !matches!(v, Value::Vector(_))) {
+                    return Err(Error::Internal(format!(
+                        "spill_vector_column_to_disk {key}: column holds no vectors for label {label}"
+                    )));
+                }
+                return Ok(SpillVectorColumnReport {
+                    label: label.to_string(),
+                    property: property.to_string(),
+                    vectors_spilled: 0,
+                    bytes_spilled: 0,
+                    spill_file: spill_file_for_key(&spill_dir, &key),
+                    already_spilled: false,
+                });
+            }
+            let dims = dimensions.expect("non-empty vectors set dimension");
+
             if let Err(e) = std::fs::create_dir_all(&spill_dir) {
-                restore(store, &vectors, &non_vector);
+                restore(store, &vectors, &restored);
                 return Err(Error::Internal(format!(
                     "spill_vector_column_to_disk {key}: create spill dir {}: {e}",
                     spill_dir.display()
@@ -192,7 +229,9 @@ mod imp {
             let mmap_storage = match MmapStorage::create(&spill_file, dims) {
                 Ok(storage) => storage,
                 Err(e) => {
-                    restore(store, &vectors, &non_vector);
+                    // Unlink any truncated file the failed create left behind.
+                    let _ = std::fs::remove_file(&spill_file);
+                    restore(store, &vectors, &restored);
                     return Err(Error::Internal(format!(
                         "spill_vector_column_to_disk {key}: create {}: {e}",
                         spill_file.display()
@@ -206,7 +245,7 @@ mod imp {
             for (id, vector) in &vectors {
                 if let Err(e) = mmap_storage.insert(*id, vector) {
                     let _ = std::fs::remove_file(&spill_file);
-                    restore(store, &vectors, &non_vector);
+                    restore(store, &vectors, &restored);
                     return Err(Error::Internal(format!(
                         "spill_vector_column_to_disk {key}: insert node {}: {e}",
                         id.0
@@ -219,15 +258,20 @@ mod imp {
             }
             if let Err(e) = mmap_storage.flush() {
                 let _ = std::fs::remove_file(&spill_file);
-                restore(store, &vectors, &non_vector);
+                restore(store, &vectors, &restored);
                 return Err(Error::Internal(format!(
                     "spill_vector_column_to_disk {key}: flush: {e}"
                 )));
             }
 
-            // Non-vector values that shared the column go back to the store.
-            if !non_vector.is_empty() {
-                store.restore_node_property_column(&prop_key, non_vector.into_iter());
+            // Foreign-label and non-vector values that shared the global
+            // column go back to the store. Note: `restore_values` clears the
+            // column's `spilled` flag; when foreign values remain the flag
+            // honestly reports "hot values present" (the registry — not the
+            // flag — is the authority for the spilled target vectors, and
+            // `PropertyColumn::get` never consults the flag).
+            if !restored.is_empty() {
+                store.restore_node_property_column(&prop_key, restored.into_iter());
             }
 
             registry.write().insert(key.clone(), Arc::new(mmap_storage));

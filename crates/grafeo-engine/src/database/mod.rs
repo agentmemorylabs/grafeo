@@ -54,14 +54,6 @@ pub mod index_build_control;
     feature = "generation-streaming"
 ))]
 pub mod mid_build_drain;
-#[cfg(all(
-    feature = "generation",
-    feature = "lpg",
-    feature = "compact-store",
-    feature = "mmap",
-    feature = "generation-streaming"
-))]
-pub(crate) mod tier_chain_sources;
 #[cfg(feature = "lpg")]
 mod persistence;
 mod query;
@@ -70,6 +62,14 @@ mod rdf_ops;
 #[cfg(feature = "lpg")]
 mod search;
 pub(crate) mod section_consumer;
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "mmap",
+    feature = "generation-streaming"
+))]
+pub(crate) mod tier_chain_sources;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 mod vector_access;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
@@ -3139,9 +3139,8 @@ impl GrafeoDB {
                 if let Some(layered) = self.layered_store.as_ref() {
                     let tiers = self.mid_build_tiers.read().clone();
                     let overlay = layered.overlay_store();
-                    let view = grafeo_core::graph::compact::tier_chain::TierChainView::new(
-                        tiers, overlay,
-                    );
+                    let view =
+                        grafeo_core::graph::compact::tier_chain::TierChainView::new(tiers, overlay);
                     return Arc::new(view) as Arc<dyn GraphStoreSearch>;
                 }
             }
@@ -3161,7 +3160,9 @@ impl GrafeoDB {
     /// Returns a clone of the current mid-build tier list (G-MIDFLUSH.1 M2).
     #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
     #[must_use]
-    pub fn mid_build_tiers(&self) -> Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>> {
+    pub fn mid_build_tiers(
+        &self,
+    ) -> Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>> {
         self.mid_build_tiers.read().clone()
     }
 

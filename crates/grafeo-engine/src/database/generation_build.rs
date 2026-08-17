@@ -568,7 +568,8 @@ impl GrafeoDB {
                     let overlay = layered.overlay_store();
                     let chain = std::sync::Arc::new(
                         grafeo_core::graph::compact::tier_chain::TierChainView::new(
-                            tiers, overlay.clone(),
+                            tiers,
+                            overlay.clone(),
                         ),
                     );
                     // Chain sources are self-contained: ChainNodeSource walks
@@ -576,10 +577,18 @@ impl GrafeoDB {
                     // each node through the chain view; the external merge sort
                     // in NodePass::stage restores canonical (label,id) order, so
                     // enumeration order need not be pre-sorted.
-                    let chain_clone = std::sync::Arc::clone(&chain) as std::sync::Arc<dyn grafeo_core::graph::traits::GraphStore>;
-                    let edge_chain_clone = std::sync::Arc::clone(&chain) as std::sync::Arc<dyn grafeo_core::graph::traits::GraphStore>;
-                    let mr_nodes = crate::database::tier_chain_sources::ChainNodeSource::new(chain_clone, max_record_bytes);
-                    let mr_edges = crate::database::tier_chain_sources::ChainEdgeSource::new(edge_chain_clone, max_record_bytes);
+                    let chain_clone = std::sync::Arc::clone(&chain)
+                        as std::sync::Arc<dyn grafeo_core::graph::traits::GraphStore>;
+                    let edge_chain_clone = std::sync::Arc::clone(&chain)
+                        as std::sync::Arc<dyn grafeo_core::graph::traits::GraphStore>;
+                    let mr_nodes = crate::database::tier_chain_sources::ChainNodeSource::new(
+                        chain_clone,
+                        max_record_bytes,
+                    );
+                    let mr_edges = crate::database::tier_chain_sources::ChainEdgeSource::new(
+                        edge_chain_clone,
+                        max_record_bytes,
+                    );
                     return Ok(grafeo_core::graph::compact::generation_builder::live_graph::LiveGraphSources {
                         nodes: Box::new(mr_nodes),
                         edges: Box::new(mr_edges),

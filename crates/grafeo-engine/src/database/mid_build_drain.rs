@@ -274,7 +274,9 @@ impl GrafeoDB {
                 }
             }
             for nid in window_store.node_ids() {
-                for (_dst, eid) in window_store.edges_from(nid, grafeo_core::graph::Direction::Outgoing) {
+                for (_dst, eid) in
+                    window_store.edges_from(nid, grafeo_core::graph::Direction::Outgoing)
+                {
                     if let Some(edge) = window_store.get_edge(eid) {
                         for (_k, v) in &edge.properties {
                             if let grafeo_common::types::Value::String(s) = v {
@@ -288,13 +290,19 @@ impl GrafeoDB {
                 .map_err(|e| Error::Internal(format!("global strings: {e}")))?;
             let section = CompactStoreSectionSource::new(window_store, global_strings)
                 .map_err(|e| Error::Internal(format!("CompactStoreSectionSource: {e}")))?;
-            let mut sections: Vec<Box<dyn grafeo_storage::file::generation_writer::ExactSectionSource>> =
-                vec![Box::new(section)];
-            create_versioned_sections_streaming(&tier_path, &header, &mut sections, &OsGenerationFileOps)
-                .map_err(|e| {
-                    let _ = std::fs::remove_file(&tier_path);
-                    Error::Internal(format!("tier write failed: {e}"))
-                })?;
+            let mut sections: Vec<
+                Box<dyn grafeo_storage::file::generation_writer::ExactSectionSource>,
+            > = vec![Box::new(section)];
+            create_versioned_sections_streaming(
+                &tier_path,
+                &header,
+                &mut sections,
+                &OsGenerationFileOps,
+            )
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tier_path);
+                Error::Internal(format!("tier write failed: {e}"))
+            })?;
         }
 
         // Compute tier SHA-256 (diagnostics) — streaming, bounded.

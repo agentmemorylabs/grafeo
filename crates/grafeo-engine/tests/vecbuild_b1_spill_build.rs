@@ -180,6 +180,19 @@ fn spill_build_serves_and_reopens_with_parity() {
     assert_k1_self_hit(&db, ids[7], 7);
     assert_k1_self_hit(&db, ids[NODES - 1], (NODES - 1) as u64);
 
+    // Packet-required heap probe: the index reports its heap footprint. The
+    // plain-HNSW index stores topology only (vectors live in the mmap spill
+    // file), so the probe measures the topology component — the vector
+    // column component is gone (asserted above via the drained-column None
+    // reads).
+    let heap = db
+        .vector_index_heap_memory_bytes(LABEL, PROP)
+        .expect("heap probe reports the spilled-build index");
+    assert!(
+        heap > 0,
+        "HNSW topology is heap-resident (C1: no paging yet)"
+    );
+
     // 6. Publish — SRV1 Gap B: reload-from-spill must restore the embedding
     // column before the freeze or the generation loses its vectors.
     let published = db
@@ -403,4 +416,136 @@ fn quantized_over_spilled_column_fails_closed() {
     // Plain HNSW over the same spilled column still works (A1 path).
     db.create_vector_index(LABEL, PROP, Some(DIMS), Some("cosine"), None, None, None)
         .expect("plain HNSW over spilled column");
+}
+
+/// Regression (review MAJOR-2): E1 must be label-scoped. Two labels sharing
+/// the property name "embedding" — spilling label A must NOT drain or steal
+/// label B's vectors (the property store drains by global PropertyKey).
+#[test]
+fn spill_is_label_scoped_and_foreign_labels_survive() {
+    let dir = TempDir::new().unwrap();
+    let mut db = GrafeoDB::with_config(
+        grafeo_engine::Config::in_memory().with_spill_path(dir.path().join("spill")),
+    )
+    .expect("open transient db");
+    db.compact().expect("compact");
+
+    const FOREIGN: &str = "OtherLabel";
+    let mut a_ids = Vec::new();
+    let mut b_ids = Vec::new();
+    for i in 0..8usize {
+        a_ids.push(
+            db.create_node_with_props(
+                &[LABEL],
+                [(PROP, Value::Vector(seeded_vector(i as u64).into()))],
+            )
+            .expect("create A"),
+        );
+        b_ids.push(
+            db.create_node_with_props(
+                &[FOREIGN],
+                [(PROP, Value::Vector(seeded_vector(1000 + i as u64).into()))],
+            )
+            .expect("create B"),
+        );
+    }
+
+    let report = db
+        .spill_vector_column_to_disk(LABEL, PROP)
+        .expect("spill label A");
+    assert_eq!(report.vectors_spilled, 8, "only label A's vectors spill");
+
+    // Label A drained; label B's vectors must survive intact.
+    let key = PropertyKey::new(PROP);
+    for id in &a_ids {
+        assert!(
+            db.graph_store().get_node_property(*id, &key).is_none(),
+            "label A drained"
+        );
+    }
+    for (i, id) in b_ids.iter().enumerate() {
+        let value = db
+            .graph_store()
+            .get_node_property(*id, &key)
+            .expect("label B vector must survive label A's spill");
+        assert_eq!(
+            value,
+            Value::Vector(seeded_vector(1000 + i as u64).into()),
+            "label B vector intact"
+        );
+    }
+
+    // Label B can still build + search its own index over the same
+    // property name.
+    db.create_vector_index(FOREIGN, PROP, Some(DIMS), Some("cosine"), None, None, None)
+        .expect("label B index build over surviving vectors");
+    let query = seeded_vector(1003);
+    let hits = db
+        .vector_search(FOREIGN, PROP, &query, 1, None, None)
+        .expect("label B search");
+    assert_eq!(hits.first().map(|h| h.0), Some(b_ids[3]));
+}
+
+/// Regression (review MAJOR-1): a dimension mismatch mid-column must restore
+/// the COMPLETE column bit-exact (the old code dropped the un-iterated tail).
+#[test]
+fn dim_mismatch_restores_full_column_bit_exact() {
+    let dir = TempDir::new().unwrap();
+    let mut db = GrafeoDB::with_config(
+        grafeo_engine::Config::in_memory().with_spill_path(dir.path().join("spill")),
+    )
+    .expect("open transient db");
+    db.compact().expect("compact");
+
+    let key = PropertyKey::new(PROP);
+    let mut expected: Vec<(grafeo_common::types::NodeId, Vec<f32>)> = Vec::new();
+    for i in 0..16usize {
+        let vec = if i == 9 {
+            // One wrong-dimension vector buried mid-column.
+            vec![0.5; DIMS + 1]
+        } else {
+            seeded_vector(i as u64)
+        };
+        let id = db
+            .create_node_with_props(&[LABEL], [(PROP, Value::Vector(vec.clone().into()))])
+            .expect("create");
+        expected.push((id, vec));
+    }
+
+    let err = db
+        .spill_vector_column_to_disk(LABEL, PROP)
+        .expect_err("dim mismatch fails closed");
+    assert!(
+        err.to_string().contains("dimension mismatch"),
+        "error names the cause: {err}"
+    );
+
+    // EVERY drained value must be back — including the tail after the
+    // mismatched entry (nodes 10..16), which the old code lost.
+    for (id, vec) in &expected {
+        let value = db
+            .graph_store()
+            .get_node_property(*id, &key)
+            .unwrap_or_else(|| panic!("node {} lost after failed spill", id.0));
+        assert_eq!(
+            value,
+            Value::Vector(vec.clone().into()),
+            "bit-exact restore"
+        );
+    }
+    // No spill file survives the failure (dim validation now happens
+    // before any file is created, so the spill dir holds nothing for us).
+    let report_files = std::fs::read_dir(dir.path().join("spill"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .contains("vectors_RetrievalUnit")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(report_files, 0, "no orphan spill file after failure");
 }

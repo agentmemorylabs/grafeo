@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use grafeo_common::types::Value;
 use grafeo_core::graph::compact::generation::GenerationBudget;
-use grafeo_engine::{generation_build_request, GrafeoDB};
+use grafeo_engine::{GrafeoDB, generation_build_request};
 use tempfile::TempDir;
 
 fn normal_budget() -> GenerationBudget {
@@ -532,11 +532,7 @@ fn drain_fail_closed_on_tier_root_not_a_directory() {
     let leftovers: Vec<_> = fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("tier-")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("tier-"))
         .collect();
     assert!(
         leftovers.is_empty(),
