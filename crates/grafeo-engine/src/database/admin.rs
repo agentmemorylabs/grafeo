@@ -122,7 +122,18 @@ impl super::GrafeoDB {
         use crate::memory_usage::{BufferManagerMemory, CacheMemory, MemoryUsage};
         use grafeo_common::memory::MemoryRegion;
 
-        let (store, indexes, mvcc, string_pool) = self.lpg_store().memory_breakdown();
+        let (mut store, indexes, mvcc, string_pool) = self.lpg_store().memory_breakdown();
+
+        // Layered mode (2026-08-19, ENGINE-MEMORY-ACCOUNTING.1): `lpg_store()`
+        // is the OVERLAY only; the decoded CompactStore base in
+        // `layered_store` is real anonymous residency that the overlay's
+        // breakdown never sees. Charge it here so `total_bytes` reflects the
+        // whole resident store, not just the overlay on top of it.
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            store.compact_base_bytes = layered.base_store_arc().memory_bytes();
+            store.compute_total();
+        }
 
         let (parsed_bytes, optimized_bytes, cached_plan_count) =
             self.query_cache.heap_memory_bytes();

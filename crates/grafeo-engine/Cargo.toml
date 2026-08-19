@@ -217,6 +217,16 @@ name = "vecbuild_b1_spill_build"
 path = "tests/vecbuild_b1_spill_build.rs"
 required-features = ["lpg", "vector-index", "mmap", "compact-store", "generation", "generation-streaming", "grafeo-file"]
 
+[[test]]
+name = "memory_accounting_probe"
+path = "tests/memory_accounting_probe.rs"
+required-features = ["lpg", "mmap", "grafeo-file"]
+
+[[test]]
+name = "layered_memory_accounting"
+path = "tests/layered_memory_accounting.rs"
+required-features = ["compact-store", "lpg"]
+
 [[bench]]
 name = "query_bench"
 harness = false
