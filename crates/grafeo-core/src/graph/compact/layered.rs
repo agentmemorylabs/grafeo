@@ -1392,24 +1392,76 @@ impl GraphStore for LayeredStore {
         if conditions.is_empty() {
             return self.node_ids();
         }
-        let deleted = self.deleted_from_base_nodes.read();
-        let dirty = self.dirty_node_ids.read();
         let overlay = self.overlay.load();
 
         // Same exclusive-overlay rule as find_nodes_by_property: the planner
         // try_plan_filter_with_property_index path calls this multi-predicate
         // API, so base∪overlay would inflate Cypher WHERE counts.
-        if conditions
-            .iter()
-            .any(|(prop, _)| overlay.has_property_index(prop))
-        {
-            return overlay
-                .find_nodes_by_properties(conditions)
+        //
+        // Pick the MOST SELECTIVE indexed condition: probe every indexed
+        // posting list once (k probes total, never per candidate) and seed
+        // from the smallest.
+        let mut seed: Option<Vec<NodeId>> = None;
+        for (prop, value) in conditions {
+            if !overlay.has_property_index(prop) {
+                continue;
+            }
+            let hits = overlay.find_nodes_by_property(prop, value);
+            if seed.as_ref().is_some_and(|best| best.len() <= hits.len()) {
+                continue;
+            }
+            seed = Some(hits);
+        }
+        if let Some(candidates) = seed {
+            // G-E1.RO exclusivity, multi-predicate safe: overlay property
+            // indexes carry FULL base+overlay postings when created through
+            // `GrafeoDB::create_property_index` / `.._from_entries` or
+            // restored from a mapped PropertyIndexSection (a raw
+            // `LpgStore::create_property_index` call would NOT see base rows;
+            // the generation path always goes through the DB layer).
+            //
+            // Secondary conditions must NOT be filtered through the overlay's
+            // own multi-predicate lookup: it verifies remaining predicates
+            // against overlay-only property storage, which has no
+            // CompactStore base rows — every base candidate would be dropped
+            // (observed 2026-08-22: keyed `MATCH (d {repo_id, path})` served
+            // `stored: None` while the rows sat in the base generation).
+            //
+            // Every condition (including the seeded one — postings can lag a
+            // mutation) is therefore verified against this LayeredStore's
+            // MERGED view. Equality uses strict `Value: PartialEq`, matching
+            // LpgStore's own index/secondary filters; cross-type numeric
+            // coercion remains a planner-level concern (pre-existing split).
+            // Known limitation: an index shell with EMPTY postings serves
+            // empty here — identical to the previous behavior, not a new
+            // failure mode.
+            let keyed_conditions: Vec<(PropertyKey, Value)> = conditions
+                .iter()
+                .map(|(prop, value)| (PropertyKey::new(*prop), value.clone()))
+                .collect();
+            // Deleted-set snapshot taken under a SHORT-LIVED read guard: the
+            // long per-candidate merged scan below holds no LayeredStore
+            // locks, so index writers are not blocked for the whole scan.
+            // (`get_node_property` additionally re-checks deletion against
+            // live state, so the snapshot is an optimization, not the
+            // correctness boundary.)
+            let deleted_snapshot = self.deleted_from_base_nodes.read().clone();
+            return candidates
                 .into_iter()
-                .filter(|id| !deleted.contains(id))
+                .filter(|id| !deleted_snapshot.contains(id))
+                .filter(|id| {
+                    keyed_conditions
+                        .iter()
+                        .all(|(key, value)| {
+                            self.get_node_property(*id, key)
+                                .is_some_and(|stored| stored == *value)
+                        })
+                })
                 .collect();
         }
 
+        let deleted = self.deleted_from_base_nodes.read();
+        let dirty = self.dirty_node_ids.read();
         let mut results: Vec<NodeId> = self
             .base
             .load()
