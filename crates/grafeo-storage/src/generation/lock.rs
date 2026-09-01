@@ -238,9 +238,16 @@ pub fn filesystem_for_path(
     let mut best: Option<(&MountEntry, usize)> = None;
     for entry in entries {
         let mp = entry.mount_point.as_str();
-        if mp == path_str
-            || (path_str.starts_with(mp) && path_str.as_bytes().get(mp.len()) == Some(&b'/'))
-        {
+        // `/` covers every absolute path. The usual "next byte is /" rule
+        // fails here because the character after `/` in `/home/...` is `h`.
+        let covers = if mp == "/" {
+            path_str.starts_with('/')
+        } else {
+            mp == path_str
+                || (path_str.starts_with(mp)
+                    && path_str.as_bytes().get(mp.len()) == Some(&b'/'))
+        };
+        if covers {
             let len = mp.len();
             if best.is_none_or(|(_, best_len)| len > best_len) {
                 best = Some((entry, len));

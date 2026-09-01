@@ -243,6 +243,22 @@ fn lock_mount_parser_no_match_is_error() {
 }
 
 #[test]
+fn lock_root_mount_covers_nested_absolute_paths() {
+    let text = "1 0 0:0 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n";
+    let entries = parse_mountinfo(text).expect("parse");
+    let fstype = filesystem_for_path(
+        Path::new("/home/josh/amlabs/data/grafeo/code-index/root"),
+        &entries,
+    )
+    .expect("root mount must cover nested paths");
+    assert_eq!(fstype, "ext4");
+    assert_eq!(
+        filesystem_for_path(Path::new("/"), &entries).expect("root equals root"),
+        "ext4"
+    );
+}
+
+#[test]
 fn lock_cloexec_probe() {
     let Some(dir) = supported_tempdir() else {
         return;
