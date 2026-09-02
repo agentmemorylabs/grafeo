@@ -603,3 +603,126 @@ fn r2_m5_storage_ledger_zero_after_cancel() {
     sink.cleanup();
     merger.cleanup();
 }
+
+/// Watch-handoff regression (plan 2026-09-02): two concurrent `DiskRunSink`s
+/// filled to the configured `sort_run_bytes`, plus the 1 MiB I/O overlap
+/// charge in `flush_run`, must stay `<= max_anon_bytes` and succeed.
+///
+/// Production failure: `anon_or_temp_budget: requested ~135266228, limit
+/// 134217728` — two 64 MiB arenas filled the 128 MiB ledger with zero slack,
+/// so the next 1 MiB `io_buffer_bytes` reserve in `flush_run` tripped
+/// fail-closed. `flush_run` holds the arena charge while reserving I/O
+/// (run+I/O overlap), so the invariant is
+/// `2 * sort_run_bytes + io_buffer_bytes + spool_slack <= max_anon_bytes`.
+/// With `acceptance()` at 32 MiB runs: 64 + 1 + 8 = 73 MiB <= 128 MiB.
+#[test]
+fn acceptance_two_full_sinks_plus_io_flush_fits() {
+    use crate::generation::budget::GenerationBudget;
+
+    let full = GenerationBudget::acceptance();
+    assert_eq!(
+        full.max_anon_bytes,
+        128 * 1024 * 1024,
+        "regression test mirrors the 128 MiB production handoff ledger"
+    );
+    let mut budget = crate::generation::budget::ExternalSortBudget::from_budget(&full);
+    // Storage `acceptance()` leaves temp to the caller (fixture disk envelope);
+    // mirror core `acceptance_linux()` 4 GiB so only the anon axis is under test.
+    budget.max_temp_bytes = 4 << 30;
+    let ledger = Arc::new(JobAnonLedger::new(full.max_anon_bytes));
+    let dir = tempdir().unwrap();
+
+    // 64 KiB payload records: arena cost 48 (struct) + 8 (key) + 65536.
+    const PAYLOAD: usize = 64 * 1024;
+    const RECORD_ARENA: u64 = 48 + 8 + PAYLOAD as u64;
+    let mut next_id: u64 = 0;
+    let mut make_record = || {
+        let id = next_id;
+        next_id += 1;
+        FramedRecord::new(format!("{id:08}").into_bytes(), vec![0xAB; PAYLOAD])
+    };
+
+    // Fill helper: push until one more record would trip this sink's own
+    // `sort_run_bytes` flush threshold (observed via the per-sink mirror),
+    // leaving the arena full-but-unflushed like the production node pass
+    // holding occ + id-index arenas simultaneously.
+    let mut fill_to_run = |sink: &mut DiskRunSink| {
+        while sink.metrics().anon_bytes_current + RECORD_ARENA <= budget.sort_run_bytes {
+            sink.push(make_record()).unwrap();
+        }
+        assert!(
+            sink.metrics().anon_bytes_current > budget.sort_run_bytes / 2,
+            "sink should hold a substantially full run, got {}",
+            sink.metrics().anon_bytes_current
+        );
+        assert_eq!(
+            sink.metrics().run_count,
+            0,
+            "fill must not auto-flush: the regression needs two live arenas"
+        );
+    };
+
+    let mut sink_a = DiskRunSink::new(
+        dir.path().join("runs-a"),
+        budget,
+        "handoff-a",
+        Arc::clone(&ledger),
+    )
+    .unwrap();
+    let mut sink_b = DiskRunSink::new(
+        dir.path().join("runs-b"),
+        budget,
+        "handoff-b",
+        Arc::clone(&ledger),
+    )
+    .unwrap();
+    fill_to_run(&mut sink_a);
+    fill_to_run(&mut sink_b);
+
+    // Flushing A reserves the 1 MiB I/O buffer while B's full arena is still
+    // live — the exact production overlap that died at 128+1MiB.
+    let runs_a = sink_a.finish().expect(
+        "flush with a sibling full arena + 1 MiB I/O must fit the anon budget",
+    );
+    assert!(!runs_a.is_empty());
+    let runs_b = sink_b.finish().expect("second flush must also succeed");
+    assert!(!runs_b.is_empty());
+
+    assert!(
+        ledger.peak() <= full.max_anon_bytes,
+        "whole-job anon peak {} exceeds {}",
+        ledger.peak(),
+        full.max_anon_bytes
+    );
+    sink_a.cleanup();
+    sink_b.cleanup();
+}
+
+/// Headroom invariant for the acceptance fixture: two full sort runs plus
+/// the I/O overlap buffer plus spool slack must fit `max_anon_bytes`.
+/// `acceptance_linux()` / `acceptance()` stay at 128 MiB anon (the fixture
+/// is not raised); the packing is fixed by shrinking `sort_run_bytes`.
+#[test]
+fn acceptance_budget_has_flush_headroom() {
+    use crate::generation::budget::GenerationBudget;
+
+    let b = GenerationBudget::acceptance();
+    // Spool + record-growth slack: orchestrator spool guards and allocator
+    // rounding ride the same job ledger outside the two sort arenas.
+    const SPOOL_SLACK: u64 = 8 * 1024 * 1024;
+    let packed = b
+        .sort_run_bytes
+        .saturating_mul(2)
+        .saturating_add(b.io_buffer_bytes)
+        .saturating_add(SPOOL_SLACK);
+    assert!(
+        packed <= b.max_anon_bytes,
+        "acceptance() packs 2×sort_run({}) + io({}) + slack({}) = {} > max_anon({}): \
+         two full arenas leave no room for the flush I/O overlap charge",
+        b.sort_run_bytes,
+        b.io_buffer_bytes,
+        SPOOL_SLACK,
+        packed,
+        b.max_anon_bytes
+    );
+}

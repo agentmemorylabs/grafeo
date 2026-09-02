@@ -290,8 +290,10 @@ impl BoundedGenerationBuilder {
         // Sort arenas: DiskRunStore charges run bytes as temp (not anon).
         // InMemoryRunStore charges arena growth as records are pushed.
         // Do NOT pre-charge 2×sort_run_bytes against max_anon_bytes — under
-        // acceptance_linux that is exactly 128 MiB and leaves zero headroom
-        // for spool buffers, making the locked profile unsatisfiable.
+        // acceptance_linux that would be 2×32 MiB against the 128 MiB ledger,
+        // and spool buffers ride the same ledger. (Before the 32 MiB runs
+        // fix, 2×64 MiB was exactly 128 MiB with zero headroom for spool or
+        // the flush I/O overlap, making the locked profile unsatisfiable.)
 
         // ── 1. Node pass ─────────────────────────────────────────────
         let npass = node_pass::NodePass::new(&budget, self.cancel.as_ref());

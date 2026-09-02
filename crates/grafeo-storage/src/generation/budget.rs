@@ -31,12 +31,17 @@ pub struct GenerationBudget {
 
 impl GenerationBudget {
     /// Acceptance configuration per W0 §8.
+    ///
+    /// Headroom invariant (mirrors core `acceptance_linux`): 32 MiB runs so
+    /// `2 * sort_run_bytes + io_buffer_bytes + spool_slack < max_anon_bytes`.
+    /// 64 MiB runs packed two arenas to exactly 128 MiB with zero slack for
+    /// the flush I/O overlap charge (`BudgetExceeded` at ~135266228).
     #[must_use]
     pub const fn acceptance() -> Self {
         Self {
             max_anon_bytes: 128 * 1024 * 1024,
             max_temp_bytes: 0, // caller supplies from fixture disk envelope
-            sort_run_bytes: 64 * 1024 * 1024,
+            sort_run_bytes: 32 * 1024 * 1024,
             io_buffer_bytes: 1024 * 1024,
             merge_fan_in: 32,
             max_record_bytes: 8 * 1024 * 1024,
