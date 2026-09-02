@@ -7,7 +7,7 @@
 use super::LpgStore;
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
-use crate::graph::lpg::{Edge, Node};
+use crate::graph::lpg::{BatchEdgeCreate, BatchNodeCreate, Edge, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
 #[cfg(feature = "vector-index")]
 use crate::index::vector::{
@@ -264,10 +264,19 @@ impl GraphStoreSearch for LpgStore {
     #[cfg(feature = "text-index")]
     fn has_text_index(&self, label: &str, property: &str) -> bool {
         self.get_text_index(label, property).is_some()
+            || self.get_mapped_text_index(label, property).is_some()
     }
 
     #[cfg(feature = "text-index")]
     fn score_text(&self, node_id: NodeId, label: &str, property: &str, query: &str) -> Option<f64> {
+        if let Some(mapped) = self.get_mapped_text_index(label, property) {
+            // Mapped path: run top-k search and look up the node (no per-doc score API).
+            return mapped
+                .search(query, usize::MAX)
+                .into_iter()
+                .find(|(id, _)| *id == node_id)
+                .map(|(_, s)| s);
+        }
         let index = self.get_text_index(label, property)?;
         let guard = index.read();
         let score = guard.score_document(node_id, query);
@@ -282,6 +291,9 @@ impl GraphStoreSearch for LpgStore {
         query: &str,
         k: usize,
     ) -> Vec<(NodeId, f64)> {
+        if let Some(mapped) = self.get_mapped_text_index(label, property) {
+            return mapped.search(query, k);
+        }
         if let Some(index) = self.get_text_index(label, property) {
             index.read().search(query, k)
         } else {
@@ -432,6 +444,24 @@ impl GraphStoreMut for LpgStore {
 
     fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId> {
         LpgStore::batch_create_edges(self, edges)
+    }
+
+    fn create_nodes_batch_versioned(
+        &self,
+        nodes: &[BatchNodeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        LpgStore::create_nodes_batch_versioned(self, nodes, epoch, transaction_id)
+    }
+
+    fn create_edges_batch_versioned(
+        &self,
+        edges: &[BatchEdgeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<EdgeId> {
+        LpgStore::create_edges_batch_versioned(self, edges, epoch, transaction_id)
     }
 
     fn delete_node(&self, id: NodeId) -> bool {

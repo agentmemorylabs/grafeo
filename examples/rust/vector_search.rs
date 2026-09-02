@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (title, embedding) in documents {
         // Create a document node using the programmatic API
-        let node_id = db.create_node(&["Document"]);
+        let node_id = db.create_node(&["Document"])?;
         db.set_node_property(node_id, "title", Value::from(*title));
 
         // Store the embedding as a Vector property.

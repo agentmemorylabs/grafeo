@@ -66,6 +66,12 @@ pub enum ErrorCode {
     StorageCorrupted,
     /// Recovery from WAL failed.
     StorageRecoveryFailed,
+    /// Requested direct memory mapping is unavailable for this storage layout.
+    StorageDirectMmapUnavailable,
+    /// Overlay admission backpressure: retryable (G-EM0.5a).
+    AdmissionRetryable,
+    /// Overlay admission rejected: terminal (G-EM0.5a).
+    AdmissionRejected,
 
     // Validation errors (V)
     /// Request validation failed.
@@ -88,6 +94,8 @@ pub enum ErrorCode {
     SerializationError,
     /// I/O error.
     IoError,
+    /// Operation cancelled by caller control surface.
+    Cancelled,
 }
 
 impl ErrorCode {
@@ -112,6 +120,9 @@ impl ErrorCode {
             Self::StorageFull => "GRAFEO-S001",
             Self::StorageCorrupted => "GRAFEO-S002",
             Self::StorageRecoveryFailed => "GRAFEO-S003",
+            Self::StorageDirectMmapUnavailable => "GRAFEO-S004",
+            Self::AdmissionRetryable => "GRAFEO-S005",
+            Self::AdmissionRejected => "GRAFEO-S006",
 
             Self::InvalidInput => "GRAFEO-V001",
             Self::NodeNotFound => "GRAFEO-V002",
@@ -123,6 +134,7 @@ impl ErrorCode {
             Self::Internal => "GRAFEO-X001",
             Self::SerializationError => "GRAFEO-X002",
             Self::IoError => "GRAFEO-X003",
+            Self::Cancelled => "GRAFEO-X004",
         }
     }
 
@@ -135,6 +147,7 @@ impl ErrorCode {
                 | Self::TransactionTimeout
                 | Self::TransactionDeadlock
                 | Self::QueryTimeout
+                | Self::AdmissionRetryable
         )
     }
 }
@@ -190,6 +203,21 @@ pub enum Error {
     /// I/O error.
     Io(std::io::Error),
 
+    /// Overlay admission backpressure (G-EM0.5a): the writable overlay is at
+    /// hard pressure and the bounded block timed out. The caller should retry
+    /// the mutation later.
+    AdmissionRetryable(String),
+
+    /// Overlay admission rejected (G-EM0.5a): the request is terminal
+    /// (oversized, shutdown, or cancelled) and will not succeed on retry.
+    AdmissionRejected(String),
+
+    /// A long-running build operation was cancelled by its control surface.
+    Cancelled {
+        /// Human-readable description of the cancelled operation.
+        operation: String,
+    },
+
     /// Internal error (should not happen in normal operation).
     Internal(String),
 }
@@ -210,6 +238,9 @@ impl Error {
             Error::Query(e) => e.error_code(),
             Error::Serialization(_) => ErrorCode::SerializationError,
             Error::Io(_) => ErrorCode::IoError,
+            Error::AdmissionRetryable(_) => ErrorCode::AdmissionRetryable,
+            Error::AdmissionRejected(_) => ErrorCode::AdmissionRejected,
+            Error::Cancelled { .. } => ErrorCode::Cancelled,
             Error::Internal(_) => ErrorCode::Internal,
         }
     }
@@ -235,6 +266,9 @@ impl fmt::Display for Error {
             Error::Query(e) => write!(f, "{e}"),
             Error::Serialization(msg) => write!(f, "{code}: Serialization error: {msg}"),
             Error::Io(e) => write!(f, "{code}: I/O error: {e}"),
+            Error::AdmissionRetryable(msg) => write!(f, "{code}: Admission retryable: {msg}"),
+            Error::AdmissionRejected(msg) => write!(f, "{code}: Admission rejected: {msg}"),
+            Error::Cancelled { operation } => write!(f, "{code}: Cancelled: {operation}"),
             Error::Internal(msg) => write!(f, "{code}: Internal error: {msg}"),
         }
     }
@@ -350,6 +384,9 @@ pub enum StorageError {
 
     /// Checkpoint failed.
     CheckpointFailed(String),
+
+    /// The section cannot be served through the direct mapped-read path.
+    DirectMmapUnavailable(String),
 }
 
 impl StorageError {
@@ -361,6 +398,7 @@ impl StorageError {
             Self::Full => ErrorCode::StorageFull,
             Self::InvalidWalEntry(_) | Self::CheckpointFailed(_) => ErrorCode::StorageCorrupted,
             Self::RecoveryFailed(_) => ErrorCode::StorageRecoveryFailed,
+            Self::DirectMmapUnavailable(_) => ErrorCode::StorageDirectMmapUnavailable,
         }
     }
 }
@@ -373,6 +411,9 @@ impl fmt::Display for StorageError {
             StorageError::InvalidWalEntry(msg) => write!(f, "Invalid WAL entry: {msg}"),
             StorageError::RecoveryFailed(msg) => write!(f, "Recovery failed: {msg}"),
             StorageError::CheckpointFailed(msg) => write!(f, "Checkpoint failed: {msg}"),
+            StorageError::DirectMmapUnavailable(msg) => {
+                write!(f, "Direct mmap unavailable: {msg}")
+            }
         }
     }
 }

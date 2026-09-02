@@ -189,6 +189,71 @@ impl<Id: EntityId> PropertyStorage<Id> {
             .set(id, value);
     }
 
+    /// Appends properties for a fresh bulk load while holding the column map
+    /// lock once.  Callers must not use this for an online mutation: it does
+    /// not update secondary indexes or transaction undo state.
+    #[cfg(not(feature = "temporal"))]
+    pub fn set_bulk_unindexed<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = (Id, FxHashMap<PropertyKey, Value>)>,
+    {
+        let mut columns = self.columns.write();
+        let mode = self.default_compression;
+        for (id, properties) in rows {
+            for (key, value) in properties {
+                columns
+                    .entry(key)
+                    .or_insert_with(|| PropertyColumn::with_compression(mode))
+                    .set(id, value);
+            }
+        }
+    }
+
+    /// Sets many property values across many entities while holding the column
+    /// map write lock exactly once.
+    ///
+    /// This is the storage-level primitive behind transactional batch node/edge
+    /// creation: the row-oriented [`set`](Self::set) re-acquires the column map
+    /// write lock for every single property, which dominates cost on wide
+    /// batches. Each row is `(entity_id, key, value)`. Columns are created
+    /// lazily with the storage's default compression mode, exactly as `set`
+    /// does. Callers remain responsible for secondary-index and transaction
+    /// undo bookkeeping; this only writes column values.
+    #[cfg(not(feature = "temporal"))]
+    pub fn set_batch<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = (Id, PropertyKey, Value)>,
+    {
+        let mut columns = self.columns.write();
+        let mode = self.default_compression;
+        for (id, key, value) in rows {
+            columns
+                .entry(key)
+                .or_insert_with(|| PropertyColumn::with_compression(mode))
+                .set(id, value);
+        }
+    }
+
+    /// Sets many property values across many entities at a specific epoch while
+    /// holding the column map write lock exactly once (temporal variant).
+    ///
+    /// Pass `EpochId::PENDING` for transactional writes so the values stay
+    /// invisible until commit finalizes them, matching [`set`](Self::set).
+    #[cfg(feature = "temporal")]
+    pub fn set_batch<I>(&self, rows: I, epoch: EpochId)
+    where
+        I: IntoIterator<Item = (Id, PropertyKey, Value)>,
+    {
+        let mut columns = self.columns.write();
+        let mode = self.default_compression;
+        for (id, key, value) in rows {
+            columns
+                .entry(key)
+                .or_insert_with(|| PropertyColumn::with_compression(mode))
+                .set(id, value, epoch);
+        }
+    }
+
     /// Sets a property value for an entity at a specific epoch.
     ///
     /// For non-transactional writes, pass the current epoch.
@@ -802,7 +867,7 @@ impl CompressedColumnData {
                 index_to_id,
             } => {
                 encoding.code_count() * 4
-                    + encoding.dictionary().iter().map(|s| s.len()).sum::<usize>()
+                    + encoding.dictionary_heap_bytes()
                     + id_to_index.len() * std::mem::size_of::<u64>()
                     + index_to_id.len() * std::mem::size_of::<u64>()
             }
@@ -1082,15 +1147,15 @@ impl<Id: EntityId> PropertyColumn<Id> {
 
     /// Restores values into this column after a reload from disk.
     ///
-    /// Clears the `spilled` flag. Callers are responsible for providing
-    /// the correct values (from `MmapStorage::export_all()` or similar).
+    /// Clears the `spilled` flag. Existing hot values win over the mmap
+    /// snapshot because they are inserts or updates written after the spill.
     pub fn restore_values(&mut self, values: impl Iterator<Item = (Id, Value)>) {
         self.spilled = false;
-        // Insert directly into the map without calling set(), which would
-        // re-increment zone map counters (row_count, null_count) on top of
-        // the already-preserved zone map from before eviction.
+        // Insert directly without re-incrementing zone map counters. Preserve
+        // mutable post-spill deltas instead of overwriting them with stale mmap
+        // values for the same entity.
         for (id, value) in values {
-            self.values.insert(id, value);
+            self.values.entry(id).or_insert(value);
         }
     }
 
@@ -1129,17 +1194,25 @@ impl<Id: EntityId> PropertyColumn<Id> {
 
     /// Returns estimated heap memory for this column.
     ///
-    /// Includes the hot buffer hash map capacity, zone map, and any
-    /// compressed data.
+    /// Includes the hot-buffer hash-map capacity, each value's payload
+    /// (`Value::estimated_size_bytes` — Vector/String/List heaps), and any
+    /// compressed data. Slot-only accounting (`size_of::<Value>()`) is not
+    /// enough: a 4096-d `Value::Vector` is ~16 KiB on the heap behind a
+    /// ~pointer-sized enum. Midflush's 1024 MiB overlay trigger reads this
+    /// through `LpgStore::memory_breakdown` → `overlay_memory_bytes`.
     #[must_use]
     pub fn heap_memory_bytes(&self) -> usize {
         // Hot buffer: FxHashMap<Id, Value> capacity
         let hot_bytes =
             self.values.capacity() * (std::mem::size_of::<Id>() + std::mem::size_of::<Value>() + 1);
+        let payload_bytes: usize = self
+            .values
+            .values()
+            .map(Value::estimated_size_bytes)
+            .sum();
         // Compressed data
         let compressed_bytes = self.compressed.as_ref().map_or(0, |c| c.memory_usage());
-        // ZoneMapEntry is inline (no heap), so just hot + compressed
-        hot_bytes + compressed_bytes
+        hot_bytes + payload_bytes + compressed_bytes
     }
 
     /// Returns whether the column has compressed data.
@@ -2595,5 +2668,28 @@ mod tests {
         assert_eq!(blocks[0].null_count, 0, "NaN is not null");
         assert_eq!(blocks[0].min, Some(Value::Float64(0.0)));
         assert_eq!(blocks[0].max, Some(Value::Float64(49.0)));
+    }
+
+    #[test]
+    fn heap_memory_bytes_counts_vector_payload_not_just_enum_slot() {
+        // G-MIDFLUSH.1: 4096-d embeddings must weigh ~16 KiB, not size_of::<Value>().
+        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
+        let dims = 4096usize;
+        col.set(
+            NodeId::new(1),
+            Value::Vector(std::sync::Arc::from(vec![0.5f32; dims])),
+        );
+        let bytes = col.heap_memory_bytes();
+        let payload = dims * std::mem::size_of::<f32>();
+        assert!(
+            bytes >= payload,
+            "heap_memory_bytes={bytes} must include {payload}-byte Vector payload"
+        );
+        // Slot-only accounting is ~tens of bytes per cell; this guard fails
+        // if someone reverts to capacity * size_of::<Value>() alone.
+        assert!(
+            bytes > 1024,
+            "heap_memory_bytes={bytes} looks like slot-only accounting"
+        );
     }
 }

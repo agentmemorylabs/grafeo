@@ -20,6 +20,13 @@ pub struct StoreMemory {
     pub edge_properties_bytes: usize,
     /// Number of property columns (node + edge).
     pub property_column_count: usize,
+    /// Decoded CompactStore base retained in layered mode (0 when the DB is
+    /// not layered). This is the columnar snapshot the overlay sits on top
+    /// of; it is real anonymous residency and must be reported, otherwise
+    /// `memory_usage()` under-counts a compacted/section-loaded DB by the
+    /// whole base (see ENGINE-MEMORY-ACCOUNTING.1).
+    #[serde(default)]
+    pub compact_base_bytes: usize,
 }
 
 impl StoreMemory {
@@ -28,7 +35,8 @@ impl StoreMemory {
         self.total_bytes = self.nodes_bytes
             + self.edges_bytes
             + self.node_properties_bytes
-            + self.edge_properties_bytes;
+            + self.edge_properties_bytes
+            + self.compact_base_bytes;
     }
 }
 

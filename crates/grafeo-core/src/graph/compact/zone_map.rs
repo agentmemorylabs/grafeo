@@ -221,6 +221,11 @@ pub fn compute_block_zone_maps(codec: &super::column::ColumnCodec) -> Vec<ZoneMa
     result
 }
 
+/// Folds one row value into an in-progress per-block zone map (streaming emit).
+pub(crate) fn fold_value_into_block_zone_map(zm: &mut ZoneMap, value: &Value) {
+    update_block_min_max(zm, value);
+}
+
 fn update_block_min_max(zm: &mut ZoneMap, value: &Value) {
     // Skip non-orderable types (lists, vectors, etc.); their min/max
     // remain `None` so the planner falls back to scanning the block.

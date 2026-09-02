@@ -16,7 +16,7 @@ use grafeo_common::types::{
     EdgeId, EpochId, HlcTimestamp, NodeId, PropertyKey, TransactionId, Value,
 };
 use grafeo_common::utils::hash::FxHashMap;
-use grafeo_core::graph::lpg::{CompareOp, Edge, Node};
+use grafeo_core::graph::lpg::{BatchEdgeCreate, BatchNodeCreate, CompareOp, Edge, Node};
 use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_core::statistics::Statistics;
 use parking_lot::Mutex;
@@ -562,6 +562,56 @@ impl GraphStoreMut for CdcGraphStore {
             event.src_id = Some(src.as_u64());
             event.dst_id = Some(dst.as_u64());
             self.record_directly(event);
+        }
+        ids
+    }
+
+    fn create_nodes_batch_versioned(
+        &self,
+        nodes: &[BatchNodeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        let ids = self
+            .inner
+            .create_nodes_batch_versioned(nodes, epoch, transaction_id);
+        // Buffer one Create event per row, mirroring `create_node_versioned`
+        // (buffer_event pins the epoch to PENDING; flush assigns the commit
+        // epoch).
+        for (node, &id) in nodes.iter().zip(ids.iter()) {
+            let mut event = make_event(
+                EntityId::Node(id),
+                ChangeKind::Create,
+                epoch,
+                self.next_ts(),
+            );
+            event.labels = Some(node.labels.iter().map(|s| (*s).to_string()).collect());
+            self.buffer_event(event);
+        }
+        ids
+    }
+
+    fn create_edges_batch_versioned(
+        &self,
+        edges: &[BatchEdgeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<EdgeId> {
+        let ids = self
+            .inner
+            .create_edges_batch_versioned(edges, epoch, transaction_id);
+        // Buffer one Create event per row, mirroring `create_edge_versioned`.
+        for (edge, &id) in edges.iter().zip(ids.iter()) {
+            let mut event = make_event(
+                EntityId::Edge(id),
+                ChangeKind::Create,
+                epoch,
+                self.next_ts(),
+            );
+            event.edge_type = Some(edge.edge_type.to_string());
+            event.src_id = Some(edge.source.as_u64());
+            event.dst_id = Some(edge.target.as_u64());
+            self.buffer_event(event);
         }
         ids
     }

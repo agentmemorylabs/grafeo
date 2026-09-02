@@ -7,6 +7,8 @@
 //! - `crud` - Node/edge CRUD operations
 //! - `index` - Property, vector, and text index management
 //! - `search` - Vector, text, and hybrid search
+//! - `vector_access` - Shared spill-aware vector accessor construction
+//! - `vector_read` - Exact spill-aware vector reads by NodeId
 //! - `embed` - Embedding model management
 //! - `persistence` - Save, load, snapshots, iteration
 //! - `admin` - Stats, introspection, diagnostics, CDC
@@ -35,10 +37,23 @@ mod crud;
 mod embed;
 #[cfg(feature = "grafeo-file")]
 pub(crate) mod flush;
+#[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+pub mod generation;
+#[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+pub mod generation_build;
 #[cfg(feature = "lpg")]
 mod import;
 #[cfg(feature = "lpg")]
 mod index;
+pub mod index_build_control;
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "mmap",
+    feature = "generation-streaming"
+))]
+pub mod mid_build_drain;
 #[cfg(feature = "lpg")]
 mod persistence;
 mod query;
@@ -47,10 +62,32 @@ mod rdf_ops;
 #[cfg(feature = "lpg")]
 mod search;
 pub(crate) mod section_consumer;
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "mmap",
+    feature = "generation-streaming"
+))]
+pub(crate) mod tier_chain_sources;
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+mod vector_access;
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+mod vector_read;
+#[cfg(all(
+    feature = "lpg",
+    feature = "vector-index",
+    feature = "mmap",
+    not(feature = "temporal")
+))]
+pub mod vector_spill_build;
 #[cfg(all(feature = "wal", feature = "lpg"))]
 pub(crate) mod wal_store;
 
-use grafeo_common::{grafeo_error, grafeo_warn};
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+pub use vector_read::IndexedVectorRead;
+
+use grafeo_common::{grafeo_error, grafeo_info, grafeo_warn};
 #[cfg(feature = "wal")]
 use std::path::Path;
 use std::sync::Arc;
@@ -77,6 +114,93 @@ use crate::config::Config;
 use crate::query::cache::QueryCache;
 use crate::session::Session;
 use crate::transaction::TransactionManager;
+
+/// Actual backing selected for a reopened CompactStore base.
+///
+/// This is intentionally an observed runtime diagnostic rather than a
+/// configuration echo. In particular, `ContainerMmap` is only reported after
+/// `GrafeoFileManager::mmap_section` has verified the selected section CRC and
+/// the CompactStore has accepted its owner-backed bytes.
+#[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompactBacking {
+    /// Read-only base is owned by the immutable CompactStore section mapping.
+    ContainerMmap {
+        /// Stable identifier for this immutable container artifact.
+        artifact_id: String,
+        /// CompactStore payload version reported by the verified header.
+        payload_version: u8,
+        /// Bytes mapped from the container section; file-backed, not heap.
+        mapped_bytes: usize,
+    },
+    /// Compatibility path for writable opens and legacy layouts.
+    LegacyEager {
+        /// Stable identifier for the container artifact read eagerly.
+        artifact_id: String,
+        /// CompactStore payload version reported by the verified header.
+        payload_version: u8,
+        /// Complete payload bytes allocated by the compatibility reader.
+        payload_bytes: usize,
+    },
+}
+
+/// Observed search-topology backing for a registered vector index (G-E2.RO).
+///
+/// Distinct from "mmap_able" section flags: this reports what the live
+/// `HnswIndex` backend actually holds after open.
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VectorTopologyBacking {
+    /// Zero-copy [`MmapTopology`] over owner-backed section bytes.
+    Mmap {
+        /// Topology blob size retained via the mmap `Bytes` owner.
+        topology_bytes: usize,
+    },
+    /// Fully reconstructed anonymous neighbor graph.
+    Heap {
+        /// Estimated heap bytes for the topology HashMap.
+        heap_bytes: usize,
+    },
+}
+
+/// Observed exact-value payload path for a registered vector index (G-E2.RO).
+///
+/// Plain HNSW does not retain a second full-f32 corpus; search uses the
+/// accessor. This diagnostic names the durable/serving source.
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VectorPayloadBacking {
+    /// Exact vectors served from CompactStore mapped Float32Vector columns.
+    CompactMappedColumn,
+    /// ForceDisk spill-backed [`MmapStorage`].
+    SpilledMmap,
+    /// Property store / overlay (inline heap or non-compact property path).
+    PropertyStore,
+}
+
+/// Per-index actual backing diagnostic after open (G-E2.RO).
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VectorIndexBacking {
+    /// Index key `"label:property"`.
+    pub key: String,
+    /// Catalog dimensions.
+    pub dimensions: usize,
+    /// Distance metric name (e.g. `"cosine"`).
+    pub metric: String,
+    /// Search-topology residency.
+    pub topology: VectorTopologyBacking,
+    /// Exact-value payload path.
+    pub payload: VectorPayloadBacking,
+    /// Estimated topology heap bytes (near-zero when mmap-backed).
+    pub topology_heap_bytes: usize,
+}
+
+#[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+struct LoadedCompactBase {
+    store: Arc<grafeo_core::graph::compact::CompactStore>,
+    backing: CompactBacking,
+}
 
 /// Your handle to a Grafeo database.
 ///
@@ -190,6 +314,63 @@ pub struct GrafeoDB {
     /// `layered_store` via `swap_base()`.
     #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
     compact_tiered: Option<Arc<compact_tiered::CompactStoreTiered>>,
+    /// Observed compact-base backing after a persistent reopen.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    compact_backing: Option<CompactBacking>,
+    /// Overlay admission controller (G-EM0.5a), installed for writable
+    /// (W-mode) generation roots.
+    ///
+    /// When present, the layered store charges every overlay mutation's
+    /// retained capacity to this controller, and the WAL admission boundary
+    /// gates writers through [`Self::admit_overlay_write`] before a mutation
+    /// is durable. Read-only and legacy databases leave it `None`.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    overlay_admission:
+        Option<Arc<grafeo_core::graph::compact::overlay_budget::OverlayAdmissionController>>,
+    /// Dual-epoch handoff coordinator (G-EM0.5c).
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "generation-streaming"
+    ))]
+    epoch_handoff: generation::EpochHandoffCoordinator,
+    /// Builder-scoped mid-build tiers (G-MIDFLUSH.1 M2).
+    ///
+    /// Empty in normal serving; non-empty during builder mid-build drains.
+    /// `graph_store()` returns a `TierChainView` when this is non-empty.
+    #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+    mid_build_tiers:
+        parking_lot::RwLock<Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>>>,
+    /// 1-based count of *committed* mid-build drains for this database.
+    /// Incremented only after write + reopen + overlay reset + tier push.
+    /// Process-wide statics are forbidden (two DBs / two tests must not share a counter).
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap",
+        feature = "generation-streaming"
+    ))]
+    mid_build_drain_seq: u64,
+    /// Writable generation-root ownership (H-ADOPT.2).
+    ///
+    /// Present only when this `GrafeoDB` was opened as a generation root via
+    /// [`GrafeoDB::open_generation_root`]. Holds the exclusive `RootLock` (Option
+    /// S: owned for the DB lifetime) and the `GenerationLeaseRegistry` (owns the
+    /// selected mmap-backed base generation), so neither is released while the
+    /// database is open. `None` for legacy single-file and in-memory databases.
+    ///
+    /// H-ADOPT.2 review M-2: the gate must include `mmap` — the constructor,
+    /// the re-export, and the `GenerationRootOwnership` type itself all
+    /// require `mmap` (the base generation is always mmap-backed).
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
+    generation_root: Option<generation::GenerationRootOwnership>,
 }
 
 impl GrafeoDB {
@@ -384,9 +565,7 @@ impl GrafeoDB {
         // compacted database. The post-construction wiring uses this to
         // rebuild the LayeredStore + tier wrapper + overlay consumer.
         #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
-        let mut loaded_compact_base: Option<
-            Arc<grafeo_core::graph::compact::CompactStore>,
-        > = None;
+        let mut loaded_compact_base: Option<LoadedCompactBase> = None;
 
         // Phase 5e: snapshot of the OverlayDeletions section (if present),
         // applied after the LayeredStore is wired so that previously-deleted
@@ -411,12 +590,14 @@ impl GrafeoDB {
                             &fm,
                             &store,
                             &catalog,
+                            #[cfg(feature = "vector-index")]
+                            true,
                             #[cfg(feature = "triple-store")]
                             &rdf_store,
                         )?;
                         #[cfg(feature = "compact-store")]
                         {
-                            loaded_compact_base = Self::extract_compact_base(&fm)?;
+                            loaded_compact_base = Self::extract_compact_base(&fm, true)?;
                             loaded_overlay_deletions = Self::extract_overlay_deletions(&fm)?;
                         }
                     } else {
@@ -469,12 +650,14 @@ impl GrafeoDB {
                         &fm,
                         &store,
                         &catalog,
+                        #[cfg(feature = "vector-index")]
+                        false,
                         #[cfg(feature = "triple-store")]
                         &rdf_store,
                     )?;
                     #[cfg(feature = "compact-store")]
                     {
-                        loaded_compact_base = Self::extract_compact_base(&fm)?;
+                        loaded_compact_base = Self::extract_compact_base(&fm, false)?;
                         loaded_overlay_deletions = Self::extract_overlay_deletions(&fm)?;
                     }
                 } else {
@@ -652,6 +835,36 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+            compact_backing: None,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            overlay_admission: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
+            generation_root: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "generation-streaming"
+            ))]
+            epoch_handoff: generation::EpochHandoffCoordinator::new(),
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
+            // Committed mid-build drain sequence (0 = none). Incremented only
+            // after a drain is fully committed — never a process-wide static.
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap",
+                feature = "generation-streaming"
+            ))]
+            mid_build_drain_seq: 0,
         };
 
         // Register storage sections as memory consumers for pressure tracking
@@ -663,9 +876,17 @@ impl GrafeoDB {
         // engine sees the full picture and the read/write paths route
         // through the layered store.
         #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
-        if let Some(compact_base) = loaded_compact_base {
-            db.wire_layered_after_load(compact_base, loaded_overlay_deletions)?;
+        if let Some(loaded) = loaded_compact_base {
+            db.compact_backing = Some(loaded.backing);
+            db.wire_layered_after_load(loaded.store, loaded_overlay_deletions)?;
         }
+
+        // After Catalog shells + VectorStore topology + WAL + layered wiring,
+        // rehydrate Quantized payloads from LPG embeddings via graph_store().
+        // Must not run inside CatalogSection::deserialize (misses CompactStore
+        // base embeddings). Topology is reused; no full HNSW rebuild.
+        #[cfg(all(feature = "lpg", feature = "vector-index"))]
+        db.rehydrate_quantized_vector_indexes()?;
 
         // Start periodic checkpoint timer if configured
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
@@ -685,16 +906,17 @@ impl GrafeoDB {
             ));
         }
 
-        // Discover existing spill files from a previous session.
-        // If vectors were spilled before close, the spill files persist on disk
-        // and need to be re-mapped so search can read from them.
+        // Spill sidecars are ephemeral mmap snapshots, never durability
+        // authority. The complete vector property column is restored from the
+        // .grafeo container (plus WAL) above; discard old sidecars before
+        // applying this session's ForceDisk policy.
         #[cfg(all(
             feature = "lpg",
             feature = "vector-index",
             feature = "mmap",
             not(feature = "temporal")
         ))]
-        db.restore_spill_files();
+        db.discard_stale_vector_spill_files();
 
         // Phase 8a: apply per-section ForceDisk overrides. Each section
         // type configured as ForceDisk triggers a targeted spill of its
@@ -704,6 +926,399 @@ impl GrafeoDB {
         db.apply_force_disk_overrides();
 
         Ok(db)
+    }
+
+    /// Opens a database backed by an immutable **generation root** (W / H-ADOPT.2).
+    ///
+    /// Unlike [`with_config`](Self::with_config) (which opens a single-file
+    /// `.grafeo` as an eager `LpgStore`, or reconstructs a `LayeredStore` from a
+    /// compacted *section file*), this opens a **directory-format generation
+    /// root** (`<logical>.grafeo.d/`): acquires the exclusive W0 root lock,
+    /// validates the selected published generation via W0 triple-validation
+    /// recovery, mmaps its `CompactStore` section as the read-only base, and
+    /// serves reads through a fresh `LayeredStore` (base + empty overlay).
+    ///
+    /// The layered store is installed as the external read **and** write store,
+    /// so production queries and CRUD route through the layered path (base +
+    /// overlay) rather than a raw `LpgStore`. The `RootLock` and
+    /// `GenerationLeaseRegistry` are retained on the database for its entire
+    /// open lifetime — neither the lock nor the base mapping is released early.
+    ///
+    /// **Fail closed:** any lock / recovery / container-open / decode error is
+    /// returned; it never silently falls back to an eager LPG open when asked
+    /// for a generation root.
+    ///
+    /// # Feature gate
+    ///
+    /// Available with `all(generation, lpg, compact-store, mmap)`; the lease
+    /// registry and zero-copy base require mmap.
+    ///
+    /// # WAL-replay status (H-ADOPT.3 Phase C)
+    ///
+    /// Durable WAL written **after** the selected boundary **is replayed**
+    /// into the fresh overlay on open (see `generation::replay`): committed
+    /// query/schema writes are restored and the transaction manager's epoch /
+    /// transaction floor is restored before the database returns. A writable
+    /// open additionally truncates a torn tail left by a crash (so the freshly
+    /// installed WAL appends after the last committed frame) and installs the
+    /// root WAL with the configured durability, making post-open writes
+    /// durable. Read-only opens replay but install no WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root cannot be exclusively locked, no valid
+    /// generation exists, or the selected generation container cannot be
+    /// opened / mapped / deserialized.
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
+    pub fn open_generation_root(root: impl AsRef<Path>, read_only: bool) -> Result<Self> {
+        let config = if read_only {
+            Config::read_only(root.as_ref())
+        } else {
+            Config::persistent(root.as_ref())
+        };
+        Self::open_generation_root_with_config(config)
+    }
+
+    /// Opens a generation root while preserving the caller's complete engine
+    /// configuration (memory budget, spill/tier policy, query settings, WAL
+    /// durability, CDC, and access mode).
+    ///
+    /// AMH production callers use this form so the single open funnel applies
+    /// the same resource policy to eager and generation-root databases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config is invalid, the root cannot be
+    /// exclusively locked, no valid generation exists, the selected container
+    /// cannot be opened / mapped / deserialized, the post-boundary WAL cannot
+    /// be replayed, or (writable mode) the torn tail cannot be truncated or
+    /// the root WAL cannot be installed.
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
+    pub fn open_generation_root_with_config(config: Config) -> Result<Self> {
+        config
+            .validate()
+            .map_err(|e| grafeo_common::utils::error::Error::Internal(e.to_string()))?;
+        let root = config.path.clone().ok_or_else(|| {
+            Error::Internal("generation-root open requires a database path".into())
+        })?;
+        let read_only = config.access_mode == crate::config::AccessMode::ReadOnly;
+        let mode = if read_only {
+            generation::OpenMode::ReadOnly
+        } else {
+            generation::OpenMode::Writable
+        };
+
+        // Acquire the lock + validate + install the lease registry (mmap base).
+        let ownership = generation::GenerationRootOwnership::open(&root, mode)?;
+
+        // Fresh overlay + shared engine state (no single-file path is touched).
+        let store = Arc::new(LpgStore::new()?);
+        #[cfg(feature = "triple-store")]
+        let rdf_store = Arc::new(RdfStore::new());
+        let transaction_manager = Arc::new(TransactionManager::new());
+        let buffer_manager = BufferManager::new(BufferManagerConfig {
+            budget: config.memory_limit.unwrap_or_else(|| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let budget = (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize;
+                budget
+            }),
+            spill_path: config.spill_path.clone().or_else(|| {
+                let parent = root.parent()?;
+                let name = root.file_name()?.to_str()?;
+                Some(parent.join(format!("{name}.spill")))
+            }),
+            ..BufferManagerConfig::default()
+        });
+        let catalog = Arc::new(Catalog::new());
+        let query_cache = Arc::new(QueryCache::default());
+
+        #[cfg(feature = "cdc")]
+        let cdc_enabled_val = config.cdc_enabled;
+        #[cfg(feature = "cdc")]
+        let cdc_retention = config.cdc_retention.clone();
+
+        let mut db = Self {
+            config,
+            #[cfg(feature = "lpg")]
+            store: Some(store),
+            catalog,
+            #[cfg(feature = "triple-store")]
+            rdf_store,
+            transaction_manager,
+            buffer_manager,
+            #[cfg(feature = "wal")]
+            wal: None,
+            #[cfg(feature = "wal")]
+            wal_graph_context: Arc::new(parking_lot::Mutex::new(None)),
+            query_cache,
+            commit_counter: Arc::new(AtomicUsize::new(0)),
+            is_open: RwLock::new(true),
+            #[cfg(feature = "cdc")]
+            cdc_log: Arc::new(crate::cdc::CdcLog::with_retention(cdc_retention)),
+            #[cfg(feature = "cdc")]
+            cdc_enabled: std::sync::atomic::AtomicBool::new(cdc_enabled_val),
+            #[cfg(feature = "embed")]
+            embedding_models: RwLock::new(hashbrown::HashMap::new()),
+            #[cfg(feature = "grafeo-file")]
+            file_manager: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
+            checkpoint_timer: parking_lot::Mutex::new(None),
+            #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+            vector_spill_storages: None,
+            external_read_store: None,
+            external_write_store: None,
+            #[cfg(feature = "metrics")]
+            metrics: Some(Arc::new(crate::metrics::MetricsRegistry::new())),
+            current_graph: RwLock::new(None),
+            current_schema: RwLock::new(None),
+            read_only,
+            projections: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+            compact_backing: None,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            overlay_admission: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
+            generation_root: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "generation-streaming"
+            ))]
+            epoch_handoff: generation::EpochHandoffCoordinator::new(),
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
+            // Committed mid-build drain sequence (0 = none). Incremented only
+            // after a drain is fully committed — never a process-wide static.
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap",
+                feature = "generation-streaming"
+            ))]
+            mid_build_drain_seq: 0,
+        };
+
+        // H-ADOPT.6 decision 5: restore the Catalog BEFORE the layered wiring
+        // and WAL replay — replay applies the post-boundary schema delta on
+        // top of the restored catalog (its register calls are idempotent).
+        let lease = ownership.registry().snapshot();
+        db.restore_generation_catalog(&lease)?;
+
+        // Wire the layered store over the mmap base + fresh overlay, then retain
+        // the ownership (lock + registry) on the database for its lifetime.
+        let base = lease.store();
+        db.wire_generation_layered(base)?;
+
+        // H-ADOPT.6 decision 5: restore the derived index sections AFTER the
+        // layered wiring and BEFORE WAL replay, so replayed post-boundary
+        // writes land on the restored postings/topology.
+        db.restore_generation_indexes(read_only, &lease)?;
+
+        // H-ADOPT.3 Phase C: replay the post-boundary WAL into the fresh
+        // overlay before any writer sees the layered store. Replay restores
+        // committed query/schema writes and the TM epoch/transaction floor;
+        // it never mutates the WAL itself.
+        #[cfg(feature = "wal")]
+        let wal_dir = root.join("wal");
+        #[cfg(feature = "wal")]
+        let report = {
+            let layered = db.layered_store.as_ref().ok_or_else(|| {
+                Error::Internal(
+                    "open_generation_root: wire_generation_layered did not install the layered store".into(),
+                )
+            })?;
+            let target = generation::replay::ReplayTarget {
+                layered,
+                catalog: &db.catalog,
+                #[cfg(feature = "triple-store")]
+                rdf_store: Some(&db.rdf_store),
+                transaction_manager: &db.transaction_manager,
+            };
+            generation::replay::replay_generation_wal(
+                &wal_dir,
+                ownership.ownership().wal_boundary(),
+                &target,
+            )
+            .map_err(|e| Error::Internal(format!("generation WAL replay failed: {e}")))?
+        };
+        #[cfg(feature = "wal")]
+        {
+            let tail = match report.tail {
+                generation::replay::WalTailClass::Clean => "clean".to_string(),
+                generation::replay::WalTailClass::TornTail { seq, byte_offset } => {
+                    format!("torn-tail(seq={seq}, byte_offset={byte_offset})")
+                }
+            };
+            grafeo_info!(
+                "generation-root WAL replay: applied_records={} committed_transactions={} tail={} final_epoch={} max_transaction_id={}",
+                report.applied_records,
+                report.committed_transactions,
+                tail,
+                report.final_epoch.0,
+                report.max_transaction_id.0
+            );
+        }
+        // Writable mode only: truncate the torn tail left by a crash so the
+        // freshly installed WAL appends after the last committed frame.
+        #[cfg(feature = "wal")]
+        if !read_only
+            && let generation::replay::WalTailClass::TornTail { seq, byte_offset } = report.tail
+        {
+            grafeo_storage::wal::truncate_active_tail(&wal_dir, seq, byte_offset)?;
+        }
+        // Writable mode only: install the root WAL with the configured
+        // durability so post-open writes are durable (mirrors the normal-open
+        // durability mapping above).
+        #[cfg(feature = "wal")]
+        if !read_only && db.config.wal_enabled {
+            let wal_durability = match db.config.wal_durability {
+                crate::config::DurabilityMode::Sync => WalDurabilityMode::Sync,
+                crate::config::DurabilityMode::Batch {
+                    max_delay_ms,
+                    max_records,
+                } => WalDurabilityMode::Batch {
+                    max_delay_ms,
+                    max_records,
+                },
+                crate::config::DurabilityMode::Adaptive { target_interval_ms } => {
+                    WalDurabilityMode::Adaptive { target_interval_ms }
+                }
+                crate::config::DurabilityMode::NoSync => WalDurabilityMode::NoSync,
+            };
+            let wal_config = WalConfig {
+                durability: wal_durability,
+                ..WalConfig::default()
+            };
+            db.wal = Some(Arc::new(LpgWal::with_config(&wal_dir, wal_config)?));
+        }
+
+        db.generation_root = Some(ownership);
+
+        db.register_section_consumers();
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        db.discard_stale_vector_spill_files();
+        db.apply_force_disk_overrides();
+        Ok(db)
+    }
+
+    /// Installs the `LayeredStore` over a generation base + this database's
+    /// fresh overlay, mirroring [`wire_layered_after_load`](Self::wire_layered_after_load)
+    /// but sourcing the base from a lease snapshot (no on-disk deletion log —
+    /// a generation root starts at the selected boundary).
+    #[cfg(all(
+        feature = "generation",
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "mmap"
+    ))]
+    fn wire_generation_layered(
+        &mut self,
+        base: Arc<grafeo_core::graph::compact::CompactStore>,
+    ) -> Result<()> {
+        use grafeo_core::graph::compact::layered::LayeredStore;
+
+        let overlay_store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| Error::Internal("open_generation_root: no LpgStore overlay".into()))?;
+
+        // H-ADOPT.2 review M-1: this is a fresh overlay, unlike the
+        // deserialized overlay in wire_layered_after_load. Seed both ID
+        // allocators above the mapped base's preserved original-ID maxima
+        // before publishing the layered store to any writer.
+        //
+        // A generation base must preserve source IDs. Fail closed if a
+        // non-empty base lacks preserved-ID metadata or if the maximum has no
+        // valid successor (arithmetic overflow or the invalid-ID sentinel);
+        // wrapping either allocator would collide with base data.
+        let next_node_id = match base.max_preserved_node_id() {
+            Some(max) => max
+                .checked_add(1)
+                .filter(|next| *next != grafeo_common::types::NodeId::INVALID.as_u64())
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "open_generation_root: base node ID maximum {max} has no valid successor; cannot seed overlay allocator"
+                    ))
+                })?,
+            None if base.total_nodes() == 0 => 0,
+            None => {
+                return Err(Error::Internal(
+                    "open_generation_root: non-empty base has no preserved node IDs".into(),
+                ));
+            }
+        };
+        let next_edge_id = match base.max_preserved_edge_id() {
+            Some(max) => max
+                .checked_add(1)
+                .filter(|next| *next != grafeo_common::types::EdgeId::INVALID.as_u64())
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "open_generation_root: base edge ID maximum {max} has no valid successor; cannot seed overlay allocator"
+                    ))
+                })?,
+            None if base.total_edges() == 0 => 0,
+            None => {
+                return Err(Error::Internal(
+                    "open_generation_root: non-empty base has no preserved edge IDs".into(),
+                ));
+            }
+        };
+        overlay_store.set_next_node_id(next_node_id);
+        overlay_store.set_next_edge_id(next_edge_id);
+
+        let layered = Arc::new(LayeredStore::with_overlay(base, Arc::clone(overlay_store)));
+
+        // Sync overlay epoch with the transaction manager (mirrors
+        // wire_layered_after_load) so writes land at the engine's epoch.
+        let current_epoch = self.transaction_manager.current_epoch();
+        layered.overlay_store().sync_epoch(current_epoch);
+
+        self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
+        self.external_write_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreMut>);
+
+        // Install the tier wrapper + consumers (mirror of wire_layered_after_load).
+        {
+            let tiered = Arc::new(compact_tiered::CompactStoreTiered::new_in_memory(
+                layered.base_store_arc(),
+            ));
+            let spill_path = self.buffer_manager.config().spill_path.clone();
+            let consumer = Arc::new(section_consumer::CompactStoreConsumer::new(
+                &tiered, &layered, spill_path,
+            ));
+            self.buffer_manager.register_consumer(consumer);
+            self.compact_tiered = Some(tiered);
+        }
+        let overlay_consumer = Arc::new(section_consumer::OverlayConsumer::new(&layered));
+        self.buffer_manager.register_consumer(overlay_consumer);
+
+        self.layered_store = Some(layered);
+        Ok(())
     }
 
     /// Creates a database backed by a custom [`GraphStoreMut`] implementation.
@@ -798,6 +1413,36 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+            compact_backing: None,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            overlay_admission: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
+            generation_root: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "generation-streaming"
+            ))]
+            epoch_handoff: generation::EpochHandoffCoordinator::new(),
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
+            // Committed mid-build drain sequence (0 = none). Incremented only
+            // after a drain is fully committed — never a process-wide static.
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap",
+                feature = "generation-streaming"
+            ))]
+            mid_build_drain_seq: 0,
         })
     }
 
@@ -889,6 +1534,36 @@ impl GrafeoDB {
             layered_store: None,
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             compact_tiered: None,
+            #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+            compact_backing: None,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            overlay_admission: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap"
+            ))]
+            generation_root: None,
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "generation-streaming"
+            ))]
+            epoch_handoff: generation::EpochHandoffCoordinator::new(),
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            mid_build_tiers: parking_lot::RwLock::new(Vec::new()),
+            // Committed mid-build drain sequence (0 = none). Incremented only
+            // after a drain is fully committed — never a process-wide static.
+            #[cfg(all(
+                feature = "generation",
+                feature = "lpg",
+                feature = "compact-store",
+                feature = "mmap",
+                feature = "generation-streaming"
+            ))]
+            mid_build_drain_seq: 0,
         })
     }
 
@@ -952,11 +1627,15 @@ impl GrafeoDB {
 
         // Named graphs are LPG-specific and outside the columnar base; move them
         // from the pre-compact overlay into the new overlay so they survive
-        // compaction.
+        // compaction. Vector/text indexes likewise live on the LPG store and
+        // must be transferred or Catalog/VectorStore checkpoint emission loses
+        // them (G-E2.RO).
         if let Some(ref old) = self.store {
             layered
                 .overlay_store()
                 .install_named_graphs(old.take_named_graphs());
+            #[cfg(any(feature = "vector-index", feature = "text-index"))]
+            Self::transfer_indexes_to_overlay(old, &layered.overlay_store());
         }
 
         self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
@@ -990,6 +1669,31 @@ impl GrafeoDB {
         self.projections.write().clear();
 
         Ok(())
+    }
+
+    /// Transfers vector/text indexes from a retiring LPG store onto a new overlay.
+    #[cfg(all(
+        feature = "compact-store",
+        feature = "lpg",
+        any(feature = "vector-index", feature = "text-index")
+    ))]
+    fn transfer_indexes_to_overlay(from: &LpgStore, to: &LpgStore) {
+        #[cfg(feature = "vector-index")]
+        {
+            for (key, index) in from.vector_index_entries() {
+                if let Some((label, property)) = key.split_once(':') {
+                    to.add_vector_index(label, property, index);
+                }
+            }
+        }
+        #[cfg(feature = "text-index")]
+        {
+            for (key, index) in from.text_index_entries() {
+                if let Some((label, property)) = key.split_once(':') {
+                    to.add_text_index(label, property, index);
+                }
+            }
+        }
     }
 
     /// Merges the overlay back into the columnar base.
@@ -1031,10 +1735,13 @@ impl GrafeoDB {
         let current_epoch = self.transaction_manager.current_epoch();
         new_layered.overlay_store().sync_epoch(current_epoch);
 
-        // Carry named graphs forward: the old overlay is about to be dropped.
+        // Carry named graphs and indexes forward: the old overlay is about to
+        // be dropped (G-E2.RO requires vector shells/topology survive recompact).
         new_layered
             .overlay_store()
             .install_named_graphs(layered.overlay_store().take_named_graphs());
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        Self::transfer_indexes_to_overlay(&layered.overlay_store(), &new_layered.overlay_store());
 
         self.external_read_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreMut>);
@@ -1507,10 +2214,20 @@ impl GrafeoDB {
     /// section file, if present. Used by the open path to reconstruct
     /// the LayeredStore wiring after a previously-compacted database
     /// reopens.
+    ///
+    /// When `direct_mmap` is true (read-only open), this path never calls
+    /// [`GrafeoFileManager::read_section_data`] and never copies the full
+    /// section into an owned payload buffer. Mapping failures — including
+    /// encrypted layouts — fail closed with
+    /// [`StorageError::DirectMmapUnavailable`](grafeo_common::utils::error::StorageError::DirectMmapUnavailable)
+    /// rather than silently falling back to eager materialization.
+    /// Writable opens keep the legacy eager path and report
+    /// [`CompactBacking::LegacyEager`]; that is not Milestone R evidence.
     #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
     fn extract_compact_base(
         fm: &GrafeoFileManager,
-    ) -> Result<Option<Arc<grafeo_core::graph::compact::CompactStore>>> {
+        direct_mmap: bool,
+    ) -> Result<Option<LoadedCompactBase>> {
         use grafeo_common::storage::{Section, SectionType};
         let Some(dir) = fm.read_section_directory()? else {
             return Ok(None);
@@ -1518,10 +2235,38 @@ impl GrafeoDB {
         let Some(entry) = dir.find(SectionType::CompactStore) else {
             return Ok(None);
         };
-        let data = fm.read_section_data(entry)?;
+        let artifact_id = format!("container:{}:{:08x}", fm.path().display(), entry.checksum);
         let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
-        section.deserialize(&data)?;
-        Ok(section.store())
+        let backing = if direct_mmap {
+            let mapped = Arc::new(fm.mmap_section(entry)?);
+            let mapped_bytes = mapped.len();
+            let data = mapped.into_bytes();
+            let payload_version = data.get(4).copied().ok_or_else(|| {
+                Error::Internal("truncated CompactStore payload after mmap validation".into())
+            })?;
+            section.deserialize_from_mapped_bytes(data)?;
+            CompactBacking::ContainerMmap {
+                artifact_id,
+                payload_version,
+                mapped_bytes,
+            }
+        } else {
+            let data = fm.read_section_data(entry)?;
+            let payload_version = data.get(4).copied().ok_or_else(|| {
+                Error::Internal("truncated CompactStore payload after read validation".into())
+            })?;
+            let payload_bytes = data.len();
+            section.deserialize(&data)?;
+            CompactBacking::LegacyEager {
+                artifact_id,
+                payload_version,
+                payload_bytes,
+            }
+        };
+        let store = section.store().ok_or_else(|| {
+            Error::Internal("CompactStore section deserialized without a store".into())
+        })?;
+        Ok(Some(LoadedCompactBase { store, backing }))
     }
 
     /// Reads the persisted overlay deletion log from the container, if
@@ -1552,14 +2297,170 @@ impl GrafeoDB {
         Ok(Some(section.take()))
     }
 
+    /// Rehydrate quantized vector index payloads after open.
+    ///
+    /// Catalog restore creates empty `VectorIndexKind` shells; VectorStore
+    /// applies topology only. Quantized indexes need in-process **codes** (not
+    /// a second full-f32 copy of LPG embeddings). Two-pass scan:
+    /// 1) train quantizer parameters without retaining every vector
+    /// 2) write codes only, rescoring uses [`PropertyVectorAccessor`] at search
+    ///
+    /// Sequencing (required): Catalog shells → LPG load → VectorStore topology
+    /// → WAL → wire_layered_after_load → **this step** → spill restore.
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    fn rehydrate_quantized_vector_indexes(&self) -> Result<()> {
+        use grafeo_common::types::{PropertyKey, Value};
+        use grafeo_core::index::vector::{BinaryQuantizer, QuantizationType};
+
+        let entries = self.lpg_store().vector_index_entries();
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let graph = self.graph_store();
+        for (key, index) in entries {
+            let Some(q_idx) = index.as_quantized() else {
+                continue;
+            };
+            let Some((label, property)) = key.split_once(':') else {
+                continue;
+            };
+            let prop_key = PropertyKey::new(property);
+            let dimensions = q_idx.config().dimensions;
+            if dimensions == 0 {
+                return Err(grafeo_common::utils::error::Error::Serialization(format!(
+                    "Cannot rehydrate vector index {key}: catalog dimensions are zero"
+                )));
+            }
+
+            match q_idx.quantization_type() {
+                QuantizationType::None => {
+                    // Exact quantized-shell path: keep legacy full-vector rehydrate.
+                    let mut vectors = Vec::new();
+                    for node_id in graph.nodes_by_label(label) {
+                        if let Some(Value::Vector(v)) = graph.get_node_property(node_id, &prop_key)
+                        {
+                            if v.len() != dimensions {
+                                return Err(grafeo_common::utils::error::Error::Serialization(
+                                    format!(
+                                        "Cannot rehydrate vector index {key}: stored vectors do not match catalog dimensions {dimensions}"
+                                    ),
+                                ));
+                            }
+                            vectors.push((node_id, v.to_vec()));
+                        }
+                    }
+                    q_idx.rehydrate_payloads_from_vectors(vectors);
+                }
+                QuantizationType::Scalar => {
+                    // Topology is already restored from VectorStore. Today's
+                    // scalar search walk/rescore uses the LPG property accessor
+                    // (full precision), not the u8 code map — see
+                    // `search_scalar_quantized`. Materializing 1 byte/dim codes
+                    // for every embedding is pure RSS overhead on reopen and
+                    // prevented the Layer 4 "scalar < plain" bar.
+                    //
+                    // Keep mode sticky via Catalog; leave codes empty so search
+                    // falls through to accessor-backed exact distances (same
+                    // memory model as plain HNSW). When HNSW gains quantized
+                    // distance scoring, rehydrate codes here again.
+                    let mut count = 0usize;
+                    for node_id in graph.nodes_by_label(label) {
+                        if let Some(Value::Vector(v)) = graph.get_node_property(node_id, &prop_key)
+                        {
+                            if v.len() != dimensions {
+                                return Err(grafeo_common::utils::error::Error::Serialization(
+                                    format!(
+                                        "Cannot rehydrate vector index {key}: stored vectors do not match catalog dimensions {dimensions}"
+                                    ),
+                                ));
+                            }
+                            count += 1;
+                        }
+                    }
+                    let _ = count; // validates dim match; empty → probe ready=false
+                    q_idx.release_quantized_payloads();
+                }
+                QuantizationType::Binary => {
+                    let mut codes = Vec::new();
+                    for node_id in graph.nodes_by_label(label) {
+                        if let Some(Value::Vector(v)) = graph.get_node_property(node_id, &prop_key)
+                        {
+                            if v.len() != dimensions {
+                                return Err(grafeo_common::utils::error::Error::Serialization(
+                                    format!(
+                                        "Cannot rehydrate vector index {key}: stored vectors do not match catalog dimensions {dimensions}"
+                                    ),
+                                ));
+                            }
+                            codes.push((node_id, BinaryQuantizer::quantize(v.as_ref())));
+                        }
+                    }
+                    if codes.is_empty() {
+                        continue;
+                    }
+                    q_idx.rehydrate_binary_codes_only(codes);
+                }
+                QuantizationType::Product { num_subvectors } => {
+                    if num_subvectors == 0 || !dimensions.is_multiple_of(num_subvectors) {
+                        return Err(grafeo_common::utils::error::Error::Serialization(format!(
+                            "Cannot rehydrate product vector index {key}: dimensions {dimensions} are not divisible by {num_subvectors} subvectors"
+                        )));
+                    }
+                    // Product training still needs a temporary sample batch; drop after codes.
+                    let mut vectors = Vec::new();
+                    for node_id in graph.nodes_by_label(label) {
+                        if let Some(Value::Vector(v)) = graph.get_node_property(node_id, &prop_key)
+                        {
+                            if v.len() != dimensions {
+                                return Err(grafeo_common::utils::error::Error::Serialization(
+                                    format!(
+                                        "Cannot rehydrate vector index {key}: stored vectors do not match catalog dimensions {dimensions}"
+                                    ),
+                                ));
+                            }
+                            vectors.push((node_id, v.to_vec()));
+                        }
+                    }
+                    q_idx.rehydrate_payloads_from_vectors(vectors);
+                }
+                _ => {
+                    // Forward-compatible: unknown quant modes keep legacy path.
+                    let mut vectors = Vec::new();
+                    for node_id in graph.nodes_by_label(label) {
+                        if let Some(Value::Vector(v)) = graph.get_node_property(node_id, &prop_key)
+                        {
+                            if v.len() != dimensions {
+                                return Err(grafeo_common::utils::error::Error::Serialization(
+                                    format!(
+                                        "Cannot rehydrate vector index {key}: stored vectors do not match catalog dimensions {dimensions}"
+                                    ),
+                                ));
+                            }
+                            vectors.push((node_id, v.to_vec()));
+                        }
+                    }
+                    q_idx.rehydrate_payloads_from_vectors(vectors);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Loads from a section-based `.grafeo` file (v2 format).
     ///
     /// Reads the section directory, then deserializes each section independently.
+    ///
+    /// When `prefer_vector_mmap` is true (read-only open), VectorStore is
+    /// restored via container mmap + [`VectorStoreSection::restore_from_mapped_bytes`]
+    /// so HNSW topology stays file-backed. Missing or corrupt required vector
+    /// artifacts fail closed when the Catalog registered vector shells.
     #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
     fn load_from_sections(
         fm: &GrafeoFileManager,
         store: &Arc<LpgStore>,
         catalog: &Arc<crate::catalog::Catalog>,
+        #[cfg(feature = "vector-index")] prefer_vector_mmap: bool,
         #[cfg(feature = "triple-store")] rdf_store: &Arc<RdfStore>,
     ) -> Result<()> {
         use grafeo_common::storage::{Section, SectionType};
@@ -1570,7 +2471,7 @@ impl GrafeoDB {
             )
         })?;
 
-        // Load catalog section first (schema defs needed before data)
+        // Load catalog section first (schema defs + index registration shells)
         if let Some(entry) = dir.find(SectionType::Catalog) {
             let data = fm.read_section_data(entry)?;
             let tm = Arc::new(crate::transaction::TransactionManager::new());
@@ -1607,25 +2508,108 @@ impl GrafeoDB {
             section.deserialize(&data)?;
         }
 
-        // Restore HNSW topology (if vector indexes exist in both catalog and section)
+        // Restore HNSW topology (if vector indexes exist in both catalog and section).
+        // G-E2.RO: fail closed when Catalog registered shells but the durable
+        // VectorStore artifact is absent or corrupt — never open with empty
+        // shells that silently return empty search results.
         #[cfg(feature = "vector-index")]
-        if let Some(entry) = dir.find(SectionType::VectorStore) {
-            let data = fm.read_section_data(entry)?;
+        {
             let indexes = store.vector_index_entries();
             if !indexes.is_empty() {
+                let Some(entry) = dir.find(SectionType::VectorStore) else {
+                    return Err(grafeo_common::utils::error::Error::Serialization(
+                        "Catalog registers vector indexes but VectorStore section is absent (fail-closed)"
+                            .to_string(),
+                    ));
+                };
                 let mut section = grafeo_core::index::vector::VectorStoreSection::new(indexes);
-                section.deserialize(&data)?;
+                if prefer_vector_mmap {
+                    let mapped = Arc::new(fm.mmap_section(entry)?);
+                    let data = mapped.into_bytes();
+                    section.restore_from_mapped_bytes(data)?;
+                } else {
+                    let data = fm.read_section_data(entry)?;
+                    section.deserialize(&data)?;
+                }
             }
         }
 
-        // Restore BM25 postings (if text indexes exist in both catalog and section)
+        // Restore PropertyIndex postings (G-E1.RO). Optional: historical files
+        // without this section keep Catalog-registered shells and fall back to
+        // scan-based lookup (never a silent “restored” claim).
+        if let Some(entry) = dir.find(SectionType::PropertyIndex) {
+            use grafeo_core::index::property::parse_property_index_section;
+            // Prefer mmap on read-only opens so postings stay file-backed.
+            let mapped_set = if fm.is_read_only() {
+                match fm.mmap_section(entry) {
+                    Ok(mapped) => {
+                        let bytes = std::sync::Arc::new(mapped).into_bytes();
+                        Some(parse_property_index_section(bytes)?)
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let mapped_set = match mapped_set {
+                Some(m) => m,
+                None => {
+                    let data = fm.read_section_data(entry)?;
+                    let mut section = grafeo_core::index::property::PropertyIndexSection::empty();
+                    section.deserialize(&data)?;
+                    section.take_mapped().ok_or_else(|| {
+                        grafeo_common::utils::error::Error::Serialization(
+                            "PropertyIndex section deserialized without mapped set".into(),
+                        )
+                    })?
+                }
+            };
+            for idx in mapped_set.indexes() {
+                store.install_mapped_property_index(std::sync::Arc::new(idx.clone()));
+            }
+            let _ = mapped_set.accounting();
+        }
+
+        // Restore BM25 postings (TextIndex). Prefer mapped v2; legacy v1
+        // hydrates heap shells created by Catalog restore.
         #[cfg(feature = "text-index")]
         if let Some(entry) = dir.find(SectionType::TextIndex) {
-            let data = fm.read_section_data(entry)?;
+            use grafeo_core::index::text::{
+                TextIndexSection, is_mapped_text_payload, parse_text_index_section,
+            };
             let indexes = store.text_index_entries();
-            if !indexes.is_empty() {
-                let mut section = grafeo_core::index::text::TextIndexSection::new(indexes);
+            if fm.is_read_only() {
+                if let Ok(mapped) = fm.mmap_section(entry) {
+                    let bytes = std::sync::Arc::new(mapped).into_bytes();
+                    if is_mapped_text_payload(&bytes) {
+                        let mapped_set = parse_text_index_section(bytes)?;
+                        for idx in mapped_set.indexes() {
+                            store.install_mapped_text_index(std::sync::Arc::new(idx.clone()));
+                        }
+                    } else {
+                        // Legacy v1 over mmap: copy into section deserialize.
+                        let mut section = TextIndexSection::new(indexes);
+                        section.deserialize(&bytes)?;
+                    }
+                } else {
+                    let data = fm.read_section_data(entry)?;
+                    let mut section = TextIndexSection::new(indexes);
+                    section.deserialize(&data)?;
+                    if let Some(mapped_set) = section.take_mapped() {
+                        for idx in mapped_set.indexes() {
+                            store.install_mapped_text_index(std::sync::Arc::new(idx.clone()));
+                        }
+                    }
+                }
+            } else {
+                let data = fm.read_section_data(entry)?;
+                let mut section = TextIndexSection::new(indexes);
                 section.deserialize(&data)?;
+                if let Some(mapped_set) = section.take_mapped() {
+                    for idx in mapped_set.indexes() {
+                        store.install_mapped_text_index(std::sync::Arc::new(idx.clone()));
+                    }
+                }
             }
         }
 
@@ -1788,12 +2772,43 @@ impl GrafeoDB {
             let overlay = layered.overlay_store();
             let layered_arc = Arc::clone(layered);
             let mut session = Session::with_adaptive(overlay, session_cfg());
-            // Override graph_store/graph_store_mut to use the LayeredStore
-            // (which merges base + overlay), not just the overlay alone.
-            session.override_stores(
-                Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>,
-                Some(layered_arc as Arc<dyn GraphStoreMut>),
-            );
+            // Read store: when mid_build_tiers is non-empty, use TierChainView
+            // (tiers + overlay) so queries see drained tiers; otherwise the
+            // raw LayeredStore (merges base + overlay).
+            #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+            let read_store: Arc<dyn GraphStoreSearch> = if !self.mid_build_tiers.read().is_empty() {
+                let tiers = self.mid_build_tiers.read().clone();
+                let ov = layered.overlay_store();
+                let view = grafeo_core::graph::compact::tier_chain::TierChainView::new(tiers, ov);
+                Arc::new(view) as Arc<dyn GraphStoreSearch>
+            } else {
+                Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>
+            };
+            #[cfg(not(all(feature = "compact-store", feature = "mmap", feature = "lpg")))]
+            let read_store = Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>;
+            // Write store: the LayeredStore, wrapped in a WalGraphStore when the
+            // database carries a WAL so query mutations reach the root's WAL
+            // (H-ADOPT.3 Phase C, D1).
+            #[cfg(feature = "wal")]
+            let write_store: Arc<dyn GraphStoreMut> = if let Some(ref wal) = self.wal {
+                let wal_store = Arc::new(crate::database::wal_store::WalGraphStore::new(
+                    layered_arc as Arc<dyn GraphStoreMut>,
+                    Arc::clone(wal),
+                    Arc::clone(&self.wal_graph_context),
+                ));
+                wal_store as Arc<dyn GraphStoreMut>
+            } else {
+                layered_arc as Arc<dyn GraphStoreMut>
+            };
+            #[cfg(not(feature = "wal"))]
+            let write_store: Arc<dyn GraphStoreMut> = layered_arc as Arc<dyn GraphStoreMut>;
+            session.override_stores(read_store, Some(write_store));
+            // Attach the WAL for TransactionCommit/EpochAdvance logging without
+            // re-wrapping the store (the write store above is already wrapped).
+            #[cfg(feature = "wal")]
+            if let Some(ref wal) = self.wal {
+                session.attach_wal(Arc::clone(wal), Arc::clone(&self.wal_graph_context));
+            }
             return session;
         }
 
@@ -2118,6 +3133,18 @@ impl GrafeoDB {
     /// operations. For write access, use [`graph_store_mut()`](Self::graph_store_mut).
     #[must_use]
     pub fn graph_store(&self) -> Arc<dyn GraphStoreSearch> {
+        #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+        {
+            if !self.mid_build_tiers.read().is_empty() {
+                if let Some(layered) = self.layered_store.as_ref() {
+                    let tiers = self.mid_build_tiers.read().clone();
+                    let overlay = layered.overlay_store();
+                    let view =
+                        grafeo_core::graph::compact::tier_chain::TierChainView::new(tiers, overlay);
+                    return Arc::new(view) as Arc<dyn GraphStoreSearch>;
+                }
+            }
+        }
         if let Some(ref ext_read) = self.external_read_store {
             Arc::clone(ext_read)
         } else {
@@ -2128,6 +3155,15 @@ impl GrafeoDB {
             #[cfg(not(feature = "lpg"))]
             unreachable!("no graph store available: enable the `lpg` feature or use with_store()")
         }
+    }
+
+    /// Returns a clone of the current mid-build tier list (G-MIDFLUSH.1 M2).
+    #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+    #[must_use]
+    pub fn mid_build_tiers(
+        &self,
+    ) -> Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>> {
+        self.mid_build_tiers.read().clone()
     }
 
     /// Returns the writable graph store, if available.
@@ -2196,6 +3232,91 @@ impl GrafeoDB {
     #[must_use]
     pub fn compact_tiered(&self) -> Option<&Arc<compact_tiered::CompactStoreTiered>> {
         self.compact_tiered.as_ref()
+    }
+
+    /// Returns the actual backing selected for a reopened CompactStore base.
+    ///
+    /// `ContainerMmap` proves that this handle owns the immutable container
+    /// mapping directly. It is distinct from the legacy spill-sidecar tier and
+    /// from a directory `mmap_able` flag, neither of which proves the normal
+    /// reopen path avoided an owned full-section read.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    #[must_use]
+    pub fn compact_backing(&self) -> Option<&CompactBacking> {
+        self.compact_backing.as_ref()
+    }
+
+    /// Returns actual per-index vector payload and topology backing after open.
+    ///
+    /// G-E2.RO: requested storage tier / directory `mmap_able` alone is not
+    /// sufficient. Callers must see whether topology is [`VectorTopologyBacking::Mmap`]
+    /// and whether payloads are served from mapped compact columns (or spill)
+    /// rather than a fully reconstructed anonymous HNSW corpus.
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    #[must_use]
+    pub fn vector_backing_diagnostics(&self) -> Vec<VectorIndexBacking> {
+        let mut out = Vec::new();
+        let has_compact = {
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            {
+                let layered = self.layered_store.is_some();
+                #[cfg(feature = "mmap")]
+                let tiered = self.compact_tiered.is_some();
+                #[cfg(not(feature = "mmap"))]
+                let tiered = false;
+                layered || tiered
+            }
+            #[cfg(not(all(feature = "compact-store", feature = "lpg")))]
+            {
+                false
+            }
+        };
+        for (key, index) in self.lpg_store().vector_index_entries() {
+            let config = index.config();
+            let topology_heap_bytes = index.heap_memory_bytes();
+            let topology = if let Some(topology_bytes) = index.mmap_topology_bytes() {
+                VectorTopologyBacking::Mmap { topology_bytes }
+            } else {
+                VectorTopologyBacking::Heap {
+                    heap_bytes: topology_heap_bytes,
+                }
+            };
+            let payload = {
+                #[cfg(all(feature = "mmap", not(feature = "temporal")))]
+                {
+                    if let Some(ref spill_map) = self.vector_spill_storages {
+                        if spill_map.read().contains_key(&key) {
+                            VectorPayloadBacking::SpilledMmap
+                        } else if has_compact {
+                            VectorPayloadBacking::CompactMappedColumn
+                        } else {
+                            VectorPayloadBacking::PropertyStore
+                        }
+                    } else if has_compact {
+                        VectorPayloadBacking::CompactMappedColumn
+                    } else {
+                        VectorPayloadBacking::PropertyStore
+                    }
+                }
+                #[cfg(not(all(feature = "mmap", not(feature = "temporal"))))]
+                {
+                    if has_compact {
+                        VectorPayloadBacking::CompactMappedColumn
+                    } else {
+                        VectorPayloadBacking::PropertyStore
+                    }
+                }
+            };
+            out.push(VectorIndexBacking {
+                key,
+                dimensions: config.dimensions,
+                metric: config.metric.name().to_string(),
+                topology,
+                payload,
+                topology_heap_bytes,
+            });
+        }
+        out
     }
 
     /// Returns the query cache.
@@ -2339,6 +3460,18 @@ impl GrafeoDB {
                 transaction_id: commit_tx,
             })?;
 
+            // Pair the blanket commit with an EpochAdvance: generation-root
+            // replay (H-ADOPT.3) requires an EpochAdvance after EVERY
+            // TransactionCommit, and a second unpaired close-time commit
+            // otherwise poisons the stream (commit-while-awaiting-epoch =>
+            // NonRecoverable), making the root unopenable after two clean
+            // closes. Legacy directory-format recovery treats EpochAdvance as
+            // metadata pass-through (wal/recovery.rs), so this changes
+            // nothing for existing recovery behavior.
+            wal.log(&WalRecord::EpochAdvance {
+                epoch: self.transaction_manager.current_epoch(),
+            })?;
+
             wal.sync()?;
         }
 
@@ -2360,6 +3493,77 @@ impl GrafeoDB {
             wal.log(record)?;
         }
         Ok(())
+    }
+
+    /// Installs the overlay admission controller for a writable (W-mode)
+    /// generation root (G-EM0.5a).
+    ///
+    /// The controller is shared with the layered store (if one is installed)
+    /// so overlay mutations charge retained capacity, and is retained on the
+    /// database so the WAL admission boundary can gate writers through
+    /// [`Self::admit_overlay_write`]. Installing twice replaces the previous
+    /// controller; callers should install once, after `compact()` wires the
+    /// layered store.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    pub fn install_overlay_admission(
+        &mut self,
+        controller: Arc<grafeo_core::graph::compact::overlay_budget::OverlayAdmissionController>,
+    ) {
+        if let Some(ref layered) = self.layered_store {
+            layered.install_admission_controller(Arc::clone(&controller));
+        }
+        self.overlay_admission = Some(controller);
+    }
+
+    /// Returns the installed overlay admission controller, if any.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    #[must_use]
+    pub fn overlay_admission(
+        &self,
+    ) -> Option<Arc<grafeo_core::graph::compact::overlay_budget::OverlayAdmissionController>> {
+        self.overlay_admission.clone()
+    }
+
+    /// WAL admission gate (G-EM0.5a): blocks boundedly or returns a typed
+    /// retryable error before a mutation is admitted to the overlay.
+    ///
+    /// Callers must invoke this *before* writing the WAL record so that an
+    /// accepted write is durable in the WAL before acknowledgement (packet
+    /// §4). When no controller is installed (read-only / legacy), this is a
+    /// no-op that always admits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable admission error when the overlay is at hard
+    /// pressure and the bounded block times out, or a terminal rejection on
+    /// shutdown/cancel/oversized requests.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    pub fn admit_overlay_write(
+        &self,
+        category: grafeo_core::graph::compact::overlay_budget::RetainedCategory,
+        bytes: usize,
+    ) -> Result<()> {
+        use grafeo_core::graph::compact::overlay_budget::{AdmissionOutcome, RejectReason};
+        let Some(ref ctl) = self.overlay_admission else {
+            return Ok(());
+        };
+        match ctl.reserve(category, bytes as u64) {
+            AdmissionOutcome::Admitted { .. } => Ok(()),
+            AdmissionOutcome::Retryable { reason } => Err(Error::AdmissionRetryable(format!(
+                "overlay admission backpressure: {reason:?}"
+            ))),
+            AdmissionOutcome::Rejected { reason } => match reason {
+                RejectReason::Oversized => Err(Error::AdmissionRejected(format!(
+                    "overlay admission rejected: request of {bytes} bytes exceeds hard limit"
+                ))),
+                RejectReason::Shutdown => Err(Error::AdmissionRejected(
+                    "overlay admission: shutting down".into(),
+                )),
+                RejectReason::Cancelled => Err(Error::AdmissionRejected(
+                    "overlay admission: cancelled".into(),
+                )),
+            },
+        }
     }
 
     /// Registers storage sections as [`MemoryConsumer`]s with the BufferManager.
@@ -2500,6 +3704,30 @@ impl GrafeoDB {
         self.buffer_manager.reload_eligible(target_fraction)
     }
 
+    /// Materializes spill-backed vectors before a mutation that may update an
+    /// existing HNSW topology.
+    ///
+    /// HNSW insertion reads neighboring vectors through the mutable property
+    /// accessor. Call this before vector-bearing GQL writes so those reads see
+    /// the complete graph rather than only the post-spill delta. The next
+    /// checkpoint reapplies ForceDisk when configured.
+    #[cfg(all(
+        feature = "lpg",
+        feature = "vector-index",
+        feature = "mmap",
+        not(feature = "temporal")
+    ))]
+    pub fn prepare_vector_mutation(&self) -> Result<()> {
+        self.buffer_manager
+            .reload_consumer_by_name("section:VectorStore")
+            .map(|_| ())
+            .map_err(|error| {
+                Error::Internal(format!(
+                    "failed to reload spilled vectors before mutation: {error}"
+                ))
+            })
+    }
+
     /// Returns the current [`StorageTier`] of every registered section consumer.
     ///
     /// The map keys are the [`SectionType`]s parsed from each consumer's name
@@ -2542,93 +3770,33 @@ impl GrafeoDB {
         out
     }
 
-    /// Discovers and re-opens spill files from a previous session.
+    /// Removes vector spill sidecars left by a prior process.
     ///
-    /// When the database was closed with spilled vector embeddings, the
-    /// `vectors_*.bin` files persist in the spill directory. This method
-    /// scans for them, opens each as `MmapStorage`, and registers them
-    /// in the `vector_spill_storages` map so search can read from them.
+    /// Spill files are ephemeral mmap snapshots. The `.grafeo` container plus
+    /// WAL is the durable authority, so reopen always rebuilds ForceDisk state
+    /// from the freshly loaded property column instead of trusting a sidecar
+    /// that may predate later Auto-tier mutations.
     #[cfg(all(
         feature = "lpg",
         feature = "vector-index",
         feature = "mmap",
         not(feature = "temporal")
     ))]
-    fn restore_spill_files(&mut self) {
-        use grafeo_core::index::vector::MmapStorage;
-
-        let spill_dir = match self.buffer_manager.config().spill_path {
-            Some(ref path) => path.clone(),
-            None => return,
-        };
-
-        if !spill_dir.exists() {
-            return;
-        }
-
-        let spill_map = match self.vector_spill_storages {
-            Some(ref map) => Arc::clone(map),
-            None => return,
-        };
-
-        let Ok(entries) = std::fs::read_dir(&spill_dir) else {
+    fn discard_stale_vector_spill_files(&self) {
+        let Some(spill_dir) = self.buffer_manager.config().spill_path.as_ref() else {
             return;
         };
-
-        let Some(ref store) = self.store else {
+        let Ok(entries) = std::fs::read_dir(spill_dir) else {
             return;
         };
-
         for entry in entries.flatten() {
             let path = entry.path();
-            let file_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-
-            // Match pattern: vectors_{key}.bin where key is percent-encoded
-            if !file_name.starts_with("vectors_")
-                || !std::path::Path::new(&file_name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
-            {
-                continue;
-            }
-
-            // Extract and decode key: "vectors_Label%3Aembedding.bin" -> "Label:embedding"
-            let key_part = &file_name["vectors_".len()..file_name.len() - ".bin".len()];
-
-            // Percent-decode: %3A -> ':', %25 -> '%'
-            let key = key_part.replace("%3A", ":").replace("%25", "%");
-
-            // Key must contain ':' (label:property format)
-            if !key.contains(':') {
-                // Legacy file with old encoding, skip (will be re-created on next spill)
-                continue;
-            }
-
-            // Only restore if the corresponding vector index exists
-            if store.get_vector_index_by_key(&key).is_none() {
-                // Stale spill file (index was dropped), clean it up
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-
-            // Open the MmapStorage
-            match MmapStorage::open(&path) {
-                Ok(mmap_storage) => {
-                    // Mark the property column as spilled so get() returns None
-                    let property = key.split(':').nth(1).unwrap_or("");
-                    let prop_key = grafeo_common::types::PropertyKey::new(property);
-                    store.node_properties_mark_spilled(&prop_key);
-
-                    spill_map.write().insert(key, Arc::new(mmap_storage));
-                }
-                Err(e) => {
-                    eprintln!("failed to restore spill file {}: {e}", path.display());
-                    // Remove corrupt spill file
-                    let _ = std::fs::remove_file(&path);
-                }
+            let is_vector_spill = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("vectors_") && name.ends_with(".bin"));
+            if is_vector_spill {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -2638,7 +3806,9 @@ impl GrafeoDB {
     fn build_sections(&self) -> Vec<Box<dyn grafeo_common::storage::Section>> {
         let mut sections: Vec<Box<dyn grafeo_common::storage::Section>> = Vec::new();
 
-        // Layered store: serialize both the compact base and the overlay.
+        // Layered store: serialize compact base + overlay + Catalog / non-vector
+        // indexes (G-E1.RO) + VectorStore (G-E2.RO). Catalog + VectorStore must be
+        // emitted after compact so RO reopen restores shells + topology.
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if let Some(ref layered) = self.layered_store {
             // Compact base section.
@@ -2647,10 +3817,42 @@ impl GrafeoDB {
             );
             sections.push(Box::new(compact_section));
 
-            // Overlay LPG section.
+            // Overlay LPG section (post-compact mutations; may be empty).
             let overlay = layered.overlay_store();
-            let overlay_section = grafeo_core::graph::lpg::LpgStoreSection::new(overlay);
+            let overlay_section =
+                grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(&overlay));
             sections.push(Box::new(overlay_section));
+
+            // Catalog (vector/text shells + schema) lives on the overlay store.
+            let catalog = catalog_section::CatalogSection::new(
+                Arc::clone(&self.catalog),
+                Arc::clone(&overlay),
+                {
+                    let tm = Arc::clone(&self.transaction_manager);
+                    move || tm.current_epoch().as_u64()
+                },
+            );
+            sections.push(Box::new(catalog));
+
+            // Vector indexes: persist HNSW topology to avoid rebuild on load.
+            #[cfg(feature = "vector-index")]
+            {
+                let indexes = overlay.vector_index_entries();
+                if !indexes.is_empty() {
+                    let vector = grafeo_core::index::vector::VectorStoreSection::new(indexes);
+                    sections.push(Box::new(vector));
+                }
+            }
+
+            // Text indexes: persist BM25 postings.
+            #[cfg(feature = "text-index")]
+            {
+                let indexes = overlay.text_index_entries();
+                if !indexes.is_empty() {
+                    let text = grafeo_core::index::text::TextIndexSection::new(indexes);
+                    sections.push(Box::new(text));
+                }
+            }
 
             // Overlay deletion log: persists base-node/edge tombstones
             // that have not yet been merged into the base. Without this,
@@ -2668,6 +3870,67 @@ impl GrafeoDB {
                 // dirty flag is cleared so subsequent checkpoints don't
                 // think they need to keep flushing.
                 layered.mark_deletions_clean();
+            }
+
+            // Catalog: schema + index registration (required data section).
+            let catalog = catalog_section::CatalogSection::new(
+                Arc::clone(&self.catalog),
+                Arc::clone(&overlay),
+                {
+                    let tm = Arc::clone(&self.transaction_manager);
+                    move || tm.current_epoch().as_u64()
+                },
+            );
+            sections.push(Box::new(catalog));
+
+            // PropertyIndex: prefer layered graph scan so base postings are
+            // captured (overlay-only create_property_index misses base rows).
+            {
+                let mut snaps = overlay.property_index_snapshot_entries();
+                // For every registered property index, ensure base nodes are
+                // included by scanning the layered graph when the overlay
+                // heap snapshot is empty or under-filled.
+                let keys = overlay.property_index_keys();
+                if !keys.is_empty() {
+                    let graph = self.graph_store();
+                    let mut by_name: std::collections::BTreeMap<
+                        String,
+                        grafeo_core::index::property::PropertyIndexSnapshot,
+                    > = snaps.drain(..).map(|s| (s.name.clone(), s)).collect();
+                    for prop in keys {
+                        let entry = by_name.entry(prop.clone()).or_insert_with(|| {
+                            grafeo_core::index::property::PropertyIndexSnapshot {
+                                name: prop.clone(),
+                                entries: Vec::new(),
+                            }
+                        });
+                        // Rebuild from full layered graph for durable fidelity.
+                        entry.entries.clear();
+                        let prop_key = grafeo_common::types::PropertyKey::new(&prop);
+                        for node_id in graph.node_ids() {
+                            if let Some(value) = graph.get_node_property(node_id, &prop_key) {
+                                entry.entries.push((value, node_id));
+                            }
+                        }
+                    }
+                    snaps = by_name.into_values().collect();
+                }
+                if !snaps.is_empty() {
+                    sections.push(Box::new(
+                        grafeo_core::index::property::PropertyIndexSection::from_snapshots(snaps),
+                    ));
+                }
+            }
+
+            // TextIndex: BM25 postings from overlay (create_text_index already
+            // scanned graph_store including base).
+            #[cfg(feature = "text-index")]
+            {
+                let indexes = overlay.text_index_entries();
+                if !indexes.is_empty() {
+                    let text = grafeo_core::index::text::TextIndexSection::new(indexes);
+                    sections.push(Box::new(text));
+                }
             }
 
             return sections;
@@ -2829,6 +4092,47 @@ impl GrafeoDB {
         fm: &GrafeoFileManager,
         reason: flush::FlushReason,
     ) -> Result<flush::FlushResult> {
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        let vector_was_on_disk =
+            self.buffer_manager
+                .snapshot_consumer_tiers()
+                .iter()
+                .any(|(name, tier)| {
+                    name == "section:VectorStore"
+                        && *tier == grafeo_common::memory::StorageTier::OnDisk
+                });
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        let vector_force_disk = self
+            .config
+            .section_configs
+            .get(&grafeo_common::storage::SectionType::VectorStore)
+            .is_some_and(|config| config.tier == grafeo_common::storage::TierOverride::ForceDisk);
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        if vector_was_on_disk {
+            self.buffer_manager
+                .reload_consumer_by_name("section:VectorStore")
+                .map_err(|error| {
+                    Error::Internal(format!(
+                        "failed to reload spilled vectors before checkpoint: {error}"
+                    ))
+                })?;
+        }
+
         let sections = self.build_sections();
         let section_refs: Vec<&dyn grafeo_common::storage::Section> =
             sections.iter().map(|s| s.as_ref()).collect();
@@ -2837,14 +4141,31 @@ impl GrafeoDB {
         #[cfg(not(feature = "lpg"))]
         let context = flush::build_context_minimal(&self.transaction_manager);
 
-        flush::flush(
+        let result = flush::flush(
             fm,
             &section_refs,
             &context,
             reason,
             #[cfg(feature = "wal")]
             self.wal.as_deref(),
-        )
+        );
+
+        // Spill sidecars are derived state. Recreate them only after the
+        // authoritative container snapshot has serialized the complete merged
+        // property column. Preserve an existing OnDisk tier, and enforce
+        // ForceDisk for indexes created after database open.
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        if vector_was_on_disk || vector_force_disk {
+            self.buffer_manager
+                .spill_consumer_by_name("section:VectorStore");
+        }
+
+        result
     }
 
     /// Returns the file manager if using single-file format.
@@ -3239,11 +4560,13 @@ mod tests {
         {
             let db = GrafeoDB::open(&db_path).unwrap();
 
-            let alix = db.create_node(&["Person"]);
-            db.set_node_property(alix, "name", Value::from("Alix"));
+            let alix = db.create_node(&["Person"]).unwrap();
+            db.set_node_property(alix, "name", Value::from("Alix"))
+                .unwrap();
 
-            let gus = db.create_node(&["Person"]);
-            db.set_node_property(gus, "name", Value::from("Gus"));
+            let gus = db.create_node(&["Person"]).unwrap();
+            db.set_node_property(gus, "name", Value::from("Gus"))
+                .unwrap();
 
             let _edge = db.create_edge(alix, gus, "KNOWS");
 
@@ -3278,8 +4601,8 @@ mod tests {
         let db = GrafeoDB::open(&db_path).unwrap();
 
         // Create some data
-        let node = db.create_node(&["Test"]);
-        db.delete_node(node);
+        let node = db.create_node(&["Test"]).unwrap();
+        db.delete_node(node).unwrap();
 
         // WAL should have records
         if let Some(wal) = db.wal() {
@@ -3302,8 +4625,9 @@ mod tests {
         // Session 1: Create initial data
         {
             let db = GrafeoDB::open(&db_path).unwrap();
-            let alix = db.create_node(&["Person"]);
-            db.set_node_property(alix, "name", Value::from("Alix"));
+            let alix = db.create_node(&["Person"]).unwrap();
+            db.set_node_property(alix, "name", Value::from("Alix"))
+                .unwrap();
             db.close().unwrap();
         }
 
@@ -3311,8 +4635,9 @@ mod tests {
         {
             let db = GrafeoDB::open(&db_path).unwrap();
             assert_eq!(db.node_count(), 1); // Previous data recovered
-            let gus = db.create_node(&["Person"]);
-            db.set_node_property(gus, "name", Value::from("Gus"));
+            let gus = db.create_node(&["Person"]).unwrap();
+            db.set_node_property(gus, "name", Value::from("Gus"))
+                .unwrap();
             db.close().unwrap();
         }
 
@@ -3344,9 +4669,9 @@ mod tests {
             let db = GrafeoDB::open(&db_path).unwrap();
 
             // Create nodes
-            let a = db.create_node(&["Node"]);
-            let b = db.create_node(&["Node"]);
-            let c = db.create_node(&["Node"]);
+            let a = db.create_node(&["Node"]).unwrap();
+            let b = db.create_node(&["Node"]).unwrap();
+            let c = db.create_node(&["Node"]).unwrap();
 
             // Create edges
             let e1 = db.create_edge(a, b, "LINKS");
@@ -3354,11 +4679,11 @@ mod tests {
 
             // Delete middle node and its edge
             db.delete_edge(e1);
-            db.delete_node(b);
+            db.delete_node(b).unwrap();
 
             // Set properties on remaining nodes
-            db.set_node_property(a, "value", Value::Int64(1));
-            db.set_node_property(c, "value", Value::Int64(3));
+            db.set_node_property(a, "value", Value::Int64(1)).unwrap();
+            db.set_node_property(c, "value", Value::Int64(3)).unwrap();
 
             db.close().unwrap();
         }
@@ -3392,7 +4717,7 @@ mod tests {
         let db_path = dir.path().join("close_test_db");
 
         let db = GrafeoDB::open(&db_path).unwrap();
-        db.create_node(&["Test"]);
+        db.create_node(&["Test"]).unwrap();
 
         // First close should succeed
         assert!(db.close().is_ok());
@@ -3442,8 +4767,8 @@ mod tests {
         let db = GrafeoDB::new_in_memory();
 
         // Perform some operations
-        db.create_node(&["Person"]);
-        db.create_node(&["Person"]);
+        db.create_node(&["Person"]).unwrap();
+        db.create_node(&["Person"]).unwrap();
 
         // Check that metrics snapshot returns data
         let snap = db.metrics();
@@ -3455,8 +4780,8 @@ mod tests {
     fn test_query_result_has_metrics() {
         // Verifies that query results include execution metrics
         let db = GrafeoDB::new_in_memory();
-        db.create_node(&["Person"]);
-        db.create_node(&["Person"]);
+        db.create_node(&["Person"]).unwrap();
+        db.create_node(&["Person"]).unwrap();
 
         #[cfg(feature = "gql")]
         {
@@ -3474,7 +4799,7 @@ mod tests {
     fn test_empty_query_result_metrics() {
         // Verifies metrics are correct for queries returning no results
         let db = GrafeoDB::new_in_memory();
-        db.create_node(&["Person"]);
+        db.create_node(&["Person"]).unwrap();
 
         #[cfg(feature = "gql")]
         {
@@ -3501,12 +4826,12 @@ mod tests {
             let db = cdc_db();
 
             // Create
-            let id = db.create_node(&["Person"]);
+            let id = db.create_node(&["Person"]).unwrap();
             // Update
-            db.set_node_property(id, "name", "Alix".into());
-            db.set_node_property(id, "name", "Gus".into());
+            db.set_node_property(id, "name", "Alix".into()).unwrap();
+            db.set_node_property(id, "name", "Gus".into()).unwrap();
             // Delete
-            db.delete_node(id);
+            db.delete_node(id).unwrap();
 
             let history = db.history(id).unwrap();
             assert_eq!(history.len(), 4); // create + 2 updates + delete
@@ -3522,8 +4847,8 @@ mod tests {
         fn test_edge_lifecycle_history() {
             let db = cdc_db();
 
-            let alix = db.create_node(&["Person"]);
-            let gus = db.create_node(&["Person"]);
+            let alix = db.create_node(&["Person"]).unwrap();
+            let gus = db.create_node(&["Person"]).unwrap();
             let edge = db.create_edge(alix, gus, "KNOWS");
             db.set_edge_property(edge, "since", 2024i64.into());
             db.delete_edge(edge);
@@ -3539,13 +4864,15 @@ mod tests {
         fn test_create_node_with_props_cdc() {
             let db = cdc_db();
 
-            let id = db.create_node_with_props(
-                &["Person"],
-                vec![
-                    ("name", grafeo_common::types::Value::from("Alix")),
-                    ("age", grafeo_common::types::Value::from(30i64)),
-                ],
-            );
+            let id = db
+                .create_node_with_props(
+                    &["Person"],
+                    vec![
+                        ("name", grafeo_common::types::Value::from("Alix")),
+                        ("age", grafeo_common::types::Value::from(30i64)),
+                    ],
+                )
+                .unwrap();
 
             let history = db.history(id).unwrap();
             assert_eq!(history.len(), 1);
@@ -3559,9 +4886,9 @@ mod tests {
         fn test_changes_between() {
             let db = cdc_db();
 
-            let id1 = db.create_node(&["A"]);
-            let _id2 = db.create_node(&["B"]);
-            db.set_node_property(id1, "x", 1i64.into());
+            let id1 = db.create_node(&["A"]).unwrap();
+            let _id2 = db.create_node(&["B"]).unwrap();
+            db.set_node_property(id1, "x", 1i64.into()).unwrap();
 
             // All events should be at the same epoch (in-memory, epoch doesn't advance without tx)
             let changes = db
@@ -3578,8 +4905,8 @@ mod tests {
             let db = GrafeoDB::new_in_memory();
             assert!(!db.is_cdc_enabled());
 
-            let id = db.create_node(&["Person"]);
-            db.set_node_property(id, "name", "Alix".into());
+            let id = db.create_node(&["Person"]).unwrap();
+            db.set_node_property(id, "name", "Alix".into()).unwrap();
 
             let history = db.history(id).unwrap();
             assert!(history.is_empty(), "CDC off by default: no events recorded");
@@ -3631,13 +4958,13 @@ mod tests {
             db.set_cdc_enabled(true);
             assert!(db.is_cdc_enabled());
 
-            let id = db.create_node(&["Person"]);
+            let id = db.create_node(&["Person"]).unwrap();
             let history = db.history(id).unwrap();
             assert_eq!(history.len(), 1, "CDC enabled at runtime records events");
 
             // Disable again
             db.set_cdc_enabled(false);
-            let id2 = db.create_node(&["Person"]);
+            let id2 = db.create_node(&["Person"]).unwrap();
             let history2 = db.history(id2).unwrap();
             assert!(
                 history2.is_empty(),
@@ -3913,7 +5240,7 @@ mod tests {
     #[test]
     fn test_database_gc() {
         let db = GrafeoDB::new_in_memory();
-        db.create_node(&["Person"]);
+        db.create_node(&["Person"]).unwrap();
         db.gc();
         // Verify no panic, node still accessible
         assert_eq!(db.node_count(), 1);
@@ -4025,7 +5352,7 @@ mod tests {
     #[test]
     fn test_graph_store_returns_lpg_by_default() {
         let db = GrafeoDB::new_in_memory();
-        db.create_node(&["Person"]);
+        db.create_node(&["Person"]).unwrap();
         let store = db.graph_store();
         assert_eq!(store.node_count(), 1);
     }
@@ -4080,7 +5407,7 @@ mod tests {
     #[allow(deprecated)]
     fn test_session_read_only() {
         let db = GrafeoDB::new_in_memory();
-        db.create_node(&["Person"]);
+        db.create_node(&["Person"]).unwrap();
 
         let session = db.session_read_only();
         // Read queries should work
@@ -4098,7 +5425,7 @@ mod tests {
     #[test]
     fn test_close_in_memory_database() {
         let db = GrafeoDB::new_in_memory();
-        db.create_node(&["Person"]);
+        db.create_node(&["Person"]).unwrap();
         assert!(db.close().is_ok());
         // Second close should also be fine (idempotent)
         assert!(db.close().is_ok());

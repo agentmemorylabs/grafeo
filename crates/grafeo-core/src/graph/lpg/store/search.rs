@@ -187,7 +187,13 @@ impl LpgStore {
         let key = PropertyKey::new(property);
         let hv = HashableValue::new(value.clone());
 
-        // Try indexed lookup first
+        // RO mapped PropertyIndex section (G-E1.RO): binary search over
+        // file-backed postings — no proportional anonymous DashMap.
+        if let Some(mapped) = self.mapped_property_indexes.read().get(&key) {
+            return mapped.lookup(value);
+        }
+
+        // Try heap indexed lookup first
         let indexes = self.property_indexes.read();
         if let Some(index) = indexes.get(&key) {
             if let Some(nodes) = index.get(&hv) {

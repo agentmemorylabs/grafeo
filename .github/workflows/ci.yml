@@ -394,6 +394,14 @@ jobs:
           - profile: ai
             features: "--features vector-index,text-index,hybrid-search"
             engine_features: "--features vector-index,text-index,hybrid-search,cdc"
+          # Generation constructor cfg guard: generation + compact-store without
+          # mmap must compile. Keep an engine-only command because selecting the
+          # facade's `lpg` feature would transitively enable storage/mmap and
+          # mask this negative feature-matrix regression (H-ADOPT.2 M-2).
+          - profile: generation-no-mmap
+            features: "--features lpg,compact-store"
+            engine_features: "--features lpg,generation,compact-store"
+            engine_only_features: "--features lpg,generation,compact-store"
           # Edge persona: Frontend/Edge Developer (minimal WASM-friendly)
           - profile: edge
             features: "--features lpg,gql,regex-lite"
@@ -439,6 +447,17 @@ jobs:
           -p grafeo-core
           -p grafeo-adapters
           --no-default-features ${{ matrix.features }}
+        env:
+          RUSTC_WRAPPER: sccache
+
+      # Engine-only negative feature guard. Do not include the facade here:
+      # its `lpg` feature enables storage/mmap and would mask this cfg check.
+      - name: Check engine-only features (${{ matrix.profile }})
+        if: ${{ matrix.engine_only_features != '' }}
+        run: >
+          cargo check
+          -p grafeo-engine
+          --no-default-features ${{ matrix.engine_only_features }}
         env:
           RUSTC_WRAPPER: sccache
 

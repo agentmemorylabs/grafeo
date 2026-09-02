@@ -1,6 +1,10 @@
 //! Node and edge CRUD operations for GrafeoDB.
 
+#[cfg(any(feature = "wal", feature = "vector-index"))]
 use grafeo_common::grafeo_warn;
+use grafeo_common::utils::error::Result;
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+use grafeo_core::graph::GraphStore;
 #[cfg(feature = "wal")]
 use grafeo_storage::wal::WalRecord;
 
@@ -21,17 +25,20 @@ impl super::GrafeoDB {
     /// let alix = db.create_node(&["Person"]);
     /// let company = db.create_node(&["Company", "Startup"]);
     /// ```
-    pub fn create_node(&self, labels: &[&str]) -> grafeo_common::types::NodeId {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL log (when enabled) fails to record the
+    /// creation.
+    pub fn create_node(&self, labels: &[&str]) -> Result<grafeo_common::types::NodeId> {
         let id = self.lpg_store().create_node(labels);
 
         // Log to WAL if enabled
         #[cfg(feature = "wal")]
-        if let Err(e) = self.log_wal(&WalRecord::CreateNode {
+        self.log_wal(&WalRecord::CreateNode {
             id,
             labels: labels.iter().map(|s| (*s).to_string()).collect(),
-        }) {
-            grafeo_warn!("Failed to log CreateNode to WAL: {}", e);
-        }
+        })?;
 
         #[cfg(feature = "cdc")]
         if self.cdc_active() {
@@ -43,12 +50,17 @@ impl super::GrafeoDB {
             );
         }
 
-        id
+        Ok(id)
     }
 
     /// Creates a new node with labels and properties.
     ///
     /// If WAL is enabled, the operation is logged for durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL log (when enabled) fails to record the
+    /// creation.
     pub fn create_node_with_props(
         &self,
         labels: &[&str],
@@ -58,7 +70,7 @@ impl super::GrafeoDB {
                 impl Into<grafeo_common::types::Value>,
             ),
         >,
-    ) -> grafeo_common::types::NodeId {
+    ) -> Result<grafeo_common::types::NodeId> {
         // Collect properties first so we can log them to WAL
         let props: Vec<(
             grafeo_common::types::PropertyKey,
@@ -90,22 +102,18 @@ impl super::GrafeoDB {
         // Log node creation to WAL
         #[cfg(feature = "wal")]
         {
-            if let Err(e) = self.log_wal(&WalRecord::CreateNode {
+            self.log_wal(&WalRecord::CreateNode {
                 id,
                 labels: labels.iter().map(|s| (*s).to_string()).collect(),
-            }) {
-                grafeo_warn!("Failed to log CreateNode to WAL: {}", e);
-            }
+            })?;
 
             // Log each property to WAL for full durability
             for (key, value) in props {
-                if let Err(e) = self.log_wal(&WalRecord::SetNodeProperty {
+                self.log_wal(&WalRecord::SetNodeProperty {
                     id,
                     key: key.to_string(),
                     value,
-                }) {
-                    grafeo_warn!("Failed to log SetNodeProperty to WAL: {}", e);
-                }
+                })?;
             }
         }
 
@@ -139,15 +147,28 @@ impl super::GrafeoDB {
             }
         }
 
-        id
+        Ok(id)
     }
 
     /// Gets a node by ID.
+    ///
+    /// Serves the complete visible graph. When a layered store (compact base
+    /// + overlay) is installed, the merged view is consulted so
+    /// base-published nodes remain visible after compact → close → reopen
+    /// and after generation-root reopen (G-GEM0.SRV1 Gap B: the overlay-only
+    /// path silently returned `None` for every base node, which made
+    /// property-sampling health probes report `dims=None` on published
+    /// generation roots). Falls back to the overlay LpgStore when no compact
+    /// base exists (plain in-memory / non-compacted databases).
     #[must_use]
     pub fn get_node(
         &self,
         id: grafeo_common::types::NodeId,
     ) -> Option<grafeo_core::graph::lpg::Node> {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.get_node(id);
+        }
         self.lpg_store().get_node(id)
     }
 
@@ -253,16 +274,15 @@ impl super::GrafeoDB {
         self.lpg_store().node_property_history(id)
     }
 
-    /// Returns the current epoch of the database.
-    #[must_use]
-    pub fn current_epoch(&self) -> grafeo_common::types::EpochId {
-        self.lpg_store().current_epoch()
-    }
-
     /// Deletes a node and all its edges.
     ///
     /// If WAL is enabled, the operation is logged for durability.
-    pub fn delete_node(&self, id: grafeo_common::types::NodeId) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL log (when enabled) fails to record the
+    /// deletion.
+    pub fn delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {
         // Capture properties for CDC before deletion
         #[cfg(feature = "cdc")]
         let cdc_props = if self.cdc_active() {
@@ -318,7 +338,18 @@ impl super::GrafeoDB {
             })
             .unwrap_or_default();
 
-        let result = self.lpg_store().delete_node(id);
+        let exists = self.lpg_store().get_node(id).is_some();
+
+        #[cfg(feature = "wal")]
+        if exists {
+            self.log_wal(&WalRecord::DeleteNode { id })?;
+        }
+
+        let result = if exists {
+            self.lpg_store().delete_node(id)
+        } else {
+            false
+        };
 
         // Remove from vector indexes after successful deletion
         #[cfg(feature = "vector-index")]
@@ -336,11 +367,6 @@ impl super::GrafeoDB {
             }
         }
 
-        #[cfg(feature = "wal")]
-        if result && let Err(e) = self.log_wal(&WalRecord::DeleteNode { id }) {
-            grafeo_warn!("Failed to log DeleteNode to WAL: {}", e);
-        }
-
         #[cfg(feature = "cdc")]
         if result && self.cdc_active() {
             self.cdc_log.record_delete(
@@ -350,18 +376,23 @@ impl super::GrafeoDB {
             );
         }
 
-        result
+        Ok(result)
     }
 
     /// Sets a property on a node.
     ///
     /// If WAL is enabled, the operation is logged for durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL log (when enabled) fails to record the
+    /// property write.
     pub fn set_node_property(
         &self,
         id: grafeo_common::types::NodeId,
         key: &str,
         value: grafeo_common::types::Value,
-    ) {
+    ) -> Result<()> {
         // Extract vector data before the value is moved into the store
         #[cfg(feature = "vector-index")]
         let vector_data = match &value {
@@ -371,13 +402,11 @@ impl super::GrafeoDB {
 
         // Log to WAL first
         #[cfg(feature = "wal")]
-        if let Err(e) = self.log_wal(&WalRecord::SetNodeProperty {
+        self.log_wal(&WalRecord::SetNodeProperty {
             id,
             key: key.to_string(),
             value: value.clone(),
-        }) {
-            grafeo_warn!("Failed to log SetNodeProperty to WAL: {}", e);
-        }
+        })?;
 
         // Capture old value for CDC before the store write
         #[cfg(feature = "cdc")]
@@ -446,6 +475,8 @@ impl super::GrafeoDB {
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Adds a label to an existing node.
@@ -735,6 +766,80 @@ impl super::GrafeoDB {
         }
 
         id
+    }
+
+    /// Appends property-less edges to a fresh offline graph without WAL or
+    /// CDC records. The underlying LPG store allocates IDs and updates both
+    /// adjacency directions under one lock per chunk.
+    ///
+    /// This is an offline-loader primitive. Callers must checkpoint the fully
+    /// built unpublished database before exposing it to readers.
+    pub fn bulk_load_edges_unindexed(
+        &self,
+        edges: &[(
+            grafeo_common::types::NodeId,
+            grafeo_common::types::NodeId,
+            &str,
+        )],
+    ) -> Vec<grafeo_common::types::EdgeId> {
+        self.lpg_store().batch_create_edges(edges)
+    }
+
+    /// Appends property-carrying edges to a fresh offline graph without WAL,
+    /// CDC, or per-edge index maintenance. Each tuple is
+    /// `(src, dst, edge_type, properties)`.
+    ///
+    /// This is the edge counterpart of
+    /// [`bulk_load_nodes_with_props_unindexed`](Self::bulk_load_nodes_with_props_unindexed):
+    /// it bypasses WAL/CDC entirely and is fail-closed once any secondary
+    /// index exists. Callers must checkpoint the fully built unpublished
+    /// database before exposing it to readers.
+    ///
+    /// Available only without `temporal` and without `tiered-storage`,
+    /// matching the underlying
+    /// `LpgStore::bulk_create_edges_with_props_unindexed` primitive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any property, vector, or text index already exists.
+    #[cfg(not(feature = "temporal"))]
+    pub fn bulk_load_edges_with_props_unindexed(
+        &self,
+        edges: &[(
+            grafeo_common::types::NodeId,
+            grafeo_common::types::NodeId,
+            &str,
+            std::collections::HashMap<
+                grafeo_common::types::PropertyKey,
+                grafeo_common::types::Value,
+            >,
+        )],
+    ) -> grafeo_common::utils::error::Result<Vec<grafeo_common::types::EdgeId>> {
+        use grafeo_common::utils::hash::FxHashMap;
+
+        let rows: Vec<(
+            grafeo_common::types::NodeId,
+            grafeo_common::types::NodeId,
+            &str,
+            FxHashMap<grafeo_common::types::PropertyKey, grafeo_common::types::Value>,
+        )> = edges
+            .iter()
+            .map(|&(src, dst, edge_type, ref properties)| {
+                (
+                    src,
+                    dst,
+                    edge_type,
+                    properties
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        self.lpg_store()
+            .bulk_create_edges_with_props_unindexed(&rows)
+            .map_err(|message| grafeo_common::utils::error::Error::Internal(message.to_owned()))
     }
 
     /// Gets an edge by ID.
@@ -1126,5 +1231,38 @@ impl super::GrafeoDB {
         }
 
         ids
+    }
+
+    /// Offline bulk loader for a fresh, unpublished graph.
+    ///
+    /// Unlike [`Self::batch_create_nodes_with_props`], this bypasses per-row
+    /// WAL/CDC/index work and holds the node and property-store locks once per
+    /// chunk.  It is rejected once any secondary index exists; create indexes
+    /// only after all rows have been loaded.
+    ///
+    /// Available only without `temporal`, matching the underlying
+    /// `LpgStore::bulk_create_nodes_with_props_unindexed` primitive (which is
+    /// also gated off under grafeo-core's `tiered-storage`, unreachable from
+    /// this crate).
+    #[cfg(not(feature = "temporal"))]
+    pub fn bulk_load_nodes_with_props_unindexed(
+        &self,
+        label: &str,
+        properties_list: Vec<
+            std::collections::HashMap<
+                grafeo_common::types::PropertyKey,
+                grafeo_common::types::Value,
+            >,
+        >,
+    ) -> Result<Vec<grafeo_common::types::NodeId>> {
+        use grafeo_common::utils::hash::FxHashMap;
+
+        let rows = properties_list
+            .into_iter()
+            .map(|properties| properties.into_iter().collect::<FxHashMap<_, _>>())
+            .collect();
+        self.lpg_store()
+            .bulk_create_nodes_with_props_unindexed(label, rows)
+            .map_err(|message| grafeo_common::utils::error::Error::Internal(message.to_owned()))
     }
 }

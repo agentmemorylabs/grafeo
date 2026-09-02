@@ -14,20 +14,38 @@ pub mod csr;
 /// Container section serialization for the layered overlay deletion log.
 #[cfg(feature = "lpg")]
 pub mod deletions_section;
+/// Source-true CompactStore generation on bounded runs (G-EM0.W0-A2).
+pub mod generation;
+/// Streaming bounded generation builder (G-EM0.5b Phase 2).
+#[cfg(feature = "generation-streaming")]
+pub mod generation_builder;
 mod graph_store_impl;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
 /// Two-layer store: columnar base + mutable LPG overlay.
 #[cfg(feature = "lpg")]
 pub mod layered;
+/// Builder-scoped tier chain view (G-MIDFLUSH.1).
+#[cfg(feature = "lpg")]
+pub mod tier_chain;
+/// Mapped CompactStore v5 views and accounting (G-EM0.2).
+pub mod mapped;
 /// Per-label node tables with columnar property storage.
 pub mod node_table;
+/// Overlay retained-capacity accounting, admission, and backpressure (G-EM0.5a).
+#[cfg(feature = "lpg")]
+pub mod overlay_budget;
+/// Retained-capacity cost estimation for overlay mutations (G-EM0.5a).
+#[cfg(feature = "lpg")]
+pub mod overlay_cost;
 /// Per-type relationship tables backed by forward/backward CSR.
 pub mod rel_table;
 /// Schema definitions for node tables and edge schemas.
 pub mod schema;
 /// Container section serialization for CompactStore.
 pub mod section;
+/// CompactStore payload version 5 codec.
+pub(crate) mod section_v5;
 #[cfg(test)]
 mod tests;
 /// Zone maps for skip-pruning predicate evaluation.
@@ -38,6 +56,7 @@ pub use builder::{CompactStoreBuilder, from_graph_store, from_graph_store_preser
 use std::sync::Arc;
 
 use arcstr::ArcStr;
+use bytes::Bytes;
 use grafeo_common::types::{EdgeId, NodeId};
 use grafeo_common::utils::hash::FxHashMap;
 
@@ -45,6 +64,24 @@ use self::node_table::NodeTable;
 use self::rel_table::RelTable;
 use crate::graph::Direction;
 use crate::statistics::Statistics;
+
+/// Proportional anonymous heap retained by a column codec.
+fn codec_proportional_heap(codec: &column::ColumnCodec, mapped_open: bool) -> usize {
+    match codec {
+        column::ColumnCodec::Dict(d) => {
+            // Codes: charge only inline (heap) codes.
+            let codes = if d.as_codes_slice().is_some() {
+                d.code_count() * 4
+            } else {
+                0
+            };
+            d.dictionary_heap_bytes().saturating_add(codes)
+        }
+        // On a mapped open, non-dict bodies are Bytes slices into the mapping.
+        _ if mapped_open => 0,
+        other => other.heap_bytes(),
+    }
+}
 
 /// A read-only columnar graph store.
 ///
@@ -82,6 +119,55 @@ pub struct CompactStore {
     node_offset_to_id: Option<Vec<Vec<NodeId>>>,
     /// Reverse: rel_table_id index -> vec of original `EdgeId` per CSR position.
     edge_offset_to_id: Option<Vec<Vec<EdgeId>>>,
+    /// Full container mapping retained for a direct mapped read-only reopen.
+    ///
+    /// This is an owner handle only: it does not copy the mapped payload and
+    /// is intentionally excluded from [`Self::memory_bytes`]. The mapped
+    /// graph-view work in G-EM0.2 replaces the remaining proportional decoded
+    /// structures; retaining this handle guarantees no codec-free snapshot can
+    /// accidentally unmap while readers still hold the CompactStore.
+    mapped_backing: Option<Bytes>,
+    /// Mapped sorted NodeId lookup (v5). Mutually exclusive with `node_id_map`.
+    mapped_node_id_lookup: Option<mapped::MappedNodeIdLookup>,
+    /// Mapped sorted EdgeId lookup (v5).
+    mapped_edge_id_lookup: Option<mapped::MappedEdgeIdLookup>,
+    /// Mapped reverse original node IDs (concatenated per table).
+    mapped_node_original_ids: Option<Bytes>,
+    /// Per-table base index into `mapped_node_original_ids`.
+    mapped_node_original_bases: Option<Vec<usize>>,
+    /// Mapped reverse original edge IDs (concatenated per rel table).
+    mapped_edge_original_ids: Option<Bytes>,
+    /// Per-rel-table base index into `mapped_edge_original_ids`.
+    mapped_edge_original_bases: Option<Vec<usize>>,
+    /// Split memory accounting for Milestone R evidence.
+    memory_accounting: Option<mapped::CompactMemoryAccounting>,
+
+    // ── G-EM0.5b D0.8.0 source-true companions ──────────────────────
+    /// Node logical-label membership (segment kind 21). `None` applies the
+    /// old-v5 default (each node belongs to exactly its physical table's
+    /// label).
+    label_membership: Option<mapped::LabelMembershipView>,
+    /// Per-column row-presence bitmap (segment kind 22). `None` applies the
+    /// old-v5 default (every encoded row present).
+    column_presence: Option<mapped::RowBitmapView>,
+    /// Per-column row-null bitmap (segment kind 23). `None` applies the
+    /// old-v5 default (every present row non-null).
+    column_null: Option<mapped::RowBitmapView>,
+    /// Retained bytes backing the presence/null/membership views.
+    companion_bytes: Option<bytes::Bytes>,
+    /// Presence segment body bytes (offsets in `column_presence` are relative
+    /// to this slice, not the whole payload).
+    presence_body: Option<bytes::Bytes>,
+    /// Null segment body bytes (offsets in `column_null` are relative to this
+    /// slice, not the whole payload).
+    null_body: Option<bytes::Bytes>,
+    /// Maps `(table_id, property_key)` to the flat column index used by the
+    /// presence/null bitmaps. Populated from the ColumnDirectory during
+    /// deserialization.
+    column_index_map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32>,
+    /// Global string dictionary (code→string) retained for membership resolution.
+    /// Present when the store was deserialized from v5 with a membership segment.
+    global_dict: Option<mapped::MappedStringDictionary>,
 }
 
 impl std::fmt::Debug for CompactStore {
@@ -149,7 +235,39 @@ impl CompactStore {
             edge_id_map: None,
             node_offset_to_id: None,
             edge_offset_to_id: None,
+            mapped_backing: None,
+            mapped_node_id_lookup: None,
+            mapped_edge_id_lookup: None,
+            mapped_node_original_ids: None,
+            mapped_node_original_bases: None,
+            mapped_edge_original_ids: None,
+            mapped_edge_original_bases: None,
+            memory_accounting: None,
+            label_membership: None,
+            column_presence: None,
+            column_null: None,
+            companion_bytes: None,
+            presence_body: None,
+            null_body: None,
+            column_index_map: FxHashMap::default(),
+            global_dict: None,
         }
+    }
+
+    /// Retains the owner for a verified direct container mapping.
+    ///
+    /// The mapping is released when this `CompactStore` and every clone of the
+    /// owner `Bytes` have been dropped. Callers must only pass bytes produced
+    /// from a successfully validated immutable container section.
+    pub fn retain_mapped_backing(&mut self, mapped_bytes: Bytes) {
+        self.mapped_backing = Some(mapped_bytes);
+    }
+
+    /// Returns the direct-container mapping length when this store was opened
+    /// from one, excluding it from anonymous heap accounting.
+    #[must_use]
+    pub fn mapped_backing_bytes(&self) -> Option<usize> {
+        self.mapped_backing.as_ref().map(Bytes::len)
     }
 
     /// Resolves a table_id to its [`NodeTable`].
@@ -251,6 +369,24 @@ impl CompactStore {
         results
     }
 
+    /// Returns the total logical node count across all node tables.
+    #[must_use]
+    pub fn total_nodes(&self) -> u64 {
+        self.node_tables_by_id
+            .iter()
+            .map(NodeTable::len)
+            .sum::<usize>() as u64
+    }
+
+    /// Returns the total logical edge count across all rel tables.
+    #[must_use]
+    pub fn total_edges(&self) -> u64 {
+        self.rel_tables_by_id
+            .iter()
+            .map(RelTable::num_edges)
+            .sum::<usize>() as u64
+    }
+
     /// Returns a rough estimate of heap memory used by the snapshot data
     /// (node columns + CSR structures + edge property columns), in bytes.
     ///
@@ -278,7 +414,37 @@ impl CompactStore {
     /// [`from_graph_store_preserving_ids`]).
     #[must_use]
     pub fn preserves_ids(&self) -> bool {
-        self.node_id_map.is_some()
+        self.node_id_map.is_some() || self.mapped_node_id_lookup.is_some()
+    }
+
+    /// The largest preserved original node ID in this store, if any.
+    ///
+    /// Heap-map form (in-memory build via [`from_graph_store_preserving_ids`])
+    /// scans the map keys; the mapped v5 form is sorted ascending by ID
+    /// (validated at load), so the last record is the maximum in O(1).
+    /// Returns `None` when the store preserves no node IDs.
+    ///
+    /// Used to seed overlay ID allocators above the base maxima before the
+    /// first overlay write (H-ADOPT.2 review M-1).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn max_preserved_node_id(&self) -> Option<u64> {
+        if let Some(ref map) = self.node_id_map {
+            return map.keys().map(|id| id.as_u64()).max();
+        }
+        self.mapped_node_id_lookup.as_ref()?.max_id()
+    }
+
+    /// The largest preserved original edge ID in this store, if any.
+    ///
+    /// Same semantics as [`max_preserved_node_id`](Self::max_preserved_node_id).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn max_preserved_edge_id(&self) -> Option<u64> {
+        if let Some(ref map) = self.edge_id_map {
+            return map.keys().map(|id| id.as_u64()).max();
+        }
+        self.mapped_edge_id_lookup.as_ref()?.max_id()
     }
 
     /// Attaches ID maps to an already-built `CompactStore`.
@@ -303,6 +469,8 @@ impl CompactStore {
     pub(crate) fn resolve_node(&self, id: NodeId) -> Option<(u16, u64)> {
         if let Some(ref map) = self.node_id_map {
             map.get(&id).copied()
+        } else if let Some(ref lookup) = self.mapped_node_id_lookup {
+            lookup.lookup(id)
         } else {
             Some(id::decode_node_id(id))
         }
@@ -313,6 +481,8 @@ impl CompactStore {
     pub(crate) fn resolve_edge(&self, id: EdgeId) -> Option<(u16, u64)> {
         if let Some(ref map) = self.edge_id_map {
             map.get(&id).copied()
+        } else if let Some(ref lookup) = self.mapped_edge_id_lookup {
+            lookup.lookup(id)
         } else {
             Some(id::decode_edge_id(id))
         }
@@ -329,6 +499,29 @@ impl CompactStore {
                 .and_then(|v| v.get(usize::try_from(offset).ok()?))
                 .copied()
                 .unwrap_or(compact_id)
+        } else if let (Some(bytes), Some(bases)) = (
+            &self.mapped_node_original_ids,
+            &self.mapped_node_original_bases,
+        ) {
+            let (table_id, offset) = id::decode_node_id(compact_id);
+            let base = *bases.get(table_id as usize).unwrap_or(&0);
+            let idx = base.saturating_add(usize::try_from(offset).unwrap_or(0));
+            let start = idx.saturating_mul(8);
+            if start + 8 <= bytes.len() {
+                let raw = u64::from_le_bytes([
+                    bytes[start],
+                    bytes[start + 1],
+                    bytes[start + 2],
+                    bytes[start + 3],
+                    bytes[start + 4],
+                    bytes[start + 5],
+                    bytes[start + 6],
+                    bytes[start + 7],
+                ]);
+                NodeId::new(raw)
+            } else {
+                compact_id
+            }
         } else {
             compact_id
         }
@@ -344,9 +537,276 @@ impl CompactStore {
                 .and_then(|v| v.get(usize::try_from(csr_pos).ok()?))
                 .copied()
                 .unwrap_or(compact_id)
+        } else if let (Some(bytes), Some(bases)) = (
+            &self.mapped_edge_original_ids,
+            &self.mapped_edge_original_bases,
+        ) {
+            let (rel_table_id, csr_pos) = id::decode_edge_id(compact_id);
+            let base = *bases.get(rel_table_id as usize).unwrap_or(&0);
+            let idx = base.saturating_add(usize::try_from(csr_pos).unwrap_or(0));
+            let start = idx.saturating_mul(8);
+            if start + 8 <= bytes.len() {
+                let raw = u64::from_le_bytes([
+                    bytes[start],
+                    bytes[start + 1],
+                    bytes[start + 2],
+                    bytes[start + 3],
+                    bytes[start + 4],
+                    bytes[start + 5],
+                    bytes[start + 6],
+                    bytes[start + 7],
+                ]);
+                EdgeId::new(raw)
+            } else {
+                compact_id
+            }
         } else {
             compact_id
         }
+    }
+
+    /// Installs mapped ID indexes from a v5 payload (G-EM0.2).
+    pub(crate) fn set_mapped_id_indexes(
+        &mut self,
+        node_lookup: mapped::MappedNodeIdLookup,
+        edge_lookup: mapped::MappedEdgeIdLookup,
+        node_orig: Bytes,
+        edge_orig: Bytes,
+        meta_node_counts: &[usize],
+        meta_edge_counts: &[usize],
+    ) {
+        let mut node_bases = Vec::with_capacity(meta_node_counts.len());
+        let mut cursor = 0usize;
+        for &c in meta_node_counts {
+            node_bases.push(cursor);
+            cursor = cursor.saturating_add(c);
+        }
+        let mut edge_bases = Vec::with_capacity(meta_edge_counts.len());
+        cursor = 0;
+        for &c in meta_edge_counts {
+            edge_bases.push(cursor);
+            cursor = cursor.saturating_add(c);
+        }
+        self.mapped_node_id_lookup = Some(node_lookup);
+        self.mapped_edge_id_lookup = Some(edge_lookup);
+        self.mapped_node_original_ids = Some(node_orig);
+        self.mapped_node_original_bases = Some(node_bases);
+        self.mapped_edge_original_ids = Some(edge_orig);
+        self.mapped_edge_original_bases = Some(edge_bases);
+        // Clear heap maps so accounting sees zero proportional anonymous.
+        self.node_id_map = None;
+        self.edge_id_map = None;
+        self.node_offset_to_id = None;
+        self.edge_offset_to_id = None;
+    }
+
+    /// Records split memory accounting for this store.
+    pub(crate) fn set_memory_accounting(&mut self, accounting: mapped::CompactMemoryAccounting) {
+        self.memory_accounting = Some(accounting);
+    }
+
+    /// Installs the G-EM0.5b D0.8.0 source-true companion views from a v5
+    /// payload (label membership + column presence/null).
+    ///
+    /// `presence_body` and `null_body` are the raw segment bodies the bitmap
+    /// offsets are relative to (the whole-payload `backing` is retained only
+    /// to keep the membership view's bytes alive).
+    pub(crate) fn set_source_true_companions(
+        &mut self,
+        membership: Option<mapped::LabelMembershipView>,
+        presence: Option<mapped::RowBitmapView>,
+        null: Option<mapped::RowBitmapView>,
+        backing: bytes::Bytes,
+        presence_body: Option<bytes::Bytes>,
+        null_body: Option<bytes::Bytes>,
+        global_dict: Option<mapped::MappedStringDictionary>,
+    ) {
+        self.label_membership = membership;
+        self.column_presence = presence;
+        self.column_null = null;
+        self.companion_bytes = Some(backing);
+        self.presence_body = presence_body;
+        self.null_body = null_body;
+        self.global_dict = global_dict;
+    }
+
+    /// Sets the column index map used to look up presence/null bitmaps.
+    pub(crate) fn set_column_index_map(
+        &mut self,
+        map: FxHashMap<(u16, grafeo_common::types::PropertyKey), u32>,
+    ) {
+        self.column_index_map = map;
+    }
+
+    /// Returns the full logical label set for a node, consulting the membership
+    /// view when present. Falls back to the physical table label when no
+    /// membership segment exists or the node has no extra labels.
+    #[must_use]
+    pub(crate) fn logical_labels_for_node(&self, table_id: u16, offset: u32) -> Vec<ArcStr> {
+        let physical_label = self
+            .table_id_to_label
+            .get(table_id as usize)
+            .cloned()
+            .unwrap_or_default();
+
+        let Some(membership) = &self.label_membership else {
+            return vec![physical_label];
+        };
+
+        let Some(dict) = &self.global_dict else {
+            return vec![physical_label];
+        };
+
+        let label_codes = membership.labels_of(table_id, offset);
+        if label_codes.is_empty() {
+            return vec![physical_label];
+        }
+
+        label_codes
+            .iter()
+            .filter_map(|&code| dict.get(code).map(ArcStr::from))
+            .collect()
+    }
+
+    /// Returns `None` if the property is absent (presence bit = 0). Returns
+    /// `Some(Value::Null)` when the row is present-null (null bit = 1).
+    /// Otherwise returns the typed body value.
+    #[must_use]
+    pub(crate) fn get_property_filtered(
+        &self,
+        table_id: u16,
+        row: u32,
+        key: &grafeo_common::types::PropertyKey,
+        raw_value: Option<grafeo_common::types::Value>,
+    ) -> Option<grafeo_common::types::Value> {
+        let Some(col_idx) = self.column_index_map.get(&(table_id, key.clone())) else {
+            return raw_value;
+        };
+        // Presence: default true when no companion installed.
+        let present = match (&self.column_presence, &self.presence_body) {
+            (Some(view), Some(body)) => view.get(body, *col_idx, row).unwrap_or(true),
+            _ => true,
+        };
+        if !present {
+            return None;
+        }
+        // Null: default false when no companion installed.
+        let is_null = match (&self.column_null, &self.null_body) {
+            (Some(view), Some(body)) => view.get(body, *col_idx, row).unwrap_or(false),
+            _ => false,
+        };
+        if is_null {
+            return Some(grafeo_common::types::Value::Null);
+        }
+        raw_value
+    }
+
+    /// Returns the full logical label codes for one physical node row.
+    ///
+    /// When no membership companion exists, the old-v5 default applies: the
+    /// node belongs to exactly its physical table's label (whose code the
+    /// caller supplies).
+    #[must_use]
+    pub(crate) fn logical_label_codes_of(
+        &self,
+        node_table_id: u16,
+        node_offset: u32,
+        physical_label_code: u32,
+    ) -> Vec<u32> {
+        match &self.label_membership {
+            Some(view) => {
+                let mut codes = view.labels_of(node_table_id, node_offset);
+                if codes.is_empty() {
+                    codes.push(physical_label_code);
+                }
+                codes
+            }
+            None => vec![physical_label_code],
+        }
+    }
+
+    /// Returns `true` when a membership companion is installed (multi-label
+    /// payload).
+    #[must_use]
+    pub(crate) fn has_label_membership(&self) -> bool {
+        self.label_membership
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Borrows the installed label-membership view, if any.
+    #[must_use]
+    pub(crate) fn label_membership_view(&self) -> Option<&mapped::LabelMembershipView> {
+        self.label_membership.as_ref()
+    }
+
+    /// Borrows the presence bitmap bytes, if any.
+    #[must_use]
+    pub(crate) fn companion_bytes(&self) -> Option<&bytes::Bytes> {
+        self.companion_bytes.as_ref()
+    }
+
+    /// Three-way per-`(column, row)` property state (D0.8.0 item 4).
+    ///
+    /// Returns `None` for absent, `Some(None)` for a present null, and
+    /// `Some(Some(body_value_present))` marker for a present typed value.
+    /// The caller combines this with the typed body read.
+    #[must_use]
+    pub(crate) fn property_state(
+        &self,
+        bytes: &bytes::Bytes,
+        column_index: u32,
+        row: u32,
+    ) -> (bool, bool) {
+        let present = match &self.column_presence {
+            Some(view) => view.get(bytes, column_index, row).unwrap_or(true),
+            None => true,
+        };
+        let is_null = match &self.column_null {
+            Some(view) => view.get(bytes, column_index, row).unwrap_or(false),
+            None => false,
+        };
+        (present, is_null)
+    }
+
+    /// Returns split memory accounting when recorded (mapped v5 open).
+    #[must_use]
+    pub fn memory_accounting(&self) -> Option<&mapped::CompactMemoryAccounting> {
+        self.memory_accounting.as_ref()
+    }
+
+    /// Anonymous bytes from proportional structures (CSR heap, dict Arc, ID maps).
+    ///
+    /// Mapped-backed structures contribute zero. A successful v5 mapped open
+    /// must report zero.
+    #[must_use]
+    pub fn proportional_anonymous_bytes(&self) -> usize {
+        // Heap ID maps always count when present.
+        let mut total = self.id_map_memory_bytes();
+
+        // When opened from a retained container mapping, column codec bodies
+        // and CSR arrays are views into that mapping. Charge only residual
+        // heap dictionary Arc tables and inline CSR variants.
+        let mapped_open = self.mapped_backing.is_some();
+        for nt in &self.node_tables_by_id {
+            for codec in nt.columns().values() {
+                total = total.saturating_add(codec_proportional_heap(codec, mapped_open));
+            }
+        }
+        for rt in &self.rel_tables_by_id {
+            if !rt.fwd().is_mapped() {
+                total = total.saturating_add(rt.fwd().memory_bytes());
+            }
+            if let Some(bwd) = rt.bwd()
+                && !bwd.is_mapped()
+            {
+                total = total.saturating_add(bwd.memory_bytes());
+            }
+            for codec in rt.properties().values() {
+                total = total.saturating_add(codec_proportional_heap(codec, mapped_open));
+            }
+        }
+        total
     }
 
     /// Approximate heap cost of the ID maps.

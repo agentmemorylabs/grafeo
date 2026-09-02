@@ -21,7 +21,7 @@
 
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
-use crate::graph::lpg::{Edge, Node};
+use crate::graph::lpg::{BatchEdgeCreate, BatchNodeCreate, Edge, Node};
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
@@ -525,6 +525,34 @@ pub trait GraphStoreMut: GraphStoreSearch {
 
     /// Creates multiple edges in batch (single lock acquisition).
     fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId>;
+
+    /// Creates many nodes in one storage-level batch under a transaction
+    /// context, returning the new IDs in input order.
+    ///
+    /// Mirrors [`LpgStore::create_nodes_batch_versioned`](crate::graph::lpg::LpgStore::create_nodes_batch_versioned):
+    /// one ID-range allocation and one lock acquisition per structure for the
+    /// whole batch. Layered stores must run every batch row through the same
+    /// dirty/post-freeze/admission bookkeeping as the row path.
+    fn create_nodes_batch_versioned(
+        &self,
+        nodes: &[BatchNodeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId>;
+
+    /// Creates many edges in one storage-level batch under a transaction
+    /// context, returning the new IDs in input order.
+    ///
+    /// Mirrors [`LpgStore::create_edges_batch_versioned`](crate::graph::lpg::LpgStore::create_edges_batch_versioned).
+    /// Layered stores must promote base-resident endpoints and run every batch
+    /// row through the same dirty/post-freeze/admission bookkeeping as the row
+    /// path.
+    fn create_edges_batch_versioned(
+        &self,
+        edges: &[BatchEdgeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<EdgeId>;
 
     // --- Deletion ---
 
@@ -1175,6 +1203,40 @@ mod tests {
             edges
                 .iter()
                 .map(|(s, d, t)| self.create_edge(*s, *d, t))
+                .collect()
+        }
+        fn create_nodes_batch_versioned(
+            &self,
+            nodes: &[BatchNodeCreate<'_>],
+            _: EpochId,
+            _: TransactionId,
+        ) -> Vec<NodeId> {
+            nodes
+                .iter()
+                .map(|n| {
+                    let id = self.create_node(n.labels);
+                    for (key, value) in &n.properties {
+                        self.set_node_property(id, key.as_str(), value.clone());
+                    }
+                    id
+                })
+                .collect()
+        }
+        fn create_edges_batch_versioned(
+            &self,
+            edges: &[BatchEdgeCreate<'_>],
+            _: EpochId,
+            _: TransactionId,
+        ) -> Vec<EdgeId> {
+            edges
+                .iter()
+                .map(|e| {
+                    let id = self.create_edge(e.source, e.target, e.edge_type);
+                    for (key, value) in &e.properties {
+                        self.set_edge_property(id, key.as_str(), value.clone());
+                    }
+                    id
+                })
                 .collect()
         }
         fn delete_node(&self, id: NodeId) -> bool {

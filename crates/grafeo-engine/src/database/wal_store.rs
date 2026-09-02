@@ -1,15 +1,16 @@
 //! WAL-aware graph store wrapper.
 //!
-//! Wraps an [`LpgStore`] and logs every mutation to the WAL so that
-//! query-engine mutations (INSERT, DELETE, SET via GQL/Cypher/etc.)
-//! survive a close/reopen cycle.
+//! Wraps an inner [`GraphStoreMut`] and logs every mutation to the WAL so
+//! that query-engine mutations (INSERT, DELETE, SET via GQL/Cypher/etc.)
+//! survive a close/reopen cycle. The inner store may be a plain [`LpgStore`]
+//! (normal open) or a layered generation-root store (H-ADOPT.3 Phase C).
 
 use std::sync::Arc;
 
 use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
-use grafeo_core::graph::lpg::{CompareOp, Edge, LpgStore, Node};
+use grafeo_core::graph::lpg::{BatchEdgeCreate, BatchNodeCreate, CompareOp, Edge, Node};
 use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_core::statistics::Statistics;
 use grafeo_storage::wal::{LpgWal, WalRecord};
@@ -17,7 +18,7 @@ use grafeo_storage::wal::{LpgWal, WalRecord};
 use arcstr::ArcStr;
 
 /// A [`GraphStoreMut`] decorator that delegates every call to an inner
-/// [`LpgStore`] and additionally logs mutation operations to the WAL.
+/// [`GraphStoreMut`] and additionally logs mutation operations to the WAL.
 ///
 /// Read-only methods are forwarded without any WAL interaction.
 ///
@@ -26,7 +27,7 @@ use arcstr::ArcStr;
 /// `wal_graph_context` mutex ensures atomicity of context-switch + mutation
 /// pairs across concurrent sessions.
 pub(crate) struct WalGraphStore {
-    inner: Arc<LpgStore>,
+    inner: Arc<dyn GraphStoreMut>,
     wal: Arc<LpgWal>,
     /// Which named graph this store represents (`None` = default graph).
     graph_name: Option<String>,
@@ -38,7 +39,7 @@ pub(crate) struct WalGraphStore {
 impl WalGraphStore {
     /// Creates a new WAL-aware store wrapper for the default graph.
     pub fn new(
-        inner: Arc<LpgStore>,
+        inner: Arc<dyn GraphStoreMut>,
         wal: Arc<LpgWal>,
         wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
     ) -> Self {
@@ -52,7 +53,7 @@ impl WalGraphStore {
 
     /// Creates a new WAL-aware store wrapper for a named graph.
     pub fn new_for_graph(
-        inner: Arc<LpgStore>,
+        inner: Arc<dyn GraphStoreMut>,
         wal: Arc<LpgWal>,
         graph_name: String,
         wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
@@ -157,11 +158,11 @@ impl GraphStore for WalGraphStore {
     }
 
     fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
-        GraphStore::neighbors(self.inner.as_ref(), node, direction)
+        self.inner.neighbors(node, direction)
     }
 
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
-        GraphStore::edges_from(self.inner.as_ref(), node, direction)
+        self.inner.edges_from(node, direction)
     }
 
     fn out_degree(&self, node: NodeId) -> usize {
@@ -327,7 +328,7 @@ impl GraphStore for WalGraphStore {
 
 // Pure delegation: the WAL wrapper logs mutations but owns no index state,
 // so every text/vector lookup has to fall through to the underlying
-// `LpgStore`. A stub impl silently turns into "no index exists" at every
+// store. A stub impl silently turns into "no index exists" at every
 // call site (has_text_index → false, text_search → [], etc.), which
 // regressed hybrid queries on persistent DBs until it was caught by the
 // `_persistent` spec variants — see issue #308.
@@ -479,6 +480,63 @@ impl GraphStoreMut for WalGraphStore {
         ids
     }
 
+    fn create_nodes_batch_versioned(
+        &self,
+        nodes: &[BatchNodeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        let ids = self
+            .inner
+            .create_nodes_batch_versioned(nodes, epoch, transaction_id);
+        // One WAL record per row plus one per property, mirroring the row path
+        // (create_node_versioned + set_node_property_versioned) so the record
+        // stream stays identical: CreateNode, then SetNodeProperty per prop.
+        for (node, &id) in nodes.iter().zip(ids.iter()) {
+            self.log_with_context(&WalRecord::CreateNode {
+                id,
+                labels: node.labels.iter().map(|s| (*s).to_string()).collect(),
+            });
+            for (key, value) in &node.properties {
+                self.log_with_context(&WalRecord::SetNodeProperty {
+                    id,
+                    key: key.as_str().to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+        ids
+    }
+
+    fn create_edges_batch_versioned(
+        &self,
+        edges: &[BatchEdgeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<EdgeId> {
+        let ids = self
+            .inner
+            .create_edges_batch_versioned(edges, epoch, transaction_id);
+        // One WAL record per row plus one per property, mirroring the row path
+        // (create_edge_versioned + set_edge_property_versioned).
+        for (edge, &id) in edges.iter().zip(ids.iter()) {
+            self.log_with_context(&WalRecord::CreateEdge {
+                id,
+                src: edge.source,
+                dst: edge.target,
+                edge_type: edge.edge_type.to_string(),
+            });
+            for (key, value) in &edge.properties {
+                self.log_with_context(&WalRecord::SetEdgeProperty {
+                    id,
+                    key: key.as_str().to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+        ids
+    }
+
     fn delete_node(&self, id: NodeId) -> bool {
         let deleted = self.inner.delete_node(id);
         if deleted {
@@ -505,11 +563,13 @@ impl GraphStoreMut for WalGraphStore {
         let outgoing: Vec<EdgeId> = self
             .inner
             .edges_from(node_id, Direction::Outgoing)
+            .into_iter()
             .map(|(_, eid)| eid)
             .collect();
         let incoming: Vec<EdgeId> = self
             .inner
             .edges_from(node_id, Direction::Incoming)
+            .into_iter()
             .map(|(_, eid)| eid)
             .collect();
 
@@ -609,6 +669,7 @@ impl GraphStoreMut for WalGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grafeo_core::graph::lpg::LpgStore;
     use grafeo_storage::wal::TypedWal;
 
     fn setup() -> (WalGraphStore, Arc<LpgWal>) {
@@ -768,6 +829,58 @@ mod tests {
         assert_eq!(ws.edge_count(), 2);
         // One WAL record per edge
         assert_eq!(wal.record_count(), 5);
+    }
+
+    #[test]
+    fn create_nodes_batch_versioned_logs_create_and_props() {
+        let (ws, wal) = setup();
+        let nodes = [
+            BatchNodeCreate {
+                labels: &["Person"],
+                properties: vec![
+                    (PropertyKey::new("name".to_string()), Value::from("A")),
+                    (PropertyKey::new("age".to_string()), Value::from(1i64)),
+                ],
+            },
+            BatchNodeCreate {
+                labels: &["Robot"],
+                properties: vec![],
+            },
+        ];
+        let ids = ws.create_nodes_batch_versioned(&nodes, EpochId::new(0), TransactionId::SYSTEM);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ws.node_count(), 2);
+        // CreateNode per row (2) + SetNodeProperty per prop (2) = 4 records.
+        assert_eq!(wal.record_count(), 4);
+    }
+
+    #[test]
+    fn create_edges_batch_versioned_logs_create_and_props() {
+        let (ws, wal) = setup();
+        let a = ws.create_node(&["Node"]);
+        let b = ws.create_node(&["Node"]);
+        let c = ws.create_node(&["Node"]);
+        let before = wal.record_count();
+
+        let edges = [
+            BatchEdgeCreate {
+                source: a,
+                target: b,
+                edge_type: "X",
+                properties: vec![(PropertyKey::new("w".to_string()), Value::from(1i64))],
+            },
+            BatchEdgeCreate {
+                source: b,
+                target: c,
+                edge_type: "Y",
+                properties: vec![],
+            },
+        ];
+        let ids = ws.create_edges_batch_versioned(&edges, EpochId::new(0), TransactionId::SYSTEM);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ws.edge_count(), 2);
+        // CreateEdge per row (2) + SetEdgeProperty per prop (1) = 3 records.
+        assert_eq!(wal.record_count(), before + 3);
     }
 
     #[test]

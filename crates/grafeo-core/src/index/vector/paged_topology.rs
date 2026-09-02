@@ -43,6 +43,8 @@
 //! paged but unaligned — Phase 7c may revisit alignment if measured
 //! page-fault counts justify it (see ARCHITECTURE.md vmcache exit).
 
+use std::io::Write;
+
 use bytes::Bytes;
 
 use grafeo_common::types::NodeId;
@@ -217,6 +219,186 @@ pub fn serialize_topology(
 
     buf.extend_from_slice(&payload);
     buf
+}
+
+/// Exact GTOP envelope bytes for `n_nodes` (fixed header + page index),
+/// excluding the payload region.
+#[must_use]
+pub const fn topology_envelope_len(n_nodes: usize) -> u64 {
+    (HEADER_SIZE + n_nodes * INDEX_ENTRY_SIZE) as u64
+}
+
+/// Arithmetically computed GTOP payload bytes for one node: the
+/// `n_levels` header plus, per level, the neighbor-count header and the
+/// neighbor IDs. Zero allocation.
+#[must_use]
+pub fn topology_node_payload_len(layers: &[Vec<NodeId>]) -> u64 {
+    let mut len: u64 = 4; // n_levels u32
+    for layer in layers {
+        len += 4 + 8 * layer.len() as u64;
+    }
+    len
+}
+
+/// Exact length of [`serialize_topology`] output for the given input,
+/// computed arithmetically with zero payload allocation (H-ADOPT.6
+/// item 0B pass 1).
+///
+/// `entry_point` and `max_level` do not affect the length (fixed-size
+/// header) but are kept for signature symmetry with
+/// [`serialize_topology`].
+#[must_use]
+pub fn serialize_topology_len(
+    _entry_point: Option<NodeId>,
+    _max_level: usize,
+    nodes: &[(NodeId, Vec<Vec<NodeId>>)],
+) -> u64 {
+    topology_envelope_len(nodes.len())
+        + nodes
+            .iter()
+            .map(|(_, layers)| topology_node_payload_len(layers))
+            .sum::<u64>()
+}
+
+/// Generic twin of [`serialize_topology_len`] over borrowed layer
+/// containers (H-ADOPT.6 item 0B heap-backend walk: no neighbor
+/// cloning).
+#[must_use]
+pub(crate) fn topology_pairs_len<L: AsRef<[Vec<NodeId>]>>(pairs: &[(NodeId, L)]) -> u64 {
+    topology_envelope_len(pairs.len())
+        + pairs
+            .iter()
+            .map(|(_, layers)| topology_node_payload_len(layers.as_ref()))
+            .sum::<u64>()
+}
+
+/// Bounded batching buffer for small writes (H-ADOPT.6 item 0B).
+///
+/// Accumulates fixed-size field writes up to [`SCRATCH_SIZE`] bytes
+/// before flushing to the sink, keeping per-neighbor `write_all`
+/// overhead off the hot path without ever buffering more than the
+/// scratch budget. Never grows with the graph.
+const SCRATCH_SIZE: usize = 8 * 1024;
+
+struct ScratchWriter<'a, W: Write + ?Sized> {
+    sink: &'a mut W,
+    buf: Vec<u8>,
+}
+
+impl<'a, W: Write + ?Sized> ScratchWriter<'a, W> {
+    fn new(sink: &'a mut W) -> Self {
+        Self {
+            sink,
+            buf: Vec::with_capacity(SCRATCH_SIZE),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.buf.len() + bytes.len() > SCRATCH_SIZE {
+            self.flush()?;
+        }
+        if bytes.len() > SCRATCH_SIZE {
+            self.sink.write_all(bytes)
+        } else {
+            self.buf.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            self.sink.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+/// Streaming twin of [`serialize_topology`], generic over the per-node
+/// layer container (H-ADOPT.6 item 0B). Emits byte-identical GTOP
+/// output directly to `sink` through a bounded [`SCRATCH_SIZE`] scratch
+/// buffer — no full-blob allocation.
+///
+/// `L: AsRef<[Vec<NodeId>]>` lets the section encoder stream borrowed
+/// layers from the heap backend without cloning neighbor `Vec`s.
+///
+/// Input contract matches [`serialize_topology`]: `nodes` MUST be
+/// sorted ascending by NodeId (page-index order). Offsets are derived
+/// arithmetically during the page-index walk, so exactly one payload
+/// byte is ever in flight per node.
+///
+/// # Errors
+///
+/// Propagates any sink I/O error.
+///
+/// # Panics
+///
+/// Same bounds as [`serialize_topology`] (level/neighbor counts and
+/// `max_level` fit in `u32`).
+pub fn write_topology_nodes<L: AsRef<[Vec<NodeId>]>, W: Write + ?Sized>(
+    entry_point: Option<NodeId>,
+    max_level: usize,
+    nodes: &[(NodeId, L)],
+    sink: &mut W,
+) -> std::io::Result<()> {
+    let mut w = ScratchWriter::new(sink);
+
+    // Header (32 bytes) — byte-identical to serialize_topology:
+    // 0..4 magic, 4 version, 5 has_entry_point, 6..8 reserved,
+    // 8..16 n_nodes, 16..20 max_level, 20..24 reserved, 24..32 entry.
+    let mut header = [0u8; HEADER_SIZE];
+    header[0..4].copy_from_slice(MAGIC);
+    header[4] = VERSION;
+    header[5] = u8::from(entry_point.is_some());
+    header[8..16].copy_from_slice(&(nodes.len() as u64).to_le_bytes());
+    let max_level_u32 = u32::try_from(max_level).expect("HNSW max_level fits in u32");
+    header[16..20].copy_from_slice(&max_level_u32.to_le_bytes());
+    let entry_raw = entry_point.map_or(0u64, |id| id.as_u64());
+    header[24..32].copy_from_slice(&entry_raw.to_le_bytes());
+    w.push(&header)?;
+
+    // Page index: one arithmetic forward walk emits (NodeId,
+    // payload_offset) entries in input order.
+    let mut entry = [0u8; INDEX_ENTRY_SIZE];
+    let mut offset: u64 = 0;
+    for (id, layers) in nodes {
+        entry[0..8].copy_from_slice(&id.as_u64().to_le_bytes());
+        entry[8..16].copy_from_slice(&offset.to_le_bytes());
+        w.push(&entry)?;
+        offset += topology_node_payload_len(layers.as_ref());
+    }
+
+    // Payload region: packed back-to-back in the same node order.
+    for (_id, layers) in nodes {
+        let layers = layers.as_ref();
+        let n_levels = u32::try_from(layers.len()).expect("HNSW level count fits in u32");
+        w.push(&n_levels.to_le_bytes())?;
+        for layer in layers {
+            let n_neighbors = u32::try_from(layer.len()).expect("HNSW neighbor count fits in u32");
+            w.push(&n_neighbors.to_le_bytes())?;
+            for nb in layer {
+                w.push(&nb.as_u64().to_le_bytes())?;
+            }
+        }
+    }
+
+    w.flush()
+}
+
+/// Streaming variant of [`serialize_topology`] over owned snapshots
+/// (H-ADOPT.6 item 0B): byte-identical output, bounded memory. See
+/// [`write_topology_nodes`] for the byte contract.
+///
+/// # Errors
+///
+/// Propagates any sink I/O error.
+pub fn write_topology(
+    entry_point: Option<NodeId>,
+    max_level: usize,
+    nodes: &[(NodeId, Vec<Vec<NodeId>>)],
+    sink: &mut dyn Write,
+) -> std::io::Result<()> {
+    write_topology_nodes(entry_point, max_level, nodes, sink)
 }
 
 /// Deserializes a v2 paged topology buffer into the heap representation
@@ -568,6 +750,24 @@ impl MmapTopology {
         self.n_nodes == 0
     }
 
+    /// Total bytes retained by the topology buffer (file-backed when
+    /// constructed from a container mmap `Bytes` owner).
+    #[must_use]
+    pub fn mapped_bytes(&self) -> usize {
+        self.data.len()
+    }
+
+    /// The underlying v2 GTOP buffer (H-ADOPT.6 item 0B).
+    ///
+    /// Verbatim section blob: byte-identical to the topology region the
+    /// section writer emitted, provided this view was constructed from an
+    /// exact GTOP slice (the production `deserialize_v2` path guarantees
+    /// this). Streaming re-emission is a plain `write_all` of these bytes.
+    #[must_use]
+    pub fn raw_bytes(&self) -> &Bytes {
+        &self.data
+    }
+
     /// Returns true if `node` is present in the page index.
     #[must_use]
     pub fn contains(&self, node: NodeId) -> bool {
@@ -864,6 +1064,104 @@ mod tests {
         let err =
             deserialize_topology(Bytes::from(bytes)).expect_err("must reject truncated header");
         assert_eq!(err, PagedTopologyError::TruncatedHeader);
+    }
+
+    // ── H-ADOPT.6 item 0B RED tests ────────────────────────────────
+    //
+    // Byte-parity oracle (PRECEDENCE RULE): `write_topology` MUST be
+    // byte-identical to `serialize_topology` for identical input, and
+    // `serialize_topology_len` MUST equal the serialized length. The v2
+    // byte layout never changes.
+
+    fn make_multi_level_nodes() -> Vec<(NodeId, Vec<Vec<NodeId>>)> {
+        vec![
+            (
+                NodeId::new(2),
+                vec![vec![NodeId::new(1), NodeId::new(3)], vec![NodeId::new(5)]],
+            ),
+            (NodeId::new(3), vec![vec![NodeId::new(2)]]),
+            (
+                NodeId::new(5),
+                vec![
+                    vec![],
+                    vec![NodeId::new(2)],
+                    vec![NodeId::new(5), NodeId::new(3), NodeId::new(2)],
+                ],
+            ),
+            (NodeId::new(7), vec![vec![NodeId::new(3), NodeId::new(2)]]),
+        ]
+    }
+
+    fn make_random_nodes(seed: u64, n: usize) -> Vec<(NodeId, Vec<Vec<NodeId>>)> {
+        let mut state = seed;
+        let mut rng = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        (1..=n as u64)
+            .map(|i| {
+                let n_layers = 1 + (rng() % 3) as usize;
+                let layers: Vec<Vec<NodeId>> = (0..n_layers)
+                    .map(|_| {
+                        let count = (rng() % 6) as usize;
+                        (0..count)
+                            .map(|_| NodeId::new(1 + rng() % (n as u64)))
+                            .collect()
+                    })
+                    .collect();
+                (NodeId::new(i), layers)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn h_adopt6_write_topology_parity_empty() {
+        let legacy = serialize_topology(None, 0, &[]);
+        let mut streamed: Vec<u8> = Vec::new();
+        write_topology(None, 0, &[], &mut streamed).expect("write_topology");
+        assert_eq!(streamed, legacy, "empty topology must be byte-identical");
+        assert_eq!(serialize_topology_len(None, 0, &[]) as usize, legacy.len());
+    }
+
+    #[test]
+    fn h_adopt6_write_topology_parity_single_node() {
+        let nodes = vec![(NodeId::new(42), vec![vec![]])];
+        let legacy = serialize_topology(Some(NodeId::new(42)), 0, &nodes);
+        let mut streamed: Vec<u8> = Vec::new();
+        write_topology(Some(NodeId::new(42)), 0, &nodes, &mut streamed).expect("write_topology");
+        assert_eq!(streamed, legacy, "single node must be byte-identical");
+        assert_eq!(
+            serialize_topology_len(Some(NodeId::new(42)), 0, &nodes) as usize,
+            legacy.len()
+        );
+    }
+
+    #[test]
+    fn h_adopt6_write_topology_parity_multi_level() {
+        let nodes = make_multi_level_nodes();
+        let legacy = serialize_topology(Some(NodeId::new(5)), 2, &nodes);
+        let mut streamed: Vec<u8> = Vec::new();
+        write_topology(Some(NodeId::new(5)), 2, &nodes, &mut streamed).expect("write_topology");
+        assert_eq!(streamed, legacy, "multi-level must be byte-identical");
+        assert_eq!(
+            serialize_topology_len(Some(NodeId::new(5)), 2, &nodes) as usize,
+            legacy.len()
+        );
+    }
+
+    #[test]
+    fn h_adopt6_write_topology_parity_random_10k() {
+        let nodes = make_random_nodes(0xDEAD_BEEF, 10_000);
+        let legacy = serialize_topology(Some(NodeId::new(1)), 2, &nodes);
+        let mut streamed: Vec<u8> = Vec::new();
+        write_topology(Some(NodeId::new(1)), 2, &nodes, &mut streamed).expect("write_topology");
+        assert_eq!(streamed, legacy, "10k random must be byte-identical");
+        assert_eq!(
+            serialize_topology_len(Some(NodeId::new(1)), 2, &nodes) as usize,
+            legacy.len()
+        );
     }
 
     #[test]

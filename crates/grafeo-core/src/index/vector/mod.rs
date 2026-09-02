@@ -188,12 +188,12 @@ impl VectorIndexKind {
 
     /// Inserts a vector into the index.
     ///
-    /// For `Hnsw`, the accessor is used for neighbor distance lookups.
-    /// For `Quantized`, the vector is stored internally and the accessor is unused.
+    /// Both variants use `accessor` for topology neighbor distances. Quantized
+    /// retains codes (not a dual full-f32 store after training/rehydrate).
     pub fn insert(&self, id: NodeId, vector: &[f32], accessor: &impl VectorAccessor) {
         match self {
             Self::Hnsw(idx) => idx.insert(id, vector, accessor),
-            Self::Quantized(idx) => idx.insert(id, vector),
+            Self::Quantized(idx) => idx.insert(id, vector, accessor),
         }
     }
 
@@ -207,7 +207,7 @@ impl VectorIndexKind {
     ) -> Vec<(NodeId, f32)> {
         match self {
             Self::Hnsw(idx) => idx.search(query, k, accessor),
-            Self::Quantized(idx) => idx.search(query, k),
+            Self::Quantized(idx) => idx.search(query, k, accessor),
         }
     }
 
@@ -222,7 +222,7 @@ impl VectorIndexKind {
     ) -> Vec<(NodeId, f32)> {
         match self {
             Self::Hnsw(idx) => idx.search_with_ef(query, k, ef, accessor),
-            Self::Quantized(idx) => idx.search_with_ef(query, k, ef),
+            Self::Quantized(idx) => idx.search_with_ef(query, k, ef, accessor),
         }
     }
 
@@ -237,7 +237,7 @@ impl VectorIndexKind {
     ) -> Vec<(NodeId, f32)> {
         match self {
             Self::Hnsw(idx) => idx.search_with_filter(query, k, allowlist, accessor),
-            Self::Quantized(idx) => idx.search_with_filter(query, k, allowlist),
+            Self::Quantized(idx) => idx.search_with_filter(query, k, allowlist, accessor),
         }
     }
 
@@ -253,7 +253,9 @@ impl VectorIndexKind {
     ) -> Vec<(NodeId, f32)> {
         match self {
             Self::Hnsw(idx) => idx.search_with_ef_and_filter(query, k, ef, allowlist, accessor),
-            Self::Quantized(idx) => idx.search_with_ef_and_filter(query, k, ef, allowlist),
+            Self::Quantized(idx) => {
+                idx.search_with_ef_and_filter(query, k, ef, allowlist, accessor)
+            }
         }
     }
 
@@ -267,7 +269,7 @@ impl VectorIndexKind {
     ) -> Vec<Vec<(NodeId, f32)>> {
         match self {
             Self::Hnsw(idx) => idx.batch_search(queries, k, accessor),
-            Self::Quantized(idx) => idx.batch_search(queries, k),
+            Self::Quantized(idx) => idx.batch_search(queries, k, accessor),
         }
     }
 
@@ -282,7 +284,7 @@ impl VectorIndexKind {
     ) -> Vec<Vec<(NodeId, f32)>> {
         match self {
             Self::Hnsw(idx) => idx.batch_search_with_ef(queries, k, ef, accessor),
-            Self::Quantized(idx) => idx.batch_search_with_ef(queries, k, ef),
+            Self::Quantized(idx) => idx.batch_search_with_ef(queries, k, ef, accessor),
         }
     }
 
@@ -297,7 +299,7 @@ impl VectorIndexKind {
     ) -> Vec<Vec<(NodeId, f32)>> {
         match self {
             Self::Hnsw(idx) => idx.batch_search_with_filter(queries, k, allowlist, accessor),
-            Self::Quantized(idx) => idx.batch_search_with_filter(queries, k, allowlist),
+            Self::Quantized(idx) => idx.batch_search_with_filter(queries, k, allowlist, accessor),
         }
     }
 
@@ -315,7 +317,9 @@ impl VectorIndexKind {
             Self::Hnsw(idx) => {
                 idx.batch_search_with_ef_and_filter(queries, k, ef, allowlist, accessor)
             }
-            Self::Quantized(idx) => idx.batch_search_with_ef_and_filter(queries, k, ef, allowlist),
+            Self::Quantized(idx) => {
+                idx.batch_search_with_ef_and_filter(queries, k, ef, allowlist, accessor)
+            }
         }
     }
 
@@ -325,6 +329,17 @@ impl VectorIndexKind {
         match self {
             Self::Hnsw(idx) => idx.snapshot_topology(),
             Self::Quantized(idx) => idx.snapshot_topology(),
+        }
+    }
+
+    /// Streaming view over this index's topology (H-ADOPT.6 item 0B).
+    /// See [`crate::index::vector::hnsw::TopologyView`] for the
+    /// lock-hold contract.
+    #[must_use]
+    pub(crate) fn topology_view(&self) -> crate::index::vector::hnsw::TopologyView<'_> {
+        match self {
+            Self::Hnsw(idx) => idx.topology_view(),
+            Self::Quantized(idx) => idx.topology_view(),
         }
     }
 
@@ -341,6 +356,51 @@ impl VectorIndexKind {
         }
     }
 
+    /// Adopt a zero-copy [`paged_topology::MmapTopology`] as the search graph.
+    ///
+    /// Prefer this over [`Self::restore_topology`] when topology bytes come
+    /// from a file-backed container mapping (G-E2.RO read-only open).
+    pub fn adopt_mmap_topology(&self, topo: paged_topology::MmapTopology) {
+        match self {
+            Self::Hnsw(idx) => idx.adopt_mmap_topology(topo),
+            Self::Quantized(idx) => idx.adopt_mmap_topology(topo),
+        }
+    }
+
+    /// Returns true when the topology is currently mmap-backed.
+    #[must_use]
+    pub fn is_mmap_backed(&self) -> bool {
+        match self {
+            Self::Hnsw(idx) => idx.is_mmap_backed(),
+            Self::Quantized(idx) => idx.is_mmap_backed(),
+        }
+    }
+
+    /// Bytes in the mmap topology buffer, if currently mmap-backed.
+    #[must_use]
+    pub fn mmap_topology_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Hnsw(idx) => idx.mmap_topology_bytes(),
+            Self::Quantized(idx) => idx.mmap_topology_bytes(),
+        }
+    }
+
+    /// Rehydrate quantized payloads without topology rebuild.
+    ///
+    /// No-op for plain [`Hnsw`] shells (search uses LPG property accessor).
+    pub fn rehydrate_payloads_from_vectors(
+        &self,
+        vectors: impl IntoIterator<Item = (NodeId, Vec<f32>)>,
+    ) {
+        match self {
+            Self::Hnsw(_) => {
+                // Plain HNSW keeps embeddings in LPG; nothing to rehydrate.
+                let _ = vectors.into_iter().count();
+            }
+            Self::Quantized(idx) => idx.rehydrate_payloads_from_vectors(vectors),
+        }
+    }
+
     /// Returns estimated heap memory in bytes.
     #[must_use]
     pub fn heap_memory_bytes(&self) -> usize {
@@ -351,6 +411,9 @@ impl VectorIndexKind {
     }
 
     /// Returns the quantization type, if this is a quantized index.
+    ///
+    /// Note: plain `Hnsw` returns `None` (not `Some(QuantizationType::None)`).
+    /// Public DB inspect APIs map missing-index vs plain-mode separately.
     #[must_use]
     pub fn quantization_type(&self) -> Option<QuantizationType> {
         match self {
@@ -669,7 +732,7 @@ mod tests {
                 let vec: Vec<f32> = (0..4)
                     .map(|j| ((i * 4 + j) as f32) / (n * 4) as f32)
                     .collect();
-                q.insert(NodeId::new(i as u64 + 1), &vec);
+                q.test_insert(NodeId::new(i as u64 + 1), &vec);
             }
             VectorIndexKind::Quantized(q)
         }

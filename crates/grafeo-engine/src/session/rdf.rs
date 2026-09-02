@@ -67,6 +67,8 @@ impl Session {
             cdc_log: Arc::new(crate::cdc::CdcLog::new()),
             #[cfg(feature = "cdc")]
             cdc_pending_events: None,
+            #[cfg(all(feature = "lpg", feature = "vector-index"))]
+            vector_index_intents: parking_lot::Mutex::new(Vec::new()),
             current_graph: parking_lot::Mutex::new(None),
             current_schema: parking_lot::Mutex::new(None),
             time_zone: parking_lot::Mutex::new(None),

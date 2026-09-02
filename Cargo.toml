@@ -104,6 +104,7 @@ unicode-normalization = "0.1"
 proptest = "1"
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 tempfile = "3"
+filetime = "0.2"
 
 # Allocators (platform-optimized)
 tikv-jemallocator = "0.6"

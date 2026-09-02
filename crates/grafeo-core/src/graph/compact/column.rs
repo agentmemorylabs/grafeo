@@ -844,7 +844,7 @@ impl ColumnCodec {
             }
             Self::Dict(dict) => {
                 buf.push(1); // discriminant
-                let dict_entries = dict.dictionary();
+                let dict_entries = dict.dictionary_entries();
                 write_usize_as_u32(buf, dict_entries.len());
                 for entry in dict_entries.iter() {
                     let s = entry.as_ref().as_bytes();
@@ -1117,7 +1117,7 @@ impl ColumnCodec {
             }
             Self::Dict(dict) => {
                 buf.push(1);
-                let entries = dict.dictionary();
+                let entries = dict.dictionary_entries();
                 write_usize_as_u32(buf, entries.len());
                 for entry in entries.iter() {
                     let s = entry.as_ref().as_bytes();
@@ -1614,9 +1614,21 @@ impl ColumnCodec {
         match self {
             Self::BitPacked(bp) => bp.data_bytes().len(),
             Self::Dict(d) => {
-                let codes_bytes = d.code_count() * 4;
-                let dict_bytes: usize = d.dictionary().iter().map(|s| s.len()).sum();
-                codes_bytes + dict_bytes
+                let codes_bytes = match d.as_codes_slice() {
+                    Some(s) => s.len() * 4,
+                    // Mapped codes are file-backed; charge only heap dictionary.
+                    None => 0,
+                };
+                // heap dictionary only; mapped dictionary is file-backed.
+                let dict_bytes = d.dictionary_heap_bytes();
+                // If codes are inline, count them; mapped codes are not anonymous.
+                let inline_codes = if d.as_codes_slice().is_some() {
+                    d.code_count() * 4
+                } else {
+                    0
+                };
+                let _ = codes_bytes;
+                inline_codes + dict_bytes
             }
             Self::Bitmap(bv) => bv.data_bytes().len(),
             Self::Int8Vector { bytes, .. } => bytes.len(),

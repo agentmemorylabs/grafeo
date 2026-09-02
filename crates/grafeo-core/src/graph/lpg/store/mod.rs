@@ -9,12 +9,18 @@
 //! - Columnar properties with zone maps for fast filtering
 //! - Forward and backward adjacency indexes
 
+pub mod batch_ops;
+#[cfg(not(feature = "tiered-storage"))]
+mod batch_ops_lpg;
+#[cfg(feature = "tiered-storage")]
+mod batch_ops_tiered;
 mod edge_ops;
 mod graph_store_impl;
 mod index;
 mod memory;
 mod node_ops;
 mod property_ops;
+mod rollback_cleanup;
 mod schema;
 mod search;
 mod statistics;
@@ -410,6 +416,13 @@ pub struct LpgStore {
     pub(super) property_indexes:
         RwLock<FxHashMap<PropertyKey, DashMap<HashableValue, FxHashSet<NodeId>>>>,
 
+    /// RO mapped property indexes restored from the PropertyIndex section
+    /// (G-E1.RO). Lookups prefer these over heap DashMaps so postings stay
+    /// file-backed after checkpoint → close → open_read_only.
+    /// Lock order: 7 (disjoint keys from property_indexes values).
+    pub(super) mapped_property_indexes:
+        RwLock<FxHashMap<PropertyKey, Arc<crate::index::property::MappedPropertyIndex>>>,
+
     /// Vector indexes: "label:property" -> HNSW index.
     ///
     /// Created via [`GrafeoDB::create_vector_index`](grafeo_engine::GrafeoDB::create_vector_index).
@@ -424,6 +437,11 @@ pub struct LpgStore {
     #[cfg(feature = "text-index")]
     pub(super) text_indexes:
         RwLock<FxHashMap<String, Arc<RwLock<crate::index::text::InvertedIndex>>>>,
+
+    /// RO mapped text indexes restored from TextIndex section v2 (G-E1.RO).
+    #[cfg(feature = "text-index")]
+    pub(super) mapped_text_indexes:
+        RwLock<FxHashMap<String, Arc<crate::index::text::MappedTextIndex>>>,
 
     /// Next node ID.
     pub(super) next_node_id: AtomicU64,
@@ -516,10 +534,13 @@ impl LpgStore {
             label_index: RwLock::new(Vec::with_capacity(16)),
             node_labels: RwLock::new(FxHashMap::default()),
             property_indexes: RwLock::new(FxHashMap::default()),
+            mapped_property_indexes: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "vector-index")]
             vector_indexes: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "text-index")]
             text_indexes: RwLock::new(FxHashMap::default()),
+            #[cfg(feature = "text-index")]
+            mapped_text_indexes: RwLock::new(FxHashMap::default()),
             next_node_id: AtomicU64::new(0),
             next_edge_id: AtomicU64::new(0),
             current_epoch: AtomicU64::new(0),
@@ -616,10 +637,13 @@ impl LpgStore {
         self.label_index.write().clear();
         self.node_labels.write().clear();
         self.property_indexes.write().clear();
+        self.mapped_property_indexes.write().clear();
         #[cfg(feature = "vector-index")]
         self.vector_indexes.write().clear();
         #[cfg(feature = "text-index")]
         self.text_indexes.write().clear();
+        #[cfg(feature = "text-index")]
+        self.mapped_text_indexes.write().clear();
 
         // Nested: Properties and adjacency
         self.node_properties.clear();

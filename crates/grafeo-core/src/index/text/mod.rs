@@ -30,10 +30,16 @@
 //! ```
 
 mod inverted_index;
+pub mod mapped;
 pub mod section;
 mod tokenizer;
 
 pub use inverted_index::{BM25Config, InvertedIndex};
+pub use mapped::{
+    MappedTextIndex, MappedTextIndexSet, TEXT_INDEX_MAGIC, TEXT_INDEX_MAPPED_VERSION,
+    TextIndexEncodeSnapshot, TextIndexMemoryAccounting, encode_text_index_section,
+    is_mapped_text_payload, parse_text_index_section,
+};
 pub use section::TextIndexSection;
 pub use tokenizer::{SimpleTokenizer, Tokenizer};
 

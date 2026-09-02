@@ -17,8 +17,10 @@ use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 
 use super::CompactStore;
+use super::overlay_budget::{OverlayAdmissionController, RetainedCategory};
+use super::overlay_cost;
 use crate::graph::Direction;
-use crate::graph::lpg::{CompareOp, Edge, LpgStore, Node};
+use crate::graph::lpg::{BatchEdgeCreate, BatchNodeCreate, CompareOp, Edge, LpgStore, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
@@ -73,6 +75,66 @@ pub struct LayeredStore {
     /// this lock — they use `ArcSwap` snapshot semantics on base and
     /// overlay separately, which already provides a consistent view.
     merge_guard: RwLock<()>,
+    /// Optional overlay admission controller (G-EM0.5a, W-mode).
+    ///
+    /// When present, every overlay mutation charges its retained capacity
+    /// to the controller so aggregate overlay bytes stay within the
+    /// calibrated soft/hard limits. The engine installs this for writable
+    /// (W-mode) roots; read-only and legacy stores leave it `None` and
+    /// behave exactly as before. The controller also carries the W-mode
+    /// flag that disables the eager `merge_overlay_in_place` pressure path
+    /// until `G-EM0.5b` installs the bounded streaming builder.
+    ///
+    /// Wrapped in an `RwLock` so the engine can install it through `&self`
+    /// after construction (the store is shared via `Arc`).
+    admission_slot: RwLock<Option<Arc<OverlayAdmissionController>>>,
+    /// Live dual-epoch handoff state (G-EM0.5c).
+    ///
+    /// When `Some`, a freeze of epoch N is in progress: new mutations are
+    /// charged to [`RetainedCategory::NextEpoch`] and tracked in the
+    /// post-freeze dirty sets so retirement can leave epoch N+1 applied
+    /// exactly once. Readers continue against the same overlay; only the
+    /// generation build consumes the materialized freeze snapshot owned
+    /// by the engine handoff coordinator.
+    handoff: RwLock<Option<OverlayHandoffLive>>,
+}
+
+/// Live dual-epoch handoff bookkeeping on the layered store (G-EM0.5c).
+///
+/// The freeze snapshot (payloads + WAL boundary) lives in the engine
+/// coordinator; this struct only tracks which live overlay mutations
+/// arrived after freeze so retirement can drop absorbed epoch-N state
+/// without discarding N+1.
+#[derive(Debug, Clone, Default)]
+pub struct OverlayHandoffLive {
+    /// Frozen overlay epoch N.
+    pub frozen_epoch: u64,
+    /// Active next epoch N+1 open for concurrent writes.
+    pub next_epoch: u64,
+    /// Dirty node ids captured at freeze (epoch N).
+    pub freeze_node_ids: FxHashSet<u64>,
+    /// Dirty edge ids captured at freeze (epoch N).
+    pub freeze_edge_ids: FxHashSet<u64>,
+    /// Base-deletion node ids captured at freeze.
+    pub freeze_deleted_nodes: FxHashSet<u64>,
+    /// Base-deletion edge ids captured at freeze.
+    pub freeze_deleted_edges: FxHashSet<u64>,
+    /// Nodes dirtied after freeze (epoch N+1).
+    pub post_freeze_nodes: FxHashSet<u64>,
+    /// Edges dirtied after freeze (epoch N+1).
+    pub post_freeze_edges: FxHashSet<u64>,
+    /// Retained bytes charged to frozen categories at freeze time
+    /// (MutationPayload + DirtySets + DeletionSets). Released on retire.
+    pub frozen_retained_bytes: u64,
+    /// Per-category frozen bytes at freeze (index = RetainedCategory::index).
+    pub frozen_category_bytes: [u64; RetainedCategory::COUNT],
+    /// Payload bytes charged to [`RetainedCategory::NextEpoch`] during this
+    /// handoff (every post-freeze mutation whose charge was rerouted from
+    /// MutationPayload). On retire these bytes are re-attributed to
+    /// [`RetainedCategory::MutationPayload`] (the surviving N+1 entities become
+    /// the next cycle's live working set) so the budget neither ratchets nor
+    /// leaks across handoffs (G-EM0.5c MAJOR-4).
+    pub next_epoch_charged_bytes: u64,
 }
 
 impl std::fmt::Debug for LayeredStore {
@@ -159,6 +221,8 @@ impl LayeredStore {
             deleted_from_base_edges: RwLock::new(FxHashSet::default()),
             deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
+            admission_slot: RwLock::new(None),
+            handoff: RwLock::new(None),
         }
     }
 
@@ -172,6 +236,8 @@ impl LayeredStore {
             deleted_from_base_edges: RwLock::new(FxHashSet::default()),
             deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
+            admission_slot: RwLock::new(None),
+            handoff: RwLock::new(None),
         }
     }
 
@@ -205,6 +271,104 @@ impl LayeredStore {
         self.overlay.load_full()
     }
 
+    /// Recovery-only: creates an overlay node at the exact ID recorded in the
+    /// WAL, marks it dirty, and charges the same retained bytes as
+    /// [`GraphStoreMut::create_node`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`grafeo_common::memory::AllocError`] if the overlay cannot
+    /// allocate the recovered node.
+    pub fn replay_create_node_with_id(
+        &self,
+        id: NodeId,
+        labels: &[&str],
+    ) -> Result<(), grafeo_common::memory::AllocError> {
+        let _guard = self.merge_guard.read();
+        self.overlay.load().create_node_with_id(id, labels)?;
+        self.mark_dirty_node(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::node_creation_retained_bytes(labels),
+        );
+        Ok(())
+    }
+
+    /// Recovery-only: creates an overlay edge at the exact ID recorded in the
+    /// WAL. Base-only endpoints are promoted exactly as in
+    /// [`GraphStoreMut::create_edge`]; the edge is marked dirty and charged the
+    /// same retained bytes as a live mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`grafeo_common::memory::AllocError`] if the overlay cannot
+    /// allocate the recovered edge.
+    pub fn replay_create_edge_with_id(
+        &self,
+        id: EdgeId,
+        src: NodeId,
+        dst: NodeId,
+        edge_type: &str,
+    ) -> Result<(), grafeo_common::memory::AllocError> {
+        let _guard = self.merge_guard.read();
+        self.ensure_in_overlay(src);
+        self.ensure_in_overlay(dst);
+        self.overlay
+            .load()
+            .create_edge_with_id(id, src, dst, edge_type)?;
+        self.mark_dirty_edge(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::edge_creation_retained_bytes(edge_type),
+        );
+        Ok(())
+    }
+
+    /// Captures overlay mutation sets for a generation freeze (schema-bounded).
+    ///
+    /// Includes every entity currently resident in the overlay (created or
+    /// modified), not only the dirty-set bookkeeping. After `compact()`,
+    /// `GrafeoDB::create_node*` may write the shared overlay Arc without
+    /// marking dirty; those nodes must still enter the freeze.
+    #[cfg(feature = "generation-streaming")]
+    #[must_use]
+    pub fn generation_freeze_epoch(&self) -> super::generation_builder::freeze::FrozenOverlayEpoch {
+        use super::generation_builder::freeze::FrozenOverlayEpoch;
+        let overlay = self.overlay.load_full();
+        let mut overlay_node_ids: FxHashSet<u64> = overlay
+            .all_node_ids()
+            .into_iter()
+            .map(|id| id.as_u64())
+            .collect();
+        for id in self.dirty_node_ids.read().iter() {
+            overlay_node_ids.insert(id.as_u64());
+        }
+        let mut overlay_edge_ids: FxHashSet<u64> = Default::default();
+        for e in overlay.all_edges() {
+            overlay_edge_ids.insert(e.id.as_u64());
+        }
+        for id in self.dirty_edge_ids.read().iter() {
+            overlay_edge_ids.insert(id.as_u64());
+        }
+        FrozenOverlayEpoch {
+            epoch: overlay.current_epoch().0,
+            overlay_node_ids,
+            overlay_edge_ids,
+            deleted_base_node_ids: self
+                .deleted_from_base_nodes
+                .read()
+                .iter()
+                .map(NodeId::as_u64)
+                .collect(),
+            deleted_base_edge_ids: self
+                .deleted_from_base_edges
+                .read()
+                .iter()
+                .map(EdgeId::as_u64)
+                .collect(),
+        }
+    }
+
     /// Number of dirty (modified/created) entities in the overlay.
     #[must_use]
     pub fn overlay_mutation_count(&self) -> usize {
@@ -230,6 +394,288 @@ impl LayeredStore {
         self.base.load().memory_bytes() + self.overlay_memory_bytes()
     }
 
+    /// Installs the overlay admission controller (G-EM0.5a, W-mode seam).
+    ///
+    /// The engine calls this once when opening a writable generation root.
+    /// After installation, every overlay mutation charges its retained
+    /// capacity to the controller, and the eager `merge_overlay_in_place`
+    /// pressure path is disabled (see [`Self::writable_mode`]). Installing
+    /// twice replaces the previous controller; callers should install once.
+    pub fn install_admission_controller(&self, controller: Arc<OverlayAdmissionController>) {
+        *self.admission_slot.write() = Some(controller);
+    }
+
+    /// Returns the installed admission controller, if any.
+    #[must_use]
+    pub fn admission_controller(&self) -> Option<Arc<OverlayAdmissionController>> {
+        self.admission_slot.read().clone()
+    }
+
+    /// Whether this store runs in writable (W-mode) admission.
+    ///
+    /// `true` exactly when an admission controller is installed. In W-mode
+    /// the eager full-base `merge_overlay_in_place` pressure path is
+    /// disabled until `G-EM0.5b` installs the bounded streaming builder;
+    /// hard pressure must fail/backpressure instead (packet §3).
+    #[must_use]
+    pub fn writable_mode(&self) -> bool {
+        self.admission_slot.read().is_some()
+    }
+
+    /// Charges retained capacity for an overlay mutation, if a controller is
+    /// installed. No-op for read-only/legacy stores.
+    ///
+    /// During an active G-EM0.5c handoff, mutation-payload charges route to
+    /// [`RetainedCategory::NextEpoch`] so frozen epoch N and next epoch N+1
+    /// both count toward the same hard budget (packet §5).
+    fn charge_retained(&self, category: RetainedCategory, bytes: usize) {
+        // During an active G-EM0.5c handoff, mutation-payload charges route to
+        // RetainedCategory::NextEpoch so frozen epoch N and next epoch N+1 both
+        // count toward the same hard budget (packet §5). The rerouted bytes are
+        // tracked on the live handoff state so retire can re-attribute them to
+        // MutationPayload for the surviving N+1 working set (MAJOR-4).
+        let mut charged = category;
+        if category == RetainedCategory::MutationPayload {
+            let mut handoff = self.handoff.write();
+            if handoff.is_some() {
+                charged = RetainedCategory::NextEpoch;
+                if let Some(h) = handoff.as_mut() {
+                    h.next_epoch_charged_bytes =
+                        h.next_epoch_charged_bytes.saturating_add(bytes as u64);
+                }
+            }
+        }
+        if let Some(ctl) = self.admission_slot.read().as_ref() {
+            ctl.try_reserve(charged, bytes as u64);
+        }
+    }
+
+    /// Records a dirty node id and, when a handoff is active, marks it as a
+    /// post-freeze (epoch N+1) mutation.
+    fn mark_dirty_node(&self, id: NodeId) {
+        self.dirty_node_ids.write().insert(id);
+        if let Some(h) = self.handoff.write().as_mut() {
+            h.post_freeze_nodes.insert(id.as_u64());
+        }
+    }
+
+    /// Batch variant of [`Self::mark_dirty_node`]: ONE write-lock acquisition
+    /// on the dirty set plus (when a handoff is active) ONE on the handoff
+    /// bookkeeping, regardless of batch size. The versioned batch node create
+    /// uses this so an N-node batch costs constant lock acquisitions, mirroring
+    /// [`Self::mark_dirty_edges`].
+    fn mark_dirty_nodes(&self, ids: &[NodeId]) {
+        if ids.is_empty() {
+            return;
+        }
+        {
+            let mut dirty = self.dirty_node_ids.write();
+            for id in ids {
+                dirty.insert(*id);
+            }
+        }
+        if let Some(h) = self.handoff.write().as_mut() {
+            for id in ids {
+                h.post_freeze_nodes.insert(id.as_u64());
+            }
+        }
+    }
+
+    /// Records a dirty edge id and, when a handoff is active, marks it as a
+    /// post-freeze (epoch N+1) mutation.
+    fn mark_dirty_edge(&self, id: EdgeId) {
+        self.dirty_edge_ids.write().insert(id);
+        if let Some(h) = self.handoff.write().as_mut() {
+            h.post_freeze_edges.insert(id.as_u64());
+        }
+    }
+
+    /// Batch variant of [`Self::mark_dirty_edge`]: ONE write-lock acquisition
+    /// on the dirty set plus (when a handoff is active) ONE on the handoff
+    /// bookkeeping, regardless of batch size. `batch_create_edges` uses this
+    /// so an N-edge batch costs constant lock acquisitions, not 2N
+    /// (G-EM0.5d hardening: per-element marking regressed the batch path to
+    /// O(N) write-lock acquisitions during an active handoff).
+    fn mark_dirty_edges(&self, ids: &[EdgeId]) {
+        if ids.is_empty() {
+            return;
+        }
+        {
+            let mut dirty = self.dirty_edge_ids.write();
+            for id in ids {
+                dirty.insert(*id);
+            }
+        }
+        if let Some(h) = self.handoff.write().as_mut() {
+            for id in ids {
+                h.post_freeze_edges.insert(id.as_u64());
+            }
+        }
+    }
+
+    /// Records a post-freeze (epoch N+1) mutation of an entity that is
+    /// ALREADY tracked (dirty or overlay-resident), so the dirty set is not
+    /// re-inserted but the handoff's post-freeze identity must still see it.
+    ///
+    /// Required by [`Self::swap_base_and_repair_overlay`]: a post-freeze
+    /// re-mutation of a FROZEN entity that never re-marks dirty would
+    /// otherwise be absent from `post_freeze_*`, and the repair swap would
+    /// clear its dirty flag and silently serve the stale frozen value baked
+    /// into the new base (or resurrect a post-freeze deletion).
+    fn record_post_freeze_node(&self, id: NodeId) {
+        if let Some(h) = self.handoff.write().as_mut() {
+            h.post_freeze_nodes.insert(id.as_u64());
+        }
+    }
+
+    /// Edge variant of [`Self::record_post_freeze_node`].
+    fn record_post_freeze_edge(&self, id: EdgeId) {
+        if let Some(h) = self.handoff.write().as_mut() {
+            h.post_freeze_edges.insert(id.as_u64());
+        }
+    }
+
+    /// True when a dual-epoch handoff freeze is active.
+    #[must_use]
+    pub fn handoff_active(&self) -> bool {
+        self.handoff.read().is_some()
+    }
+
+    /// Snapshot of the live handoff bookkeeping, if any.
+    #[must_use]
+    pub fn handoff_live(&self) -> Option<OverlayHandoffLive> {
+        self.handoff.read().clone()
+    }
+
+    /// Acquires the writer barrier for the freeze critical section
+    /// (G-EM0.5c MAJOR-1).
+    ///
+    /// Every [`GraphStoreMut`] overlay mutation holds the merge guard as
+    /// `.read()` for the duration of the whole operation (see
+    /// [`Self::merge_guard`]). Holding `.write()` here — across the WAL
+    /// boundary cut, the epoch sync, the freeze payload capture, and the
+    /// `begin_epoch_handoff` install — makes the freeze a writer
+    /// linearization point: no mutation can land between the cut and the
+    /// capture, so G(N) can neither duplicate a frozen entity (record > B)
+    /// nor include an N+1-epoch entity. The caller MUST drop the returned
+    /// guard before the freeze returns so N+1 writers proceed only after the
+    /// handoff is fully installed.
+    pub fn freeze_write_barrier(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.merge_guard.write()
+    }
+
+    /// Installs live handoff tracking after the engine freezes epoch N.
+    ///
+    /// Fails closed when a handoff is already active. Does not mutate overlay
+    /// payloads; concurrent readers keep seeing frozen + next-epoch state on
+    /// the single live overlay until retirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a handoff is already in progress.
+    pub fn begin_epoch_handoff(&self, state: OverlayHandoffLive) -> Result<(), String> {
+        let mut slot = self.handoff.write();
+        if slot.is_some() {
+            return Err("epoch handoff already active".into());
+        }
+        if let Some(ctl) = self.admission_slot.read().as_ref() {
+            ctl.set_active_epoch(state.next_epoch);
+        }
+        *slot = Some(state);
+        Ok(())
+    }
+
+    /// Clears live handoff tracking after successful retirement or cancel.
+    ///
+    /// On the cancel/failed path no G(N) is published and nothing is
+    /// absorbed, so only the next-epoch working-set charges are re-attributed
+    /// from [`RetainedCategory::NextEpoch`] to
+    /// [`RetainedCategory::MutationPayload`] (the N+1 writes remain the live
+    /// working set; G-EM0.5c MAJOR-4). The frozen snapshot bytes are NOT
+    /// released here — no absorption happened. Retirement uses
+    /// [`Self::retire_frozen_overlay_prefix`] instead of this path.
+    pub fn end_epoch_handoff(&self) {
+        let removed = self.handoff.write().take();
+        if let Some(state) = removed
+            && let Some(ctl) = self.admission_slot.read().as_ref()
+            && state.next_epoch_charged_bytes > 0
+        {
+            ctl.transfer_retained(
+                RetainedCategory::NextEpoch,
+                RetainedCategory::MutationPayload,
+                state.next_epoch_charged_bytes,
+            );
+        }
+    }
+
+    /// Retires the frozen epoch-N overlay prefix after G(N) is published —
+    /// NON-DESTRUCTIVELY on the live read view (G-EM0.5c MAJOR-2).
+    ///
+    /// Overlay payloads, dirty sets, and base-deletion tombstones are left
+    /// fully intact, so `get_node`/`get_edge`/`is_*_deleted_from_base` return
+    /// exactly what they returned before retire for every entity. The live
+    /// base `Arc` is not swapped until G-EM0.5d; physically removing absorbed
+    /// payloads or clearing tombstones before that swap would regress
+    /// base-modified nodes to their stale base values, resurrect base-deleted
+    /// nodes, and make overlay-only nodes vanish — the "mutation falls between
+    /// generation and overlay state" corruption. Physical removal of the
+    /// absorbed prefix is deferred to the 5d base-swap, which owns the overlay
+    /// reset.
+    ///
+    /// What retire does:
+    /// - releases the frozen retained-accounting bytes charged at freeze
+    ///   (MutationPayload + DirtySets + DeletionSets) for the absorbed epoch-N
+    ///   state;
+    /// - re-attributes the next-epoch working-set bytes from
+    ///   [`RetainedCategory::NextEpoch`] to
+    ///   [`RetainedCategory::MutationPayload`] (the N+1 entities stay live on
+    ///   the overlay and become the next cycle's working set; the aggregate
+    ///   retained total is unchanged — no ratchet, no leak); G-EM0.5c MAJOR-4
+    /// - marks the handoff slot complete/cleared.
+    ///
+    /// Absorbed/retained counts are computed by the caller as pure set
+    /// arithmetic over the freeze and post-freeze id sets; no live state is
+    /// mutated here.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no handoff is active.
+    pub fn retire_frozen_overlay_prefix(&self) -> Result<OverlayHandoffLive, String> {
+        let state = self
+            .handoff
+            .write()
+            .take()
+            .ok_or_else(|| "no active epoch handoff to retire".to_string())?;
+
+        if let Some(ctl) = self.admission_slot.read().as_ref() {
+            // (a) Release the frozen (absorbed) epoch-N accounting.
+            for cat in [
+                RetainedCategory::MutationPayload,
+                RetainedCategory::DirtySets,
+                RetainedCategory::DeletionSets,
+            ] {
+                let bytes = state.frozen_category_bytes[cat.index()];
+                if bytes > 0 {
+                    ctl.release(cat, bytes);
+                }
+            }
+            // (b) Re-attribute the N+1 working set: the post-freeze entities
+            // remain on the live overlay, so their charges move back from
+            // NextEpoch to MutationPayload atomically (aggregate unchanged).
+            if state.next_epoch_charged_bytes > 0 {
+                ctl.transfer_retained(
+                    RetainedCategory::NextEpoch,
+                    RetainedCategory::MutationPayload,
+                    state.next_epoch_charged_bytes,
+                );
+            }
+            ctl.set_active_epoch(state.next_epoch);
+            ctl.complete_generation_build();
+        }
+
+        Ok(state)
+    }
+
     /// Replaces the overlay with a fresh empty `LpgStore` and clears
     /// dirty/deleted bookkeeping (Phase 5c).
     ///
@@ -247,8 +693,9 @@ impl LayeredStore {
     /// store so this is a fatal condition rather than a recoverable
     /// error.
     pub fn reset_overlay(&self) {
-        let fresh = Arc::new(LpgStore::new().expect("LpgStore allocation"));
-        // Seed allocators from the base so new ids don't collide.
+        // Compute the current scanned watermark, then delegate to the explicit
+        // watermark swap (no behavior change for existing callers like
+        // swap_base_and_reset_overlay at :776).
         let base = self.base.load();
         let max_nid = base
             .all_node_ids()
@@ -256,19 +703,170 @@ impl LayeredStore {
             .map(|id| id.as_u64())
             .max()
             .unwrap_or(0);
-        // Edge ids are not directly enumerable from CompactStore; use
-        // the current overlay's allocator as a conservative lower bound.
         let current_overlay = self.overlay.load();
         let max_eid = current_overlay.next_edge_id().saturating_sub(1);
-        fresh.set_next_node_id(max_nid + 1);
-        fresh.set_next_edge_id(max_eid + 1);
+        let next_node_id = max_nid + 1;
+        let next_edge_id = max_eid + 1;
+        drop(base);
+        drop(current_overlay);
+        self.reset_overlay_with_watermark(next_node_id, next_edge_id);
+    }
 
+    /// Seeds a FRESH overlay from an explicit watermark instead of scanning the
+    /// base (O(N)) and conservatively under-seeding edges. For mid-build drains
+    /// where the drained overlay's next counters ARE the global watermark.
+    pub fn reset_overlay_with_watermark(&self, next_node_id: u64, next_edge_id: u64) {
+        let fresh = Arc::new(LpgStore::new().expect("LpgStore allocation"));
+        fresh.set_next_node_id(next_node_id);
+        fresh.set_next_edge_id(next_edge_id);
         self.overlay.store(fresh);
         self.dirty_node_ids.write().clear();
         self.dirty_edge_ids.write().clear();
         self.deleted_from_base_nodes.write().clear();
         self.deleted_from_base_edges.write().clear();
         self.deletions_dirty.store(false, Ordering::Release);
+    }
+
+    /// Publish a newly-built whole-graph generation as the live base and reset
+    /// the overlay — G-EM0.5d (Milestone W).
+    ///
+    /// This is the bounded fast-path base swap for a **whole-live-graph**
+    /// generation built via `GrafeoDB::build_and_publish_generation` (streams the
+    /// whole base **and** overlay). Because `new_base` contains every accepted
+    /// write *that the build's freeze captured*, the live overlay can be reset to
+    /// empty.
+    ///
+    /// ## Concurrency truth (what `merge_guard` does and does NOT give you)
+    ///
+    /// The swap+reset is atomic **as a store operation**: under `merge_guard
+    /// .write()`, a concurrent `GraphStoreMut` mutation either (a) completes
+    /// entirely before this swap begins — it lands in the old base/overlay — or
+    /// (b) starts entirely after — it lands in the fresh reset overlay. No
+    /// writer observes an intermediate "base swapped, overlay not yet reset"
+    /// state. Every *individual* reader load is likewise untorn
+    /// (`base`/`overlay` are `ArcSwap`) — but that is a weaker guarantee than
+    /// it sounds; see the reader-precision section below.
+    ///
+    /// ## Reader precision (what the atomic store op does NOT give readers)
+    ///
+    /// `base`, `overlay`, and the dirty/deletion bookkeeping are three
+    /// separate atomics, not one snapshot. A lock-free reader performing the
+    /// check-then-act sequence (read the dirty-set, then `overlay.load()`,
+    /// then the base) spans multiple independent loads, and a swap+reset may
+    /// land between them: the dirty-set load sees the pre-swap "dirty" mark,
+    /// `overlay.load()` picks up the post-reset EMPTY overlay, and the entity
+    /// — in fact resident in the new base — is reported in neither. Such a
+    /// reader can therefore observe a transient `None` for an entity the new
+    /// base does contain. The writer side remains atomic (mutators serialize
+    /// under `merge_guard`); only the reader's multi-load sequence races.
+    /// This is exactly why the concurrent-reader cycle test
+    /// (`repeated_cycles_with_concurrent_readers` in
+    /// tests/compact_store_writable_cycles.rs) asserts `min_observed <=
+    /// max_observed` over its in-flight reads and demands exactness only on
+    /// the single final stable read taken after the writer has quiesced.
+    ///
+    /// **But it does NOT make a lost write impossible**: a mutation that commits
+    /// *between* the build's freeze capture (`generation_freeze_epoch`/`build()`
+    /// start — a different, earlier barrier) and this swap is present in the OLD
+    /// overlay, is absent from `new_base`, and is destroyed by `reset_overlay`.
+    /// The single-writer / handoff contract (`generation_build.rs`) forbids
+    /// mid-build mutations; 5c's freeze writer-linearization holds the overlay
+    /// steady from WAL-cut through `begin_epoch_handoff`. Callers MUST only swap
+    /// to a base that is a complete snapshot of the overlay at the freeze
+    /// instant, with no writes admitted between freeze and swap.
+    // Reader-precision note (G-EM0.5d closeout): the writer-side swap+reset is
+    // atomic as a store operation (mutators serialize under `merge_guard`), but
+    // base/overlay/dirty are three separate atomics, not one snapshot: a reader
+    // spanning them in a check-then-act sequence (dirty-set -> overlay.load()
+    // -> base) can observe a transient `None` for an entity that is in fact
+    // resident in the new base. See the doc above; the concurrent-reader cycle
+    // test asserts min<=max over in-flight reads and exactness only on the
+    // final stable read. No code change — documentation precision only.
+    #[cfg(feature = "lpg")]
+    pub fn swap_base_and_reset_overlay(&self, new_base: Arc<CompactStore>) -> Arc<CompactStore> {
+        let _barrier = self.merge_guard.write();
+        let old_base = self.base.swap(new_base);
+        // `reset_overlay` re-seeds id allocators from the *new* base and clears
+        // the dirty/deletion bookkeeping under the same barrier, so a freshly
+        // created post-swap id can never collide with a base id.
+        self.reset_overlay();
+        old_base
+    }
+
+    /// Publish a **handoff** generation (`old base + epoch-N frozen overlay`) as
+    /// the live base, repairing overlay bookkeeping — G-EM0.5d (Milestone W).
+    ///
+    /// Unlike [`Self::swap_base_and_reset_overlay`], the handoff build
+    /// (`complete_epoch_handoff`) produces a generation that contains the **old
+    /// base plus the frozen epoch-N snapshot** — it does *not* include the
+    /// post-freeze N+1 mutations. So the dirty sets **cannot** be cleared
+    /// wholesale.
+    ///
+    /// Read dispatch order (`get_node`/`get_edge` + versioned variants):
+    ///
+    /// 1. cleared-from-base tombstone → hidden;
+    /// 2. **dirty** → overlay;
+    /// 3. otherwise base, else overlay (base-miss fallthrough).
+    ///
+    /// `frozen_node_ids`/`frozen_edge_ids` are the **freeze identity** (every id
+    /// resident/dirtied in the overlay at freeze ⇒ absorbed into this
+    /// generation). `post_freeze_node_ids`/`post_freeze_edge_ids` are **every
+    /// id mutated after the freeze** (epoch N+1), as recorded by the mutation
+    /// paths on this store during the handoff. `complete_epoch_handoff`
+    /// propagates both sets on its report.
+    ///
+    /// Under the `merge_guard` writer barrier this swaps the base and retains
+    /// dirty for exactly two classes:
+    ///
+    /// - **post-freeze mutations** (`post_freeze_*`): the new base holds at
+    ///   most the entity's frozen value, so the overlay (or its absence, for a
+    ///   post-freeze deletion) must stay authoritative. Clearing dirty here
+    ///   would silently serve the stale frozen value or resurrect a deleted
+    ///   entity.
+    /// - **base-resident entities mutated post-freeze but not frozen** (not in
+    ///   `frozen_*`, present in the old base): the base merge could not absorb
+    ///   the new value; retaining dirty keeps dispatch on the overlay.
+    ///
+    /// Everything else (frozen-absorbed with no post-freeze mutation, and
+    /// post-freeze *creates* absent from the base) is cleared: absorbed
+    /// entities are shadowed by the new base, and post-freeze creates resolve
+    /// via base-miss → overlay fallthrough.
+    ///
+    /// Base-deletion tombstones (`deleted_from_base_*`) are intentionally left
+    /// intact: the handoff build may have absorbed an entity whose tombstone
+    /// postdates the freeze, and the tombstone is what keeps it hidden.
+    ///
+    /// Returns the previous base `Arc`.
+    #[cfg(feature = "lpg")]
+    pub fn swap_base_and_repair_overlay(
+        &self,
+        new_base: Arc<CompactStore>,
+        frozen_node_ids: &FxHashSet<NodeId>,
+        frozen_edge_ids: &FxHashSet<EdgeId>,
+        post_freeze_node_ids: &FxHashSet<NodeId>,
+        post_freeze_edge_ids: &FxHashSet<EdgeId>,
+    ) -> Arc<CompactStore> {
+        let _barrier = self.merge_guard.write();
+        let old_base = self.base.swap(new_base);
+        // Selective undirty (see method docs): retain dirty for every
+        // post-freeze mutation and for unfrozen base entities re-mutated
+        // post-freeze; clear it for absorbed (frozen, unmodified) entities and
+        // for post-freeze creates served by base-miss fallthrough.
+        {
+            let mut dirty = self.dirty_node_ids.write();
+            dirty.retain(|id| {
+                post_freeze_node_ids.contains(id)
+                    || (!frozen_node_ids.contains(id) && old_base.get_node(*id).is_some())
+            });
+        }
+        {
+            let mut dirty = self.dirty_edge_ids.write();
+            dirty.retain(|id| {
+                post_freeze_edge_ids.contains(id)
+                    || (!frozen_edge_ids.contains(id) && old_base.get_edge(*id).is_some())
+            });
+        }
+        old_base
     }
 
     /// Returns a snapshot of the base node ids the overlay has marked as
@@ -293,6 +891,18 @@ impl LayeredStore {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Snapshot of overlay dirty (created/modified) node ids.
+    #[must_use]
+    pub fn snapshot_dirty_node_ids(&self) -> Vec<NodeId> {
+        self.dirty_node_ids.read().iter().copied().collect()
+    }
+
+    /// Snapshot of overlay dirty (created/modified) edge ids.
+    #[must_use]
+    pub fn snapshot_dirty_edge_ids(&self) -> Vec<EdgeId> {
+        self.dirty_edge_ids.read().iter().copied().collect()
     }
 
     /// Seeds the deleted-from-base sets from a previously-persisted
@@ -356,6 +966,15 @@ impl LayeredStore {
 
         // Reset the overlay (already seeds id allocators from the new base).
         self.reset_overlay();
+
+        // G-EM0.5a: the overlay is now empty, so release all retained
+        // accounting. In W-mode this path is disabled under pressure
+        // (OverlayConsumer refuses to call it until G-EM0.5b), but an
+        // explicit compact() may still reach here; draining keeps the
+        // controller's counters truthful either way.
+        if let Some(ctl) = self.admission_slot.read().as_ref() {
+            ctl.drain_all_retained();
+        }
         Ok(())
     }
 
@@ -742,6 +1361,20 @@ impl GraphStore for LayeredStore {
     fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
         let deleted = self.deleted_from_base_nodes.read();
         let dirty = self.dirty_node_ids.read();
+        let overlay = self.overlay.load();
+
+        // G-E1.RO: after compact, create_property_index / mapped PropertyIndex
+        // restore store full base+overlay postings on the overlay. Merging a
+        // CompactStore base scan with those postings double-counts base nodes
+        // (planner WHERE / find_nodes_by_properties see 2× hits). Prefer the
+        // overlay index exclusively whenever one is registered.
+        if overlay.has_property_index(property) {
+            return overlay
+                .find_nodes_by_property(property, value)
+                .into_iter()
+                .filter(|id| !deleted.contains(id))
+                .collect();
+        }
 
         let mut results: Vec<NodeId> = self
             .base
@@ -751,7 +1384,7 @@ impl GraphStore for LayeredStore {
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
 
-        results.extend(self.overlay.load().find_nodes_by_property(property, value));
+        results.extend(overlay.find_nodes_by_property(property, value));
         results
     }
 
@@ -759,9 +1392,76 @@ impl GraphStore for LayeredStore {
         if conditions.is_empty() {
             return self.node_ids();
         }
+        let overlay = self.overlay.load();
+
+        // Same exclusive-overlay rule as find_nodes_by_property: the planner
+        // try_plan_filter_with_property_index path calls this multi-predicate
+        // API, so base∪overlay would inflate Cypher WHERE counts.
+        //
+        // Pick the MOST SELECTIVE indexed condition: probe every indexed
+        // posting list once (k probes total, never per candidate) and seed
+        // from the smallest.
+        let mut seed: Option<Vec<NodeId>> = None;
+        for (prop, value) in conditions {
+            if !overlay.has_property_index(prop) {
+                continue;
+            }
+            let hits = overlay.find_nodes_by_property(prop, value);
+            if seed.as_ref().is_some_and(|best| best.len() <= hits.len()) {
+                continue;
+            }
+            seed = Some(hits);
+        }
+        if let Some(candidates) = seed {
+            // G-E1.RO exclusivity, multi-predicate safe: overlay property
+            // indexes carry FULL base+overlay postings when created through
+            // `GrafeoDB::create_property_index` / `.._from_entries` or
+            // restored from a mapped PropertyIndexSection (a raw
+            // `LpgStore::create_property_index` call would NOT see base rows;
+            // the generation path always goes through the DB layer).
+            //
+            // Secondary conditions must NOT be filtered through the overlay's
+            // own multi-predicate lookup: it verifies remaining predicates
+            // against overlay-only property storage, which has no
+            // CompactStore base rows — every base candidate would be dropped
+            // (observed 2026-08-22: keyed `MATCH (d {repo_id, path})` served
+            // `stored: None` while the rows sat in the base generation).
+            //
+            // Every condition (including the seeded one — postings can lag a
+            // mutation) is therefore verified against this LayeredStore's
+            // MERGED view. Equality uses strict `Value: PartialEq`, matching
+            // LpgStore's own index/secondary filters; cross-type numeric
+            // coercion remains a planner-level concern (pre-existing split).
+            // Known limitation: an index shell with EMPTY postings serves
+            // empty here — identical to the previous behavior, not a new
+            // failure mode.
+            let keyed_conditions: Vec<(PropertyKey, Value)> = conditions
+                .iter()
+                .map(|(prop, value)| (PropertyKey::new(*prop), value.clone()))
+                .collect();
+            // Deleted-set snapshot taken under a SHORT-LIVED read guard: the
+            // long per-candidate merged scan below holds no LayeredStore
+            // locks, so index writers are not blocked for the whole scan.
+            // (`get_node_property` additionally re-checks deletion against
+            // live state, so the snapshot is an optimization, not the
+            // correctness boundary.)
+            let deleted_snapshot = self.deleted_from_base_nodes.read().clone();
+            return candidates
+                .into_iter()
+                .filter(|id| !deleted_snapshot.contains(id))
+                .filter(|id| {
+                    keyed_conditions
+                        .iter()
+                        .all(|(key, value)| {
+                            self.get_node_property(*id, key)
+                                .is_some_and(|stored| stored == *value)
+                        })
+                })
+                .collect();
+        }
+
         let deleted = self.deleted_from_base_nodes.read();
         let dirty = self.dirty_node_ids.read();
-
         let mut results: Vec<NodeId> = self
             .base
             .load()
@@ -770,7 +1470,7 @@ impl GraphStore for LayeredStore {
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
 
-        results.extend(self.overlay.load().find_nodes_by_properties(conditions));
+        results.extend(overlay.find_nodes_by_properties(conditions));
         results
     }
 
@@ -1133,7 +1833,11 @@ impl GraphStoreMut for LayeredStore {
     fn create_node(&self, labels: &[&str]) -> NodeId {
         let _guard = self.merge_guard.read();
         let id = self.overlay.load().create_node(labels);
-        self.dirty_node_ids.write().insert(id);
+        self.mark_dirty_node(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::node_creation_retained_bytes(labels),
+        );
         id
     }
 
@@ -1148,7 +1852,11 @@ impl GraphStoreMut for LayeredStore {
             .overlay
             .load()
             .create_node_versioned(labels, epoch, transaction_id);
-        self.dirty_node_ids.write().insert(id);
+        self.mark_dirty_node(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::node_creation_retained_bytes(labels),
+        );
         id
     }
 
@@ -1158,7 +1866,11 @@ impl GraphStoreMut for LayeredStore {
         self.ensure_in_overlay(src);
         self.ensure_in_overlay(dst);
         let id = self.overlay.load().create_edge(src, dst, edge_type);
-        self.dirty_edge_ids.write().insert(id);
+        self.mark_dirty_edge(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::edge_creation_retained_bytes(edge_type),
+        );
         id
     }
 
@@ -1177,20 +1889,126 @@ impl GraphStoreMut for LayeredStore {
             self.overlay
                 .load()
                 .create_edge_versioned(src, dst, edge_type, epoch, transaction_id);
-        self.dirty_edge_ids.write().insert(id);
+        self.mark_dirty_edge(id);
+        self.charge_retained(
+            RetainedCategory::MutationPayload,
+            overlay_cost::edge_creation_retained_bytes(edge_type),
+        );
         id
     }
 
     fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId> {
         let _guard = self.merge_guard.read();
+        // Endpoint preparation, batched: promote base-resident endpoints once
+        // each, and record the post-freeze identity of already-tracked
+        // endpoints in ONE handoff lock acquisition (not one per endpoint).
+        let mut endpoints: FxHashSet<NodeId> = FxHashSet::default();
         for &(src, dst, _) in edges {
-            self.ensure_in_overlay(src);
-            self.ensure_in_overlay(dst);
+            endpoints.insert(src);
+            endpoints.insert(dst);
         }
+        let mut tracked: Vec<NodeId> = Vec::new();
+        for nid in endpoints {
+            if self.is_node_dirty(nid) {
+                tracked.push(nid);
+            } else {
+                self.ensure_in_overlay(nid);
+            }
+        }
+        if !tracked.is_empty() {
+            if let Some(h) = self.handoff.write().as_mut() {
+                for nid in &tracked {
+                    h.post_freeze_nodes.insert(nid.as_u64());
+                }
+            }
+        }
+
         let ids = self.overlay.load().batch_create_edges(edges);
-        let mut dirty = self.dirty_edge_ids.write();
-        for &id in &ids {
-            dirty.insert(id);
+        self.mark_dirty_edges(&ids);
+
+        // Charge the whole batch ONCE (one admission/handoff lock acquisition
+        // instead of one per edge).
+        let total: usize = edges
+            .iter()
+            .map(|(_, _, edge_type)| overlay_cost::edge_creation_retained_bytes(edge_type))
+            .sum();
+        if total > 0 {
+            self.charge_retained(RetainedCategory::MutationPayload, total);
+        }
+        ids
+    }
+
+    fn create_nodes_batch_versioned(
+        &self,
+        nodes: &[BatchNodeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        let _guard = self.merge_guard.read();
+        let ids = self
+            .overlay
+            .load()
+            .create_nodes_batch_versioned(nodes, epoch, transaction_id);
+        // One dirty-set write lock + (during a handoff) one handoff lock for
+        // the whole batch, mirroring `mark_dirty_edges`.
+        self.mark_dirty_nodes(&ids);
+
+        // Charge the whole batch ONCE.
+        let total: usize = nodes
+            .iter()
+            .map(|n| overlay_cost::node_creation_retained_bytes(n.labels))
+            .sum();
+        if total > 0 {
+            self.charge_retained(RetainedCategory::MutationPayload, total);
+        }
+        ids
+    }
+
+    fn create_edges_batch_versioned(
+        &self,
+        edges: &[BatchEdgeCreate<'_>],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<EdgeId> {
+        let _guard = self.merge_guard.read();
+        // Endpoint preparation, batched exactly like `batch_create_edges`:
+        // promote base-resident endpoints once each, and record the
+        // post-freeze identity of already-tracked endpoints in ONE handoff
+        // lock acquisition.
+        let mut endpoints: FxHashSet<NodeId> = FxHashSet::default();
+        for e in edges {
+            endpoints.insert(e.source);
+            endpoints.insert(e.target);
+        }
+        let mut tracked: Vec<NodeId> = Vec::new();
+        for nid in endpoints {
+            if self.is_node_dirty(nid) {
+                tracked.push(nid);
+            } else {
+                self.ensure_in_overlay(nid);
+            }
+        }
+        if !tracked.is_empty()
+            && let Some(h) = self.handoff.write().as_mut()
+        {
+            for nid in &tracked {
+                h.post_freeze_nodes.insert(nid.as_u64());
+            }
+        }
+
+        let ids = self
+            .overlay
+            .load()
+            .create_edges_batch_versioned(edges, epoch, transaction_id);
+        self.mark_dirty_edges(&ids);
+
+        // Charge the whole batch ONCE.
+        let total: usize = edges
+            .iter()
+            .map(|e| overlay_cost::edge_creation_retained_bytes(e.edge_type))
+            .sum();
+        if total > 0 {
+            self.charge_retained(RetainedCategory::MutationPayload, total);
         }
         ids
     }
@@ -1198,12 +2016,21 @@ impl GraphStoreMut for LayeredStore {
     fn delete_node(&self, id: NodeId) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_node_dirty(id) {
-            // Node is in the overlay: delete from overlay.
+            // Node is in the overlay: delete from overlay. Record the
+            // post-freeze deletion so `swap_base_and_repair_overlay` keeps
+            // the id out of the absorbed (undirty) class — otherwise a
+            // frozen entity deleted at N+1 would resurrect from the new
+            // base.
+            self.record_post_freeze_node(id);
             return self.overlay.load().delete_node(id);
         }
         if self.base.load().get_node(id).is_some() {
             if self.deleted_from_base_nodes.write().insert(id) {
                 self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
             }
             return true;
         }
@@ -1218,6 +2045,8 @@ impl GraphStoreMut for LayeredStore {
     ) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_node_dirty(id) {
+            // See `delete_node`: record the N+1 deletion for the repair swap.
+            self.record_post_freeze_node(id);
             return self
                 .overlay
                 .load()
@@ -1226,6 +2055,10 @@ impl GraphStoreMut for LayeredStore {
         if self.base.load().get_node(id).is_some() {
             if self.deleted_from_base_nodes.write().insert(id) {
                 self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
             }
             return true;
         }
@@ -1236,30 +2069,55 @@ impl GraphStoreMut for LayeredStore {
         let _guard = self.merge_guard.read();
         // Delete overlay edges.
         if self.is_node_dirty(node_id) {
-            self.overlay.load().delete_node_edges(node_id);
+            let overlay = self.overlay.load();
+            // Record the incident overlay edges as post-freeze mutations
+            // BEFORE removing them: a frozen edge deleted at N+1 must not
+            // resurrect from the new base at the repair swap.
+            let incident: Vec<EdgeId> = overlay
+                .edges_from(node_id, Direction::Both)
+                .map(|(_, eid)| eid)
+                .collect();
+            if !incident.is_empty() {
+                if let Some(h) = self.handoff.write().as_mut() {
+                    for eid in &incident {
+                        h.post_freeze_edges.insert(eid.as_u64());
+                    }
+                }
+            }
+            overlay.delete_node_edges(node_id);
         }
         // Mark base edges as deleted.
-        let mut deleted_any = false;
+        let mut newly_deleted = 0usize;
         let mut edges = self.deleted_from_base_edges.write();
         for (_, eid) in self.base.load().edges_from(node_id, Direction::Both) {
             if edges.insert(eid) {
-                deleted_any = true;
+                newly_deleted += 1;
             }
         }
         drop(edges);
-        if deleted_any {
+        if newly_deleted > 0 {
             self.deletions_dirty.store(true, Ordering::Release);
+            self.charge_retained(
+                RetainedCategory::DeletionSets,
+                newly_deleted * overlay_cost::deletion_entry_retained_bytes(),
+            );
         }
     }
 
     fn delete_edge(&self, id: EdgeId) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_edge_dirty(id) {
+            // See `delete_node`: record the N+1 deletion for the repair swap.
+            self.record_post_freeze_edge(id);
             return self.overlay.load().delete_edge(id);
         }
         if self.base.load().get_edge(id).is_some() {
             if self.deleted_from_base_edges.write().insert(id) {
                 self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
             }
             return true;
         }
@@ -1274,6 +2132,8 @@ impl GraphStoreMut for LayeredStore {
     ) -> bool {
         let _guard = self.merge_guard.read();
         if self.is_edge_dirty(id) {
+            // See `delete_node`: record the N+1 deletion for the repair swap.
+            self.record_post_freeze_edge(id);
             return self
                 .overlay
                 .load()
@@ -1282,6 +2142,10 @@ impl GraphStoreMut for LayeredStore {
         if self.base.load().get_edge(id).is_some() {
             if self.deleted_from_base_edges.write().insert(id) {
                 self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
             }
             return true;
         }
@@ -1290,8 +2154,10 @@ impl GraphStoreMut for LayeredStore {
 
     fn set_node_property(&self, id: NodeId, key: &str, value: Value) {
         let _guard = self.merge_guard.read();
+        let cost = overlay_cost::property_retained_bytes(key, &value);
         self.ensure_in_overlay(id);
         self.overlay.load().set_node_property(id, key, value);
+        self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
 
     fn set_node_property_versioned(
@@ -1302,16 +2168,20 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) {
         let _guard = self.merge_guard.read();
+        let cost = overlay_cost::property_retained_bytes(key, &value);
         self.ensure_in_overlay(id);
         self.overlay
             .load()
             .set_node_property_versioned(id, key, value, transaction_id);
+        self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
 
     fn set_edge_property(&self, id: EdgeId, key: &str, value: Value) {
         let _guard = self.merge_guard.read();
+        let cost = overlay_cost::property_retained_bytes(key, &value);
         self.ensure_edge_in_overlay(id);
         self.overlay.load().set_edge_property(id, key, value);
+        self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
 
     fn set_edge_property_versioned(
@@ -1322,10 +2192,12 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) {
         let _guard = self.merge_guard.read();
+        let cost = overlay_cost::property_retained_bytes(key, &value);
         self.ensure_edge_in_overlay(id);
         self.overlay
             .load()
             .set_edge_property_versioned(id, key, value, transaction_id);
+        self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
 
     fn remove_node_property(&self, id: NodeId, key: &str) -> Option<Value> {
@@ -1412,7 +2284,13 @@ impl LayeredStore {
     /// copies its labels and properties into the overlay and marks it dirty.
     fn ensure_in_overlay(&self, id: NodeId) {
         if self.is_node_dirty(id) {
-            return; // already in overlay
+            // Already overlay-tracked. During an active handoff this mutation
+            // is an epoch-N+1 write on an entity that may itself be frozen —
+            // record it so `swap_base_and_repair_overlay` can retain dirty
+            // for it (the dirty mark itself was set pre- or post-freeze and
+            // is not re-inserted here).
+            self.record_post_freeze_node(id);
+            return;
         }
         let Some(base_node) = self.base.load().get_node(id) else {
             return; // not in base either (new node case handled by caller)
@@ -1437,12 +2315,15 @@ impl LayeredStore {
                 .set_node_property(id, key.as_str(), value.clone());
         }
 
-        self.dirty_node_ids.write().insert(id);
+        self.mark_dirty_node(id);
     }
 
     /// Ensures an edge exists in the overlay.
     fn ensure_edge_in_overlay(&self, id: EdgeId) {
         if self.is_edge_dirty(id) {
+            // Already overlay-tracked: see `ensure_in_overlay` — record the
+            // epoch-N+1 mutation for the repair swap.
+            self.record_post_freeze_edge(id);
             return;
         }
         let Some(base_edge) = self.base.load().get_edge(id) else {
@@ -1474,7 +2355,7 @@ impl LayeredStore {
                 .set_edge_property(id, key.as_str(), value.clone());
         }
 
-        self.dirty_edge_ids.write().insert(id);
+        self.mark_dirty_edge(id);
     }
 }
 

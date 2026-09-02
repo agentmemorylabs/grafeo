@@ -28,10 +28,16 @@ impl GraphStore for CompactStore {
         }
 
         let mut node = Node::new(id);
-        node.add_label(nt.label());
-        let props = nt.get_all_properties(row);
-        for (k, v) in props {
-            node.set_property(k, v);
+        let row_u32 = u32::try_from(offset).ok()?;
+        // Use the full logical label set (physical + membership extras).
+        for label in self.logical_labels_for_node(table_id, row_u32) {
+            node.add_label(label);
+        }
+        for key in nt.columns().keys() {
+            let raw = nt.get_property(row, key);
+            if let Some(filtered) = self.get_property_filtered(table_id, row_u32, key, raw) {
+                node.set_property(key.clone(), filtered);
+            }
         }
         Some(node)
     }
@@ -85,7 +91,9 @@ impl GraphStore for CompactStore {
         let (table_id, offset) = self.resolve_node(id)?;
         let nt = self.resolve_node_table(table_id)?;
         let row = usize::try_from(offset).ok()?;
-        nt.get_property(row, key)
+        let raw = nt.get_property(row, key);
+        let row_u32 = u32::try_from(offset).ok()?;
+        self.get_property_filtered(table_id, row_u32, key, raw)
     }
 
     fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value> {
@@ -225,25 +233,56 @@ impl GraphStore for CompactStore {
             for nt in &self.node_tables_by_id {
                 ids.extend(nt.node_ids());
             }
+            // ID-preserving stores (mapped v5 base from a generation-root
+            // open, or any store with an original-id mapping) expose the
+            // store's LOGICAL id space to every lookup API; the raw table
+            // enumeration above yields PHYSICAL (table_id<<48|offset) ids
+            // that no lookup resolves. Map through the same translation the
+            // labeled-scan and property-scan paths already use
+            // (`nodes_by_label`, `find_nodes_by_property`). Without this,
+            // anonymous scans (MATCH (n), un-anchored ()-[r]->()) collapse:
+            // G-GEM0.SRV1 Gap A.
+            if self.preserves_ids() {
+                ids = ids
+                    .into_iter()
+                    .map(|cid| self.to_original_node_id(cid))
+                    .collect();
+            }
             ids.sort_unstable();
             ids
         }
     }
 
     fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
-        let compact_ids = self
-            .label_to_table_id
-            .get(label)
-            .map(|&tid| self.node_tables_by_id[tid as usize].node_ids())
-            .unwrap_or_default();
+        let mut result = FxHashSet::default();
+
+        // Physical table nodes (existing behavior).
+        if let Some(&tid) = self.label_to_table_id.get(label) {
+            result.extend(self.node_tables_by_id[tid as usize].node_ids());
+        }
+
+        // Membership extras: scan for nodes with this label code.
+        if let (Some(membership), Some(dict)) = (&self.label_membership, &self.global_dict) {
+            if let Some(label_code) = dict.encode(label) {
+                for (table_id, offset) in membership.nodes_with(label_code) {
+                    if let Some(nt) = self.node_tables_by_id.get(table_id as usize) {
+                        if let Some(node_id) = nt.node_id_at(offset as usize) {
+                            result.insert(node_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut ids: Vec<NodeId> = result.into_iter().collect();
         if self.preserves_ids() {
-            compact_ids
+            ids = ids
                 .into_iter()
                 .map(|cid| self.to_original_node_id(cid))
-                .collect()
-        } else {
-            compact_ids
+                .collect();
         }
+        ids.sort_unstable();
+        ids
     }
 
     fn nodes_by_label_count(&self, label: &str) -> usize {
@@ -281,6 +320,18 @@ impl GraphStore for CompactStore {
             if let Some(col) = nt.column(&key) {
                 let table_id = nt.table_id();
                 for offset in col.find_eq(value) {
+                    let row_u32 = u32::try_from(offset).ok();
+                    let Some(row_u32) = row_u32 else {
+                        continue;
+                    };
+                    let raw = col.get(offset);
+                    if self
+                        .get_property_filtered(table_id, row_u32, &key, raw)
+                        .as_ref()
+                        != Some(value)
+                    {
+                        continue;
+                    }
                     let compact_id = encode_node_id(table_id, offset as u64);
                     results.push(self.to_original_node_id(compact_id));
                 }
@@ -353,6 +404,17 @@ impl GraphStore for CompactStore {
             if let Some(col) = nt.column(&key) {
                 let table_id = nt.table_id();
                 for offset in col.find_in_range(min, max, min_inclusive, max_inclusive) {
+                    let row_u32 = u32::try_from(offset).ok();
+                    let Some(row_u32) = row_u32 else {
+                        continue;
+                    };
+                    let raw = col.get(offset);
+                    let Some(val) = self.get_property_filtered(table_id, row_u32, &key, raw) else {
+                        continue;
+                    };
+                    if !value_in_range(&val, min, max, min_inclusive, max_inclusive) {
+                        continue;
+                    }
                     let compact_id = encode_node_id(table_id, offset as u64);
                     results.push(self.to_original_node_id(compact_id));
                 }
@@ -387,12 +449,26 @@ impl GraphStore for CompactStore {
 
     fn edge_property_might_match(
         &self,
-        _property: &PropertyKey,
-        _op: CompareOp,
-        _value: &Value,
+        property: &PropertyKey,
+        op: CompareOp,
+        value: &Value,
     ) -> bool {
-        // Conservative: no zone maps on edge properties
-        true
+        // R3-B2: use installed rel zone maps for pruning.
+        let mut might_match = false;
+        for rt in &self.rel_tables_by_id {
+            match rt.zone_map(property) {
+                Some(zm) => {
+                    if zm.might_match(op, value) {
+                        return true;
+                    }
+                }
+                None => {
+                    // No stats for this property in this rel table: conservatively assume match
+                    might_match = true;
+                }
+            }
+        }
+        might_match
     }
 
     fn statistics(&self) -> Arc<Statistics> {
@@ -439,10 +515,25 @@ impl GraphStore for CompactStore {
     }
 
     fn all_labels(&self) -> Vec<String> {
-        self.table_id_to_label
+        let mut labels: FxHashSet<String> = self
+            .table_id_to_label
             .iter()
             .map(|s| s.to_string())
-            .collect()
+            .collect();
+
+        // Add membership labels from the global dictionary.
+        if let (Some(membership), Some(dict)) = (&self.label_membership, &self.global_dict) {
+            for i in 0..membership.len() {
+                let rec = membership.record_at(i);
+                if let Some(label_str) = dict.get(rec.label_code) {
+                    labels.insert(label_str.to_string());
+                }
+            }
+        }
+
+        let mut result: Vec<String> = labels.into_iter().collect();
+        result.sort();
+        result
     }
 
     fn all_edge_types(&self) -> Vec<String> {
@@ -533,4 +624,42 @@ impl GraphStoreSearch for CompactStore {
 
         Box::new(per_table.flatten())
     }
+}
+
+fn value_in_range(
+    value: &Value,
+    min: Option<&Value>,
+    max: Option<&Value>,
+    min_inclusive: bool,
+    max_inclusive: bool,
+) -> bool {
+    use std::cmp::Ordering;
+    fn cmp(a: &Value, b: &Value) -> Option<Ordering> {
+        match (a, b) {
+            (Value::Int64(a), Value::Int64(b)) => Some(a.cmp(b)),
+            (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b),
+            (Value::Int64(a), Value::Float64(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float64(a), Value::Int64(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+    if let Some(min_val) = min {
+        match cmp(value, min_val) {
+            Some(Ordering::Less) => return false,
+            Some(Ordering::Equal) if !min_inclusive => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    if let Some(max_val) = max {
+        match cmp(value, max_val) {
+            Some(Ordering::Greater) => return false,
+            Some(Ordering::Equal) if !max_inclusive => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    true
 }

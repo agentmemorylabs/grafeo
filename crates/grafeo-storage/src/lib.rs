@@ -26,3 +26,6 @@ pub mod async_backend;
 
 #[cfg(feature = "async-storage")]
 pub mod async_local;
+
+#[cfg(feature = "generation")]
+pub mod generation;

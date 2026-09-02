@@ -61,6 +61,9 @@ crc32fast = { workspace = true, optional = true }
 # Memory-mapped files (optional, for compact-store mmap spill)
 memmap2 = { workspace = true, optional = true }
 
+# Atomic Arc swap for generation-lease base redirect (G-EM0.4a)
+arc-swap = { workspace = true, optional = true }
+
 # Refcounted byte slices for mmap-backed column storage (Phase 3c)
 bytes.workspace = true
 
@@ -70,6 +73,8 @@ tempfile.workspace = true
 serde_json = "1"
 tokio.workspace = true
 proptest.workspace = true
+filetime.workspace = true
+libc = "0.2"
 
 [features]
 default = ["lpg", "gql", "parallel", "wal", "grafeo-file", "spill", "mmap", "regex"]
@@ -91,9 +96,11 @@ algos = ["grafeo-adapters/algos"]  # Graph algorithm plugin (SSSP, PageRank, etc
 wal = ["dep:grafeo-storage", "grafeo-storage/wal"]  # Write-ahead log storage
 async-storage = ["dep:grafeo-storage", "grafeo-storage/async-storage", "dep:tokio"]  # Async WAL and storage backend
 grafeo-file = ["dep:grafeo-storage", "grafeo-storage/grafeo-file", "dep:crc32fast"]  # Single-file .grafeo format
+generation = ["grafeo-file", "grafeo-storage/generation"]  # Streaming generation container writer
+generation-streaming = ["generation", "grafeo-storage/generation-streaming", "grafeo-core/generation-streaming"]  # Bounded out-of-core generation (G-EM0.5b)
 encryption = ["dep:grafeo-storage", "grafeo-common/encryption", "grafeo-storage/encryption"]  # AES-256-GCM encryption at rest
 spill = ["grafeo-core/spill"]  # Disk spilling for out-of-core execution
-mmap = ["grafeo-core/mmap", "dep:memmap2"]  # File-backed vector storage and compact-store spill
+mmap = ["grafeo-core/mmap", "dep:memmap2", "dep:arc-swap"]  # File-backed vector storage and compact-store spill
 temporal = ["grafeo-core/temporal"]  # Append-only versioned properties
 compact-store = ["grafeo-core/compact-store"]  # CompactStore — columnar graph for read-only workloads
 # Convenience groups
@@ -130,6 +137,96 @@ testing-statement-injection = ["grafeo-common/testing-statement-injection"]  # F
 [lints]
 workspace = true
 
+[[test]]
+name = "exact_vector_read"
+path = "tests/exact_vector_read/main.rs"
+required-features = ["vector-index", "mmap", "grafeo-file"]
+
+[[test]]
+name = "compact_store_generation_contract"
+path = "tests/compact_store_generation_contract.rs"
+required-features = ["generation", "compact-store"]
+
+[[test]]
+name = "compact_store_source_true"
+path = "tests/compact_store_source_true.rs"
+required-features = ["generation-streaming", "compact-store"]
+
+[[test]]
+name = "compact_store_source_true_outer"
+path = "tests/compact_store_source_true_outer/main.rs"
+required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
+
+[[test]]
+name = "compact_store_disk_parity"
+path = "tests/compact_store_disk_parity.rs"
+required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
+
+[[test]]
+name = "generation_build_orchestration"
+path = "tests/generation_build_orchestration.rs"
+required-features = ["generation", "compact-store", "lpg"]
+
+[[test]]
+name = "compact_store_manifest_publication"
+path = "tests/compact_store_manifest_publication.rs"
+required-features = ["generation", "compact-store", "lpg"]
+
+[[test]]
+name = "compact_store_manifest_recovery"
+path = "tests/compact_store_manifest_recovery.rs"
+required-features = ["generation", "compact-store", "lpg"]
+
+[[test]]
+name = "compact_store_generation_leases"
+path = "tests/compact_store_generation_leases.rs"
+required-features = ["generation", "compact-store", "lpg", "mmap"]
+
+[[test]]
+name = "compact_store_overlay_admission"
+path = "tests/compact_store_overlay_admission.rs"
+required-features = ["compact-store", "lpg"]
+
+[[test]]
+name = "compact_store_generation_retirement"
+path = "tests/compact_store_generation_retirement.rs"
+required-features = ["generation", "compact-store", "lpg", "mmap"]
+
+[[test]]
+name = "compact_store_epoch_handoff"
+path = "tests/compact_store_epoch_handoff.rs"
+required-features = ["generation", "compact-store", "lpg"]
+
+[[test]]
+name = "compact_store_writable_cycles"
+path = "tests/compact_store_writable_cycles.rs"
+required-features = ["generation", "compact-store", "lpg", "generation-streaming", "mmap"]
+
+[[test]]
+name = "generation_budget_peaks"
+path = "tests/generation_budget_peaks.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap"]
+
+[[test]]
+name = "generation_sections"
+path = "tests/generation_sections.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index", "text-index"]
+
+[[test]]
+name = "vecbuild_b1_spill_build"
+path = "tests/vecbuild_b1_spill_build.rs"
+required-features = ["lpg", "vector-index", "mmap", "compact-store", "generation", "generation-streaming", "grafeo-file"]
+
+[[test]]
+name = "memory_accounting_probe"
+path = "tests/memory_accounting_probe.rs"
+required-features = ["lpg", "mmap", "grafeo-file"]
+
+[[test]]
+name = "layered_memory_accounting"
+path = "tests/layered_memory_accounting.rs"
+required-features = ["compact-store", "lpg"]
+
 [[bench]]
 name = "query_bench"
 harness = false
@@ -148,4 +245,12 @@ harness = false
 
 [[bench]]
 name = "topk_e2e"
+harness = false
+
+[[bench]]
+name = "transactional_batch_bench"
+harness = false
+
+[[bench]]
+name = "offline_bulk_bench"
 harness = false

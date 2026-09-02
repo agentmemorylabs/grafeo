@@ -17,9 +17,16 @@ and writable**: it produces a layered store with an immutable columnar base plus
 mutable overlay. Inserts and property updates after `compact()` land in the overlay;
 `recompact()` merges the overlay back into a fresh base.
 
-Queries keep working across all supported languages, indexes (vector, text, hybrid)
-can be created and searched post-compact, and named graphs are preserved across
-`compact()` / `recompact()`.
+Graph queries keep working across supported languages after `compact()`, and
+named graphs are preserved across `compact()` / `recompact()`.
+
+**Index caveat (not closed by CompactStore E-0):** vector, text, and hybrid
+indexes on a layered store are **incomplete** relative to a full LPG
+database. Catalog / index-state preservation across layered checkpoint
+(E-1) and immutable-base-plus-overlay vector serving (E-2) are separate
+work. Do not treat post-compact vector/text/hybrid search as fully
+production-complete until those land. Prefer verifying the paths you need
+against the current release notes before relying on them.
 
 **When to use it:** workloads that ingest once and query many times, or read-heavy
 workloads with occasional updates. Code analysis tools, static knowledge graphs,
@@ -186,8 +193,28 @@ Call `recompact()` to merge the overlay back into a fresh base:
     db.execute("INSERT (:Person {name: 'Mia'})")   # lands in overlay
     db.recompact()                                  # merges overlay into new base
 
-Indexes (`create_vector_index`, `create_text_index`, hybrid search) work on layered
-stores: vector/text scan and search now fall through both layers.
+**Indexes on layered stores:** creating vector/text indexes after `compact()` may
+succeed for overlay-local data, but **base-only vectors are not fully served
+from the immutable CompactStore** until the E-2 layered vector work lands, and
+catalog/index descriptors are not fully preserved through every layered
+checkpoint path until E-1. Treat index coverage as partial unless your release
+explicitly claims otherwise.
+
+## Persistence and format
+
+On a persistent `.grafeo` database, `compact()` + explicit `close()` checkpoints
+a **CompactStore** section (`GCST` payload) into the container alongside the
+overlay LPG section. Reopen reconstructs a layered store from that section.
+
+- **Current payload version:** **4** (section-level strings use `u32` lengths).
+- **Readers** accept CompactStore payload v1–v4; **old writers/readers** that
+  only understand ≤v3 cannot read v4 (fail closed).
+- **Container open today** still eagerly loads the CompactStore section into
+  owned memory (then may spill under ForceDisk). Direct mmap of the container
+  CompactStore section is **not** the default open path yet.
+- Historical files may carry outer directory version `1` while the GCST payload
+  is v2/v3/v4; dispatch from the payload header, not a strict outer-version
+  equality check.
 
 ## Limitations
 
@@ -200,18 +227,27 @@ stores: vector/text scan and search now fall through both layers.
     - **Preferred:** use a single label per node before compacting.
     - **Alternative:** query the compound label explicitly, e.g., `MATCH (n:Actor:Person)` (labels in alphabetical order).
     - **Alternative:** assign a canonical "primary" label and store additional labels as a list property instead.
-- **No disk serialization**: `compact()` operates in memory. To persist a compacted database,
-  use snapshot export (WASM) or save before compacting.
+- **Layered index completeness**: see the index caveat above (E-1/E-2).
+- **Open memory**: container reopen is not yet disk-native for CompactStore; large
+  compacted graphs still allocate proportional anonymous memory on open until
+  the direct-mmap lifecycle lands.
 
 ## Feature Flag
 
-CompactStore requires the `compact-store` feature flag. It is **not** included in the engine-level named profiles (`embedded`, `browser`, `server`, `full`), but it is included in the binding-level defaults:
+CompactStore requires the `compact-store` feature flag.
 
-| Binding | Profile | Includes `compact-store` |
-|---------|---------|--------------------------|
-| Python (`grafeo-python`) | `embedded` | Yes |
-| Node.js (`grafeo-node`) | `embedded` | Yes |
-| C (`grafeo-c`) | `embedded` | Yes |
-| WASM (`grafeo-wasm`) | `edge` | Yes |
+**Engine-level named profiles** (`grafeo-engine` / `grafeo` crate): `embedded`,
+`browser`, `server`, and `full` do **not** automatically enable `compact-store`.
+Enable it explicitly: `cargo build -p grafeo-engine --features compact-store`
+(and add `grafeo-file` / `mmap` when you need persistence or spill).
+
+**Binding-level defaults** (checked against current binding manifests):
+
+| Binding | Default profile | Includes `compact-store` |
+|---------|-----------------|--------------------------|
+| Python (`crates/bindings/python`) | `embedded` | Yes |
+| Node.js (`crates/bindings/node`) | `embedded` | Yes |
+| C (`crates/bindings/c`) | `embedded` | Yes |
+| WASM (`crates/bindings/wasm`) | `edge` | Yes |
 
 For custom Rust builds: `cargo build --features compact-store`.

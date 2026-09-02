@@ -21,6 +21,11 @@
 //! assert_eq!(dict.dictionary_size(), 2);  // Only 2 unique strings stored
 //! ```
 
+// The `as usize`/`as u32`/`as u16` casts in this module convert between wire
+// field widths and in-memory indices for data already bounds-checked against
+// the resident section length; they cannot truncate on the 64-bit targets
+// this engine supports.
+#![allow(clippy::cast_possible_truncation)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -137,16 +142,153 @@ impl NullBitmap {
     }
 }
 
+/// Dictionary string table: heap `Arc` entries or mapped offset/bytes view.
+#[derive(Debug, Clone)]
+enum StringTable {
+    Heap(Arc<[Arc<str>]>),
+    /// Mapped dictionary: offsets (u64 LE, with sentinel) + UTF-8 blob.
+    /// Local codes are indices into this table (0..len).
+    Mapped {
+        offsets: Bytes,
+        bytes: Bytes,
+        /// Number of dictionary entries (offsets.len()/8 - 1).
+        len: usize,
+        /// Optional kind-20 sorted code index: `(off:u64, len:u32, code:u32)` × N.
+        /// Enables O(log D) string→code; when absent, encode falls back to O(D).
+        code_index: Option<Bytes>,
+    },
+}
+
+impl StringTable {
+    fn len(&self) -> usize {
+        match self {
+            Self::Heap(d) => d.len(),
+            Self::Mapped { len, .. } => *len,
+        }
+    }
+
+    fn get(&self, code: usize) -> Option<&str> {
+        match self {
+            Self::Heap(d) => d.get(code).map(|s| s.as_ref()),
+            Self::Mapped {
+                offsets,
+                bytes,
+                len,
+                ..
+            } => {
+                if code >= *len {
+                    return None;
+                }
+                let start = read_u64_at(offsets, code)? as usize;
+                let end = read_u64_at(offsets, code + 1)? as usize;
+                if end < start || end > bytes.len() {
+                    return None;
+                }
+                std::str::from_utf8(&bytes[start..end]).ok()
+            }
+        }
+    }
+
+    fn as_heap(&self) -> Option<&Arc<[Arc<str>]>> {
+        match self {
+            Self::Heap(d) => Some(d),
+            Self::Mapped { .. } => None,
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Heap(d) => d.iter().map(|s| s.len()).sum(),
+            // Mapped dictionary strings are file-backed.
+            Self::Mapped { .. } => 0,
+        }
+    }
+
+    fn mapped_bytes(&self) -> usize {
+        match self {
+            Self::Mapped {
+                offsets,
+                bytes,
+                code_index,
+                ..
+            } => offsets.len() + bytes.len() + code_index.as_ref().map_or(0, Bytes::len),
+            Self::Heap(_) => 0,
+        }
+    }
+
+    fn encode(&self, value: &str) -> Option<u32> {
+        match self {
+            Self::Heap(d) => d
+                .iter()
+                .position(|s| s.as_ref() == value)
+                .and_then(|i| u32::try_from(i).ok()),
+            Self::Mapped {
+                len,
+                code_index: Some(index),
+                ..
+            } => encode_with_code_index(self, index, value, *len),
+            Self::Mapped { len, .. } => {
+                for i in 0..*len {
+                    if self.get(i) == Some(value) {
+                        return u32::try_from(i).ok();
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Binary search over a kind-20 code index body.
+fn encode_with_code_index(
+    table: &StringTable,
+    index: &Bytes,
+    value: &str,
+    dict_len: usize,
+) -> Option<u32> {
+    const REC: usize = 16;
+    if !index.len().is_multiple_of(REC) {
+        return None;
+    }
+    let count = index.len() / REC;
+    if count != dict_len {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let base = mid * REC;
+        let code = u32::from_le_bytes(index.get(base + 12..base + 16)?.try_into().ok()?);
+        let s = table.get(code as usize)?;
+        match s.cmp(value) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Some(code),
+        }
+    }
+    None
+}
+
+#[inline]
+fn read_u64_at(bytes: &Bytes, idx: usize) -> Option<u64> {
+    let start = idx.checked_mul(8)?;
+    let end = start.checked_add(8)?;
+    let chunk: [u8; 8] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(chunk))
+}
+
 /// Stores repeated strings efficiently by referencing them with integer codes.
 ///
 /// Each unique string appears once in the dictionary. Values are stored as
 /// LE u32 indices pointing into that dictionary, refcounted as
 /// [`bytes::Bytes`] so heap-owned and mmap-backed columns share the same
-/// type (revised D7).
+/// type (revised D7). Mapped CompactStore v5 reopen uses
+/// [`StringTable::Mapped`] so dictionary UTF-8 stays file-backed.
 #[derive(Debug, Clone)]
 pub struct DictionaryEncoding {
     /// The dictionary of unique strings.
-    dictionary: Arc<[Arc<str>]>,
+    dictionary: StringTable,
     /// Encoded values: `Inline(Vec<u32>)` or `Mapped(Bytes)`.
     codes: CodeStore,
     /// Number of code values.
@@ -161,7 +303,7 @@ impl DictionaryEncoding {
     pub fn new(dictionary: Arc<[Arc<str>]>, codes: Vec<u32>) -> Self {
         let code_count = codes.len();
         Self {
-            dictionary,
+            dictionary: StringTable::Heap(dictionary),
             codes: CodeStore::Inline(codes),
             code_count,
             null_bitmap: None,
@@ -178,11 +320,117 @@ impl DictionaryEncoding {
         code_count: usize,
     ) -> Self {
         Self {
-            dictionary,
+            dictionary: StringTable::Heap(dictionary),
             codes: CodeStore::Mapped(codes_bytes),
             code_count,
             null_bitmap: None,
         }
+    }
+
+    /// Constructs a dictionary encoding with a mapped string table and
+    /// mapped codes (CompactStore v5 / G-EM0.2).
+    ///
+    /// `offsets` is a u64 LE array of length `dict_len + 1` (trailing sentinel).
+    /// `string_bytes` holds the UTF-8 payload referenced by those offsets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when offset geometry is invalid or any entry is not
+    /// valid UTF-8.
+    pub fn from_mapped_strings(
+        offsets: Bytes,
+        string_bytes: Bytes,
+        codes_bytes: Bytes,
+        code_count: usize,
+    ) -> Result<Self, String> {
+        Self::from_mapped_strings_with_index(offsets, string_bytes, codes_bytes, code_count, None)
+    }
+
+    /// Like [`from_mapped_strings`](Self::from_mapped_strings) but attaches a
+    /// sorted dictionary code index for O(log D) string→code lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dictionary offsets/string bytes are malformed,
+    /// the code index is truncated, or any string is not valid UTF-8.
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal offset arithmetic overflows (should not occur with
+    /// well-formed input).
+    pub fn from_mapped_strings_with_index(
+        offsets: Bytes,
+        string_bytes: Bytes,
+        codes_bytes: Bytes,
+        code_count: usize,
+        code_index: Option<Bytes>,
+    ) -> Result<Self, String> {
+        if !offsets.len().is_multiple_of(8) || offsets.len() < 8 {
+            return Err("mapped dictionary offsets must be non-empty u64 array".into());
+        }
+        let dict_len = offsets.len() / 8 - 1;
+        let mut prev = 0u64;
+        for i in 0..=dict_len {
+            let off = read_u64_at(&offsets, i)
+                .ok_or_else(|| format!("truncated mapped dictionary offset {i}"))?;
+            if off < prev {
+                return Err(format!("mapped dictionary offsets not monotonic at {i}"));
+            }
+            if off as usize > string_bytes.len() {
+                return Err(format!(
+                    "mapped dictionary offset {off} exceeds string bytes {}",
+                    string_bytes.len()
+                ));
+            }
+            prev = off;
+        }
+        for i in 0..dict_len {
+            let start = read_u64_at(&offsets, i).unwrap() as usize;
+            let end = read_u64_at(&offsets, i + 1).unwrap() as usize;
+            std::str::from_utf8(&string_bytes[start..end])
+                .map_err(|_| format!("invalid UTF-8 in mapped dictionary entry {i}"))?;
+        }
+        if codes_bytes.len() < code_count.saturating_mul(4) {
+            return Err("mapped dictionary codes truncated".into());
+        }
+        if let Some(ref idx) = code_index {
+            const REC: usize = 16;
+            if !idx.len().is_multiple_of(REC) || idx.len() / REC != dict_len {
+                return Err(format!(
+                    "code index length {} incompatible with dict_len {dict_len}",
+                    idx.len()
+                ));
+            }
+        }
+        Ok(Self {
+            dictionary: StringTable::Mapped {
+                offsets,
+                bytes: string_bytes,
+                len: dict_len,
+                code_index,
+            },
+            codes: CodeStore::Mapped(codes_bytes),
+            code_count,
+            null_bitmap: None,
+        })
+    }
+
+    /// Returns `true` when dictionary strings are file-backed.
+    #[must_use]
+    pub fn is_mapped_dictionary(&self) -> bool {
+        matches!(self.dictionary, StringTable::Mapped { .. })
+    }
+
+    /// Mapped dictionary byte length (offsets + string blob), or 0.
+    #[must_use]
+    pub fn mapped_dictionary_bytes(&self) -> usize {
+        self.dictionary.mapped_bytes()
+    }
+
+    /// Anonymous heap bytes retained by the dictionary string table.
+    #[must_use]
+    pub fn dictionary_heap_bytes(&self) -> usize {
+        self.dictionary.heap_bytes()
     }
 
     /// Adds a null bitmap to this encoding (legacy `Vec<u64>` input).
@@ -212,9 +460,29 @@ impl DictionaryEncoding {
         self.dictionary.len()
     }
 
-    /// Returns the dictionary.
-    pub fn dictionary(&self) -> &Arc<[Arc<str>]> {
-        &self.dictionary
+    /// Returns the heap dictionary when present.
+    ///
+    /// Mapped dictionaries return `None`; use [`Self::get`] for code→string.
+    pub fn dictionary(&self) -> Option<&Arc<[Arc<str>]>> {
+        self.dictionary.as_heap()
+    }
+
+    /// Materializes dictionary entries as `Arc<str>` (allocates for mapped).
+    ///
+    /// Prefer [`Self::get`] for reads. Serializers that need heap entries may
+    /// call this; it is query/build scratch, not retained reopen state.
+    pub fn dictionary_entries(&self) -> Arc<[Arc<str>]> {
+        match &self.dictionary {
+            StringTable::Heap(d) => Arc::clone(d),
+            StringTable::Mapped { len, .. } => {
+                let mut entries = Vec::with_capacity(*len);
+                for i in 0..*len {
+                    let s = self.dictionary.get(i).unwrap_or("");
+                    entries.push(Arc::<str>::from(s));
+                }
+                Arc::from(entries.into_boxed_slice())
+            }
+        }
     }
 
     /// Returns the encoded codes as raw LE u32 bytes (always materialised).
@@ -283,7 +551,7 @@ impl DictionaryEncoding {
             return None;
         }
         let code = self.code_at(index)?;
-        self.dictionary.get(code as usize).map(|s| s.as_ref())
+        self.dictionary.get(code as usize)
     }
 
     /// Returns the code at the given index.
@@ -309,12 +577,14 @@ impl DictionaryEncoding {
         let original_size: usize = (0..self.code_count)
             .map(|i| {
                 let code = self.codes.code_at(i).unwrap_or(0) as usize;
-                self.dictionary.get(code).map_or(0, |s| s.len())
+                self.dictionary.get(code).map_or(0, str::len)
             })
             .sum();
 
         // Compressed size: dictionary + codes
-        let dict_size: usize = self.dictionary.iter().map(|s| s.len()).sum();
+        let dict_size: usize = (0..self.dictionary.len())
+            .map(|i| self.dictionary.get(i).map_or(0, str::len))
+            .sum();
         let codes_size = self.codes.byte_len();
         let compressed_size = dict_size + codes_size;
 
@@ -327,10 +597,7 @@ impl DictionaryEncoding {
 
     /// Encodes a lookup value into a code, if it exists in the dictionary.
     pub fn encode(&self, value: &str) -> Option<u32> {
-        self.dictionary
-            .iter()
-            .position(|s| s.as_ref() == value)
-            .and_then(|i| u32::try_from(i).ok())
+        self.dictionary.encode(value)
     }
 
     /// Returns the row offsets where the code matches `predicate` and the
@@ -755,7 +1022,7 @@ mod tests {
         let inline = b.build();
 
         let codes_b = inline.codes_bytes();
-        let dict_arc = inline.dictionary().clone();
+        let dict_arc = inline.dictionary_entries();
         let mapped = DictionaryEncoding::from_bytes_storage(dict_arc, codes_b, strings.len());
 
         let target = inline.encode("a").unwrap();

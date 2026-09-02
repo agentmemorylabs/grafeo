@@ -11,6 +11,7 @@ use super::column::ColumnCodec;
 use super::csr::CsrAdjacency;
 use super::id::{encode_edge_id, encode_node_id};
 use super::schema::EdgeSchema;
+use super::zone_map::ZoneMap;
 
 /// A relationship table holding all edges of a single type.
 ///
@@ -35,6 +36,10 @@ pub struct RelTable {
     src_table_id: u16,
     /// Table ID of the destination node table.
     dst_table_id: u16,
+    /// Table-level zone maps for edge property columns (R3-B2).
+    zone_maps: FxHashMap<PropertyKey, ZoneMap>,
+    /// Block-level zone maps for edge property columns (R3-B2).
+    block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>>,
 }
 
 impl RelTable {
@@ -52,6 +57,34 @@ impl RelTable {
         src_table_id: u16,
         dst_table_id: u16,
     ) -> Self {
+        Self::with_zone_maps(
+            schema,
+            fwd,
+            bwd,
+            properties,
+            src_table_id,
+            dst_table_id,
+            FxHashMap::default(),
+            FxHashMap::default(),
+        )
+    }
+
+    /// Creates a new relationship table with zone maps (R3-B2).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bwd` is a non-empty CSR that has no edge data populated.
+    #[must_use]
+    pub fn with_zone_maps(
+        schema: EdgeSchema,
+        fwd: CsrAdjacency,
+        bwd: Option<CsrAdjacency>,
+        properties: FxHashMap<PropertyKey, ColumnCodec>,
+        src_table_id: u16,
+        dst_table_id: u16,
+        zone_maps: FxHashMap<PropertyKey, ZoneMap>,
+        block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>>,
+    ) -> Self {
         if let Some(ref b) = bwd {
             assert!(
                 b.has_edge_data() || b.num_edges() == 0,
@@ -65,6 +98,8 @@ impl RelTable {
             properties,
             src_table_id,
             dst_table_id,
+            zone_maps,
+            block_zone_maps,
         }
     }
 
@@ -115,9 +150,9 @@ impl RelTable {
         let rel_id = self.schema.rel_table_id;
 
         neighbors
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(i, &target_offset)| {
+            .map(|(i, target_offset)| {
                 let node_id = encode_node_id(self.dst_table_id, u64::from(target_offset));
                 let edge_id = encode_edge_id(rel_id, start_pos + i as u64);
                 (node_id, edge_id)
@@ -138,9 +173,9 @@ impl RelTable {
         let rel_id = self.schema.rel_table_id;
 
         let results = source_offsets
-            .iter()
+            .into_iter()
             .enumerate()
-            .filter_map(|(i, &src_offset)| {
+            .filter_map(|(i, src_offset)| {
                 // O(1) lookup via edge_data stored on the backward CSR.
                 // Returns None if edge_data was not populated on backward CSR.
                 let fwd_pos = bwd.edge_data_at(bwd_start + i)?;
@@ -222,6 +257,30 @@ impl RelTable {
     #[must_use]
     pub fn properties(&self) -> &FxHashMap<PropertyKey, ColumnCodec> {
         &self.properties
+    }
+
+    /// Returns the table-level zone map for a property key, if present (R3-B2).
+    #[must_use]
+    pub fn zone_map(&self, key: &PropertyKey) -> Option<&ZoneMap> {
+        self.zone_maps.get(key)
+    }
+
+    /// Returns all table-level zone maps (R3-B2).
+    #[must_use]
+    pub fn zone_maps(&self) -> &FxHashMap<PropertyKey, ZoneMap> {
+        &self.zone_maps
+    }
+
+    /// Returns block-level zone maps for a property key, if present (R3-B2).
+    #[must_use]
+    pub fn block_zone_maps_for(&self, key: &PropertyKey) -> Option<&[ZoneMap]> {
+        self.block_zone_maps.get(key).map(Vec::as_slice)
+    }
+
+    /// Returns all block-level zone maps (R3-B2).
+    #[must_use]
+    pub fn block_zone_maps(&self) -> &FxHashMap<PropertyKey, Vec<ZoneMap>> {
+        &self.block_zone_maps
     }
 
     /// Returns an estimate of heap memory used by the CSR structures and

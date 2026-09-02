@@ -51,7 +51,77 @@ pub use admin::{
 pub use auth::{Grant, Identity, Role, StatementKind};
 pub use catalog::{Catalog, CatalogError, IndexDefinition, IndexType};
 pub use config::{AccessMode, Config, ConfigError, DurabilityMode, GraphModel};
+#[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+pub use database::CompactBacking;
 pub use database::GrafeoDB;
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+pub use database::IndexedVectorRead;
+#[cfg(all(
+    debug_assertions,
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming"
+))]
+#[doc(hidden)]
+pub use database::generation::epoch_handoff::{FREEZE_STALL_BEFORE_CAPTURE, FREEZE_STALL_ENTERED};
+#[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+pub use database::generation::{
+    BACKUP_MANIFEST_NAME, BackedUpWalFile, BackupPin, BackupPinGuard, ClassifiedGeneration,
+    GenerationBackupManifest, GenerationBackupReceipt, OpenMode, OwnershipError, RetentionClass,
+    RetirementAuthority, RetirementError, RetirementPlan, RootLifecycleReport, RootLockOwnerState,
+    RootOwnership, backup_generation_root, collect_retirement, plan_retirement,
+    restore_generation_root,
+};
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "mmap"
+))]
+pub use database::generation::{
+    BaseGeneration, GenerationLease, GenerationLeaseRegistry, GenerationLeaseStats,
+    GenerationTransitionError, TransitionReport,
+};
+#[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+pub use database::generation::{
+    BuildPublication, ExpectedSelection, ManifestSelection, ManifestState, ManifestStateError,
+    OrphanClassification, PublicationCrashPoint, PublicationPhase, PublicationPhaseError,
+    PublishedGeneration, RecoveryViewError, RootRecovery, WalBoundary, read_manifest_state,
+    recover_generation_root,
+};
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming"
+))]
+pub use database::generation::{
+    EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle,
+};
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "generation-streaming",
+    feature = "mmap"
+))]
+pub use database::generation::{HandoffInstallError, HandoffInstallReport};
+#[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+pub use database::generation_build::{
+    GenerationBuildRequest, PublishedGenerationDescriptor, generation_build_request,
+    path_is_generation_root,
+};
+#[cfg(all(
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "mmap",
+    feature = "generation-streaming"
+))]
+pub use database::mid_build_drain::MidBuildDrainReport;
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+pub use database::{VectorIndexBacking, VectorPayloadBacking, VectorTopologyBacking};
 pub use grafeo_core::graph::{GraphStore, GraphStoreMut, ProjectionSpec};
 pub use memory_usage::MemoryUsage;
 #[cfg(feature = "metrics")]

@@ -65,10 +65,19 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // Re-export the main database API
+#[cfg(feature = "vector-index")]
+pub use grafeo_engine::IndexedVectorRead;
 pub use grafeo_engine::{
     AccessMode, Catalog, CatalogError, Config, ConfigError, DurabilityMode, GrafeoDB, Grant,
     GraphModel, GraphStore, GraphStoreMut, Identity, IndexDefinition, IndexType, Role, Session,
     StatementKind, VERSION,
+};
+
+// Re-export the index-build control surface (G-OBS.1): cancellation check,
+// progress callback, and the optional control struct passed to the
+// `*_with_control` index-build entry points.
+pub use grafeo_engine::database::index_build_control::{
+    IndexBuildCancelCheck, IndexBuildControl, IndexBuildProgress,
 };
 
 // Re-export submodules for qualified access (e.g. grafeo::auth::Identity)

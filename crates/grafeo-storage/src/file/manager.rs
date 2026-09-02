@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use grafeo_common::utils::error::{Error, Result};
+use grafeo_common::utils::error::{Error, Result, StorageError};
 use parking_lot::Mutex;
 
 use super::format::{DATA_OFFSET, DbHeader, FileHeader};
@@ -420,7 +420,35 @@ impl GrafeoFileManager {
 
     // ── Section-based I/O (v2 container format) ─────────────────────
 
+    /// Writes multiple sections with directory version fixed to `1` for each.
+    ///
+    /// Prefer [`Self::write_versioned_sections`] when the caller knows each
+    /// section's declared format version (engine flush path). This legacy
+    /// entry point remains for tests and callers that only have opaque bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if write or sync fails.
+    pub fn write_sections(
+        &self,
+        sections: &[(grafeo_common::storage::SectionType, &[u8])],
+        epoch: u64,
+        transaction_id: u64,
+        node_count: u64,
+        edge_count: u64,
+    ) -> Result<()> {
+        let versioned: Vec<(grafeo_common::storage::SectionType, u8, &[u8])> = sections
+            .iter()
+            .map(|(section_type, data)| (*section_type, 1u8, *data))
+            .collect();
+        self.write_versioned_sections(&versioned, epoch, transaction_id, node_count, edge_count)
+    }
+
     /// Writes multiple sections to the file using the v2 container format.
+    ///
+    /// Each tuple is `(section_type, directory_version, payload)`. The directory
+    /// entry records the supplied `directory_version` (the section's declared
+    /// format version) rather than a hard-coded `1`.
     ///
     /// Each section is written at a page-aligned offset. A section directory
     /// is written at `DIRECTORY_OFFSET`, and a new DbHeader is committed to
@@ -429,9 +457,9 @@ impl GrafeoFileManager {
     /// # Errors
     ///
     /// Returns an error if write or sync fails.
-    pub fn write_sections(
+    pub fn write_versioned_sections(
         &self,
-        sections: &[(grafeo_common::storage::SectionType, &[u8])],
+        sections: &[(grafeo_common::storage::SectionType, u8, &[u8])],
         epoch: u64,
         transaction_id: u64,
         node_count: u64,
@@ -466,7 +494,7 @@ impl GrafeoFileManager {
         #[allow(clippy::cast_possible_truncation)]
         let nonce_iteration = (active_header.iteration + 1) as u32;
 
-        for (section_type, data) in sections {
+        for (section_type, version, data) in sections {
             // Encrypt section data if encryption is enabled.
             // Nonce high word: iteration in bits [31:8], section type in bits [7:0].
             // Bit-packing (not XOR) ensures unique high words: XOR is commutative
@@ -502,7 +530,7 @@ impl GrafeoFileManager {
 
             dir.upsert(SectionDirectoryEntry {
                 section_type: *section_type,
-                version: 1,
+                version: *version,
                 flags: section_type.default_flags(),
                 offset: current_offset,
                 length,
@@ -701,24 +729,49 @@ impl GrafeoFileManager {
     ///
     /// Returns an error if:
     /// - The section is not mmap-able (data section)
+    /// - The section is encrypted (typed `DirectMmapUnavailable`)
     /// - The mmap system call fails
     /// - The CRC-32 checksum does not match (corrupt data)
+    ///
+    /// # Direct-mmap support matrix (G-EM0.1)
+    ///
+    /// | Layout | Direct mmap |
+    /// | --- | --- |
+    /// | Plaintext, `mmap_able`, non-zero length CompactStore/index | yes (CRC-verified) |
+    /// | Encrypted section (AES-GCM) | no — `DirectMmapUnavailable` |
+    /// | Non-`mmap_able` data section (LPG, Catalog, …) | no — `DirectMmapUnavailable` |
+    /// | Zero-length section | no — `DirectMmapUnavailable` |
+    /// | Compressed payload (none shipped today) | would need a separate design |
+    ///
+    /// CRC validation may fault every page into the OS file cache; it must not
+    /// copy the section into an anonymous `Vec`. Callers must not fall back to
+    /// `read_section_data` while still reporting a mapped backing diagnostic.
     #[allow(unsafe_code)]
     pub fn mmap_section(
         &self,
         entry: &grafeo_common::storage::SectionDirectoryEntry,
     ) -> Result<crate::container::MmapSection> {
+        // Direct mapping is valid only for the plaintext container bytes.
+        // AES-GCM sections require whole-section decryption today, so letting
+        // callers mmap ciphertext would either expose invalid bytes or tempt a
+        // silent eager fallback. A future page-decryption design can add a
+        // distinct mapped backend without weakening this fail-closed contract.
+        #[cfg(feature = "encryption")]
+        if self.section_encryptor.is_some() {
+            return Err(Error::Storage(StorageError::DirectMmapUnavailable(
+                "encrypted sections require page decryption before direct mmap".to_string(),
+            )));
+        }
+
         if !entry.flags.mmap_able {
-            return Err(Error::Internal(format!(
-                "section {:?} is not mmap-able (data sections must be deserialized)",
-                entry.section_type
+            return Err(Error::Storage(StorageError::DirectMmapUnavailable(
+                format!("section {:?} is not mmap-able", entry.section_type),
             )));
         }
 
         if entry.length == 0 {
-            return Err(Error::Internal(format!(
-                "section {:?} has zero length, cannot mmap",
-                entry.section_type
+            return Err(Error::Storage(StorageError::DirectMmapUnavailable(
+                format!("section {:?} has zero length", entry.section_type),
             )));
         }
 
@@ -1269,7 +1322,16 @@ mod tests {
 
         let result = manager.mmap_section(lpg_entry);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not mmap-able"));
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("not mmap-able"),
+            "unexpected error text: {err}"
+        );
+        // Typed fail-closed result — never a silent eager materialization.
+        match err {
+            Error::Storage(StorageError::DirectMmapUnavailable(_)) => {}
+            other => panic!("expected DirectMmapUnavailable, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1653,5 +1715,179 @@ mod tests {
             let result = manager.read_section_data(entry);
             assert!(result.is_err(), "decryption with wrong key should fail");
         }
+    }
+
+    // ── G-F0.1: truthful per-section directory versions ─────────────
+
+    #[test]
+    fn write_versioned_sections_preserves_supplied_versions() {
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("versioned.grafeo");
+
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager
+            .write_versioned_sections(
+                &[
+                    (SectionType::Catalog, 2, b"catalog-v2".as_slice()),
+                    (SectionType::LpgStore, 2, b"lpg-v2".as_slice()),
+                    (SectionType::CompactStore, 3, b"compact-v3".as_slice()),
+                    (SectionType::VectorStore, 2, b"vector-v2".as_slice()),
+                    (SectionType::TextIndex, 1, b"text-v1".as_slice()),
+                    (SectionType::PropertyIndex, 1, b"prop-v1".as_slice()),
+                ],
+                1,
+                1,
+                0,
+                0,
+            )
+            .unwrap();
+
+        let section_dir = manager
+            .read_section_directory()
+            .unwrap()
+            .expect("directory should exist");
+
+        let expected = [
+            (SectionType::Catalog, 2u8, b"catalog-v2".as_slice()),
+            (SectionType::LpgStore, 2, b"lpg-v2"),
+            (SectionType::CompactStore, 3, b"compact-v3"),
+            (SectionType::VectorStore, 2, b"vector-v2"),
+            (SectionType::TextIndex, 1, b"text-v1"),
+            (SectionType::PropertyIndex, 1, b"prop-v1"),
+        ];
+        for (section_type, version, payload) in expected {
+            let entry = section_dir
+                .find(section_type)
+                .unwrap_or_else(|| panic!("missing {section_type:?}"));
+            assert_eq!(entry.version, version, "{section_type:?} directory version");
+            let data = manager.read_section_data(entry).unwrap();
+            assert_eq!(data, payload, "{section_type:?} payload");
+        }
+        manager.close().unwrap();
+    }
+
+    #[test]
+    fn write_sections_still_records_directory_version_one() {
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("legacy_write.grafeo");
+
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager
+            .write_sections(
+                &[
+                    (SectionType::LpgStore, b"legacy".as_slice()),
+                    (SectionType::VectorStore, b"vec".as_slice()),
+                ],
+                1,
+                1,
+                0,
+                0,
+            )
+            .unwrap();
+
+        let section_dir = manager
+            .read_section_directory()
+            .unwrap()
+            .expect("directory should exist");
+        assert_eq!(section_dir.find(SectionType::LpgStore).unwrap().version, 1);
+        assert_eq!(
+            section_dir.find(SectionType::VectorStore).unwrap().version,
+            1
+        );
+        manager.close().unwrap();
+    }
+
+    #[test]
+    fn historical_outer_v1_with_higher_payload_bytes_remains_readable() {
+        // Historical writers recorded directory version 1 even when the
+        // payload body was a later format. Readers must not reject that
+        // outer-vs-payload mismatch (no strict equality gate).
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("outer_v1_payload.grafeo");
+
+        // Simulate historical outer-v1: use write_sections (always v1) with
+        // bytes that a modern CompactStore/LPG payload reader would treat as
+        // its own higher internal version. Storage only needs the bytes
+        // round-trip; payload dispatch is covered by engine/core tests.
+        let payload = b"pretend-v2-or-v3-payload-body";
+        {
+            let manager = GrafeoFileManager::create(&path).unwrap();
+            manager
+                .write_sections(
+                    &[(SectionType::CompactStore, payload.as_slice())],
+                    1,
+                    1,
+                    0,
+                    0,
+                )
+                .unwrap();
+            manager.close().unwrap();
+        }
+
+        let manager = GrafeoFileManager::open(&path).unwrap();
+        let section_dir = manager
+            .read_section_directory()
+            .unwrap()
+            .expect("directory should exist");
+        let entry = section_dir.find(SectionType::CompactStore).unwrap();
+        assert_eq!(
+            entry.version, 1,
+            "historical outer directory version stays 1"
+        );
+        assert_eq!(manager.read_section_data(entry).unwrap(), payload);
+        manager.close().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(feature = "encryption", not(miri)))]
+    fn encrypted_write_versioned_sections_preserves_versions() {
+        use grafeo_common::encryption::KeyChain;
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("encrypted_versions.grafeo");
+        let kc = KeyChain::new([0xCD; 32]);
+
+        {
+            let mut manager = GrafeoFileManager::create(&path).unwrap();
+            manager.set_section_encryptor(kc.encryptor_for("section", b"test"));
+            manager
+                .write_versioned_sections(
+                    &[
+                        (SectionType::Catalog, 2, b"enc-catalog".as_slice()),
+                        (SectionType::LpgStore, 2, b"enc-lpg".as_slice()),
+                        (SectionType::VectorStore, 2, b"enc-vec".as_slice()),
+                    ],
+                    1,
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap();
+            manager.close().unwrap();
+        }
+
+        let mut manager = GrafeoFileManager::open(&path).unwrap();
+        manager.set_section_encryptor(kc.encryptor_for("section", b"test"));
+        let section_dir = manager
+            .read_section_directory()
+            .unwrap()
+            .expect("directory should exist");
+        for (section_type, version, payload) in [
+            (SectionType::Catalog, 2u8, b"enc-catalog".as_slice()),
+            (SectionType::LpgStore, 2, b"enc-lpg"),
+            (SectionType::VectorStore, 2, b"enc-vec"),
+        ] {
+            let entry = section_dir.find(section_type).unwrap();
+            assert_eq!(entry.version, version, "{section_type:?}");
+            assert_eq!(manager.read_section_data(entry).unwrap(), payload);
+        }
+        manager.close().unwrap();
     }
 }

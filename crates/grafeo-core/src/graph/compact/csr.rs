@@ -3,21 +3,77 @@
 //! For node i, its neighbors are `targets[offsets[i]..offsets[i+1]]`.
 //! Uses u32 for both offsets and targets (max ~4B nodes/edges per table).
 
+/// Two-variant backing for CSR u32 arrays: heap `Vec` or mapped `Bytes`.
+#[derive(Debug, Clone)]
+enum U32Store {
+    Inline(Vec<u32>),
+    Mapped(super::mapped::U32View),
+}
+
+impl U32Store {
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline(v) => v.len(),
+            Self::Mapped(v) => v.len(),
+        }
+    }
+
+    fn get(&self, idx: usize) -> Option<u32> {
+        match self {
+            Self::Inline(v) => v.get(idx).copied(),
+            Self::Mapped(v) => v.get(idx),
+        }
+    }
+
+    #[allow(dead_code)] // reserved for mapped CSR slice fast-paths (Milestone W)
+    fn as_slice(&self) -> Option<&[u32]> {
+        match self {
+            Self::Inline(v) => Some(v.as_slice()),
+            Self::Mapped(_) => None,
+        }
+    }
+
+    fn memory_bytes(&self) -> usize {
+        match self {
+            // Mapped arrays are file-backed; do not charge anonymous heap.
+            Self::Mapped(_) => 0,
+            Self::Inline(v) => v.len() * std::mem::size_of::<u32>(),
+        }
+    }
+
+    fn mapped_bytes(&self) -> usize {
+        match self {
+            Self::Mapped(v) => v.byte_len(),
+            Self::Inline(_) => 0,
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u32> {
+        match self {
+            Self::Inline(v) => v.clone(),
+            Self::Mapped(v) => (0..v.len()).map(|i| v.get(i).unwrap_or(0)).collect(),
+        }
+    }
+}
+
 /// Compressed Sparse Row adjacency structure.
 ///
 /// Stores a directed graph in two flat arrays: `offsets` (one per node + 1
 /// sentinel) and `targets` (concatenated neighbor lists). This layout is
 /// cache-friendly for forward traversal and has O(1) neighbor access.
+///
+/// Arrays may be heap-resident ([`U32Store::Inline`]) or mapped
+/// ([`U32Store::Mapped`]) for disk-native CompactStore reopen.
 #[derive(Debug, Clone)]
 pub struct CsrAdjacency {
     /// One entry per node plus a trailing sentinel.
     /// `offsets[i]..offsets[i+1]` is the range in `targets` for node `i`.
-    offsets: Vec<u32>,
+    offsets: U32Store,
     /// Concatenated target node offsets, grouped by source.
-    targets: Vec<u32>,
+    targets: U32Store,
     /// Optional per-edge auxiliary data, parallel to `targets`.
     /// For backward CSRs, stores the corresponding forward CSR position.
-    edge_data: Option<Vec<u32>>,
+    edge_data: Option<U32Store>,
 }
 
 impl CsrAdjacency {
@@ -52,8 +108,8 @@ impl CsrAdjacency {
         let targets: Vec<u32> = edges.iter().map(|&(_, dst)| dst).collect();
 
         Self {
-            offsets,
-            targets,
+            offsets: U32Store::Inline(offsets),
+            targets: U32Store::Inline(targets),
             edge_data: None,
         }
     }
@@ -69,7 +125,7 @@ impl CsrAdjacency {
             self.targets.len(),
             "edge_data length must equal targets length"
         );
-        self.edge_data = Some(data);
+        self.edge_data = Some(U32Store::Inline(data));
     }
 
     /// Returns `true` if per-edge auxiliary data has been set.
@@ -84,7 +140,7 @@ impl CsrAdjacency {
     /// out of bounds.
     #[must_use]
     pub fn edge_data_at(&self, position: usize) -> Option<u32> {
-        self.edge_data.as_ref()?.get(position).copied()
+        self.edge_data.as_ref()?.get(position)
     }
 
     /// Returns the number of nodes in this CSR.
@@ -102,17 +158,49 @@ impl CsrAdjacency {
 
     /// Returns the neighbors (target offsets) of the given node.
     ///
-    /// Returns an empty slice if `node_offset` is out of range.
+    /// Returns an empty vector if `node_offset` is out of range. The returned
+    /// `Vec` is query scratch: mapped CSRs decode LE bytes on demand; heap
+    /// CSRs copy the existing slice range. Callers must not treat this as a
+    /// retained proportional structure.
     #[inline]
     #[must_use]
-    pub fn neighbors(&self, node_offset: u32) -> &[u32] {
+    pub fn neighbors(&self, node_offset: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.neighbors_into(node_offset, &mut out);
+        out
+    }
+
+    /// Writes neighbors of `node_offset` into `out` (query scratch).
+    pub fn neighbors_into(&self, node_offset: u32, out: &mut Vec<u32>) {
+        out.clear();
         let i = node_offset as usize;
-        if i + 1 >= self.offsets.len() {
-            return &[];
+        let Some(start) = self.offsets.get(i) else {
+            return;
+        };
+        let Some(end) = self.offsets.get(i + 1) else {
+            return;
+        };
+        let start = start as usize;
+        let end = end as usize;
+        if end < start {
+            return;
         }
-        let start = self.offsets[i] as usize;
-        let end = self.offsets[i + 1] as usize;
-        &self.targets[start..end]
+        // Fast path: inline storage can copy a contiguous slice.
+        if let (U32Store::Inline(offsets), U32Store::Inline(targets)) =
+            (&self.offsets, &self.targets)
+        {
+            let _ = offsets; // bounds already checked via get
+            if let Some(slice) = targets.get(start..end) {
+                out.extend_from_slice(slice);
+                return;
+            }
+        }
+        out.reserve(end - start);
+        for idx in start..end {
+            if let Some(t) = self.targets.get(idx) {
+                out.push(t);
+            }
+        }
     }
 
     /// Returns the out-degree of the given node.
@@ -121,7 +209,14 @@ impl CsrAdjacency {
     #[inline]
     #[must_use]
     pub fn degree(&self, node_offset: u32) -> usize {
-        self.neighbors(node_offset).len()
+        let i = node_offset as usize;
+        let Some(start) = self.offsets.get(i) else {
+            return 0;
+        };
+        let Some(end) = self.offsets.get(i + 1) else {
+            return 0;
+        };
+        end.saturating_sub(start) as usize
     }
 
     /// Finds the source node for a given CSR position via binary search.
@@ -143,7 +238,8 @@ impl CsrAdjacency {
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.offsets[mid + 1] <= position {
+            let mid_end = self.offsets.get(mid + 1).unwrap_or(0);
+            if mid_end <= position {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -164,16 +260,12 @@ impl CsrAdjacency {
     #[inline]
     #[must_use]
     pub fn offset_of(&self, node_offset: u32) -> u32 {
-        let i = node_offset as usize;
-        if i >= self.offsets.len() {
-            return 0;
-        }
-        self.offsets[i]
+        self.offsets.get(node_offset as usize).unwrap_or(0)
     }
 
     /// Reconstructs from pre-built raw parts.
     ///
-    /// Used by section deserialization.
+    /// Used by section deserialization and in-memory builders.
     #[must_use]
     pub fn from_raw_parts(
         offsets: Vec<u32>,
@@ -181,40 +273,81 @@ impl CsrAdjacency {
         edge_data: Option<Vec<u32>>,
     ) -> Self {
         Self {
-            offsets,
-            targets,
-            edge_data,
+            offsets: U32Store::Inline(offsets),
+            targets: U32Store::Inline(targets),
+            edge_data: edge_data.map(U32Store::Inline),
         }
     }
 
-    /// Returns the raw offsets array.
-    #[must_use]
-    pub fn offsets(&self) -> &[u32] {
-        &self.offsets
+    /// Reconstructs from mapped u32 views (G-EM0.2 disk-native path).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when edge_data length does not match targets.
+    pub fn from_mapped_parts(
+        offsets: super::mapped::U32View,
+        targets: super::mapped::U32View,
+        edge_data: Option<super::mapped::U32View>,
+    ) -> Result<Self, &'static str> {
+        if let Some(ref ed) = edge_data
+            && ed.len() != targets.len()
+        {
+            return Err("mapped edge_data length must equal targets length");
+        }
+        Ok(Self {
+            offsets: U32Store::Mapped(offsets),
+            targets: U32Store::Mapped(targets),
+            edge_data: edge_data.map(U32Store::Mapped),
+        })
     }
 
-    /// Returns the raw targets array.
+    /// Returns the raw offsets array when heap-backed.
+    ///
+    /// Mapped CSRs return a materialized copy. Prefer [`Self::offset_of`]
+    /// for element access without allocation.
     #[must_use]
-    pub fn targets(&self) -> &[u32] {
-        &self.targets
+    pub fn offsets(&self) -> Vec<u32> {
+        self.offsets.to_vec()
     }
 
-    /// Returns the raw edge_data array, if set.
+    /// Returns the raw targets array when heap-backed (or a copy when mapped).
     #[must_use]
-    pub fn edge_data(&self) -> Option<&[u32]> {
-        self.edge_data.as_deref()
+    pub fn targets(&self) -> Vec<u32> {
+        self.targets.to_vec()
+    }
+
+    /// Returns the raw edge_data array, if set (copy when mapped).
+    #[must_use]
+    pub fn edge_data(&self) -> Option<Vec<u32>> {
+        self.edge_data.as_ref().map(U32Store::to_vec)
+    }
+
+    /// Returns `true` when offsets/targets are mapped (file-backed).
+    #[must_use]
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.offsets, U32Store::Mapped(_))
+    }
+
+    /// File-backed byte length for offsets/targets/edge_data.
+    #[must_use]
+    pub fn mapped_bytes(&self) -> usize {
+        self.offsets.mapped_bytes()
+            + self.targets.mapped_bytes()
+            + self.edge_data.as_ref().map_or(0, U32Store::mapped_bytes)
     }
 
     /// Serializes this CSR to a byte buffer.
     pub fn write_to(&self, buf: &mut Vec<u8>) {
         // offsets
         write_usize_as_u32(buf, self.offsets.len());
-        for &o in &self.offsets {
+        for i in 0..self.offsets.len() {
+            let o = self.offsets.get(i).unwrap_or(0);
             buf.extend_from_slice(&o.to_le_bytes());
         }
         // targets
         write_usize_as_u32(buf, self.targets.len());
-        for &t in &self.targets {
+        for i in 0..self.targets.len() {
+            let t = self.targets.get(i).unwrap_or(0);
             buf.extend_from_slice(&t.to_le_bytes());
         }
         // edge_data
@@ -222,7 +355,8 @@ impl CsrAdjacency {
             Some(ed) => {
                 buf.push(1);
                 write_usize_as_u32(buf, ed.len());
-                for &d in ed {
+                for i in 0..ed.len() {
+                    let d = ed.get(i).unwrap_or(0);
                     buf.extend_from_slice(&d.to_le_bytes());
                 }
             }
@@ -234,14 +368,17 @@ impl CsrAdjacency {
     ///
     /// # Errors
     ///
-    /// Returns an error string if data is truncated.
+    /// Returns an error string if data is truncated or a count would require a
+    /// pathological pre-allocation beyond the remaining payload.
     pub fn read_from(data: &[u8], pos: &mut usize) -> Result<Self, &'static str> {
         let offsets_len = read_u32_le(data, pos)? as usize;
+        ensure_count_fits(offsets_len, *pos, data.len(), 4)?;
         let mut offsets = Vec::with_capacity(offsets_len);
         for _ in 0..offsets_len {
             offsets.push(read_u32_le(data, pos)?);
         }
         let targets_len = read_u32_le(data, pos)? as usize;
+        ensure_count_fits(targets_len, *pos, data.len(), 4)?;
         let mut targets = Vec::with_capacity(targets_len);
         for _ in 0..targets_len {
             targets.push(read_u32_le(data, pos)?);
@@ -250,6 +387,7 @@ impl CsrAdjacency {
         *pos += 1;
         let edge_data = if has_edge_data == 1 {
             let ed_len = read_u32_le(data, pos)? as usize;
+            ensure_count_fits(ed_len, *pos, data.len(), 4)?;
             let mut ed = Vec::with_capacity(ed_len);
             for _ in 0..ed_len {
                 ed.push(read_u32_le(data, pos)?);
@@ -264,18 +402,34 @@ impl CsrAdjacency {
     /// Returns the approximate heap memory usage in bytes.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.offsets.len() * std::mem::size_of::<u32>()
-            + self.targets.len() * std::mem::size_of::<u32>()
-            + self
-                .edge_data
-                .as_ref()
-                .map_or(0, |d| d.len() * std::mem::size_of::<u32>())
+        self.offsets.memory_bytes()
+            + self.targets.memory_bytes()
+            + self.edge_data.as_ref().map_or(0, U32Store::memory_bytes)
     }
 }
 
 fn write_usize_as_u32(buf: &mut Vec<u8>, v: usize) {
     let n = u32::try_from(v).expect("value exceeds u32::MAX in CSR serialization");
     buf.extend_from_slice(&n.to_le_bytes());
+}
+
+/// Ensures `count * item_bytes` fits in the remaining payload before
+/// `Vec::with_capacity`, so corrupt lengths cannot request pathological
+/// allocations.
+fn ensure_count_fits(
+    count: usize,
+    pos: usize,
+    data_len: usize,
+    item_bytes: usize,
+) -> Result<(), &'static str> {
+    let remaining = data_len.saturating_sub(pos);
+    let fits = count
+        .checked_mul(item_bytes)
+        .is_some_and(|need| need <= remaining);
+    if !fits {
+        return Err("CSR count exceeds remaining payload");
+    }
+    Ok(())
 }
 
 fn read_u32_le(data: &[u8], pos: &mut usize) -> Result<u32, &'static str> {
@@ -301,15 +455,15 @@ mod tests {
         assert_eq!(csr.num_edges(), 3);
 
         // Node 0: neighbors [1, 2]
-        assert_eq!(csr.neighbors(0), &[1, 2]);
+        assert_eq!(csr.neighbors(0), vec![1, 2]);
         assert_eq!(csr.degree(0), 2);
 
         // Node 1: neighbors [2]
-        assert_eq!(csr.neighbors(1), &[2]);
+        assert_eq!(csr.neighbors(1), vec![2]);
         assert_eq!(csr.degree(1), 1);
 
         // Node 2: no neighbors
-        assert_eq!(csr.neighbors(2), &[] as &[u32]);
+        assert_eq!(csr.neighbors(2), Vec::<u32>::new());
         assert_eq!(csr.degree(2), 0);
     }
 
@@ -341,5 +495,17 @@ mod tests {
         assert_eq!(csr.num_edges(), 0);
         assert_eq!(csr.source_for_position(0), None);
         assert_eq!(csr.memory_bytes(), 4); // 1 offset entry (sentinel)
+    }
+
+    #[test]
+    fn huge_offsets_len_fails_closed_without_pathological_alloc() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // offsets_len
+        let mut pos = 0;
+        let err = CsrAdjacency::read_from(&data, &mut pos).expect_err("must reject");
+        assert!(
+            err.contains("exceeds remaining") || err.contains("truncated"),
+            "unexpected error: {err}"
+        );
     }
 }

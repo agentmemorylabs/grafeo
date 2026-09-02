@@ -27,6 +27,10 @@ crossbeam = { workspace = true, optional = true }
 # Checksums (always needed for section directory CRC)
 crc32fast.workspace = true
 
+# Hashing (streaming SHA-256 for generation validation; the additive
+# GenerationFileOps seam lives at the grafeo-file level)
+sha2.workspace = true
+
 # I/O (optional, feature-gated)
 memmap2 = { workspace = true, optional = true }
 fs2 = { workspace = true, optional = true }
@@ -36,6 +40,16 @@ tokio = { workspace = true, optional = true }
 
 # Tracing (optional, zero-cost when disabled)
 tracing = { workspace = true, optional = true }
+
+# Core graph types (optional, for generation adapter)
+grafeo-core = { workspace = true, default-features = false, optional = true, features = ["compact-store", "lpg"] }
+
+# Correlation IDs for unpublished build dirs (generation lifecycle)
+rand = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# FD_CLOEXEC for the root lock handle (W0-B lock module)
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -47,11 +61,18 @@ name = "wal_bench"
 harness = false
 required-features = ["wal"]
 
+[[bench]]
+name = "generation_build_bench"
+harness = false
+required-features = ["generation"]
+
 [features]
 default = ["wal"]
 wal = ["memmap2", "tokio", "crossbeam"]
 async-storage = ["wal"]
 grafeo-file = ["wal", "fs2"]
+generation = ["grafeo-file", "dep:grafeo-core", "dep:rand"]
+generation-streaming = ["generation", "grafeo-core/generation-streaming"]
 tracing = ["dep:tracing", "grafeo-common/tracing"]
 testing-crash-injection = ["grafeo-common/testing-crash-injection"]
 encryption = ["grafeo-common/encryption"]
