@@ -4264,32 +4264,9 @@ impl Session {
         let commit_epoch = match self.transaction_manager.commit(transaction_id) {
             Ok(epoch) => epoch,
             Err(e) => {
-                // Conflict detected: rollback the data changes
-                for graph_name in &touched {
-                    let store = self.resolve_store(graph_name);
-                    store.rollback_transaction_properties(transaction_id);
-                }
-                // The conflict error is what the caller gets; an incomplete
-                // layered undo is only logged here.
-                #[cfg(all(feature = "compact-store", feature = "lpg"))]
-                {
-                    let unrestored = self.rollback_layered_bookkeeping(transaction_id);
-                    if unrestored > 0 {
-                        let _ = Self::incomplete_rollback_error(transaction_id, unrestored, false);
-                    }
-                }
-                #[cfg(feature = "triple-store")]
-                self.rollback_rdf_transaction(transaction_id);
-                // Discard buffered CDC events on conflict rollback
-                #[cfg(feature = "cdc")]
-                if let Some(ref pending) = self.cdc_pending_events {
-                    pending.lock().clear();
-                }
-                #[cfg(all(feature = "lpg", feature = "vector-index"))]
-                self.clear_vector_intents();
-                *self.read_only_tx.lock() = self.db_read_only;
-                self.savepoints.lock().clear();
-                self.touched_graphs.lock().clear();
+                // Conflict detected: abort the transaction completely so its
+                // entities are released and its versions discarded (#409).
+                let _ = self.abort_transaction(transaction_id, &touched);
                 #[cfg(feature = "metrics")]
                 {
                     crate::metrics::record_metric!(self.metrics, tx_active, dec);
@@ -4500,12 +4477,40 @@ impl Session {
             )
         })?;
 
-        // Reset read-only flag
+        let touched = std::mem::take(&mut *self.touched_graphs.lock());
+        let result = self.abort_transaction(transaction_id, &touched);
+
+        #[cfg(feature = "metrics")]
+        if result.is_ok() {
+            crate::metrics::record_metric!(self.metrics, tx_active, dec);
+            crate::metrics::record_metric!(self.metrics, tx_rolled_back, inc);
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(start) = self.tx_start_time.lock().take() {
+                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                crate::metrics::record_metric!(self.metrics, tx_duration, observe duration_ms);
+            }
+        }
+
+        result
+    }
+
+    /// Aborts a transaction that has already been taken out of
+    /// `current_transaction`: discards its versions in every touched graph,
+    /// its RDF changes and buffered CDC events, marks it aborted in the
+    /// transaction manager and logs the abort to the WAL.
+    ///
+    /// Shared by rollback and by a commit that fails validation, so a failed
+    /// commit leaves no active transaction holding its entities.
+    #[cfg(feature = "lpg")]
+    fn abort_transaction(
+        &self,
+        transaction_id: TransactionId,
+        touched: &[Option<String>],
+    ) -> Result<()> {
         *self.read_only_tx.lock() = self.db_read_only;
 
         // Discard uncommitted versions in ALL touched LPG stores (cross-graph atomicity).
-        let touched = self.touched_graphs.lock().clone();
-        for graph_name in &touched {
+        for graph_name in touched {
             let store = self.resolve_store(graph_name);
             store.discard_uncommitted_versions(transaction_id);
         }
@@ -4515,11 +4520,9 @@ impl Session {
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         let unrestored = self.rollback_layered_bookkeeping(transaction_id);
 
-        // Discard pending operations in the RDF store
         #[cfg(feature = "triple-store")]
         self.rollback_rdf_transaction(transaction_id);
 
-        // Discard buffered CDC events on rollback
         #[cfg(feature = "cdc")]
         if let Some(ref pending) = self.cdc_pending_events {
             pending.lock().clear();
@@ -4527,11 +4530,9 @@ impl Session {
         #[cfg(all(feature = "lpg", feature = "vector-index"))]
         self.clear_vector_intents();
 
-        // Clear savepoints and touched graphs
         self.savepoints.lock().clear();
         self.touched_graphs.lock().clear();
 
-        // Mark transaction as aborted in the manager
         let result = self.transaction_manager.abort(transaction_id);
 
         // Log transaction abort to WAL so recovery clears any data records
@@ -4544,17 +4545,6 @@ impl Session {
             use grafeo_storage::wal::WalRecord;
             if let Err(e) = wal.log(&WalRecord::TransactionAbort { transaction_id }) {
                 grafeo_warn!("Failed to log transaction abort to WAL: {}", e);
-            }
-        }
-
-        #[cfg(feature = "metrics")]
-        if result.is_ok() {
-            crate::metrics::record_metric!(self.metrics, tx_active, dec);
-            crate::metrics::record_metric!(self.metrics, tx_rolled_back, inc);
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Some(start) = self.tx_start_time.lock().take() {
-                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                crate::metrics::record_metric!(self.metrics, tx_duration, observe duration_ms);
             }
         }
 
