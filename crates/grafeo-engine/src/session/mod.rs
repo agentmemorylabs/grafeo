@@ -178,12 +178,10 @@ pub struct Session {
     transaction_start_node_count: AtomicUsize,
     /// Edge count at the start of the current transaction (for PreparedCommit stats).
     transaction_start_edge_count: AtomicUsize,
-    /// WAL for logging schema changes.
+    /// This session's WAL records, written as one group per transaction
+    /// (`None` without a WAL).
     #[cfg(feature = "wal")]
-    wal: Option<Arc<grafeo_storage::wal::LpgWal>>,
-    /// Shared WAL graph context tracker for named graph awareness.
-    #[cfg(feature = "wal")]
-    wal_graph_context: Option<Arc<parking_lot::Mutex<Option<String>>>>,
+    wal: Option<Arc<crate::transaction::wal_buffer::WalBuffer>>,
     /// CDC log for change tracking.
     #[cfg(feature = "cdc")]
     cdc_log: Arc<crate::cdc::CdcLog>,
@@ -295,6 +293,10 @@ struct SavepointState {
     /// Layered-store journal position at savepoint creation.
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
     layered_position: usize,
+    /// WAL buffer position at savepoint creation.
+    /// On rollback-to-savepoint, the buffer is truncated to this position.
+    #[cfg(feature = "wal")]
+    wal_position: usize,
 }
 
 /// What [`Session::abort_transaction`] could not finish. The abort itself
@@ -303,9 +305,6 @@ struct SavepointState {
 struct AbortOutcome {
     /// The transaction manager's abort.
     aborted: Result<()>,
-    /// Why the `TransactionAbort` marker could not be appended (layered
-    /// databases only; the WAL is poisoned by then).
-    marker_error: Option<String>,
     /// Layered base changes the undo could no longer restore.
     unrestored: usize,
 }
@@ -315,23 +314,16 @@ impl AbortOutcome {
     /// The result of an explicit rollback, after everything else is done.
     fn into_rollback_result(self, transaction_id: TransactionId) -> Result<()> {
         self.aborted?;
-        // Built (and logged) even when the marker error is the one returned.
         #[cfg(feature = "compact-store")]
-        let incomplete = (self.unrestored > 0)
-            .then(|| Session::incomplete_rollback_error(transaction_id, self.unrestored, false));
+        if self.unrestored > 0 {
+            return Err(Session::incomplete_rollback_error(
+                transaction_id,
+                self.unrestored,
+                false,
+            ));
+        }
         #[cfg(not(feature = "compact-store"))]
         let _ = (transaction_id, self.unrestored);
-        if let Some(marker) = self.marker_error {
-            return Err(grafeo_common::utils::error::Error::Internal(format!(
-                "transaction rolled back in memory, but its WAL abort marker could not be \
-                 written ({marker}); the WAL refuses further writes until the database is \
-                 reopened"
-            )));
-        }
-        #[cfg(feature = "compact-store")]
-        if let Some(e) = incomplete {
-            return Err(e);
-        }
         Ok(())
     }
 }
@@ -372,8 +364,6 @@ impl Session {
             transaction_start_edge_count: AtomicUsize::new(0),
             #[cfg(feature = "wal")]
             wal: None,
-            #[cfg(feature = "wal")]
-            wal_graph_context: None,
             #[cfg(feature = "cdc")]
             cdc_log: Arc::new(crate::cdc::CdcLog::new()),
             #[cfg(feature = "cdc")]
@@ -468,61 +458,65 @@ impl Session {
 
     /// Sets the WAL for this session (shared with the database).
     ///
-    /// This also wraps `graph_store` in a [`WalGraphStore`] so that mutation
-    /// operators (INSERT, DELETE, SET via queries) log to the WAL.
+    /// The session gets its own [`WalBuffer`](crate::transaction::wal_buffer::WalBuffer),
+    /// and `graph_store` is wrapped in a [`WalGraphStore`] so that mutation
+    /// operators (INSERT, DELETE, SET via queries) record into it. The buffer
+    /// is written to the WAL as one group per transaction.
     #[cfg(all(feature = "wal", feature = "lpg"))]
-    pub(crate) fn set_wal(
-        &mut self,
-        wal: Arc<grafeo_storage::wal::LpgWal>,
-        wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
-    ) {
-        // Wrap the graph store so query-engine mutations are WAL-logged
+    pub(crate) fn set_wal(&mut self, wal: Arc<grafeo_storage::wal::LpgWal>) {
+        let buffer = Arc::new(crate::transaction::wal_buffer::WalBuffer::new(wal));
         let wal_store = Arc::new(crate::database::wal_store::WalGraphStore::new(
             Arc::clone(&self.store) as Arc<dyn GraphStoreMut>,
-            Arc::clone(&wal),
-            Arc::clone(&wal_graph_context),
+            Arc::clone(&buffer),
         ));
         self.graph_store = Arc::clone(&wal_store) as Arc<dyn GraphStoreSearch>;
         self.graph_store_mut = Some(wal_store as Arc<dyn GraphStoreMut>);
-        self.wal = Some(wal);
-        self.wal_graph_context = Some(wal_graph_context);
+        self.wal = Some(buffer);
     }
 
-    /// Attaches the WAL for commit/epoch logging without re-wrapping the store
-    /// (the layered session branch already holds a WAL-wrapped write store).
+    /// Attaches the session's WAL buffer without re-wrapping the store: the
+    /// layered session branch already holds a write store wrapped around the
+    /// same buffer.
     #[cfg(all(feature = "wal", feature = "lpg"))]
-    pub(crate) fn attach_wal(
-        &mut self,
-        wal: Arc<grafeo_storage::wal::LpgWal>,
-        wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
-    ) {
-        self.wal = Some(wal);
-        self.wal_graph_context = Some(wal_graph_context);
+    pub(crate) fn attach_wal(&mut self, buffer: Arc<crate::transaction::wal_buffer::WalBuffer>) {
+        self.wal = Some(buffer);
     }
 
-    /// Logs a WAL record if WAL is enabled. No-op for in-memory sessions.
+    /// Records a WAL record for the active graph. No-op for in-memory sessions.
     ///
-    /// Mirrors `GrafeoDB::log_wal`: WAL write failures are logged via
-    /// `grafeo_warn!` and not propagated, so a transient WAL error never
-    /// fails a Session mutation. The caller is responsible for invoking
-    /// this immediately after the in-memory LPG mutation so that recovery
-    /// replays records in the same order writes happened.
+    /// The record joins the current transaction's group. Callers outside a
+    /// transaction finish with [`flush_wal_outside_transaction`](Self::flush_wal_outside_transaction).
     #[cfg(all(feature = "wal", feature = "lpg"))]
-    pub(crate) fn log_wal_record(&self, record: &grafeo_storage::wal::WalRecord) {
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log(record)
-        {
-            grafeo_warn!("Session: failed to log WAL record: {}", e);
+    pub(crate) fn log_wal_record(&self, record: grafeo_storage::wal::WalRecord) {
+        if let Some(ref wal) = self.wal {
+            wal.push(self.active_graph_storage_key(), record);
         }
     }
 
-    /// Logs a direct write's WAL record at the point its store calls for.
+    /// Writes records made outside a transaction to the WAL as an implicit
+    /// group with its own commit marker. Does nothing inside a transaction,
+    /// whose records are written at commit.
     ///
-    /// The layered target logs **before** the store write (`before == true`)
-    /// and returns a failure, so a write the WAL refused is neither applied
-    /// nor reported as done. Every other target keeps its original order
-    /// (after the store write, `before == false`) and only warns, as
-    /// [`log_wal_record`](Self::log_wal_record) does.
+    /// WAL write failures are logged via `grafeo_warn!` and not propagated.
+    #[cfg(feature = "wal")]
+    fn flush_wal_outside_transaction(&self) {
+        if let Some(ref wal) = self.wal
+            && self.current_transaction.lock().is_none()
+            && let Err(e) = wal.flush_implicit()
+        {
+            grafeo_warn!("Session: failed to write WAL records: {}", e);
+        }
+    }
+
+    /// Records a direct write's WAL record at the point its store calls for.
+    ///
+    /// The record joins the session's WAL buffer, like every other write: it
+    /// reaches the WAL with the transaction's group at commit, or (outside a
+    /// transaction) when [`with_direct_write`](Self::with_direct_write)
+    /// flushes. The layered target records it **before** the store write
+    /// (`before == true`); a WAL that refuses appends fails the implicit or
+    /// explicit commit, which rolls the write back. Every other target keeps
+    /// its original order (after the store write, `before == false`).
     #[cfg(all(feature = "wal", feature = "lpg"))]
     fn log_direct_wal_record(
         &self,
@@ -530,19 +524,10 @@ impl Session {
         record: &grafeo_storage::wal::WalRecord,
         before: bool,
     ) -> Result<()> {
-        match (store.is_layered(), before) {
-            (true, true) => {
-                if let Some(ref wal) = self.wal {
-                    wal.log(record)?;
-                }
-                Ok(())
-            }
-            (false, false) => {
-                self.log_wal_record(record);
-                Ok(())
-            }
-            _ => Ok(()),
+        if store.is_layered() == before {
+            self.log_wal_record(record.clone());
         }
+        Ok(())
     }
 
     /// Sets the CDC log for this session (shared with the database).
@@ -616,8 +601,6 @@ impl Session {
             transaction_start_edge_count: AtomicUsize::new(0),
             #[cfg(feature = "wal")]
             wal: None,
-            #[cfg(feature = "wal")]
-            wal_graph_context: None,
             #[cfg(feature = "cdc")]
             cdc_log: Arc::new(crate::cdc::CdcLog::new()),
             #[cfg(feature = "cdc")]
@@ -740,12 +723,11 @@ impl Session {
             Some(ref name) => match self.store.graph(name) {
                 Some(named_store) => {
                     #[cfg(feature = "wal")]
-                    if let (Some(wal), Some(ctx)) = (&self.wal, &self.wal_graph_context) {
+                    if let Some(wal) = &self.wal {
                         return Arc::new(crate::database::wal_store::WalGraphStore::new_for_graph(
                             named_store,
                             Arc::clone(wal),
                             name.clone(),
-                            Arc::clone(ctx),
                         )) as Arc<dyn GraphStoreSearch>;
                     }
                     named_store as Arc<dyn GraphStoreSearch>
@@ -771,7 +753,7 @@ impl Session {
                     let mut store: Arc<dyn GraphStoreMut> = named_store;
 
                     #[cfg(feature = "wal")]
-                    if let (Some(wal), Some(ctx)) = (&self.wal, &self.wal_graph_context) {
+                    if let Some(wal) = &self.wal {
                         store = Arc::new(crate::database::wal_store::WalGraphStore::new_for_graph(
                             // WAL needs Arc<LpgStore>, get it fresh
                             self.store
@@ -779,7 +761,6 @@ impl Session {
                                 .unwrap_or_else(|| Arc::clone(&self.store)),
                             Arc::clone(wal),
                             name.clone(),
-                            Arc::clone(ctx),
                         ));
                     }
 
@@ -863,7 +844,11 @@ impl Session {
     ) -> Result<T> {
         self.check_wal_writable()?;
         if !store.is_layered() {
-            return write();
+            let result = write();
+            // Outside a transaction the write's records form their own group.
+            #[cfg(feature = "wal")]
+            self.flush_wal_outside_transaction();
+            return result;
         }
         if self.db_read_only || *self.read_only_tx.lock() {
             return Err(grafeo_common::utils::error::Error::Transaction(
@@ -871,7 +856,10 @@ impl Session {
             ));
         }
         if !self.needs_auto_commit(true) {
-            return write();
+            let result = write();
+            #[cfg(feature = "wal")]
+            self.flush_wal_outside_transaction();
+            return result;
         }
         self.check_no_active_streams("write")?;
         self.begin_transaction_inner(false, None)?;
@@ -901,7 +889,7 @@ impl Session {
     fn check_wal_writable(&self) -> Result<()> {
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal
-            && let Some(reason) = wal.poisoned_reason()
+            && let Some(reason) = wal.wal().poisoned_reason()
         {
             return Err(grafeo_common::utils::error::Error::Internal(format!(
                 "WAL refuses writes until the database is reopened: {reason}"
@@ -1462,10 +1450,19 @@ impl Session {
     }
 
     /// Logs a WAL record for a schema change (no-op if WAL is not enabled).
+    ///
+    /// Schema changes take effect immediately, not at commit, so the record is
+    /// written as its own committed group instead of joining the transaction.
     #[cfg(feature = "wal")]
     fn log_schema_wal(&self, record: &grafeo_storage::wal::WalRecord) {
+        use grafeo_storage::wal::WalRecord;
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log(record)
+            && let Err(e) = wal.wal().log_batch(&[
+                record.clone(),
+                WalRecord::TransactionCommit {
+                    transaction_id: TransactionId::SYSTEM,
+                },
+            ])
         {
             grafeo_warn!("Failed to log schema change to WAL: {}", e);
         }
@@ -4194,6 +4191,16 @@ impl Session {
             return Ok(());
         }
 
+        // Records made before this transaction must not join its group.
+        // (`current` is held, so this cannot go through
+        // `flush_wal_outside_transaction`.)
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
+            && let Err(e) = wal.flush_implicit()
+        {
+            grafeo_warn!("Session: failed to write WAL records: {}", e);
+        }
+
         let active = self.active_lpg_store();
         self.transaction_start_node_count
             .store(active.node_count(), Ordering::Relaxed);
@@ -4367,22 +4374,21 @@ impl Session {
             }));
         }
 
-        // Log transaction commit and epoch advance to WAL so that crash
-        // recovery can identify committed transactions and their epoch
-        // boundaries. Without these markers, WAL recovery discards all
-        // records as uncommitted (fixes #252 for the crash scenario).
+        // Write the transaction's records to the WAL as one group, closed by
+        // the commit marker and the epoch advance, so crash recovery can
+        // identify committed transactions and their epoch boundaries (#252)
+        // and no other session's records can land inside the group (#411).
         #[cfg(all(feature = "wal", feature = "compact-store"))]
         let mut durability_error: Option<String> = None;
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal {
             use grafeo_storage::wal::WalRecord;
             // One atomic append: generation-root replay rejects any record
-            // (another session's data, commit or abort) between the two. On a
-            // layered database a failure poisons the WAL inside that append:
-            // the transaction is applied in memory but its marker may or may
-            // not be on disk, and any later commit or abort could settle its
-            // records the wrong way on replay.
-            let pair = [
+            // between the commit and its epoch advance. On a layered database
+            // a failure poisons the WAL inside that append: the transaction
+            // is applied in memory but its group may or may not be on disk,
+            // and a later group could otherwise land after a partial one.
+            let markers = [
                 WalRecord::TransactionCommit { transaction_id },
                 WalRecord::EpochAdvance {
                     epoch: commit_epoch,
@@ -4390,14 +4396,14 @@ impl Session {
             ];
             #[cfg(feature = "compact-store")]
             let logged = if self.layered_store.is_some() {
-                wal.log_atomic_or_poison(&pair)
+                wal.flush_or_poison(&markers)
             } else {
-                wal.log_atomic(&pair)
+                wal.flush(&markers)
             };
             #[cfg(not(feature = "compact-store"))]
-            let logged = wal.log_atomic(&pair);
+            let logged = wal.flush(&markers);
             if let Err(e) = logged {
-                grafeo_warn!("Failed to log transaction commit to WAL: {}", e);
+                grafeo_warn!("Failed to write transaction to WAL: {}", e);
                 // A layered database poisoned its WAL above: report the
                 // commit as unconfirmed once the in-memory commit finishes.
                 #[cfg(feature = "compact-store")]
@@ -4549,7 +4555,7 @@ impl Session {
     /// `current_transaction`: discards its versions in every touched graph,
     /// undoes its layered base changes, its RDF changes and buffered CDC and
     /// vector-index updates, clears the session's transaction state, marks it
-    /// aborted in the transaction manager and logs the abort to the WAL.
+    /// aborted in the transaction manager and drops its buffered WAL records.
     ///
     /// Shared by rollback and by a commit that fails validation, so a failed
     /// commit leaves no active transaction holding its entities (#409).
@@ -4588,60 +4594,20 @@ impl Session {
         self.touched_graphs.lock().clear();
         *self.transaction_nesting_depth.lock() = 0;
 
-        // Log the abort before the manager releases the entities: once they
-        // are released another session can write them and append its commit
-        // pair, which would settle this transaction's records on replay if
-        // it landed ahead of the abort marker.
-        let marker_error = self.log_transaction_abort(transaction_id);
+        // The transaction's WAL records were only buffered: drop them. Nothing
+        // of it reached the WAL, so there is nothing to undo on replay, and no
+        // abort marker is written (a marker could only discard records of
+        // other writers that are still waiting for a commit).
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal {
+            wal.clear();
+        }
         let aborted = self.transaction_manager.abort(transaction_id);
 
         AbortOutcome {
             aborted,
-            marker_error,
             unrestored,
         }
-    }
-
-    /// Logs `TransactionAbort` so recovery clears any data records emitted
-    /// during the transaction. Without this marker, recovery's
-    /// per-transaction buffer would carry the aborted records into the next
-    /// `TransactionCommit` and resurrect them on reopen.
-    ///
-    /// On a layered database a failed append poisons the WAL (as a failed
-    /// commit marker does), since a later commit marker would otherwise
-    /// settle the aborted records on replay, and the failure is returned.
-    /// A WAL that was already poisoned refuses the append; that is not a
-    /// new failure, because the poison already refuses every later append.
-    #[cfg(feature = "lpg")]
-    fn log_transaction_abort(&self, transaction_id: TransactionId) -> Option<String> {
-        #[cfg(feature = "wal")]
-        if let Some(ref wal) = self.wal {
-            use grafeo_storage::wal::WalRecord;
-            let already_poisoned = wal.poisoned_reason().is_some();
-            let record = [WalRecord::TransactionAbort { transaction_id }];
-            #[cfg(feature = "compact-store")]
-            let layered = self.layered_store.is_some();
-            #[cfg(not(feature = "compact-store"))]
-            let layered = false;
-            let logged = if layered {
-                wal.log_atomic_or_poison(&record)
-            } else {
-                wal.log(&record[0])
-            };
-            if let Err(e) = logged {
-                grafeo_warn!("Failed to log transaction abort to WAL: {}", e);
-                if layered && !already_poisoned {
-                    // `log_atomic_or_poison` poisons on a write failure but
-                    // not on a serialization error; poison either way, so
-                    // the error below is true.
-                    wal.poison(format!("WAL abort marker could not be written: {e}"));
-                    return Some(e.to_string());
-                }
-            }
-        }
-        #[cfg(not(feature = "wal"))]
-        let _ = transaction_id;
-        None
     }
 
     /// Creates a named savepoint within the current transaction.
@@ -4694,6 +4660,8 @@ impl Session {
                 .layered_store
                 .as_ref()
                 .map_or(0, |l| l.transaction_layer_position(tx_id)),
+            #[cfg(feature = "wal")]
+            wal_position: self.wal.as_ref().map_or(0, |w| w.len()),
         });
         Ok(())
     }
@@ -4787,6 +4755,12 @@ impl Session {
         }
         #[cfg(all(feature = "lpg", feature = "vector-index"))]
         self.truncate_vector_intents(sp_state.vector_intent_position);
+
+        // Drop the WAL records buffered after the savepoint.
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal {
+            wal.truncate(sp_state.wal_position);
+        }
 
         // Restore touched_graphs to only the graphs that were known at savepoint time.
         let mut touched = self.touched_graphs.lock();
@@ -4959,7 +4933,10 @@ impl Session {
                 }
             }
         } else {
-            body()
+            let result = body();
+            #[cfg(feature = "wal")]
+            self.flush_wal_outside_transaction();
+            result
         }
     }
 
@@ -4969,7 +4946,10 @@ impl Session {
     where
         F: FnOnce() -> Result<QueryResult>,
     {
-        body()
+        let result = body();
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
+        result
     }
 
     /// Quick heuristic: returns `true` when the query text looks like it
@@ -5424,10 +5404,13 @@ impl Session {
         );
 
         #[cfg(feature = "wal")]
-        self.log_wal_record(&grafeo_storage::wal::WalRecord::CreateNode {
+        self.log_wal_record(grafeo_storage::wal::WalRecord::CreateNode {
             id,
             labels: labels.iter().map(|s| (*s).to_string()).collect(),
         });
+
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         id
     }
@@ -5481,12 +5464,12 @@ impl Session {
 
         #[cfg(feature = "wal")]
         {
-            self.log_wal_record(&grafeo_storage::wal::WalRecord::CreateNode {
+            self.log_wal_record(grafeo_storage::wal::WalRecord::CreateNode {
                 id,
                 labels: labels.iter().map(|s| (*s).to_string()).collect(),
             });
             for (key, value) in wal_props {
-                self.log_wal_record(&grafeo_storage::wal::WalRecord::SetNodeProperty {
+                self.log_wal_record(grafeo_storage::wal::WalRecord::SetNodeProperty {
                     id,
                     key,
                     value,
@@ -5502,6 +5485,9 @@ impl Session {
                 property,
             })?;
         }
+
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         Ok(id)
     }
@@ -5533,12 +5519,15 @@ impl Session {
         );
 
         #[cfg(feature = "wal")]
-        self.log_wal_record(&grafeo_storage::wal::WalRecord::CreateEdge {
+        self.log_wal_record(grafeo_storage::wal::WalRecord::CreateEdge {
             id: eid,
             src,
             dst,
             edge_type: edge_type.to_string(),
         });
+
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         eid
     }
@@ -5570,20 +5559,23 @@ impl Session {
 
         #[cfg(feature = "wal")]
         {
-            self.log_wal_record(&grafeo_storage::wal::WalRecord::CreateEdge {
+            self.log_wal_record(grafeo_storage::wal::WalRecord::CreateEdge {
                 id: eid,
                 src,
                 dst,
                 edge_type: edge_type.to_string(),
             });
             for (key, value) in props {
-                self.log_wal_record(&grafeo_storage::wal::WalRecord::SetEdgeProperty {
+                self.log_wal_record(grafeo_storage::wal::WalRecord::SetEdgeProperty {
                     id: eid,
                     key: key.to_string(),
                     value,
                 });
             }
         }
+
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         Ok(eid)
     }
@@ -6033,6 +6025,11 @@ impl Drop for Session {
         if self.in_transaction() {
             let _ = self.rollback_inner();
         }
+
+        // Records made outside a transaction that no statement boundary wrote
+        // yet.
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         #[cfg(feature = "metrics")]
         if let Some(ref reg) = self.metrics {

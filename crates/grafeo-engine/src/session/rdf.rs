@@ -63,8 +63,6 @@ impl Session {
             active_streams: AtomicUsize::new(0),
             #[cfg(feature = "wal")]
             wal: None,
-            #[cfg(feature = "wal")]
-            wal_graph_context: None,
             #[cfg(feature = "cdc")]
             cdc_log: Arc::new(crate::cdc::CdcLog::new()),
             #[cfg(feature = "cdc")]
@@ -124,6 +122,9 @@ impl Session {
 
         let executor = self.make_executor(physical_plan.columns.clone());
         let result = executor.execute(physical_plan.operator.as_mut());
+        // Without a transaction, the statement's WAL records form their own group.
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         #[cfg(feature = "metrics")]
         {
@@ -192,6 +193,9 @@ impl Session {
 
         let executor = self.make_executor(physical_plan.columns.clone());
         let result = executor.execute(physical_plan.operator.as_mut());
+        // Without a transaction, the statement's WAL records form their own group.
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         #[cfg(feature = "metrics")]
         {
@@ -247,6 +251,9 @@ impl Session {
 
         let executor = self.make_executor(physical_plan.columns.clone());
         let result = executor.execute(physical_plan.operator.as_mut());
+        // Without a transaction, the statement's WAL records form their own group.
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         #[cfg(feature = "metrics")]
         {
@@ -311,6 +318,9 @@ impl Session {
 
         let executor = self.make_executor(physical_plan.columns.clone());
         let result = executor.execute(physical_plan.operator.as_mut());
+        // Without a transaction, the statement's WAL records form their own group.
+        #[cfg(feature = "wal")]
+        self.flush_wal_outside_transaction();
 
         #[cfg(feature = "metrics")]
         {
