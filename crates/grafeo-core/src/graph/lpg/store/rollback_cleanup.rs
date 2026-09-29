@@ -257,7 +257,6 @@ impl LpgStore {
         let existed = self.node_versions.write().remove(&id).is_some();
         if existed {
             self.cleanup_node_secondaries(&[id], false);
-            self.needs_stats_recompute.store(true, Ordering::Relaxed);
         }
         existed
     }
@@ -297,7 +296,6 @@ impl LpgStore {
             return false;
         };
         self.cleanup_discarded_edge_secondaries(&[edge]);
-        self.needs_stats_recompute.store(true, Ordering::Relaxed);
         true
     }
 }

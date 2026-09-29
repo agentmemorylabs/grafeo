@@ -1978,6 +1978,14 @@ impl<Id: EntityId> PropertyColumn<Id> {
             }
         }
     }
+
+    /// Replaces PENDING epochs with the commit epoch for one entity (commit
+    /// of the transaction that wrote them).
+    pub fn finalize_pending_for(&mut self, id: Id, real_epoch: EpochId) {
+        if let Some(log) = self.values.get_mut(&id) {
+            log.finalize_pending(real_epoch);
+        }
+    }
 }
 
 /// Computes per-block zone maps for a sorted column by chunking the values
