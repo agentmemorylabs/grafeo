@@ -664,6 +664,115 @@ impl GraphStoreMut for WalGraphStore {
         }
         removed
     }
+
+    // The transactional mutators must reach the inner store's versioned
+    // methods, which record undo entries; the trait defaults would call the
+    // plain methods above and a rollback could not restore the old values.
+    // (Ported from upstream GrafeoDB/grafeo d66fd692.)
+
+    fn set_node_property_versioned(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.inner
+            .set_node_property_versioned(id, key, value.clone(), transaction_id);
+        self.log_with_context(&WalRecord::SetNodeProperty {
+            id,
+            key: key.to_string(),
+            value,
+        });
+    }
+
+    fn set_edge_property_versioned(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.inner
+            .set_edge_property_versioned(id, key, value.clone(), transaction_id);
+        self.log_with_context(&WalRecord::SetEdgeProperty {
+            id,
+            key: key.to_string(),
+            value,
+        });
+    }
+
+    fn remove_node_property_versioned(
+        &self,
+        id: NodeId,
+        key: &str,
+        transaction_id: TransactionId,
+    ) -> Option<Value> {
+        let removed = self
+            .inner
+            .remove_node_property_versioned(id, key, transaction_id);
+        if removed.is_some() {
+            self.log_with_context(&WalRecord::RemoveNodeProperty {
+                id,
+                key: key.to_string(),
+            });
+        }
+        removed
+    }
+
+    fn remove_edge_property_versioned(
+        &self,
+        id: EdgeId,
+        key: &str,
+        transaction_id: TransactionId,
+    ) -> Option<Value> {
+        let removed = self
+            .inner
+            .remove_edge_property_versioned(id, key, transaction_id);
+        if removed.is_some() {
+            self.log_with_context(&WalRecord::RemoveEdgeProperty {
+                id,
+                key: key.to_string(),
+            });
+        }
+        removed
+    }
+
+    fn add_label_versioned(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        transaction_id: TransactionId,
+    ) -> bool {
+        let added = self
+            .inner
+            .add_label_versioned(node_id, label, transaction_id);
+        if added {
+            self.log_with_context(&WalRecord::AddNodeLabel {
+                id: node_id,
+                label: label.to_string(),
+            });
+        }
+        added
+    }
+
+    fn remove_label_versioned(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        transaction_id: TransactionId,
+    ) -> bool {
+        let removed = self
+            .inner
+            .remove_label_versioned(node_id, label, transaction_id);
+        if removed {
+            self.log_with_context(&WalRecord::RemoveNodeLabel {
+                id: node_id,
+                label: label.to_string(),
+            });
+        }
+        removed
+    }
 }
 
 #[cfg(test)]

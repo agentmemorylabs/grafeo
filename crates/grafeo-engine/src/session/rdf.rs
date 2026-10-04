@@ -82,6 +82,8 @@ impl Session {
             #[cfg(feature = "metrics")]
             tx_start_time: parking_lot::Mutex::new(None),
             projections: cfg.projections,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
         }
     }
 

@@ -125,6 +125,11 @@ pub struct Session {
     graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
+    /// Layered store behind the default graph on a generation root / after
+    /// `compact()`. Its base tombstones and copy-ups live outside the overlay
+    /// `store`'s MVCC, so commit/rollback/savepoints drive them explicitly.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    layered_store: Option<Arc<grafeo_core::graph::compact::layered::LayeredStore>>,
     /// Schema and metadata catalog shared across sessions.
     catalog: Arc<Catalog>,
     /// RDF triple store (if RDF feature is enabled).
@@ -282,6 +287,9 @@ struct SavepointState {
     /// Vector intent buffer position at savepoint creation.
     #[cfg(all(feature = "lpg", feature = "vector-index"))]
     vector_intent_position: usize,
+    /// Layered-store journal position at savepoint creation.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    layered_position: usize,
 }
 
 impl Session {
@@ -340,6 +348,8 @@ impl Session {
             #[cfg(feature = "metrics")]
             tx_start_time: parking_lot::Mutex::new(None),
             projections: cfg.projections,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
         }
     }
 
@@ -356,6 +366,16 @@ impl Session {
     ) {
         self.graph_store = read_store;
         self.graph_store_mut = write_store;
+    }
+
+    /// Attaches the layered store whose transaction-scoped bookkeeping
+    /// (base tombstones, copy-ups) this session commits and rolls back.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    pub(crate) fn set_layered_store(
+        &mut self,
+        layered: Arc<grafeo_core::graph::compact::layered::LayeredStore>,
+    ) {
+        self.layered_store = Some(layered);
     }
 
     /// Sets the WAL for this session (shared with the database).
@@ -500,6 +520,8 @@ impl Session {
             tx_start_time: parking_lot::Mutex::new(None),
             #[cfg(feature = "lpg")]
             projections: cfg.projections,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
         })
     }
 
@@ -4060,6 +4082,10 @@ impl Session {
                     let store = self.resolve_store(graph_name);
                     store.rollback_transaction_properties(transaction_id);
                 }
+                #[cfg(all(feature = "compact-store", feature = "lpg"))]
+                if let Some(ref layered) = self.layered_store {
+                    layered.rollback_transaction_layers(transaction_id);
+                }
                 #[cfg(feature = "triple-store")]
                 self.rollback_rdf_transaction(transaction_id);
                 // Discard buffered CDC events on conflict rollback
@@ -4103,6 +4129,10 @@ impl Session {
         for graph_name in &touched {
             let store = self.resolve_store(graph_name);
             store.commit_transaction_properties(transaction_id);
+        }
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(ref layered) = self.layered_store {
+            layered.commit_transaction_layers(transaction_id);
         }
 
         // Flush buffered CDC events now that the transaction is committed.
@@ -4255,6 +4285,13 @@ impl Session {
             let store = self.resolve_store(graph_name);
             store.discard_uncommitted_versions(transaction_id);
         }
+        // Then lift the layered store's base tombstones and copy-ups (after
+        // the overlay discard, so no rolled-back edge still references a
+        // copy-up when it is purged).
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(ref layered) = self.layered_store {
+            layered.rollback_transaction_layers(transaction_id);
+        }
 
         // Discard pending operations in the RDF store
         #[cfg(feature = "triple-store")]
@@ -4347,6 +4384,11 @@ impl Session {
                 .map_or(0, |p| p.lock().len()),
             #[cfg(all(feature = "lpg", feature = "vector-index"))]
             vector_intent_position: self.vector_index_intents.lock().len(),
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_position: self
+                .layered_store
+                .as_ref()
+                .map_or(0, |l| l.transaction_layer_position(tx_id)),
         });
         Ok(())
     }
@@ -4425,6 +4467,12 @@ impl Session {
                 let store = self.resolve_store(graph_name);
                 store.discard_uncommitted_versions(transaction_id);
             }
+        }
+
+        // Undo layered tombstones / copy-ups made after the savepoint.
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(ref layered) = self.layered_store {
+            layered.rollback_transaction_layers_to(transaction_id, sp_state.layered_position);
         }
 
         // Truncate CDC event buffer to the savepoint position.

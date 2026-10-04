@@ -2803,6 +2803,7 @@ impl GrafeoDB {
             #[cfg(not(feature = "wal"))]
             let write_store: Arc<dyn GraphStoreMut> = layered_arc as Arc<dyn GraphStoreMut>;
             session.override_stores(read_store, Some(write_store));
+            session.set_layered_store(Arc::clone(layered));
             // Attach the WAL for TransactionCommit/EpochAdvance logging without
             // re-wrapping the store (the write store above is already wrapped).
             #[cfg(feature = "wal")]

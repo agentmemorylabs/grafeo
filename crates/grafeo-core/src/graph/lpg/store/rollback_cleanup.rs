@@ -218,3 +218,64 @@ impl LpgStore {
         out
     }
 }
+
+impl LpgStore {
+    /// Removes a node outright, whatever transaction wrote it: its version
+    /// chain plus every secondary entry (labels, label index, property
+    /// columns/indexes, live counter).
+    ///
+    /// Used by `LayeredStore` to undo a rolled-back copy-up of a base node:
+    /// the copy was written non-versioned (so concurrent readers keep seeing
+    /// the base values), so the MVCC discard cannot remove it. Returns whether
+    /// the node existed.
+    #[doc(hidden)]
+    pub fn purge_node(&self, id: NodeId) -> bool {
+        #[cfg(not(feature = "tiered-storage"))]
+        let existed = self.nodes.write().remove(&id).is_some();
+        #[cfg(feature = "tiered-storage")]
+        let existed = self.node_versions.write().remove(&id).is_some();
+        if existed {
+            self.cleanup_discarded_node_secondaries(&[id]);
+            self.needs_stats_recompute.store(true, Ordering::Relaxed);
+        }
+        existed
+    }
+
+    /// Edge variant of [`Self::purge_node`]: removes the version chain, both
+    /// adjacency entries, the edge-type count and the property columns.
+    #[doc(hidden)]
+    pub fn purge_edge(&self, id: EdgeId) -> bool {
+        #[cfg(not(feature = "tiered-storage"))]
+        let discarded = {
+            let removed = self.edges.write().remove(&id);
+            removed.and_then(|chain| {
+                chain.latest().map(|record| DiscardedEdge {
+                    id,
+                    src: record.src,
+                    dst: record.dst,
+                    type_id: record.type_id,
+                })
+            })
+        };
+        #[cfg(feature = "tiered-storage")]
+        let discarded = {
+            let removed = self.edge_versions.write().remove(&id);
+            removed.and_then(|index| {
+                let vref = index.latest()?;
+                let record = self.read_edge_record(&vref)?;
+                Some(DiscardedEdge {
+                    id,
+                    src: record.src,
+                    dst: record.dst,
+                    type_id: record.type_id,
+                })
+            })
+        };
+        let Some(edge) = discarded else {
+            return false;
+        };
+        self.cleanup_discarded_edge_secondaries(&[edge]);
+        self.needs_stats_recompute.store(true, Ordering::Relaxed);
+        true
+    }
+}
