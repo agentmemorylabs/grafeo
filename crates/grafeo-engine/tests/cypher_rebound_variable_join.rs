@@ -461,3 +461,61 @@ fn guard_optional_match_end_bound() {
         ]
     );
 }
+
+/// The anchored translation expands forward (`o -> d`) and then backward
+/// (`o <- ev`) from the bound middle node, so the two expands are adjacent
+/// but not linked. The factorized expand-chain planner must not fuse them.
+#[test]
+fn middle_bound_two_hop_unlabeled_ends() {
+    let db = fixture();
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence) WHERE o.document_id IN $ids \
+         MATCH (ev)-[:EVIDENCE_FOR_OCCURRENCE]->(o)-[:IN_DOC]->(d) \
+         RETURN ev.name, d.name",
+        Some(ids_a()),
+    );
+    assert_eq!(got, vec![vec![s("ev1"), s("dA")], vec![s("ev2"), s("dA")]]);
+}
+
+#[test]
+fn middle_bound_two_hop_unlabeled_ends_count() {
+    let db = fixture();
+    let n = count(
+        &db,
+        "MATCH (o:SymbolOccurrence) \
+         MATCH (ev)-[:EVIDENCE_FOR_OCCURRENCE]->(o)-[:IN_DOC]->(d) \
+         RETURN count(*)",
+        None,
+    );
+    assert_eq!(n, 4);
+}
+
+/// A bound variable in the middle of a longer path, written last-to-first.
+#[test]
+fn middle_bound_three_hop_mixed_directions() {
+    let db = fixture();
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence {name: 'o3'}) \
+         MATCH (d:Document)<-[:IN_DOC]-(o)<-[:EVIDENCE_FOR_OCCURRENCE]-(ev) \
+         RETURN d.name, ev.name",
+        None,
+    );
+    assert_eq!(got, vec![vec![s("dB"), s("ev3")], vec![s("dB"), s("ev4")]]);
+}
+
+#[test]
+fn bound_variable_repeated_within_later_pattern() {
+    let db = fixture();
+    // o3 is reached from ev3 and back from ev4 through o3: ev3 -> o3 <- ev4.
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence {name: 'o3'}) \
+         MATCH (a:RelationshipEvidence)-[:EVIDENCE_FOR_OCCURRENCE]->(o)<-[:EVIDENCE_FOR_OCCURRENCE]-(b) \
+         WHERE a.name < b.name \
+         RETURN a.name, b.name",
+        None,
+    );
+    assert_eq!(got, vec![vec![s("ev3"), s("ev4")]]);
+}

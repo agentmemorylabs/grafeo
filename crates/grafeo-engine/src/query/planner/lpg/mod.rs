@@ -388,6 +388,18 @@ impl Planner {
         name
     }
 
+    /// Whether `expand` continues a chain from the expand below it, i.e. it
+    /// starts from that expand's target. The factorized chain operator reads
+    /// each later step's source from the previous step's target, so an expand
+    /// from any other column (e.g. a path translated outward from a bound
+    /// middle node) must start a new chain.
+    fn continues_expand_chain(expand: &ExpandOp) -> bool {
+        match expand.input.as_ref() {
+            LogicalOperator::Expand(inner) => inner.to_variable == expand.from_variable,
+            _ => true,
+        }
+    }
+
     /// Counts consecutive single-hop expand operations.
     ///
     /// Returns the count and the deepest non-expand operator (the base of the chain).
@@ -396,11 +408,13 @@ impl Planner {
             LogicalOperator::Expand(expand) => {
                 let is_single_hop = expand.min_hops == 1 && expand.max_hops == Some(1);
 
-                if is_single_hop {
+                if !is_single_hop {
+                    (0, op)
+                } else if Self::continues_expand_chain(expand) {
                     let (inner_count, base) = Self::count_expand_chain(&expand.input);
                     (inner_count + 1, base)
                 } else {
-                    (0, op)
+                    (1, &expand.input)
                 }
             }
             _ => (0, op),
@@ -420,6 +434,9 @@ impl Planner {
                 break;
             }
             chain.push(expand);
+            if !Self::continues_expand_chain(expand) {
+                break;
+            }
             current = &expand.input;
         }
 
@@ -3738,6 +3755,37 @@ mod tests {
         });
         let (count, _) = Planner::count_expand_chain(&var_expand);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_expand_chain_stops_at_unlinked_expand() {
+        let hop = |from: &str, to: &str, input: LogicalOperator| {
+            LogicalOperator::Expand(ExpandOp {
+                from_variable: from.to_string(),
+                to_variable: to.to_string(),
+                edge_variable: None,
+                direction: ExpandDirection::Outgoing,
+                edge_types: vec![],
+                min_hops: 1,
+                max_hops: Some(1),
+                input: Box::new(input),
+                path_alias: None,
+                path_mode: PathMode::Walk,
+            })
+        };
+        // b -> c, then a second expand from b (not from c): two chains of one.
+        let unlinked = hop("b", "a", hop("b", "c", scan_person("b")));
+        let (count, base) = Planner::count_expand_chain(&unlinked);
+        assert_eq!(count, 1);
+        assert!(matches!(base, LogicalOperator::Expand(_)));
+        assert_eq!(Planner::collect_expand_chain(&unlinked).len(), 1);
+
+        // a -> b -> c is one linked chain of two.
+        let linked = hop("b", "c", hop("a", "b", scan_person("a")));
+        let (count, base) = Planner::count_expand_chain(&linked);
+        assert_eq!(count, 2);
+        assert!(matches!(base, LogicalOperator::NodeScan(_)));
+        assert_eq!(Planner::collect_expand_chain(&linked).len(), 2);
     }
 
     // ==================== StaticResultOperator ====================

@@ -417,6 +417,10 @@ impl CypherTranslator {
         let pattern_vars: Vec<HashSet<String>> =
             patterns.iter().map(Self::pattern_variables).collect();
 
+        // Variables bound by earlier clauses: a pattern joined below must
+        // also join on these, since it is translated without the input.
+        let input_vars = input.as_ref().map(scope_variables).unwrap_or_default();
+
         let mut plan = self.translate_pattern(&patterns[0], input)?;
         let mut bound_vars = pattern_vars[0].clone();
 
@@ -425,12 +429,20 @@ impl CypherTranslator {
             let shared: Vec<String> = current_vars.intersection(&bound_vars).cloned().collect();
 
             if shared.is_empty() {
-                // No shared variables: chain as input (cross product)
+                // No variables shared with earlier patterns: chain as input.
+                // The pattern then anchors on any variable the input binds,
+                // or is a cross product if it binds none.
                 plan = self.translate_pattern(pattern, Some(plan))?;
             } else {
                 // Shared variables: translate independently and inner join
                 let right = self.translate_pattern(pattern, None)?;
-                let conditions = shared
+                let mut join_vars: Vec<String> = current_vars
+                    .iter()
+                    .filter(|v| bound_vars.contains(*v) || input_vars.contains(*v))
+                    .cloned()
+                    .collect();
+                join_vars.sort();
+                let conditions = join_vars
                     .iter()
                     .map(|var| JoinCondition {
                         left: LogicalExpression::Variable(var.clone()),
@@ -611,10 +623,78 @@ impl CypherTranslator {
         input: Option<LogicalOperator>,
         path_alias: Option<String>,
     ) -> Result<LogicalOperator> {
+        // A later MATCH whose pattern reuses a variable an earlier clause
+        // bound must join on it. When the start node is not bound but a later
+        // node is, anchor the traversal at that node so it expands from the
+        // bound value instead of cross-joining a scan of the start node.
+        // Named paths keep their written order (their path columns are
+        // ordered); they rely on the bound-target filter in `translate_hop`.
+        if path_alias.is_none()
+            && let Some(input_plan) = &input
+        {
+            let bound = scope_variables(input_plan);
+            let is_bound =
+                |node: &ast::NodePattern| node.variable.as_ref().is_some_and(|v| bound.contains(v));
+            if !is_bound(&path.start)
+                && let Some(anchor) = path.chain.iter().position(|rel| is_bound(&rel.target))
+                && let Some(input) = input
+            {
+                return self.translate_anchored_path(path, anchor, input);
+            }
+        }
+
         let mut plan = self.translate_node_pattern(&path.start, input)?;
 
         for rel in &path.chain {
             plan = self.translate_relationship_pattern_with_alias(rel, plan, path_alias.clone())?;
+        }
+
+        Ok(plan)
+    }
+
+    /// Translates a linear path starting from `path.chain[anchor].target`,
+    /// whose variable is already bound in `input`.
+    ///
+    /// The anchor node reuses the bound column (the node scan planner skips
+    /// the scan for a bound variable) and keeps its label and property
+    /// filters. The hops after the anchor expand forward as written; the hops
+    /// before it expand backward from the anchor with their direction
+    /// reversed, ending at the pattern's start node.
+    fn translate_anchored_path(
+        &self,
+        path: &ast::PathPattern,
+        anchor: usize,
+        input: LogicalOperator,
+    ) -> Result<LogicalOperator> {
+        let anchor_node = &path.chain[anchor].target;
+        let anchor_var = anchor_node
+            .variable
+            .clone()
+            .ok_or_else(|| Error::Internal("anchor node must be named".to_string()))?;
+        let mut plan = self.translate_node_pattern(anchor_node, Some(input))?;
+
+        let mut from = anchor_var.clone();
+        for rel in &path.chain[anchor + 1..] {
+            let direction = expand_direction(rel.direction, false);
+            let (next, to) =
+                self.translate_hop(rel, &rel.target, &rel.target.labels, direction, from, plan)?;
+            plan = next;
+            from = to;
+        }
+
+        let mut from = anchor_var;
+        for index in (0..=anchor).rev() {
+            let rel = &path.chain[index];
+            let target = if index == 0 {
+                &path.start
+            } else {
+                &path.chain[index - 1].target
+            };
+            let direction = expand_direction(rel.direction, true);
+            let (next, to) =
+                self.translate_hop(rel, target, &target.labels, direction, from, plan)?;
+            plan = next;
+            from = to;
         }
 
         Ok(plan)
@@ -764,23 +844,65 @@ impl CypherTranslator {
         path_alias: Option<String>,
     ) -> Result<LogicalOperator> {
         let from_variable = Self::get_last_variable(&input)?;
+        let direction = expand_direction(rel.direction, false);
+        let target_labels = &rel.target.labels[..rel.target.labels.len().min(1)];
+        self.translate_hop_with_alias(
+            rel,
+            &rel.target,
+            target_labels,
+            direction,
+            from_variable,
+            input,
+            path_alias,
+        )
+        .map(|(plan, _)| plan)
+    }
+
+    /// Translates one relationship hop from `from_variable` to `target`
+    /// without a path alias. Returns the plan and the target's variable.
+    fn translate_hop(
+        &self,
+        rel: &ast::RelationshipPattern,
+        target: &ast::NodePattern,
+        target_labels: &[String],
+        direction: ExpandDirection,
+        from_variable: String,
+        input: LogicalOperator,
+    ) -> Result<(LogicalOperator, String)> {
+        self.translate_hop_with_alias(
+            rel,
+            target,
+            target_labels,
+            direction,
+            from_variable,
+            input,
+            None,
+        )
+    }
+
+    /// Translates one relationship hop from `from_variable` to `target`,
+    /// checking `target_labels` on the target. Returns the plan and the
+    /// target's variable.
+    #[allow(clippy::too_many_arguments)]
+    fn translate_hop_with_alias(
+        &self,
+        rel: &ast::RelationshipPattern,
+        target: &ast::NodePattern,
+        target_labels: &[String],
+        direction: ExpandDirection,
+        from_variable: String,
+        input: LogicalOperator,
+        path_alias: Option<String>,
+    ) -> Result<(LogicalOperator, String)> {
         let edge_variable = rel.variable.clone();
         if let Some(ref ev) = edge_variable {
             self.register_edge_variable(ev);
         }
         let edge_types = rel.types.clone();
-        let to_variable = rel
-            .target
+        let to_variable = target
             .variable
             .clone()
             .unwrap_or_else(|| self.next_anon_var());
-        let target_label = rel.target.labels.first().cloned();
-
-        let direction = match rel.direction {
-            ast::Direction::Outgoing => ExpandDirection::Outgoing,
-            ast::Direction::Incoming => ExpandDirection::Incoming,
-            ast::Direction::Undirected => ExpandDirection::Both,
-        };
 
         let (min_hops, max_hops) = if let Some(range) = &rel.length {
             (range.min.unwrap_or(1), range.max)
@@ -788,9 +910,12 @@ impl CypherTranslator {
             (1, Some(1))
         };
 
-        // Detect cycle pattern: (s)-[*]->(s) where source == target variable.
-        // The expand must use a temporary target, then filter for equality.
-        let is_cycle = to_variable == from_variable;
+        // The target may already be bound: a cycle (s)-[*]->(s), or a
+        // variable bound by an earlier clause or earlier in this pattern. The
+        // expand must then use a temporary target and filter for equality,
+        // otherwise it would add a second, unrelated column for the variable.
+        let is_cycle =
+            to_variable == from_variable || scope_variables(&input).contains(&to_variable);
         let expand_target = if is_cycle {
             self.next_anon_var()
         } else {
@@ -832,21 +957,20 @@ impl CypherTranslator {
             expand
         };
 
-        let mut result = if let Some(label) = target_label {
-            wrap_filter(
-                expand,
+        let mut result = expand;
+        for label in target_labels {
+            result = wrap_filter(
+                result,
                 LogicalExpression::FunctionCall {
                     name: "hasLabel".into(),
                     args: vec![
                         LogicalExpression::Variable(to_variable.clone()),
-                        LogicalExpression::Literal(Value::from(label)),
+                        LogicalExpression::Literal(Value::from(label.clone())),
                     ],
                     distinct: false,
                 },
-            )
-        } else {
-            expand
-        };
+            );
+        }
 
         // Apply property filters on the edge: -[r {since: 2020}]->
         if !rel.properties.is_empty()
@@ -863,12 +987,12 @@ impl CypherTranslator {
         }
 
         // Apply property filters on the target node: ()-[r]->(o {id: "X"})
-        if !rel.target.properties.is_empty() {
-            let predicate = self.build_property_predicate(&to_variable, &rel.target.properties)?;
+        if !target.properties.is_empty() {
+            let predicate = self.build_property_predicate(&to_variable, &target.properties)?;
             result = wrap_filter(result, predicate);
         }
 
-        Ok(result)
+        Ok((result, to_variable))
     }
 
     fn translate_where(
@@ -2553,6 +2677,106 @@ impl CypherTranslator {
         }
 
         Ok((current_input, rewritten_items))
+    }
+}
+
+/// Maps a pattern direction to an expand direction, optionally walking the
+/// relationship from its target back to its source.
+fn expand_direction(direction: ast::Direction, reversed: bool) -> ExpandDirection {
+    match (direction, reversed) {
+        (ast::Direction::Outgoing, false) | (ast::Direction::Incoming, true) => {
+            ExpandDirection::Outgoing
+        }
+        (ast::Direction::Incoming, false) | (ast::Direction::Outgoing, true) => {
+            ExpandDirection::Incoming
+        }
+        (ast::Direction::Undirected, _) => ExpandDirection::Both,
+    }
+}
+
+/// Returns the variables a plan makes visible to the clause that follows it.
+///
+/// Used to tell when a later MATCH reuses an already-bound variable. It is
+/// conservative: an operator it does not model contributes nothing, so an
+/// unknown shape keeps the plain translation rather than referring to a
+/// column that does not exist.
+fn scope_variables(op: &LogicalOperator) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    collect_scope_variables(op, &mut vars);
+    vars
+}
+
+fn collect_scope_variables(op: &LogicalOperator, vars: &mut HashSet<String>) {
+    match op {
+        LogicalOperator::NodeScan(scan) => {
+            vars.insert(scan.variable.clone());
+            if let Some(input) = &scan.input {
+                collect_scope_variables(input, vars);
+            }
+        }
+        LogicalOperator::Expand(expand) => {
+            vars.insert(expand.to_variable.clone());
+            if let Some(edge_var) = &expand.edge_variable {
+                vars.insert(edge_var.clone());
+            }
+            collect_scope_variables(&expand.input, vars);
+        }
+        LogicalOperator::Join(join) => {
+            collect_scope_variables(&join.left, vars);
+            collect_scope_variables(&join.right, vars);
+        }
+        LogicalOperator::LeftJoin(join) => {
+            collect_scope_variables(&join.left, vars);
+            collect_scope_variables(&join.right, vars);
+        }
+        LogicalOperator::Project(project) => {
+            if project.pass_through_input {
+                collect_scope_variables(&project.input, vars);
+            }
+            for projection in &project.projections {
+                match (&projection.alias, &projection.expression) {
+                    (Some(alias), _) => {
+                        vars.insert(alias.clone());
+                    }
+                    (None, LogicalExpression::Variable(name)) => {
+                        vars.insert(name.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        LogicalOperator::Aggregate(agg) => {
+            for expr in &agg.group_by {
+                if let LogicalExpression::Variable(name) = expr {
+                    vars.insert(name.clone());
+                }
+            }
+            for agg_expr in &agg.aggregates {
+                if let Some(alias) = &agg_expr.alias {
+                    vars.insert(alias.clone());
+                }
+            }
+        }
+        LogicalOperator::Unwind(unwind) => {
+            vars.insert(unwind.variable.clone());
+            collect_scope_variables(&unwind.input, vars);
+        }
+        LogicalOperator::ParameterScan(scan) => {
+            vars.extend(scan.columns.iter().cloned());
+        }
+        LogicalOperator::CreateNode(create) => {
+            vars.insert(create.variable.clone());
+            if let Some(input) = &create.input {
+                collect_scope_variables(input, vars);
+            }
+        }
+        LogicalOperator::Filter(filter) => collect_scope_variables(&filter.input, vars),
+        LogicalOperator::Distinct(distinct) => collect_scope_variables(&distinct.input, vars),
+        LogicalOperator::Sort(sort) => collect_scope_variables(&sort.input, vars),
+        LogicalOperator::Skip(skip) => collect_scope_variables(&skip.input, vars),
+        LogicalOperator::Limit(limit) => collect_scope_variables(&limit.input, vars),
+        LogicalOperator::Apply(apply) => collect_scope_variables(&apply.input, vars),
+        _ => {}
     }
 }
 
