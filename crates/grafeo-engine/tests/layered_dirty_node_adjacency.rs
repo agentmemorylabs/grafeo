@@ -29,7 +29,7 @@ use grafeo_common::types::{EdgeId, NodeId, Value};
 use grafeo_core::graph::Direction;
 use grafeo_core::graph::compact::layered::LayeredStore;
 use grafeo_core::graph::traits::GraphStore;
-use grafeo_engine::{GrafeoDB, generation_build_request};
+use grafeo_engine::{Config, GrafeoDB, generation_build_request};
 use tempfile::tempdir;
 
 /// Publishes the base generation:
@@ -394,4 +394,228 @@ fn deleted_base_edge_hidden_from_neighbors() {
         "MATCH (:Symbol {name: 'S'})-[r:USES]->(:Symbol {name: 'T'}) DELETE r",
     );
     assert_s_adjacency(&db, BASE_IN, &["T2"], "after base edge delete");
+}
+
+/// AMH cleanup shape: a touched (dirty) base node is DETACH DELETEd. Its
+/// neighbours must keep no edge to it, before and after reopen. DETACH
+/// DELETE finds the edges through `edges_from`, so this depends on the base
+/// pass running for a dirty node.
+#[test]
+fn detach_delete_of_touched_base_node_removes_all_its_edges() {
+    let (_dir, root) = fresh_root();
+    let s_id;
+    {
+        let db = open(&root);
+        s_id = node_named(layered(&db), "S");
+        cypher(&db, "MATCH (s:Symbol {name: 'S'}) SET s.touched = true");
+        cypher(&db, "MATCH (s:Symbol {name: 'S'}) DETACH DELETE s");
+        assert_no_links_to(&db, s_id, "after DETACH DELETE");
+        db.close().expect("close");
+    }
+    let db = open(&root);
+    assert_no_links_to(&db, s_id, "after reopen");
+}
+
+/// Plain DELETE of a touched base node that still has base edges must be
+/// refused (the degree check must see the base edges of a dirty node).
+#[test]
+fn plain_delete_of_touched_base_node_with_base_edges_is_refused() {
+    let (_dir, root) = fresh_root();
+    let db = open(&root);
+    cypher(&db, "MATCH (s:Symbol {name: 'S'}) SET s.touched = true");
+    let result = db
+        .session()
+        .execute_cypher("MATCH (s:Symbol {name: 'S'}) DELETE s");
+    assert!(
+        result.is_err(),
+        "DELETE of a node that still has edges must fail, got {result:?}"
+    );
+    assert_s_adjacency(&db, BASE_IN, BASE_OUT, "after refused DELETE");
+}
+
+fn assert_no_links_to(db: &GrafeoDB, s: NodeId, ctx: &str) {
+    let store = layered(db);
+    assert!(store.get_node(s).is_none(), "{ctx}: S is gone");
+    for name in ["f1", "f2", "T", "T2"] {
+        let n = node_named(store, name);
+        for dir in [Direction::Outgoing, Direction::Incoming] {
+            assert!(
+                !store.edges_from(n, dir).iter().any(|(t, _)| *t == s),
+                "{ctx}: edges_from({name}, {dir:?}) still reaches S"
+            );
+            assert!(
+                !store.neighbors(n, dir).contains(&s),
+                "{ctx}: neighbors({name}, {dir:?}) still reaches S"
+            );
+        }
+    }
+    assert_eq!(
+        cypher_count(db, "MATCH (s:Symbol {name: 'S'}) RETURN count(s)"),
+        0,
+        "{ctx}: Cypher S"
+    );
+    assert_eq!(
+        cypher_count(db, "MATCH ()-[r]->() RETURN count(r)"),
+        0,
+        "{ctx}: every base edge touched S"
+    );
+}
+
+/// Single-file `.grafeo` (not a generation root): after `compact()`, a base
+/// edge copied into the overlay (by a SET) and then deleted, and a base node
+/// copied into the overlay and then deleted, must stay deleted across a
+/// checkpointed close + reopen. That reopen rebuilds the dirty sets from the
+/// overlay contents (`LayeredStore::with_overlay`), where the deleted copies
+/// no longer exist, so only a base tombstone keeps them hidden.
+#[test]
+fn single_file_promoted_then_deleted_stays_deleted_after_reopen() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("d4.grafeo");
+    let (edge_id, gone_id);
+    {
+        let mut db = GrafeoDB::with_config(Config::persistent(&path)).expect("create");
+        cypher(
+            &db,
+            "CREATE (s:Symbol {name: 'S'})-[:USES {w: 0}]->(:Symbol {name: 'T'}), \
+             (s)-[:USES {w: 0}]->(:Symbol {name: 'T2'}), (:Symbol {name: 'Gone'})",
+        );
+        db.compact().expect("compact");
+        let store = layered(&db);
+        let s = node_named(store, "S");
+        let t = node_named(store, "T");
+        edge_id = store
+            .edges_from(s, Direction::Outgoing)
+            .into_iter()
+            .find(|(n, _)| *n == t)
+            .map(|(_, e)| e)
+            .expect("base S->T edge");
+        gone_id = node_named(store, "Gone");
+
+        cypher(
+            &db,
+            "MATCH (:Symbol {name: 'S'})-[r:USES]->(:Symbol {name: 'T'}) SET r.w = 7",
+        );
+        cypher(
+            &db,
+            "MATCH (:Symbol {name: 'S'})-[r:USES]->(:Symbol {name: 'T'}) DELETE r",
+        );
+        cypher(&db, "MATCH (g:Symbol {name: 'Gone'}) SET g.touched = true");
+        cypher(&db, "MATCH (g:Symbol {name: 'Gone'}) DELETE g");
+        assert_single_file_deletions(&db, edge_id, gone_id, "before close");
+        db.close().expect("close");
+    }
+    // One reopen only: on d63e3708 a compacted single file already loses
+    // its base from Cypher's view on the *second* close + reopen even with no
+    // writes at all (separate pre-existing bug, reported on the PR).
+    let db = GrafeoDB::with_config(Config::persistent(&path)).expect("reopen");
+    assert_single_file_deletions(&db, edge_id, gone_id, "after reopen");
+}
+
+fn assert_single_file_deletions(db: &GrafeoDB, edge: EdgeId, gone: NodeId, ctx: &str) {
+    let store = layered(db);
+    assert!(store.get_edge(edge).is_none(), "{ctx}: get_edge(S->T)");
+    let s = node_named(store, "S");
+    assert_eq!(
+        edge_targets(store, s, Direction::Outgoing),
+        strs(&["T2"]),
+        "{ctx}: edges_from(S, Outgoing)"
+    );
+    assert_eq!(
+        neighbor_names(store, s, Direction::Outgoing),
+        strs(&["T2"]),
+        "{ctx}: neighbors(S, Outgoing)"
+    );
+    assert_eq!(
+        cypher_count(db, "MATCH (:Symbol {name: 'S'})-[r]->() RETURN count(r)"),
+        1,
+        "{ctx}: Cypher S edges"
+    );
+    assert!(store.get_node(gone).is_none(), "{ctx}: get_node(Gone)");
+    assert_eq!(
+        cypher_count(db, "MATCH (g:Symbol {name: 'Gone'}) RETURN count(g)"),
+        0,
+        "{ctx}: Cypher Gone"
+    );
+}
+
+/// A base node copied into the overlay (by a SET) and then deleted must not
+/// be listed by `node_ids` (it was listed from the base copy, while
+/// `nodes_by_label` already treated the overlay as authoritative).
+#[test]
+fn deleted_promoted_node_not_listed_by_node_ids() {
+    let (_dir, root) = fresh_root();
+    let db = open(&root);
+    let t2 = node_named(layered(&db), "T2");
+    cypher(&db, "MATCH (t:Symbol {name: 'T2'}) SET t.touched = true");
+    cypher(&db, "MATCH (t:Symbol {name: 'T2'}) DETACH DELETE t");
+    let store = layered(&db);
+    assert!(store.get_node(t2).is_none());
+    assert!(!store.node_ids().contains(&t2), "node_ids lists deleted T2");
+    assert_eq!(store.node_count(), store.node_ids().len());
+}
+
+/// The tombstone for a deleted overlay copy is derived when the deletion log
+/// is written, not at delete time, so a rolled-back delete of a touched base
+/// edge or node leaves nothing behind: both stay visible, also after a
+/// checkpointed close + reopen of a single file.
+#[test]
+fn rolled_back_delete_of_touched_base_entities_keeps_them() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("d4-rollback.grafeo");
+    {
+        let mut db = GrafeoDB::with_config(Config::persistent(&path)).expect("create");
+        cypher(
+            &db,
+            "CREATE (s:Symbol {name: 'S'})-[:USES {w: 0}]->(:Symbol {name: 'T'}), \
+             (:Symbol {name: 'Keep'})",
+        );
+        db.compact().expect("compact");
+        cypher(
+            &db,
+            "MATCH (:Symbol {name: 'S'})-[r:USES]->(:Symbol {name: 'T'}) SET r.w = 7",
+        );
+        cypher(&db, "MATCH (k:Symbol {name: 'Keep'}) SET k.touched = true");
+
+        let mut session = db.session();
+        session.begin_transaction().expect("begin");
+        session
+            .execute_cypher("MATCH (:Symbol {name: 'S'})-[r:USES]->(:Symbol {name: 'T'}) DELETE r")
+            .expect("delete edge");
+        session
+            .execute_cypher("MATCH (k:Symbol {name: 'Keep'}) DELETE k")
+            .expect("delete node");
+        session.rollback().expect("rollback");
+        drop(session);
+
+        assert_rollback_kept(&db, "after rollback");
+        db.close().expect("close");
+    }
+    let db = GrafeoDB::with_config(Config::persistent(&path)).expect("reopen");
+    assert_rollback_kept(&db, "after reopen");
+}
+
+fn assert_rollback_kept(db: &GrafeoDB, ctx: &str) {
+    let store = layered(db);
+    let s = node_named(store, "S");
+    assert_eq!(
+        edge_targets(store, s, Direction::Outgoing),
+        strs(&["T"]),
+        "{ctx}: edges_from(S, Outgoing)"
+    );
+    assert_eq!(
+        cypher_count(
+            db,
+            "MATCH (:Symbol {name: 'S'})-[r:USES]->() WHERE r.w = 7 RETURN count(r)"
+        ),
+        1,
+        "{ctx}: Cypher S-[w=7]->T"
+    );
+    assert_eq!(
+        cypher_count(
+            db,
+            "MATCH (k:Symbol {name: 'Keep'}) WHERE k.touched = true RETURN count(k)"
+        ),
+        1,
+        "{ctx}: Cypher Keep"
+    );
 }
