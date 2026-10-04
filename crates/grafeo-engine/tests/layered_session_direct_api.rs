@@ -559,3 +559,348 @@ fn cypher_set_on_base_node_keeps_its_base_edges() {
     assert_eq!(cypher_count(&db, knows_from_ada), 1, "after reopen");
     assert_eq!(cypher_count(&db, "MATCH ()-[e]->() RETURN count(e)"), 2);
 }
+
+// ── Review round 1 (PR #13) ───────────────────────────────────────────
+
+/// Item 1: a copy-up must be visible to snapshots older than the copy.
+/// Transaction A starts, another session commits (the epoch advances), then A
+/// writes a base node. The copy-up used to be created at the current epoch,
+/// so A's own snapshot no longer saw the node at all.
+#[test]
+fn copy_up_stays_visible_to_an_older_snapshot() {
+    let (_dir, root) = fresh_root();
+    let db = open_root(&root);
+    let ids = base_ids(&db);
+
+    let mut a = db.session();
+    a.begin_transaction().expect("begin A");
+    db.session()
+        .execute_cypher("CREATE (:Other {n: 1})")
+        .expect("B commits");
+
+    a.set_node_property(ids.ada, "source_hash", Value::from("s1"))
+        .expect("A writes base node");
+    let ada = a
+        .get_node(ids.ada)
+        .expect("A still sees Ada after its copy-up");
+    assert_eq!(ada.get_property("source_hash"), Some(&Value::from("s1")));
+    let r = a
+        .execute_cypher("MATCH (n:Person {name: 'Ada'}) RETURN n.source_hash")
+        .expect("A's Cypher");
+    assert_eq!(r.row_count(), 1, "A's Cypher still sees Ada");
+
+    a.set_edge_property(ids.knows, "since", Value::from(1990i64))
+        .expect("A writes base edge");
+    assert_eq!(
+        a.get_edge(ids.knows)
+            .and_then(|e| e.get_property("since").cloned()),
+        Some(Value::from(1990i64)),
+        "A still sees KNOWS after its copy-up"
+    );
+    a.commit().expect("commit A");
+    assert_eq!(cypher_ada_hash(&db), Some(Value::from("s1")));
+}
+
+/// Item 2: the `GrafeoDB` handle's own direct CRUD methods reach base
+/// elements and survive replay past a later abort.
+#[test]
+fn database_handle_direct_crud_on_base_elements() {
+    let (_dir, root) = fresh_root();
+    {
+        let db = open_root(&root);
+        let ids = base_ids(&db);
+
+        db.set_node_property(ids.ada, "source_hash", Value::from("d1"))
+            .expect("db.set_node_property");
+        assert_eq!(
+            db.get_node(ids.ada)
+                .and_then(|n| n.get_property("source_hash").cloned()),
+            Some(Value::from("d1"))
+        );
+        assert_eq!(cypher_ada_hash(&db), Some(Value::from("d1")));
+
+        assert!(db.get_edge(ids.knows).is_some(), "db.get_edge(base)");
+        db.set_edge_property(ids.knows, "since", Value::from(1999i64));
+        assert_eq!(
+            db.get_edge(ids.knows)
+                .and_then(|e| e.get_property("since").cloned()),
+            Some(Value::from(1999i64))
+        );
+
+        assert!(db.delete_edge(ids.mentors), "db.delete_edge(base)");
+        assert!(
+            db.delete_node(ids.linus).expect("db.delete_node"),
+            "db.delete_node(base)"
+        );
+        assert_eq!(cypher_count(&db, "MATCH (n:Person) RETURN count(n)"), 2);
+
+        // A later unrelated rollback must not discard the writes above.
+        let mut other = db.session();
+        other.begin_transaction().expect("begin");
+        other
+            .execute_cypher("CREATE (:Scratch {n: 1})")
+            .expect("scratch");
+        other.rollback().expect("rollback");
+        db.close().expect("close");
+    }
+    let db = open_root(&root);
+    assert_eq!(cypher_ada_hash(&db), Some(Value::from("d1")));
+    assert_eq!(
+        cypher_count(
+            &db,
+            "MATCH ()-[e:KNOWS]->() WHERE e.since = 1999 RETURN count(e)"
+        ),
+        1
+    );
+    assert_eq!(
+        cypher_count(&db, "MATCH ()-[e:MENTORS]->() RETURN count(e)"),
+        0
+    );
+    assert_eq!(cypher_count(&db, "MATCH (n:Person) RETURN count(n)"), 2);
+}
+
+/// Item 3a: writing a property on an id that does not exist is an error.
+#[test]
+fn set_property_on_missing_id_is_an_error() {
+    let (_dir, root) = fresh_root();
+    let db = open_root(&root);
+    let session = db.session();
+    assert!(
+        session
+            .set_node_property(NodeId::new(9_999), "k", Value::from(1i64))
+            .is_err()
+    );
+    assert!(
+        session
+            .set_edge_property(EdgeId::new(9_999), "k", Value::from(1i64))
+            .is_err()
+    );
+}
+
+/// Item 3b: a write to a deleted base node must not bring it back.
+#[test]
+fn write_to_deleted_base_node_is_an_error_and_does_not_resurrect() {
+    let (_dir, root) = fresh_root();
+    {
+        let db = open_root(&root);
+        let ids = base_ids(&db);
+        let session = db.session();
+        assert!(session.delete_edge(ids.mentors));
+        assert!(session.delete_node(ids.linus));
+        assert!(
+            session
+                .set_node_property(ids.linus, "name", Value::from("Zombie"))
+                .is_err(),
+            "write to a deleted base node must fail"
+        );
+        assert!(session.get_node(ids.linus).is_none());
+        assert_eq!(cypher_count(&db, "MATCH (n:Person) RETURN count(n)"), 2);
+        assert_eq!(cypher_count(&db, "MATCH (n) RETURN count(n)"), 2);
+        db.close().expect("close");
+    }
+    let db = open_root(&root);
+    assert_eq!(cypher_count(&db, "MATCH (n) RETURN count(n)"), 2);
+}
+
+/// Item 3c: direct writes on a read-only root fail and change nothing.
+#[test]
+fn direct_writes_on_read_only_root_fail() {
+    let (_dir, root) = fresh_root();
+    let db = GrafeoDB::open_generation_root(&root, true).expect("open read-only");
+    let ids = base_ids(&db);
+    let session = db.session();
+    assert!(
+        session
+            .set_node_property(ids.ada, "source_hash", Value::from("ro"))
+            .is_err()
+    );
+    assert!(
+        session
+            .set_edge_property(ids.knows, "since", Value::from(1i64))
+            .is_err()
+    );
+    assert!(!session.delete_edge(ids.mentors));
+    assert!(!session.delete_node(ids.linus));
+    assert_eq!(cypher_ada_hash(&db), Some(Value::from("h0")));
+    assert_eq!(cypher_count(&db, "MATCH ()-[e]->() RETURN count(e)"), 2);
+    assert_eq!(cypher_count(&db, "MATCH (n) RETURN count(n)"), 3);
+}
+
+/// Item 4a: concurrent auto-commit direct writes must leave a root that
+/// reopens. A commit marker and its epoch advance used to be two separate WAL
+/// appends, so another session's record could land between them, which replay
+/// rejects as unrecoverable.
+#[test]
+fn concurrent_direct_writes_leave_a_root_that_reopens() {
+    const THREADS: usize = 8;
+    const WRITES: usize = 150;
+    let (_dir, root) = fresh_root();
+    {
+        let db = open_root(&root);
+        let ids = base_ids(&db);
+        let targets = [ids.ada, ids.grace, ids.linus];
+        let ok = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let (db, ok) = (&db, &ok);
+                scope.spawn(move || {
+                    let session = db.session();
+                    for i in 0..WRITES {
+                        let id = targets[(t + i) % targets.len()];
+                        // Two implicit transactions writing the same node can
+                        // conflict; that is ordinary MVCC and not under test.
+                        if session
+                            .set_node_property(id, "w", Value::from((t * WRITES + i) as i64))
+                            .is_ok()
+                        {
+                            ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(ok.into_inner() > 0, "some concurrent writes succeed");
+        db.close().expect("close");
+    }
+    let db = GrafeoDB::open_generation_root(&root, false)
+        .expect("root written by concurrent direct writes must reopen");
+    assert_eq!(cypher_count(&db, "MATCH (n:Person) RETURN count(n)"), 3);
+}
+
+/// Item 4b: copy-ups and concurrent node creates must not hand out the same
+/// id. Copy-ups used to lower the overlay's id counter, create, and restore
+/// it, so a create racing with them could take a base node's id.
+#[test]
+fn copy_ups_and_concurrent_creates_get_distinct_ids() {
+    const BASE: usize = 400;
+    let dir = tempdir().expect("temp dir");
+    let root = dir.path().join("race.grafeo.d");
+    std::fs::create_dir_all(&root).expect("create root");
+    {
+        let source = GrafeoDB::new_in_memory();
+        for i in 0..BASE {
+            source
+                .create_node_with_props(&["B"], [("i", Value::from(i as i64))])
+                .expect("base node");
+        }
+        source
+            .build_and_publish_generation(generation_build_request(&root, "race-g1"))
+            .expect("publish");
+    }
+    let db = open_root(&root);
+    let r = db
+        .session()
+        .execute_cypher("MATCH (n:B) RETURN id(n), n.i")
+        .expect("base ids");
+    let base: Vec<(NodeId, i64)> = r
+        .rows()
+        .iter()
+        .map(|row| {
+            let Value::Int64(i) = row[1] else {
+                panic!("int")
+            };
+            (NodeId::new(as_u64(&row[0])), i)
+        })
+        .collect();
+    assert_eq!(base.len(), BASE);
+
+    let created = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for t in 0..4 {
+            let (db, base) = (&db, &base);
+            scope.spawn(move || {
+                let session = db.session();
+                for (k, (id, _)) in base.iter().enumerate() {
+                    if k % 4 == t {
+                        session
+                            .set_node_property(*id, "touched", Value::from(true))
+                            .expect("copy-up write");
+                    }
+                }
+            });
+        }
+        for _ in 0..4 {
+            let (db, created) = (&db, &created);
+            scope.spawn(move || {
+                let session = db.session();
+                let mut mine = Vec::new();
+                for _ in 0..BASE {
+                    mine.push(session.create_node(&["New"]));
+                }
+                created.lock().unwrap().extend(mine);
+            });
+        }
+    });
+    let created = created.into_inner().unwrap();
+    let mut all: Vec<u64> = created.iter().map(|id| id.as_u64()).collect();
+    all.extend(base.iter().map(|(id, _)| id.as_u64()));
+    let n = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), n, "a created node reused an existing id");
+    let session = db.session();
+    for (id, i) in &base {
+        let node = session.get_node(*id).expect("base node still there");
+        assert_eq!(node.get_property("i"), Some(&Value::from(*i)));
+    }
+}
+
+/// Item 5: a direct write that cannot commit must not leave an implicit
+/// transaction open behind it.
+#[test]
+fn failed_implicit_commit_leaves_no_transaction_open() {
+    let (_dir, root) = fresh_root();
+    let db = open_root(&root);
+    let ids = base_ids(&db);
+    let session = db.session();
+    {
+        let _stream = session
+            .execute_streaming("MATCH (n:Person) RETURN n.name")
+            .expect("open a stream");
+        assert!(
+            session
+                .set_node_property(ids.ada, "source_hash", Value::from("x"))
+                .is_err(),
+            "auto-commit write while a stream is open must fail"
+        );
+        assert!(
+            !session.in_transaction(),
+            "no implicit transaction left open"
+        );
+    }
+    session
+        .set_node_property(ids.ada, "source_hash", Value::from("y"))
+        .expect("write after the stream is dropped");
+    assert!(!session.in_transaction());
+    assert_eq!(cypher_ada_hash(&db), Some(Value::from("y")));
+}
+
+/// Item 6: a transaction on a generation root sees the typed edges it created
+/// itself before committing (upstream 2bc6da09).
+#[test]
+fn transaction_sees_its_own_new_typed_edge() {
+    let (_dir, root) = fresh_root();
+    let db = open_root(&root);
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Linus'}) CREATE (a)-[:ADVISES]->(b)",
+        )
+        .expect("create edge in tx");
+    let r = session
+        .execute_cypher("MATCH (:Person {name: 'Ada'})-[:ADVISES]->(b) RETURN b.name")
+        .expect("typed expand in tx");
+    assert_eq!(r.row_count(), 1, "typed expansion sees the tx's own edge");
+    let r = session
+        .execute_cypher(
+            "MATCH (:Person {name: 'Ada'})-[r]->(:Person {name: 'Linus'}) RETURN type(r)",
+        )
+        .expect("type(r) in tx");
+    assert_eq!(r.rows()[0][0], Value::from("ADVISES"));
+    session.commit().expect("commit");
+    assert_eq!(
+        cypher_count(&db, "MATCH ()-[e:ADVISES]->() RETURN count(e)"),
+        1
+    );
+}
