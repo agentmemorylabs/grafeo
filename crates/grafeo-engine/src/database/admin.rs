@@ -422,21 +422,49 @@ impl super::GrafeoDB {
         }
 
         #[cfg(feature = "wal")]
-        if let Some(ref wal) = self.wal {
-            let epoch = self.lpg_store().current_epoch();
-            let transaction_id = self
-                .transaction_manager
-                .last_assigned_transaction_id()
-                .unwrap_or_else(|| self.transaction_manager.begin());
-            wal.checkpoint(transaction_id, epoch)?;
-            wal.sync()?;
-        }
+        let wal_mark = |covered_sequence: Option<u64>| -> Result<()> {
+            if let Some(ref wal) = self.wal {
+                let epoch = self.lpg_store().current_epoch();
+                let transaction_id = self
+                    .transaction_manager
+                    .last_assigned_transaction_id()
+                    .unwrap_or_else(|| self.transaction_manager.begin());
+                match covered_sequence {
+                    Some(seq) => wal.checkpoint_covering(transaction_id, epoch, seq)?,
+                    None => wal.checkpoint(transaction_id, epoch)?,
+                }
+                wal.sync()?;
+            }
+            Ok(())
+        };
 
-        // Flush all sections to .grafeo file (explicit checkpoint)
+        // Single-file format: flush all sections to the .grafeo file first.
+        // The WAL checkpoint marker lets recovery skip older log files, so it
+        // may only be written once the new image is durable; written earlier,
+        // a crash mid-flush would leave the old image and a WAL that no longer
+        // replays the records the old image is missing. The WAL position is
+        // captured before the snapshot so records that race with it (or land
+        // in a log file rotated out meanwhile) are still replayed.
         #[cfg(feature = "grafeo-file")]
         if let Some(ref fm) = self.file_manager {
+            #[cfg(feature = "wal")]
+            let covered_sequence = match self.wal {
+                Some(ref wal) => {
+                    wal.sync()?;
+                    Some(wal.current_sequence())
+                }
+                None => None,
+            };
             let _ = self.checkpoint_to_file(fm, super::flush::FlushReason::Explicit)?;
+            #[cfg(feature = "wal")]
+            if let Some(seq) = covered_sequence {
+                wal_mark(Some(seq))?;
+            }
+            return Ok(());
         }
+
+        #[cfg(feature = "wal")]
+        wal_mark(None)?;
 
         Ok(())
     }

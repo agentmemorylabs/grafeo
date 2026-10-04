@@ -383,17 +383,24 @@ impl WalManager {
         self.log(&WalRecord::Checkpoint {
             transaction_id: current_transaction,
         })?;
-        self.complete_checkpoint(current_transaction, epoch)
+        self.complete_checkpoint(current_transaction, epoch, None)
     }
 
     /// Completes a checkpoint after the checkpoint record has been written.
     ///
     /// Syncs the WAL, writes checkpoint metadata atomically, updates the
     /// in-memory epoch, and truncates old log files.
+    ///
+    /// `covered_sequence` caps the log sequence recorded in the metadata.
+    /// Recovery skips log files below the recorded sequence, so a caller
+    /// that captured the sequence before taking its snapshot passes it here:
+    /// records that landed in files rotated out after the capture are then
+    /// still replayed.
     pub(crate) fn complete_checkpoint(
         &self,
         transaction_id: TransactionId,
         epoch: EpochId,
+        covered_sequence: Option<u64>,
     ) -> Result<()> {
         // Ordering guarantee: fsync all WAL data before writing checkpoint
         // metadata. This ensures that on recovery, any WAL entries referenced
@@ -403,7 +410,8 @@ impl WalManager {
         self.sync()?;
 
         // Get current log sequence
-        let log_sequence = self.current_sequence.load(Ordering::SeqCst);
+        let current_sequence = self.current_sequence.load(Ordering::SeqCst);
+        let log_sequence = covered_sequence.map_or(current_sequence, |s| s.min(current_sequence));
 
         // Get current timestamp
         let timestamp_ms = SystemTime::now()
@@ -431,7 +439,7 @@ impl WalManager {
         *self.checkpoint_epoch.lock() = Some(epoch);
 
         // Optionally truncate old logs
-        self.truncate_old_logs()?;
+        self.truncate_old_logs(log_sequence)?;
 
         Ok(())
     }
@@ -695,7 +703,7 @@ impl WalManager {
             .and_then(|s| s.parse().ok())
     }
 
-    fn truncate_old_logs(&self) -> Result<()> {
+    fn truncate_old_logs(&self, checkpoint_sequence: u64) -> Result<()> {
         let Some(checkpoint) = *self.checkpoint_epoch.lock() else {
             return Ok(());
         };
@@ -707,8 +715,9 @@ impl WalManager {
 
         for file in files {
             if let Some(seq) = Self::sequence_from_path(&file) {
-                // Keep the last 2 log files before current
-                if seq + 2 < current_seq {
+                // Keep the last 2 log files before current, and every file
+                // recovery would still read after this checkpoint
+                if seq + 2 < current_seq && seq < checkpoint_sequence {
                     // Only delete if we have a checkpoint after this log
                     if checkpoint.as_u64() > seq {
                         let _ = fs::remove_file(&file);
