@@ -97,6 +97,10 @@ pub struct LayeredStore {
     /// generation build consumes the materialized freeze snapshot owned
     /// by the engine handoff coordinator.
     handoff: RwLock<Option<OverlayHandoffLive>>,
+    /// Serializes first-time copy-ups (`ensure_in_overlay` /
+    /// `ensure_edge_in_overlay`) so two writers promoting the same base
+    /// entity cannot both insert it. Entities already in the overlay skip it.
+    promote_lock: parking_lot::Mutex<()>,
 }
 
 /// Live dual-epoch handoff bookkeeping on the layered store (G-EM0.5c).
@@ -223,6 +227,7 @@ impl LayeredStore {
             merge_guard: RwLock::new(()),
             admission_slot: RwLock::new(None),
             handoff: RwLock::new(None),
+            promote_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -238,6 +243,7 @@ impl LayeredStore {
             merge_guard: RwLock::new(()),
             admission_slot: RwLock::new(None),
             handoff: RwLock::new(None),
+            promote_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -1347,6 +1353,28 @@ impl GraphStore for LayeredStore {
             .or_else(|| self.overlay.load().edge_type(id))
     }
 
+    fn edge_type_versioned(
+        &self,
+        id: EdgeId,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Option<ArcStr> {
+        if self.is_edge_deleted_from_base(id) {
+            return None;
+        }
+        if self.is_edge_dirty(id) {
+            return self
+                .overlay
+                .load()
+                .edge_type_versioned(id, epoch, transaction_id);
+        }
+        self.base.load().edge_type(id).or_else(|| {
+            self.overlay
+                .load()
+                .edge_type_versioned(id, epoch, transaction_id)
+        })
+    }
+
     fn has_property_index(&self, property: &str) -> bool {
         // Property indexes only live on the overlay LpgStore (the columnar
         // base has no index store). Without this delegate the trait default
@@ -2289,27 +2317,35 @@ impl LayeredStore {
             self.record_post_freeze_node(id);
             return;
         }
+        if self.is_node_deleted_from_base(id) {
+            return; // deleted: never copy it back
+        }
+        let _promote = self.promote_lock.lock();
+        if self.is_node_dirty(id) {
+            self.record_post_freeze_node(id);
+            return; // another writer promoted it meanwhile
+        }
         let Some(base_node) = self.base.load().get_node(id) else {
             return; // not in base either (new node case handled by caller)
         };
 
-        // Copy the node into the overlay at the same ID.
-        // We temporarily lower the ID counter, create the node, then restore it.
-        let saved_next = self.overlay.load().next_node_id();
-        self.overlay.load().set_next_node_id(id.as_u64());
+        // Copy the node into the overlay at the same ID, created at epoch 0
+        // by the system transaction: it stands for committed base data, so
+        // every snapshot (including transactions that began before this
+        // write) must keep seeing it. An explicit ID never touches the
+        // overlay's ID allocator, so concurrent creates cannot take it.
         let labels: Vec<&str> = base_node.labels.iter().map(|l| l.as_str()).collect();
-        let promoted_id = self.overlay.load().create_node(&labels);
-        debug_assert_eq!(
-            promoted_id, id,
-            "promoted node should reuse the original ID"
-        );
-        self.overlay.load().set_next_node_id(saved_next);
+        let overlay = self.overlay.load();
+        if overlay
+            .create_node_with_id_at(id, &labels, EpochId::new(0))
+            .is_err()
+        {
+            return;
+        }
 
         // Copy properties.
         for (key, value) in base_node.properties.iter() {
-            self.overlay
-                .load()
-                .set_node_property(id, key.as_str(), value.clone());
+            overlay.set_node_property(id, key.as_str(), value.clone());
         }
 
         self.mark_dirty_node(id);
@@ -2323,33 +2359,42 @@ impl LayeredStore {
             self.record_post_freeze_edge(id);
             return;
         }
+        if self.is_edge_deleted_from_base(id) {
+            return; // deleted: never copy it back
+        }
         let Some(base_edge) = self.base.load().get_edge(id) else {
             return;
         };
 
-        // Ensure endpoints are in the overlay first.
+        // Ensure endpoints are in the overlay first (takes `promote_lock`
+        // itself, so call it before taking it here).
         self.ensure_in_overlay(base_edge.src);
         self.ensure_in_overlay(base_edge.dst);
 
-        // Create the edge at the same ID.
-        let saved_next = self.overlay.load().next_edge_id();
-        self.overlay.load().set_next_edge_id(id.as_u64());
-        let promoted_id = self.overlay.load().create_edge(
-            base_edge.src,
-            base_edge.dst,
-            base_edge.edge_type.as_str(),
-        );
-        debug_assert_eq!(
-            promoted_id, id,
-            "promoted edge should reuse the original ID"
-        );
-        self.overlay.load().set_next_edge_id(saved_next);
+        let _promote = self.promote_lock.lock();
+        if self.is_edge_dirty(id) {
+            self.record_post_freeze_edge(id);
+            return; // another writer promoted it meanwhile
+        }
+
+        // Create the edge at the same ID, at epoch 0: see `ensure_in_overlay`.
+        let overlay = self.overlay.load();
+        if overlay
+            .create_edge_with_id_at(
+                id,
+                base_edge.src,
+                base_edge.dst,
+                base_edge.edge_type.as_str(),
+                EpochId::new(0),
+            )
+            .is_err()
+        {
+            return;
+        }
 
         // Copy properties.
         for (key, value) in base_edge.properties.iter() {
-            self.overlay
-                .load()
-                .set_edge_property(id, key.as_str(), value.clone());
+            overlay.set_edge_property(id, key.as_str(), value.clone());
         }
 
         self.mark_dirty_edge(id);
