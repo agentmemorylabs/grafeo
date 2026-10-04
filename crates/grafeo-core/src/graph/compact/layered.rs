@@ -997,12 +997,6 @@ impl LayeredStore {
             || (self.is_node_dirty(id) && self.overlay.load().get_node(id).is_none())
     }
 
-    /// Edge counterpart of [`base_node_gone`](Self::base_node_gone).
-    fn base_edge_gone(&self, id: EdgeId) -> bool {
-        self.is_edge_deleted_from_base(id)
-            || (self.is_edge_dirty(id) && self.overlay.load().get_edge(id).is_none())
-    }
-
     /// Checks whether an edge ID is in the overlay (dirty or deleted).
     #[inline]
     fn is_edge_dirty(&self, id: EdgeId) -> bool {
@@ -1222,14 +1216,18 @@ impl GraphStore for LayeredStore {
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
         let mut results = Vec::new();
 
-        // Base edges (minus deleted). A promoted (dirty) node keeps its base
-        // adjacency: promotion copies the node's labels and properties into
-        // the overlay but not its edges, so skipping base edges for dirty
-        // nodes would hide every un-promoted base edge of a node as soon as
-        // one of its properties is written.
+        // Base edges, read even when `node` is dirty: `ensure_in_overlay`
+        // copies labels and properties but not adjacency. Dirty (promoted)
+        // edges are skipped: the overlay copy is authoritative, and deleting
+        // a promoted edge only removes that copy. (Same rule as upstream
+        // d8ca6da0; additionally, a base node promoted and then deleted in
+        // the overlay is treated as gone.)
         if !self.base_node_gone(node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !self.base_node_gone(target) && !self.base_edge_gone(eid) {
+                if !self.base_node_gone(target)
+                    && !self.is_edge_deleted_from_base(eid)
+                    && !self.is_edge_dirty(eid)
+                {
                     results.push((target, eid));
                 }
             }
