@@ -813,12 +813,18 @@ impl GrafeoFileManager {
     /// `flags.mmap_able = true` can be mapped (index sections).
     ///
     /// The returned [`MmapSection`](crate::container::MmapSection) is
-    /// independent of the file mutex: multiple mmaps can coexist. However,
-    /// all `MmapSection` handles **must be dropped before writing** (via
-    /// `write_sections()` or `write_snapshot()`). On Windows the OS rejects
-    /// writes to a file with active mappings; on Linux/macOS stale mappings
-    /// would read outdated data. See [`MmapSection`](crate::container::MmapSection)
-    /// for the full lifecycle.
+    /// independent of the file mutex: multiple mmaps can coexist.
+    ///
+    /// Checkpoints (`write_sections()` / `write_snapshot()`) never modify the
+    /// mapped file in place: they rename a new image over the database path.
+    /// On Linux/macOS an existing mapping therefore keeps a consistent view
+    /// of the old image (it does not see the new checkpoint) and keeps the
+    /// old file's disk space allocated until it is unmapped. On Windows an
+    /// active mapping makes the rename that publishes the new image fail.
+    /// Drop all `MmapSection` handles **before writing** on every platform:
+    /// it is required on Windows and frees the old image's space elsewhere.
+    /// See [`MmapSection`](crate::container::MmapSection) for the full
+    /// lifecycle.
     ///
     /// # Errors
     ///
@@ -872,8 +878,10 @@ impl GrafeoFileManager {
 
         let file = self.file.lock();
 
-        // SAFETY: We hold an exclusive lock on the `.grafeo` file, preventing
-        // concurrent modification by other processes. The mapping is read-only.
+        // SAFETY: We hold a lock on the `.grafeo` file, preventing
+        // concurrent modification by other processes, and checkpoints never
+        // write a published file in place (they rename a new image over the
+        // path), so the mapped bytes do not change. The mapping is read-only.
         // The section region [offset .. offset+length] was written by
         // write_sections() and its CRC is verified below before the mmap
         // is exposed to callers.

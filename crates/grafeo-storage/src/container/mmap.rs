@@ -32,12 +32,20 @@ use super::page_fetcher::AccessHint;
 ///
 /// # Platform note
 ///
-/// On Windows, the OS rejects writes to a file with active memory mappings
-/// (error 1224: `ERROR_USER_MAPPED_FILE`). All `MmapSection` handles must
-/// be dropped before calling `write_sections()` or `write_snapshot()`.
-/// On Linux/macOS, writes succeed with active mappings (old mappings see
-/// stale data), but the drop-before-write lifecycle is used on all platforms
-/// for consistency.
+/// Checkpoints never write the mapped file in place. `write_sections()` and
+/// `write_snapshot()` build a complete new image in a staging file and
+/// rename it over the database path.
+///
+/// On Linux/macOS a mapping created before a checkpoint keeps referring to
+/// the old, now unlinked file: it keeps a consistent view of the old image
+/// (it never sees torn or new bytes), and that file's disk space stays
+/// allocated until the last mapping of it is dropped.
+///
+/// On Windows an active mapping prevents the old file from being replaced,
+/// so the rename that publishes the new image fails. All `MmapSection`
+/// handles must be dropped before calling `write_sections()` or
+/// `write_snapshot()`. Follow the drop-before-write lifecycle on all
+/// platforms; it also frees the old image's disk space promptly.
 pub struct MmapSection {
     mmap: memmap2::Mmap,
     section_type: SectionType,
