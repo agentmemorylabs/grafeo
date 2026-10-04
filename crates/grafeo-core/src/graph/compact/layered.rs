@@ -882,6 +882,39 @@ impl LayeredStore {
             .collect()
     }
 
+    /// Base node ids that were copied into the overlay (dirty) and whose
+    /// overlay copy has since been deleted. Deleting a dirty node only
+    /// removes the overlay copy, so nothing else records that the base copy
+    /// is dead; the persistence layer adds these to the `OverlayDeletions`
+    /// section, because a reopen through [`Self::with_overlay`] rebuilds the
+    /// dirty set from live overlay entities and would otherwise serve the
+    /// base copy again. Derived here rather than tombstoned at delete time so
+    /// a rolled-back delete (which restores the overlay copy) needs no undo.
+    #[must_use]
+    pub fn snapshot_deleted_promoted_node_ids(&self) -> Vec<NodeId> {
+        let base = self.base.load();
+        let overlay = self.overlay.load();
+        self.dirty_node_ids
+            .read()
+            .iter()
+            .copied()
+            .filter(|id| overlay.get_node(*id).is_none() && base.get_node(*id).is_some())
+            .collect()
+    }
+
+    /// Edge counterpart of [`Self::snapshot_deleted_promoted_node_ids`].
+    #[must_use]
+    pub fn snapshot_deleted_promoted_edge_ids(&self) -> Vec<EdgeId> {
+        let base = self.base.load();
+        let overlay = self.overlay.load();
+        self.dirty_edge_ids
+            .read()
+            .iter()
+            .copied()
+            .filter(|id| overlay.get_edge(*id).is_none() && base.get_edge(*id).is_some())
+            .collect()
+    }
+
     /// Snapshot of base edge ids deleted-but-not-merged. See
     /// [`Self::snapshot_deleted_node_ids`].
     #[must_use]
@@ -1000,6 +1033,22 @@ impl LayeredStore {
     #[inline]
     fn is_edge_deleted_from_base(&self, id: EdgeId) -> bool {
         self.deleted_from_base_edges.read().contains(&id)
+    }
+
+    /// Deleting a dirty node that also exists in the base kills the base
+    /// copy too; flag the deletion log so the next checkpoint re-emits it
+    /// (see [`Self::snapshot_deleted_promoted_node_ids`]).
+    fn note_promoted_node_delete(&self, id: NodeId) {
+        if self.base.load().get_node(id).is_some() {
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Edge counterpart of [`Self::note_promoted_node_delete`].
+    fn note_promoted_edge_delete(&self, id: EdgeId) {
+        if self.base.load().get_edge(id).is_some() {
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -1285,13 +1334,17 @@ impl GraphStore for LayeredStore {
 
     fn node_ids(&self) -> Vec<NodeId> {
         let deleted = self.deleted_from_base_nodes.read();
+        let dirty = self.dirty_node_ids.read();
 
+        // A dirty id is owned by the overlay (as in `nodes_by_label`): it is
+        // listed below if its overlay copy is live, and not from the base, so
+        // a base node copied into the overlay and then deleted stays gone.
         let mut ids: Vec<NodeId> = self
             .base
             .load()
             .node_ids()
             .into_iter()
-            .filter(|id| !deleted.contains(id))
+            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
         ids.extend(self.overlay.load().node_ids());
         ids.sort_unstable();
@@ -2035,6 +2088,7 @@ impl GraphStoreMut for LayeredStore {
             // frozen entity deleted at N+1 would resurrect from the new
             // base.
             self.record_post_freeze_node(id);
+            self.note_promoted_node_delete(id);
             return self.overlay.load().delete_node(id);
         }
         if self.base.load().get_node(id).is_some() {
@@ -2060,6 +2114,7 @@ impl GraphStoreMut for LayeredStore {
         if self.is_node_dirty(id) {
             // See `delete_node`: record the N+1 deletion for the repair swap.
             self.record_post_freeze_node(id);
+            self.note_promoted_node_delete(id);
             return self
                 .overlay
                 .load()
@@ -2122,6 +2177,7 @@ impl GraphStoreMut for LayeredStore {
         if self.is_edge_dirty(id) {
             // See `delete_node`: record the N+1 deletion for the repair swap.
             self.record_post_freeze_edge(id);
+            self.note_promoted_edge_delete(id);
             return self.overlay.load().delete_edge(id);
         }
         if self.base.load().get_edge(id).is_some() {
@@ -2147,6 +2203,7 @@ impl GraphStoreMut for LayeredStore {
         if self.is_edge_dirty(id) {
             // See `delete_node`: record the N+1 deletion for the repair swap.
             self.record_post_freeze_edge(id);
+            self.note_promoted_edge_delete(id);
             return self
                 .overlay
                 .load()
@@ -4604,6 +4661,32 @@ mod tests {
         assert!(layered.edges_from(alix, Direction::Outgoing).is_empty());
         assert!(layered.neighbors(alix, Direction::Outgoing).is_empty());
         assert_eq!(layered.neighbors(amsterdam, Direction::Incoming), vec![gus]);
+    }
+
+    /// A dirty base id whose overlay copy was deleted is reported for the
+    /// persisted deletion log, hidden from `node_ids`, and counted once.
+    #[test]
+    fn test_deleted_promoted_ids_reported_for_deletion_log() {
+        let layered = build_test_layered();
+        let (alix, gus, _amsterdam, eid) = fixture_ids(&layered);
+        assert!(layered.snapshot_deleted_promoted_node_ids().is_empty());
+
+        layered.set_edge_property(eid, "since", Value::Int64(2024));
+        layered.mark_deletions_clean();
+        assert!(layered.delete_edge(eid));
+        assert!(layered.deletions_dirty(), "deletion log must be re-emitted");
+        assert_eq!(layered.snapshot_deleted_promoted_edge_ids(), vec![eid]);
+        assert!(layered.snapshot_deleted_edge_ids().is_empty());
+
+        layered.set_node_property(gus, "age", Value::Int64(26));
+        layered.delete_node_edges(gus);
+        assert!(layered.delete_node(gus));
+        assert_eq!(layered.snapshot_deleted_promoted_node_ids(), vec![gus]);
+        assert!(!layered.node_ids().contains(&gus));
+        assert_eq!(layered.node_count(), layered.node_ids().len());
+        // A live dirty node is not reported.
+        assert!(layered.is_node_dirty(alix));
+        assert!(!layered.snapshot_deleted_promoted_node_ids().contains(&alix));
     }
 
     // ── Phase 5c: overlay reset + in-place merge ──────────────────────
