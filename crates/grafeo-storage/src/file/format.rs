@@ -9,8 +9,9 @@
 //! | 8 KiB | 4 KiB | [`DbHeader`] slot 1 (H2) |
 //! | 12 KiB+ | variable | Snapshot data payload |
 //!
-//! The two database headers alternate writes for crash safety. The one
-//! with the higher [`DbHeader::iteration`] counter is the current state.
+//! The database header with the higher [`DbHeader::iteration`] counter is
+//! the current state. Checkpoints never rewrite this file in place: they
+//! build a new image and rename it over the old one.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,12 +81,15 @@ impl Default for FileHeader {
     }
 }
 
-/// Database header stored in two alternating slots for crash safety.
+/// Database header stored in one of two slots.
 ///
-/// On each checkpoint the *inactive* slot is overwritten with a new header
-/// pointing to the freshly written snapshot data, then the file is fsynced.
-/// If the process crashes mid-write, the other slot still contains valid
-/// metadata for the previous checkpoint.
+/// Each checkpoint writes a complete new image of the file to a staging file
+/// and atomically renames it over the old one (see
+/// [`GrafeoFileManager`](crate::file::GrafeoFileManager)). The new image
+/// carries the new header in the slot after the previous active one and an
+/// empty header in the other slot. Readers pick the slot with the higher
+/// iteration, so files written by older versions (which alternated slots in
+/// place) still open.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DbHeader {
     /// Monotonically increasing counter, incremented on each checkpoint.

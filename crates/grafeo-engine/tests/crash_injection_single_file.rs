@@ -289,9 +289,13 @@ fn crash_before_sidecar_wal_removal_recovered_on_reopen() {
             .execute("INSERT (:Person {name: 'Beatrix'})")
             .unwrap();
 
-        // Crash point 9 = close:before_remove_sidecar_wal (added after the existing 8)
+        // Crash point 10 = close:before_remove_sidecar_wal. Close-path points:
+        // flush:before_serialize, flush:after_serialize, write_sections:before_data,
+        // write_sections:after_data, write_sections:after_directory,
+        // checkpoint:before_rename, checkpoint:after_rename,
+        // write_sections:after_fsync, flush:after_write, close:before_remove_sidecar_wal
         let db = AssertUnwindSafe(db);
-        let result = with_crash_at(9, move || {
+        let result = with_crash_at(10, move || {
             let _ = db.close();
         });
 

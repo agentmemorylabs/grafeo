@@ -96,7 +96,36 @@ impl<R: WalEntry> TypedWal<R> {
     pub fn checkpoint(&self, current_transaction: TransactionId, epoch: EpochId) -> Result<()> {
         let checkpoint_record = R::make_checkpoint(current_transaction);
         self.log(&checkpoint_record)?;
-        self.manager.complete_checkpoint(current_transaction, epoch)
+        self.manager
+            .complete_checkpoint(current_transaction, epoch, None)
+    }
+
+    /// Like [`checkpoint`](Self::checkpoint), for a snapshot taken when the
+    /// WAL was at log sequence `covered_sequence`, read before the snapshot.
+    /// Recovery will still replay every log file from that sequence on, so
+    /// records written while the snapshot was being taken are not skipped
+    /// even if the WAL rotated meanwhile.
+    ///
+    /// Pass `current_sequence().saturating_sub(1)`, not
+    /// [`current_sequence`](Self::current_sequence) itself: rotation bumps
+    /// the sequence before it swaps in the new log file, so the value read
+    /// can be one ahead of the file that is still receiving writes.
+    ///
+    /// Call this only after the snapshot is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint cannot be written.
+    pub fn checkpoint_covering(
+        &self,
+        current_transaction: TransactionId,
+        epoch: EpochId,
+        covered_sequence: u64,
+    ) -> Result<()> {
+        let checkpoint_record = R::make_checkpoint(current_transaction);
+        self.log(&checkpoint_record)?;
+        self.manager
+            .complete_checkpoint(current_transaction, epoch, Some(covered_sequence))
     }
 
     /// Syncs the WAL to disk (fsync).
