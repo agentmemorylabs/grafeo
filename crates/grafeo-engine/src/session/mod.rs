@@ -724,28 +724,50 @@ impl Session {
 
     /// Runs a direct write against `store`.
     ///
-    /// On the layered target with no open transaction (and auto-commit on),
-    /// the write runs in an implicit transaction that commits on success and
-    /// rolls back on error, like an auto-commit query. Generation-root WAL
-    /// replay applies only records followed by a `TransactionCommit`, and a
-    /// later `TransactionAbort` discards everything still pending, so a bare
-    /// write without its own commit could be lost on reopen. Everywhere else
-    /// `write` runs as before.
+    /// On the layered target:
+    /// - a read-only session (or read-only transaction) refuses the write;
+    /// - with no open transaction (and auto-commit on), the write runs in an
+    ///   implicit transaction that commits on success and rolls back on
+    ///   error, like an auto-commit query. Generation-root WAL replay applies
+    ///   only records followed by a `TransactionCommit`, and a later
+    ///   `TransactionAbort` discards everything still pending, so a bare
+    ///   write without its own commit could be lost on reopen. A commit that
+    ///   fails is rolled back, and the write is refused up front while a
+    ///   result stream is open (commit and rollback both refuse then), so no
+    ///   implicit transaction is ever left open behind the call.
+    ///
+    /// Everywhere else `write` runs as before.
     #[cfg(feature = "lpg")]
     fn with_direct_write<T>(
         &self,
         store: &direct_store::DirectStore,
         write: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        if !(store.is_layered() && self.needs_auto_commit(true)) {
+        if !store.is_layered() {
             return write();
         }
+        if self.db_read_only || *self.read_only_tx.lock() {
+            return Err(grafeo_common::utils::error::Error::Transaction(
+                grafeo_common::utils::error::TransactionError::ReadOnly,
+            ));
+        }
+        if !self.needs_auto_commit(true) {
+            return write();
+        }
+        self.check_no_active_streams("write")?;
         self.begin_transaction_inner(false, None)?;
         match write() {
-            Ok(value) => {
-                self.commit_inner()?;
-                Ok(value)
-            }
+            Ok(value) => match self.commit_inner() {
+                Ok(()) => Ok(value),
+                Err(e) => {
+                    // `commit_inner` already rolls back on most failures;
+                    // make sure nothing is left open when it did not.
+                    if self.current_transaction.lock().is_some() {
+                        let _ = self.rollback_inner();
+                    }
+                    Err(e)
+                }
+            },
             Err(e) => {
                 let _ = self.rollback_inner();
                 Err(e)
@@ -4199,13 +4221,15 @@ impl Session {
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal {
             use grafeo_storage::wal::WalRecord;
-            if let Err(e) = wal.log(&WalRecord::TransactionCommit { transaction_id }) {
+            // One atomic append: generation-root replay rejects any record
+            // (another session's data, commit or abort) between the two.
+            if let Err(e) = wal.log_atomic(&[
+                WalRecord::TransactionCommit { transaction_id },
+                WalRecord::EpochAdvance {
+                    epoch: commit_epoch,
+                },
+            ]) {
                 grafeo_warn!("Failed to log transaction commit to WAL: {}", e);
-            }
-            if let Err(e) = wal.log(&WalRecord::EpochAdvance {
-                epoch: commit_epoch,
-            }) {
-                grafeo_warn!("Failed to log epoch advance to WAL: {}", e);
             }
         }
 
@@ -5257,6 +5281,15 @@ impl Session {
             #[cfg(feature = "vector-index")]
             let vector_intent = self.active_graph_storage_key();
 
+            if store.is_layered() {
+                // A layered write to a missing or deleted id would otherwise
+                // be a silent no-op (or copy a deleted base row back).
+                let (epoch, _) = self.get_transaction_context();
+                let tid = transaction_id.unwrap_or(TransactionId::SYSTEM);
+                if store.get_node_versioned(id, epoch, tid).is_none() {
+                    return Err(grafeo_common::utils::error::Error::NodeNotFound(id));
+                }
+            }
             if let Some(tid) = transaction_id {
                 self.transaction_manager.record_write(tid, id)?;
             }
@@ -5300,6 +5333,13 @@ impl Session {
             #[cfg(feature = "wal")]
             let value_for_wal = value.clone();
 
+            if store.is_layered() {
+                let (epoch, _) = self.get_transaction_context();
+                let tid = transaction_id.unwrap_or(TransactionId::SYSTEM);
+                if store.get_edge_versioned(id, epoch, tid).is_none() {
+                    return Err(grafeo_common::utils::error::Error::EdgeNotFound(id));
+                }
+            }
             store.set_edge_property(id, key, value, transaction_id);
 
             #[cfg(feature = "wal")]
@@ -5324,7 +5364,13 @@ impl Session {
         let store = self.direct_store();
         let result = self.with_direct_write(&store, || {
             let (epoch, transaction_id) = self.get_transaction_context();
-            let deleted = store.delete_node(id, epoch, transaction_id);
+            // On the layered target a base delete only records a tombstone and
+            // would report `true` again for an id that is already gone.
+            let visible = !store.is_layered()
+                || store
+                    .get_node_versioned(id, epoch, transaction_id.unwrap_or(TransactionId::SYSTEM))
+                    .is_some();
+            let deleted = visible && store.delete_node(id, epoch, transaction_id);
 
             #[cfg(feature = "wal")]
             if deleted {
@@ -5356,7 +5402,11 @@ impl Session {
         let store = self.direct_store();
         let result = self.with_direct_write(&store, || {
             let (epoch, transaction_id) = self.get_transaction_context();
-            let deleted = store.delete_edge(id, epoch, transaction_id);
+            let visible = !store.is_layered()
+                || store
+                    .get_edge_versioned(id, epoch, transaction_id.unwrap_or(TransactionId::SYSTEM))
+                    .is_some();
+            let deleted = visible && store.delete_edge(id, epoch, transaction_id);
 
             #[cfg(feature = "wal")]
             if deleted {
