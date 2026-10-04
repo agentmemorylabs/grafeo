@@ -96,6 +96,11 @@ struct Snapshot {
     cypher_edges: Vec<(String, String, String)>,
     /// label -> sorted ids
     by_label: BTreeMap<String, Vec<u64>>,
+    /// edge id -> sorted properties
+    edge_props: BTreeMap<u64, BTreeMap<String, String>>,
+    /// `find_nodes_by_property("name", v)` for every base name (this is the
+    /// property-index path when an index on `name` exists)
+    name_lookup: BTreeMap<String, Vec<u64>>,
 }
 
 fn cypher_count(db: &GrafeoDB, query: &str) -> i64 {
@@ -115,6 +120,7 @@ fn snapshot(db: &GrafeoDB) -> Snapshot {
     let mut nodes = BTreeMap::new();
     let mut outgoing = BTreeMap::new();
     let mut incoming = BTreeMap::new();
+    let mut edge_props = BTreeMap::new();
     for id in &node_ids {
         let node = store
             .get_node(*id)
@@ -143,12 +149,24 @@ fn snapshot(db: &GrafeoDB) -> Snapshot {
                 })
                 .collect();
             adj.sort_unstable();
+            for (_, eid, _) in &adj {
+                let props: BTreeMap<String, String> = store
+                    .get_edge(grafeo_common::types::EdgeId::new(*eid))
+                    .map(|e| {
+                        e.properties
+                            .iter()
+                            .map(|(k, v)| (k.as_str().to_string(), format!("{v:?}")))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                edge_props.insert(*eid, props);
+            }
             map.insert(id.as_u64(), adj);
         }
     }
 
     let mut by_label = BTreeMap::new();
-    for label in ["Person", "Temp"] {
+    for label in ["Person", "Temp", "Extra"] {
         let mut ids: Vec<u64> = store
             .nodes_by_label(label)
             .into_iter()
@@ -175,6 +193,17 @@ fn snapshot(db: &GrafeoDB) -> Snapshot {
         .collect();
     cypher_edges.sort_unstable();
 
+    let mut name_lookup = BTreeMap::new();
+    for name in NAMES {
+        let mut ids: Vec<u64> = store
+            .find_nodes_by_property("name", &Value::from(name))
+            .into_iter()
+            .map(|id| id.as_u64())
+            .collect();
+        ids.sort_unstable();
+        name_lookup.insert(name.to_string(), ids);
+    }
+
     Snapshot {
         node_count: store.node_count(),
         edge_count: store.edge_count(),
@@ -185,6 +214,8 @@ fn snapshot(db: &GrafeoDB) -> Snapshot {
         incoming,
         cypher_edges,
         by_label,
+        edge_props,
+        name_lookup,
     }
 }
 
@@ -297,16 +328,26 @@ fn rollback_after_partial_failure_mid_transaction() {
     session.execute(MUTATIONS[1]).expect("SET");
     session.execute(MUTATIONS[2]).expect("CREATE edge");
     session.execute(MUTATIONS[3]).expect("DELETE edge");
-    // A NODETACH delete of every node deletes the edge-less ones it reaches
-    // first (the new isolated node) and then fails on a node that still has
-    // edges, leaving the statement half-applied.
+    // Strip alix's base edges so alix is edge-less, then one NODETACH
+    // DELETE over alix (id 0, scanned first) and jules (still connected):
+    // alix is deleted, then the statement fails on jules.
     session
-        .execute("CREATE (:Temp {name: 'isolated'})")
-        .expect("create isolated");
-    let err = session.execute("MATCH (n) DELETE n");
+        .execute("MATCH (:Person {name: 'alix'})-[r]-() DELETE r")
+        .expect("delete alix's edges");
+    let err = session.execute("MATCH (n:Person) WHERE n.name IN ['alix', 'jules'] DELETE n");
     assert!(
         err.is_err(),
-        "NODETACH delete over connected nodes must fail"
+        "NODETACH delete of a connected node must fail"
+    );
+    // The failure really left the statement half-applied: alix's delete,
+    // made before the failing row, is visible inside the transaction.
+    let alix_left = session
+        .execute("MATCH (n:Person {name: 'alix'}) RETURN count(n)")
+        .expect("count alix");
+    assert_eq!(
+        alix_left.rows()[0][0],
+        Value::Int64(0),
+        "the first half of the failed statement must have been applied"
     );
     session.rollback().expect("rollback");
     drop(session);
@@ -395,4 +436,229 @@ fn commit_of_same_operations_still_applies() {
     let db = open_root(&root);
     let reopened = check(&db, "after COMMIT + reopen");
     assert_eq!(live.nodes, reopened.nodes, "node payloads survive reopen");
+}
+
+/// Engine-level test for the review's high-priority finding: on a layered
+/// DB, `create_property_index` builds the overlay index with base postings
+/// included. A rolled-back SET on a base node must not remove that node's
+/// postings, so indexed lookups still find it.
+#[test]
+fn indexed_lookup_after_rollback_still_finds_base_node() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    db.create_property_index("name");
+    let before = snapshot(&db);
+    assert_eq!(before.name_lookup["gus"].len(), 1, "sanity: gus is indexed");
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    session
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 99")
+        .expect("SET");
+    session.rollback().expect("rollback");
+    drop(session);
+
+    assert_snapshot_eq("indexed lookup after ROLLBACK", &snapshot(&db), &before);
+    let rows = db
+        .session()
+        .execute("MATCH (n:Person {name: 'gus'}) RETURN n.age")
+        .expect("cypher lookup");
+    assert_eq!(rows.rows().len(), 1, "Cypher property lookup finds gus");
+}
+
+/// Label SET/REMOVE, property REMOVE and edge-property SET through Cypher
+/// (all go through `WalGraphStore`'s versioned mutators and copy-ups), then
+/// ROLLBACK.
+#[test]
+fn cypher_label_remove_and_edge_set_rollback() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    let before = snapshot(&db);
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    for q in [
+        "MATCH (n:Person {name: 'gus'}) SET n:Extra",
+        "MATCH (n:Person {name: 'vincent'}) REMOVE n.age",
+        "MATCH (n:Person {name: 'mia'}) REMOVE n:Person",
+        "MATCH ()-[r:KNOWS]->() SET r.w = 100",
+    ] {
+        session.execute(q).expect(q);
+    }
+    session.rollback().expect("rollback");
+    drop(session);
+
+    assert_snapshot_eq("labels/REMOVE/edge SET rollback", &snapshot(&db), &before);
+    db.close().expect("close");
+    drop(db);
+    let db = open_root(&root);
+    assert_snapshot_eq("labels/REMOVE/edge SET, reopen", &snapshot(&db), &before);
+}
+
+/// Live state after deleting only `alix` (the first MUTATION), for the
+/// savepoint and nested-transaction tests.
+fn snapshot_after_alix_only(root_parent: &Path) -> Snapshot {
+    let root = root_parent.join("reference");
+    publish_base(&root);
+    let db = open_root(&root);
+    db.session().execute(MUTATIONS[0]).expect("delete alix");
+    snapshot(&db)
+}
+
+/// Savepoint rollback undoes only the layered changes made after the
+/// savepoint; a full ROLLBACK afterwards restores everything.
+#[test]
+fn savepoint_rollback_undoes_only_later_base_mutations() {
+    let dir = tempdir().expect("tempdir");
+    let expected_mid = snapshot_after_alix_only(dir.path());
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    let before = snapshot(&db);
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    session.execute(MUTATIONS[0]).expect("delete alix");
+    session.savepoint("sp").expect("savepoint");
+    for q in &MUTATIONS[1..] {
+        session.execute(q).expect(q);
+    }
+    session
+        .execute("MATCH ()-[r:KNOWS]->() SET r.w = 100")
+        .expect("edge SET");
+    session
+        .rollback_to_savepoint("sp")
+        .expect("rollback to savepoint");
+    drop_session_view_check(&db, &expected_mid, "after ROLLBACK TO SAVEPOINT");
+    session.rollback().expect("rollback");
+    drop(session);
+
+    assert_snapshot_eq("savepoint then full ROLLBACK", &snapshot(&db), &before);
+    db.close().expect("close");
+    drop(db);
+    let db = open_root(&root);
+    assert_snapshot_eq(
+        "savepoint then full ROLLBACK, reopen",
+        &snapshot(&db),
+        &before,
+    );
+}
+
+/// Compares the store-level (transaction-agnostic) view against `expected`.
+/// Inside an open transaction the overlay's own uncommitted rows are hidden
+/// from other sessions, so only the store-level fields are compared.
+fn drop_session_view_check(db: &GrafeoDB, expected: &Snapshot, context: &str) {
+    let layered = db.layered_store().expect("layered");
+    let store: &dyn GraphStore = layered.as_ref();
+    for (name, ids) in &expected.name_lookup {
+        let mut got: Vec<u64> = store
+            .find_nodes_by_property("name", &Value::from(name.as_str()))
+            .into_iter()
+            .map(|id| id.as_u64())
+            .collect();
+        got.sort_unstable();
+        assert_eq!(&got, ids, "{context}: lookup of {name}");
+    }
+    assert_eq!(
+        store.node_count(),
+        expected.node_count,
+        "{context}: node count"
+    );
+    assert_eq!(
+        store.edge_count(),
+        expected.edge_count,
+        "{context}: edge count"
+    );
+    for (id, (_, props)) in &expected.nodes {
+        let node = store
+            .get_node(NodeId::new(*id))
+            .unwrap_or_else(|| panic!("{context}: node {id} missing"));
+        let got: BTreeMap<String, String> = node
+            .properties
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), format!("{v:?}")))
+            .collect();
+        assert_eq!(&got, props, "{context}: node {id} properties");
+    }
+}
+
+/// A nested transaction is an auto-savepoint: rolling the inner one back
+/// must undo only its base mutations, and the outer COMMIT keeps the rest.
+#[test]
+fn nested_transaction_rollback_keeps_outer_base_mutations() {
+    let dir = tempdir().expect("tempdir");
+    let expected = snapshot_after_alix_only(dir.path());
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin outer");
+    session.execute(MUTATIONS[0]).expect("delete alix");
+    session.begin_transaction().expect("begin inner");
+    for q in &MUTATIONS[1..] {
+        session.execute(q).expect(q);
+    }
+    session.rollback().expect("rollback inner");
+    session.commit().expect("commit outer");
+    drop(session);
+
+    // Live state only: the fork's WAL has no savepoint marker, so a reopen
+    // after a partial rollback replays the undone records (see the PR's
+    // write-up); that is out of scope here.
+    assert_snapshot_eq("nested rollback + outer commit", &snapshot(&db), &expected);
+}
+
+/// Two sessions share a copy-up: the first rolls back, the second commits.
+/// The committed edge must survive and the rolled-back SET must vanish.
+#[test]
+fn concurrent_sessions_share_a_copy_up() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    db.create_property_index("name");
+
+    let mut a = db.session();
+    let mut b = db.session();
+    a.begin_transaction().expect("begin a");
+    b.begin_transaction().expect("begin b");
+    // `a` copies gus up for a SET; `b` relies on the same copy-up for a new
+    // edge onto gus (no write-write conflict: an edge create does not record
+    // a write on its endpoints).
+    a.execute("MATCH (n:Person {name: 'gus'}) SET n.age = 40")
+        .expect("a SET");
+    b.execute("MATCH (g:Person {name: 'gus'}) CREATE (:Temp {name: 'b'})-[:NEW]->(g)")
+        .expect("b CREATE edge");
+    a.rollback().expect("rollback a");
+    b.commit().expect("commit b");
+    drop(a);
+    drop(b);
+
+    let check = |db: &GrafeoDB, context: &str| {
+        let snap = snapshot(db);
+        assert_eq!(snap.name_lookup["gus"].len(), 1, "{context}: gus indexed");
+        let gus = &snap.nodes[&snap.name_lookup["gus"][0]].1;
+        assert_eq!(
+            gus.get("age").map(String::as_str),
+            Some("Int64(31)"),
+            "{context}"
+        );
+        let gus_id = snap.name_lookup["gus"][0];
+        assert!(
+            snap.incoming[&gus_id].iter().any(|(_, _, t)| t == "NEW"),
+            "{context}: committed edge onto gus survives: {:?}",
+            snap.incoming[&gus_id]
+        );
+    };
+    // Live state only. A reopen loses `b`'s committed edge, but that is a
+    // separate WAL bug that also reproduces on a plain single-file
+    // database: WAL records carry no transaction id, so recovery drops the
+    // committed records of `b` that interleave with the aborted `a` (see the
+    // PR write-up).
+    check(&db, "live");
 }

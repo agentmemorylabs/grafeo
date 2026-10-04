@@ -5116,4 +5116,86 @@ mod tests {
         assert!(layered.delete_node_versioned(NodeId::new(0), epoch, TransactionId::SYSTEM));
         assert!(!layered.txn_journal_pending.load(Ordering::Acquire));
     }
+
+    /// Review finding (concurrency): a rollback that undoes a copy-up must not
+    /// race with another transaction writing the same node. Thread `rb`
+    /// repeatedly copies gus up inside a transaction and rolls it back; the
+    /// main thread does the same with its own transactions and checks that
+    /// its write is visible before its own rollback; a reader must never see
+    /// gus vanish.
+    #[test]
+    fn rollback_of_copy_up_does_not_race_other_writers() {
+        use std::sync::atomic::AtomicBool;
+        let layered = Arc::new(build_test_layered());
+        let gus = NodeId::new(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let vanished = Arc::new(AtomicBool::new(false));
+
+        let rb = {
+            let layered = Arc::clone(&layered);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut n = 1_000_000u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let tx = TransactionId::new(n);
+                    n += 1;
+                    layered.set_node_property_versioned(gus, "a", Value::Int64(1), tx);
+                    rollback(&layered, tx);
+                }
+            })
+        };
+        let reader = {
+            let layered = Arc::clone(&layered);
+            let stop = Arc::clone(&stop);
+            let vanished = Arc::clone(&vanished);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if layered.get_node(gus).is_none() {
+                        vanished.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        let mut lost = 0usize;
+        for j in 0..20_000i64 {
+            let tx = TransactionId::new(10 + j as u64);
+            layered.set_node_property_versioned(gus, "b", Value::Int64(j), tx);
+            if layered.get_node_property(gus, &PropertyKey::new("b")) != Some(Value::Int64(j)) {
+                lost += 1;
+            }
+            rollback(&layered, tx);
+        }
+        stop.store(true, Ordering::Relaxed);
+        rb.join().unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(
+            lost, 0,
+            "a write was purged by another transaction's rollback"
+        );
+        assert!(
+            !vanished.load(Ordering::Relaxed),
+            "a reader saw gus vanish mid-undo"
+        );
+        assert_eq!(
+            layered.get_node_property(gus, &PropertyKey::new("age")),
+            Some(Value::Int64(25))
+        );
+    }
+
+    /// Review finding: dropping pending journal entries (overlay reset /
+    /// merge while a transaction is open) must be visible, not silent.
+    #[test]
+    fn forgetting_pending_layer_changes_is_counted() {
+        let layered = build_test_layered();
+        let tx = TransactionId::new(7);
+        let epoch = layered.current_epoch();
+        assert!(layered.delete_node_versioned(NodeId::new(0), epoch, tx));
+        assert_eq!(layered.forgotten_layer_changes(), 0);
+        layered.reset_overlay();
+        assert_eq!(layered.forgotten_layer_changes(), 1);
+        // The later rollback finds nothing to undo (the change is gone).
+        layered.rollback_transaction_layers(tx);
+        assert_eq!(layered.forgotten_layer_changes(), 1);
+    }
 }
