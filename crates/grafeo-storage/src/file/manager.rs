@@ -133,20 +133,15 @@ impl GrafeoFileManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file does not exist, has invalid magic, or
-    /// an unsupported format version.
+    /// Returns an error if the file does not exist, is locked by another
+    /// process, keeps being replaced by a concurrent checkpoint while it is
+    /// being locked, has invalid magic, or an unsupported format version.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-
-        // Acquire an exclusive lock: prevents other processes from opening the same file
-        file.try_lock_exclusive().map_err(|_| {
-            Error::Internal(format!(
-                "database file is locked by another process: {}",
-                path.display()
-            ))
-        })?;
+        // Exclusive lock: prevents other processes from opening the same
+        // file. The lock is verified to be on the file currently at `path`.
+        let mut file = open_locked(&path, LockKind::Exclusive)?;
 
         let file_header = header::read_file_header(&mut file)?;
         header::validate_file_header(&file_header)?;
@@ -156,7 +151,8 @@ impl GrafeoFileManager {
 
         // A staging file left by a checkpoint that died before its rename is
         // garbage: the published file is the old, consistent image. We hold
-        // the exclusive lock, so no other writer can be using it.
+        // a verified exclusive lock on the published file, so no other
+        // writer can be mid-checkpoint.
         remove_if_exists(&checkpoint_tmp_path(&publish_target(&path)))?;
 
         Ok(Self {
@@ -183,21 +179,16 @@ impl GrafeoFileManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file does not exist, has invalid magic, or
-    /// an unsupported format version.
+    /// Returns an error if the file does not exist, cannot be locked for
+    /// reading, keeps being replaced by a concurrent checkpoint while it is
+    /// being locked, has invalid magic, or an unsupported format version.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        let mut file = OpenOptions::new().read(true).open(&path)?;
-
-        // Acquire a shared lock: coexists with other shared locks but
-        // blocks if an exclusive lock cannot be shared (platform-dependent).
-        file.try_lock_shared().map_err(|_| {
-            Error::Internal(format!(
-                "database file cannot be locked for reading: {}",
-                path.display()
-            ))
-        })?;
+        // Shared lock: coexists with other shared locks but blocks if an
+        // exclusive lock cannot be shared (platform-dependent). The lock is
+        // verified to be on the file currently at `path`.
+        let mut file = open_locked(&path, LockKind::Shared)?;
 
         let file_header = header::read_file_header(&mut file)?;
         header::validate_file_header(&file_header)?;
@@ -343,7 +334,11 @@ impl GrafeoFileManager {
 
         let staged = (|| -> Result<DbHeader> {
             // Lock before the image becomes visible under the database path,
-            // so there is no window in which the published file is unlocked.
+            // so the new image is locked from the moment it is published.
+            // The old inode's lock is released when its handle is dropped
+            // after the rename; an opener that opened the old inode before
+            // the rename and locks it afterwards is caught by the identity
+            // check in `open_locked` and retries on the new image.
             tmp.try_lock_exclusive().map_err(|e| {
                 Error::Internal(format!(
                     "cannot lock checkpoint staging file {}: {e}",
@@ -946,6 +941,94 @@ impl GrafeoFileManager {
             .map_err(|e| Error::Internal(format!("failed to unlock database file: {e}")))?;
         Ok(())
     }
+}
+
+/// How many times [`open_locked`] reopens the database file when a
+/// concurrent checkpoint replaced it between the open and the lock.
+const LOCK_IDENTITY_ATTEMPTS: usize = 8;
+
+/// Kind of advisory lock [`open_locked`] takes on the database file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockKind {
+    /// Read/write handle with an exclusive lock (writable open).
+    Exclusive,
+    /// Read-only handle with a shared lock (read-only open).
+    Shared,
+}
+
+/// Opens the database file at `path` and locks it.
+///
+/// Every checkpoint renames a new image over `path` and then drops the old
+/// handle, which releases the lock on the old (now unlinked) inode. A second
+/// opener that opened `path` just before that rename can then lock the old
+/// inode and believe it owns the database. So after locking, the handle's
+/// identity is compared with the file currently at `path`; on a mismatch the
+/// handle is dropped and the open is retried on the new file (whose lock is
+/// held by the checkpointing writer, so a writable retry normally fails with
+/// "locked by another process").
+///
+/// On non-Unix platforms the identity check is skipped (current behaviour).
+fn open_locked(path: &Path, kind: LockKind) -> Result<File> {
+    open_locked_with(path, kind, || {})
+}
+
+/// [`open_locked`] with a hook that runs between each open and lock attempt,
+/// so tests can replace the file inside that window deterministically.
+fn open_locked_with(path: &Path, kind: LockKind, mut before_lock: impl FnMut()) -> Result<File> {
+    for _ in 0..LOCK_IDENTITY_ATTEMPTS {
+        let file = match kind {
+            LockKind::Exclusive => OpenOptions::new().read(true).write(true).open(path)?,
+            LockKind::Shared => OpenOptions::new().read(true).open(path)?,
+        };
+
+        before_lock();
+
+        match kind {
+            LockKind::Exclusive => file.try_lock_exclusive().map_err(|_| {
+                Error::Internal(format!(
+                    "database file is locked by another process: {}",
+                    path.display()
+                ))
+            })?,
+            LockKind::Shared => file.try_lock_shared().map_err(|_| {
+                Error::Internal(format!(
+                    "database file cannot be locked for reading: {}",
+                    path.display()
+                ))
+            })?,
+        }
+
+        if handle_is_file_at_path(&file, path)? {
+            return Ok(file);
+        }
+        // The lock is on a replaced inode; dropping the handle releases it.
+        drop(file);
+    }
+    Err(Error::Internal(format!(
+        "database file {} was replaced by a concurrent checkpoint on each of \
+         {LOCK_IDENTITY_ATTEMPTS} open attempts; giving up",
+        path.display()
+    )))
+}
+
+/// Returns `true` if `file` is the file currently at `path` (same device and
+/// inode). A missing path counts as a mismatch; the retry then reports it.
+#[cfg(unix)]
+fn handle_is_file_at_path(file: &File, path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handle = file.metadata()?;
+    match fs::metadata(path) {
+        Ok(current) => Ok(handle.dev() == current.dev() && handle.ino() == current.ino()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Non-Unix: no portable file identity in std, keep the previous behaviour.
+#[cfg(not(unix))]
+fn handle_is_file_at_path(_file: &File, _path: &Path) -> Result<bool> {
+    Ok(true)
 }
 
 /// Path the checkpoint image is published to: the database path with
@@ -2178,6 +2261,140 @@ mod tests {
             assert_eq!(
                 read_all_sections(&manager),
                 vec![(SectionType::LpgStore, b"via link".to_vec())]
+            );
+        }
+
+        // ── Lock identity after a concurrent checkpoint's rename ─────
+
+        #[cfg(unix)]
+        fn inode(path: &Path) -> u64 {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(path).unwrap().ino()
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn identity_check_detects_file_replaced_under_open_handle() {
+            let dir = test_dir();
+            let path = dir.path().join("ident.grafeo");
+            let other = dir.path().join("other.grafeo");
+            fs::write(&path, b"old").unwrap();
+            fs::write(&other, b"new").unwrap();
+
+            let handle = File::open(&path).unwrap();
+            assert!(handle_is_file_at_path(&handle, &path).unwrap());
+            fs::rename(&other, &path).unwrap();
+            assert!(!handle_is_file_at_path(&handle, &path).unwrap());
+            fs::remove_file(&path).unwrap();
+            assert!(!handle_is_file_at_path(&handle, &path).unwrap());
+        }
+
+        /// Deterministic replay of the race: the file at `path` is replaced
+        /// after the open but before the lock. The stale handle's lock must
+        /// be rejected and the retry must lock the new inode.
+        #[cfg(unix)]
+        #[test]
+        fn open_retries_and_locks_new_inode_when_replaced_before_lock() {
+            use std::os::unix::fs::MetadataExt;
+
+            let dir = test_dir();
+            let path = dir.path().join("race.grafeo");
+            let replacement = dir.path().join("replacement.grafeo");
+            GrafeoFileManager::create(&path).unwrap().close().unwrap();
+            {
+                let manager = GrafeoFileManager::create(&replacement).unwrap();
+                manager
+                    .write_sections(&[(SectionType::LpgStore, b"new image")], 1, 1, 0, 0)
+                    .unwrap();
+            }
+            let old_ino = inode(&path);
+            let new_ino = inode(&replacement);
+            assert_ne!(old_ino, new_ino);
+
+            for kind in [LockKind::Exclusive, LockKind::Shared] {
+                if kind == LockKind::Shared {
+                    // Set the race up again for the read-only path.
+                    fs::copy(&path, &replacement).unwrap();
+                }
+                let expected_ino = inode(&replacement);
+                let mut attempts = 0;
+                let file = open_locked_with(&path, kind, || {
+                    attempts += 1;
+                    if attempts == 1 {
+                        // A concurrent checkpoint publishes its image now.
+                        fs::rename(&replacement, &path).unwrap();
+                    }
+                })
+                .unwrap();
+                assert_eq!(attempts, 2, "{kind:?}: exactly one retry expected");
+                assert_eq!(file.metadata().unwrap().ino(), expected_ino, "{kind:?}");
+                drop(file);
+            }
+
+            // The retried open is a fully usable manager on the new image.
+            let manager = GrafeoFileManager::open(&path).unwrap();
+            assert_eq!(
+                read_all_sections(&manager),
+                vec![(SectionType::LpgStore, b"new image".to_vec())]
+            );
+        }
+
+        /// The review scenario end to end: a second opener opens the file,
+        /// the owning writer checkpoints (rename + drop of the old handle,
+        /// which releases the old inode's lock), then the second opener
+        /// locks. It must not end up owning the replaced inode.
+        #[cfg(unix)]
+        #[test]
+        fn second_opener_cannot_lock_inode_replaced_by_checkpoint() {
+            let dir = test_dir();
+            let path = dir.path().join("owner.grafeo");
+            let writer = GrafeoFileManager::create(&path).unwrap();
+            writer
+                .write_sections(&[(SectionType::LpgStore, b"v1")], 1, 1, 0, 0)
+                .unwrap();
+
+            let mut checkpointed = false;
+            let result = open_locked_with(&path, LockKind::Exclusive, || {
+                if !checkpointed {
+                    checkpointed = true;
+                    writer
+                        .write_sections(&[(SectionType::LpgStore, b"v2")], 2, 2, 0, 0)
+                        .unwrap();
+                }
+            });
+            assert!(checkpointed);
+            let err = result.expect_err("the replaced inode must not be handed out");
+            assert!(
+                err.to_string().contains("locked by another process"),
+                "unexpected error: {err}"
+            );
+            // The writer's staging file and image are untouched.
+            assert!(!checkpoint_tmp_path(&publish_target(&path)).exists());
+            assert_eq!(
+                read_all_sections(&writer),
+                vec![(SectionType::LpgStore, b"v2".to_vec())]
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn open_gives_up_when_file_is_replaced_on_every_attempt() {
+            let dir = test_dir();
+            let path = dir.path().join("churn.grafeo");
+            let next = dir.path().join("next.grafeo");
+            fs::write(&path, b"0").unwrap();
+            let mut attempts = 0;
+            let err = open_locked_with(&path, LockKind::Exclusive, || {
+                attempts += 1;
+                fs::write(&next, b"x").unwrap();
+                fs::rename(&next, &path).unwrap();
+            })
+            .expect_err("must stop retrying");
+            assert_eq!(attempts, LOCK_IDENTITY_ATTEMPTS);
+            assert!(
+                err.to_string()
+                    .contains("replaced by a concurrent checkpoint"),
+                "unexpected error: {err}"
             );
         }
 
