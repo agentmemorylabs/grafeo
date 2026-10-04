@@ -108,8 +108,8 @@ fn post_compact_edge_between_base_and_overlay_nodes() {
 #[test]
 fn post_compact_property_anchored_edge_survives_unrelated_overlay_write() {
     let mut db = GrafeoDB::new_in_memory();
-    let a = db.create_node(&["A"]);
-    let b = db.create_node(&["B"]);
+    let a = db.create_node(&["A"]).unwrap();
+    let b = db.create_node(&["B"]).unwrap();
     db.set_node_property(a, "id", Value::Int64(1));
     db.set_node_property(b, "id", Value::Int64(2));
     db.create_edge(a, b, "T");
@@ -118,10 +118,7 @@ fn post_compact_property_anchored_edge_survives_unrelated_overlay_write() {
     // Both endpoints are now entirely in the snapshot tier and the
     // BUSINESS_MEMBER-shaped pattern resolves cleanly.
     assert_eq!(
-        row_count(
-            &db,
-            "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"
-        ),
+        row_count(&db, "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"),
         1,
         "double-anchor edge query should match before any overlay write"
     );
@@ -129,15 +126,12 @@ fn post_compact_property_anchored_edge_survives_unrelated_overlay_write() {
     // Unrelated overlay write that promotes `a` (it becomes the endpoint of
     // a brand-new overlay edge). The original snapshot-tier `T` edge between
     // `a` and `b` is not touched in any way.
-    let c = db.create_node(&["C"]);
+    let c = db.create_node(&["C"]).unwrap();
     db.set_node_property(c, "id", Value::Int64(99));
     db.create_edge(a, c, "UNRELATED");
 
     assert_eq!(
-        row_count(
-            &db,
-            "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"
-        ),
+        row_count(&db, "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"),
         1,
         "snapshot-tier T edge must still match after an unrelated overlay write \
          promotes its source endpoint"
@@ -146,22 +140,19 @@ fn post_compact_property_anchored_edge_survives_unrelated_overlay_write() {
     // And the same when the destination endpoint is the one that gets
     // promoted — the planner may anchor on either side.
     let mut db = GrafeoDB::new_in_memory();
-    let a = db.create_node(&["A"]);
-    let b = db.create_node(&["B"]);
+    let a = db.create_node(&["A"]).unwrap();
+    let b = db.create_node(&["B"]).unwrap();
     db.set_node_property(a, "id", Value::Int64(1));
     db.set_node_property(b, "id", Value::Int64(2));
     db.create_edge(a, b, "T");
     db.compact().expect("compact");
 
-    let c = db.create_node(&["C"]);
+    let c = db.create_node(&["C"]).unwrap();
     db.set_node_property(c, "id", Value::Int64(99));
     db.create_edge(c, b, "UNRELATED"); // promotes b
 
     assert_eq!(
-        row_count(
-            &db,
-            "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"
-        ),
+        row_count(&db, "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"),
         1,
         "snapshot-tier T edge must still match after an unrelated overlay write \
          promotes its destination endpoint"
