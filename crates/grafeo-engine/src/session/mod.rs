@@ -125,9 +125,12 @@ pub struct Session {
     graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
-    /// Layered store behind the default graph on a generation root / after
-    /// `compact()`. Its base tombstones and copy-ups live outside the overlay
-    /// `store`'s MVCC, so commit/rollback/savepoints drive them explicitly.
+    /// The raw layered store (compact base + overlay) of a layered database,
+    /// which the direct node/edge APIs use for the default graph; `store` is
+    /// only the overlay there. `None` for every other database.
+    ///
+    /// Its base tombstones and copy-ups live outside the overlay's MVCC, so
+    /// commit, rollback and savepoint rollback also drive them through it.
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
     layered_store: Option<Arc<grafeo_core::graph::compact::layered::LayeredStore>>,
     /// Schema and metadata catalog shared across sessions.
@@ -304,6 +307,8 @@ impl Session {
             lpg_backend: LpgBackend::Active,
             graph_store,
             graph_store_mut,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -348,8 +353,6 @@ impl Session {
             #[cfg(feature = "metrics")]
             tx_start_time: parking_lot::Mutex::new(None),
             projections: cfg.projections,
-            #[cfg(all(feature = "compact-store", feature = "lpg"))]
-            layered_store: None,
         }
     }
 
@@ -368,8 +371,8 @@ impl Session {
         self.graph_store_mut = write_store;
     }
 
-    /// Attaches the layered store whose transaction-scoped bookkeeping
-    /// (base tombstones, copy-ups) this session commits and rolls back.
+    /// Hands the session the raw layered store. Commit, rollback and
+    /// savepoint rollback drive its transaction-scoped bookkeeping.
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
     pub(crate) fn set_layered_store(
         &mut self,
@@ -475,6 +478,8 @@ impl Session {
             lpg_backend: LpgBackend::Placeholder,
             graph_store: read_store,
             graph_store_mut: write_store,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -520,8 +525,6 @@ impl Session {
             tx_start_time: parking_lot::Mutex::new(None),
             #[cfg(feature = "lpg")]
             projections: cfg.projections,
-            #[cfg(all(feature = "compact-store", feature = "lpg"))]
-            layered_store: None,
         })
     }
 

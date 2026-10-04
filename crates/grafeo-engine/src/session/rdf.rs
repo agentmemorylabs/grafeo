@@ -39,6 +39,8 @@ impl Session {
             lpg_backend: super::LpgBackend::Active,
             graph_store,
             graph_store_mut,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
             catalog: cfg.catalog,
             rdf_store,
             transaction_manager: cfg.transaction_manager,
@@ -82,8 +84,6 @@ impl Session {
             #[cfg(feature = "metrics")]
             tx_start_time: parking_lot::Mutex::new(None),
             projections: cfg.projections,
-            #[cfg(all(feature = "compact-store", feature = "lpg"))]
-            layered_store: None,
         }
     }
 
