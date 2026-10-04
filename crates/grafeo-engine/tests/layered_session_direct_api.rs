@@ -178,10 +178,9 @@ fn get_neighbors_see_base_edges() {
         session.get_neighbors_outgoing_by_type(ids.grace, "MENTORS"),
         vec![(ids.linus, ids.mentors)]
     );
-    assert!(
-        session
-            .get_neighbors_outgoing_by_type(ids.grace, "KNOWS")
-            .is_empty()
+    assert_eq!(
+        session.get_neighbors_outgoing_by_type(ids.grace, "KNOWS"),
+        Vec::<(NodeId, EdgeId)>::new()
     );
     assert_eq!(session.get_degree(ids.grace), (1, 1));
 }
@@ -356,7 +355,10 @@ fn delete_edge_on_base_edge_takes_effect() {
         let session = db.session();
         assert!(session.delete_edge(ids.knows), "delete_edge(base KNOWS)");
         assert!(session.get_edge(ids.knows).is_none());
-        assert!(session.get_neighbors_outgoing(ids.ada).is_empty());
+        assert_eq!(
+            session.get_neighbors_outgoing(ids.ada),
+            Vec::<(NodeId, EdgeId)>::new()
+        );
         assert_eq!(
             cypher_count(&db, "MATCH ()-[e:KNOWS]->() RETURN count(e)"),
             0
@@ -527,7 +529,10 @@ fn single_file_database_direct_api_unchanged() {
     assert!(session.delete_edge(e));
     assert!(session.delete_node(b));
     assert!(session.get_node(b).is_none());
-    assert!(session.get_neighbors_outgoing(a).is_empty());
+    assert_eq!(
+        session.get_neighbors_outgoing(a),
+        Vec::<(NodeId, EdgeId)>::new()
+    );
 }
 
 // ── Promotion keeps base edges (Cypher-only, no direct API) ───────────
