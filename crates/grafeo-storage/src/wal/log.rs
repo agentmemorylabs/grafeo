@@ -435,6 +435,10 @@ impl WalManager {
         // Write checkpoint metadata atomically
         self.write_checkpoint_metadata(&metadata)?;
 
+        // Crash window: recovery now skips files below `log_sequence`, but
+        // old log files are not truncated yet.
+        grafeo_common::testing::crash::maybe_crash("wal_checkpoint:after_metadata");
+
         // Update in-memory checkpoint epoch
         *self.checkpoint_epoch.lock() = Some(epoch);
 

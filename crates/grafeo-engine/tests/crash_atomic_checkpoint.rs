@@ -42,6 +42,18 @@ const ENV_PATH: &str = "GRAFEO_CRASH_CHILD_PATH";
 /// child from ever completing cannot loop forever.
 const MAX_POINTS: u64 = 64;
 
+/// Crash sites every checkpoint must pass through: either side of the
+/// rename that publishes the new image.
+const PUBLISH_SITES: &[&str] = &["checkpoint:before_rename", "checkpoint:after_rename"];
+
+/// `wal_checkpoint()` also writes `checkpoint.meta` after the image is
+/// durable; die between that and the old-log truncation too.
+const WAL_CHECKPOINT_SITES: &[&str] = &[
+    "checkpoint:before_rename",
+    "checkpoint:after_rename",
+    "wal_checkpoint:after_metadata",
+];
+
 const ROUND1: &[&str] = &["Alix", "Gus"];
 const ROUND2: &[&str] = &["Jules", "Vincent"];
 
@@ -194,10 +206,16 @@ fn spawn_child(scenario: &str, point: u64, path: &Path) -> Option<String> {
 }
 
 /// Runs a scenario across all crash points and returns one line per point
-/// where reopening failed or lost data.
-fn run_scenario(scenario: &str, accept: impl Fn(&[String]) -> bool) -> Vec<String> {
+/// where reopening failed or lost data. Every site in `required_sites` must
+/// be among the crash points the child died at.
+fn run_scenario(
+    scenario: &str,
+    required_sites: &[&str],
+    accept: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
     let mut failures = Vec::new();
     let mut crashed_points = 0;
+    let mut sites = Vec::new();
     for point in 1..=MAX_POINTS {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("crash.grafeo");
@@ -207,7 +225,9 @@ fn run_scenario(scenario: &str, accept: impl Fn(&[String]) -> bool) -> Vec<Strin
         let crashed = site.is_some();
         let crash_site = if let Some(site) = site {
             crashed_points += 1;
-            format!("crash point {point} ({site})")
+            let line = format!("crash point {point} ({site})");
+            sites.push(site);
+            line
         } else {
             "completed".to_string()
         };
@@ -230,6 +250,12 @@ fn run_scenario(scenario: &str, accept: impl Fn(&[String]) -> bool) -> Vec<Strin
         assert!(point < MAX_POINTS, "{scenario}: child never completed");
     }
     assert!(crashed_points > 0, "{scenario}: no crash point was reached");
+    for required in required_sites {
+        assert!(
+            sites.iter().any(|s| s == required),
+            "{scenario}: crash site {required} was never reached; sites: {sites:?}"
+        );
+    }
     eprintln!("{scenario}: exercised {crashed_points} crash points");
     failures
 }
@@ -248,14 +274,22 @@ fn report(failures: &[String]) {
 #[test]
 fn sigkill_during_close_checkpoint_never_corrupts_file() {
     let all = sorted(&[ROUND1, ROUND2]);
-    report(&run_scenario("close_wal_on", |got| got == all));
+    report(&run_scenario("close_wal_on", PUBLISH_SITES, |got| {
+        got == all
+    }));
 }
 
-/// Explicit `wal_checkpoint()` with the database left open.
+/// Explicit `wal_checkpoint()` with the database left open. Includes a death
+/// inside the WAL checkpoint itself, after `checkpoint.meta` is written and
+/// before old log files are truncated.
 #[test]
 fn sigkill_during_wal_checkpoint_never_corrupts_file() {
     let all = sorted(&[ROUND1, ROUND2]);
-    report(&run_scenario("wal_checkpoint", |got| got == all));
+    report(&run_scenario(
+        "wal_checkpoint",
+        WAL_CHECKPOINT_SITES,
+        |got| got == all,
+    ));
 }
 
 /// Close-time checkpoint with the WAL off: the file is the only copy, so
@@ -264,7 +298,7 @@ fn sigkill_during_wal_checkpoint_never_corrupts_file() {
 fn sigkill_during_close_checkpoint_wal_off_keeps_old_or_new() {
     let old = sorted(&[ROUND1]);
     let new = sorted(&[ROUND1, ROUND2]);
-    report(&run_scenario("close_wal_off", |got| {
+    report(&run_scenario("close_wal_off", PUBLISH_SITES, |got| {
         got == old || got == new
     }));
 }
@@ -275,5 +309,9 @@ fn sigkill_during_close_checkpoint_wal_off_keeps_old_or_new() {
 #[test]
 fn sigkill_during_wal_checkpoint_after_rotation_keeps_wal_records() {
     let all = sorted(&[ROUND1, ROUND2]);
-    report(&run_scenario("wal_checkpoint_rotated", |got| got == all));
+    report(&run_scenario(
+        "wal_checkpoint_rotated",
+        WAL_CHECKPOINT_SITES,
+        |got| got == all,
+    ));
 }
