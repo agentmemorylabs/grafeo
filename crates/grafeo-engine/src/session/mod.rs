@@ -4,6 +4,8 @@
 //! its own transaction state, so concurrent sessions don't interfere with
 //! each other. Sessions are cheap to create - spin up as many as you need.
 
+#[cfg(feature = "lpg")]
+mod direct_store;
 #[cfg(feature = "triple-store")]
 mod rdf;
 #[cfg(feature = "lpg")]
@@ -125,6 +127,11 @@ pub struct Session {
     graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
+    /// The raw layered store (compact base + overlay) of a layered database,
+    /// which the direct node/edge APIs use for the default graph; `store` is
+    /// only the overlay there. `None` for every other database.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    layered_store: Option<Arc<grafeo_core::graph::compact::layered::LayeredStore>>,
     /// Schema and metadata catalog shared across sessions.
     catalog: Arc<Catalog>,
     /// RDF triple store (if RDF feature is enabled).
@@ -296,6 +303,8 @@ impl Session {
             lpg_backend: LpgBackend::Active,
             graph_store,
             graph_store_mut,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -356,6 +365,16 @@ impl Session {
     ) {
         self.graph_store = read_store;
         self.graph_store_mut = write_store;
+    }
+
+    /// Hands the session the raw layered store, so the direct node/edge APIs
+    /// reach base elements (see [`direct_store`](Self::direct_store)).
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    pub(crate) fn set_layered_store(
+        &mut self,
+        layered: Arc<grafeo_core::graph::compact::layered::LayeredStore>,
+    ) {
+        self.layered_store = Some(layered);
     }
 
     /// Sets the WAL for this session (shared with the database).
@@ -455,6 +474,8 @@ impl Session {
             lpg_backend: LpgBackend::Placeholder,
             graph_store: read_store,
             graph_store_mut: write_store,
+            #[cfg(all(feature = "compact-store", feature = "lpg"))]
+            layered_store: None,
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -675,6 +696,60 @@ impl Session {
                 .store
                 .graph(name)
                 .unwrap_or_else(|| Arc::clone(&self.store)),
+        }
+    }
+
+    /// Returns the store the direct node/edge APIs use for the active graph.
+    ///
+    /// On a layered database the default graph (and a named graph that does
+    /// not exist, which `active_lpg_store` maps to the default graph) is the
+    /// layered store: base plus overlay. Named graphs live wholly in the
+    /// overlay and keep using `active_lpg_store`, as everywhere else.
+    #[cfg(feature = "lpg")]
+    fn direct_store(&self) -> direct_store::DirectStore {
+        #[cfg(feature = "compact-store")]
+        if let Some(ref layered) = self.layered_store {
+            let named = self
+                .active_graph_storage_key()
+                .is_some_and(|name| self.store.graph(&name).is_some());
+            if !named {
+                return direct_store::DirectStore::Layered {
+                    read: Arc::clone(&self.graph_store),
+                    write: Arc::clone(layered),
+                };
+            }
+        }
+        direct_store::DirectStore::Lpg(self.active_lpg_store())
+    }
+
+    /// Runs a direct write against `store`.
+    ///
+    /// On the layered target with no open transaction (and auto-commit on),
+    /// the write runs in an implicit transaction that commits on success and
+    /// rolls back on error, like an auto-commit query. Generation-root WAL
+    /// replay applies only records followed by a `TransactionCommit`, and a
+    /// later `TransactionAbort` discards everything still pending, so a bare
+    /// write without its own commit could be lost on reopen. Everywhere else
+    /// `write` runs as before.
+    #[cfg(feature = "lpg")]
+    fn with_direct_write<T>(
+        &self,
+        store: &direct_store::DirectStore,
+        write: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if !(store.is_layered() && self.needs_auto_commit(true)) {
+            return write();
+        }
+        self.begin_transaction_inner(false, None)?;
+        match write() {
+            Ok(value) => {
+                self.commit_inner()?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = self.rollback_inner();
+                Err(e)
+            }
         }
     }
 
@@ -5173,36 +5248,36 @@ impl Session {
     #[cfg(feature = "lpg")]
     pub fn set_node_property(&self, id: NodeId, key: &str, value: Value) -> Result<()> {
         self.check_property_size(key, &value)?;
-        let (_, transaction_id) = self.get_transaction_context();
+        let store = self.direct_store();
+        self.with_direct_write(&store, || {
+            let (_, transaction_id) = self.get_transaction_context();
 
-        #[cfg(feature = "wal")]
-        let value_for_wal = value.clone();
-        #[cfg(feature = "vector-index")]
-        let vector_intent = self.active_graph_storage_key();
+            #[cfg(feature = "wal")]
+            let value_for_wal = value.clone();
+            #[cfg(feature = "vector-index")]
+            let vector_intent = self.active_graph_storage_key();
 
-        if let Some(tid) = transaction_id {
-            self.transaction_manager.record_write(tid, id)?;
-            self.active_lpg_store()
-                .set_node_property_versioned(id, key, value, tid);
-        } else {
-            self.active_lpg_store().set_node_property(id, key, value);
-        }
+            if let Some(tid) = transaction_id {
+                self.transaction_manager.record_write(tid, id)?;
+            }
+            store.set_node_property(id, key, value, transaction_id);
 
-        #[cfg(feature = "wal")]
-        self.log_wal_record(&grafeo_storage::wal::WalRecord::SetNodeProperty {
-            id,
-            key: key.to_string(),
-            value: value_for_wal,
-        });
+            #[cfg(feature = "wal")]
+            self.log_wal_record(&grafeo_storage::wal::WalRecord::SetNodeProperty {
+                id,
+                key: key.to_string(),
+                value: value_for_wal,
+            });
 
-        #[cfg(feature = "vector-index")]
-        self.push_vector_intent(VectorIndexIntent::Upsert {
-            graph_name: vector_intent,
-            node_id: id,
-            property: key.to_string(),
-        })?;
+            #[cfg(feature = "vector-index")]
+            self.push_vector_intent(VectorIndexIntent::Upsert {
+                graph_name: vector_intent,
+                node_id: id,
+                property: key.to_string(),
+            })?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Sets an edge property within the active transaction context.
@@ -5218,72 +5293,82 @@ impl Session {
         value: Value,
     ) -> Result<()> {
         self.check_property_size(key, &value)?;
-        let (_, transaction_id) = self.get_transaction_context();
+        let store = self.direct_store();
+        self.with_direct_write(&store, || {
+            let (_, transaction_id) = self.get_transaction_context();
 
-        #[cfg(feature = "wal")]
-        let value_for_wal = value.clone();
+            #[cfg(feature = "wal")]
+            let value_for_wal = value.clone();
 
-        if let Some(tid) = transaction_id {
-            self.active_lpg_store()
-                .set_edge_property_versioned(id, key, value, tid);
-        } else {
-            self.active_lpg_store().set_edge_property(id, key, value);
-        }
+            store.set_edge_property(id, key, value, transaction_id);
 
-        #[cfg(feature = "wal")]
-        self.log_wal_record(&grafeo_storage::wal::WalRecord::SetEdgeProperty {
-            id,
-            key: key.to_string(),
-            value: value_for_wal,
-        });
+            #[cfg(feature = "wal")]
+            self.log_wal_record(&grafeo_storage::wal::WalRecord::SetEdgeProperty {
+                id,
+                key: key.to_string(),
+                value: value_for_wal,
+            });
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Deletes a node within the active transaction context.
+    ///
+    /// On a layered database with no open transaction the delete commits in
+    /// its own implicit transaction; if that transaction cannot begin or
+    /// commit (e.g. a read-only session), the failure is logged and `false`
+    /// is returned.
     #[cfg(feature = "lpg")]
     pub fn delete_node(&self, id: NodeId) -> bool {
-        let (epoch, transaction_id) = self.get_transaction_context();
-        let deleted = if let Some(tid) = transaction_id {
-            self.active_lpg_store()
-                .delete_node_versioned(id, epoch, tid)
-        } else {
-            self.active_lpg_store().delete_node(id)
-        };
+        let store = self.direct_store();
+        let result = self.with_direct_write(&store, || {
+            let (epoch, transaction_id) = self.get_transaction_context();
+            let deleted = store.delete_node(id, epoch, transaction_id);
 
-        #[cfg(feature = "wal")]
-        if deleted {
-            self.log_wal_record(&grafeo_storage::wal::WalRecord::DeleteNode { id });
-        }
+            #[cfg(feature = "wal")]
+            if deleted {
+                self.log_wal_record(&grafeo_storage::wal::WalRecord::DeleteNode { id });
+            }
 
-        #[cfg(feature = "vector-index")]
-        if deleted {
-            let _ = self.push_vector_intent(VectorIndexIntent::Delete {
-                graph_name: self.active_graph_storage_key(),
-                node_id: id,
-            });
-        }
+            #[cfg(feature = "vector-index")]
+            if deleted {
+                let _ = self.push_vector_intent(VectorIndexIntent::Delete {
+                    graph_name: self.active_graph_storage_key(),
+                    node_id: id,
+                });
+            }
 
-        deleted
+            Ok(deleted)
+        });
+        result.unwrap_or_else(|e| {
+            grafeo_warn!("Session: delete_node({id:?}) failed: {e}");
+            false
+        })
     }
 
     /// Deletes an edge within the active transaction context.
+    ///
+    /// On a layered database the same implicit-transaction rule as
+    /// [`delete_node`](Self::delete_node) applies.
     #[cfg(feature = "lpg")]
     pub fn delete_edge(&self, id: grafeo_common::types::EdgeId) -> bool {
-        let (epoch, transaction_id) = self.get_transaction_context();
-        let deleted = if let Some(tid) = transaction_id {
-            self.active_lpg_store()
-                .delete_edge_versioned(id, epoch, tid)
-        } else {
-            self.active_lpg_store().delete_edge(id)
-        };
+        let store = self.direct_store();
+        let result = self.with_direct_write(&store, || {
+            let (epoch, transaction_id) = self.get_transaction_context();
+            let deleted = store.delete_edge(id, epoch, transaction_id);
 
-        #[cfg(feature = "wal")]
-        if deleted {
-            self.log_wal_record(&grafeo_storage::wal::WalRecord::DeleteEdge { id });
-        }
+            #[cfg(feature = "wal")]
+            if deleted {
+                self.log_wal_record(&grafeo_storage::wal::WalRecord::DeleteEdge { id });
+            }
 
-        deleted
+            Ok(deleted)
+        });
+        result.unwrap_or_else(|e| {
+            grafeo_warn!("Session: delete_edge({id:?}) failed: {e}");
+            false
+        })
     }
 
     // =========================================================================
@@ -5317,7 +5402,7 @@ impl Session {
     #[must_use]
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
         let (epoch, transaction_id) = self.get_transaction_context();
-        self.active_lpg_store().get_node_versioned(
+        self.direct_store().get_node_versioned(
             id,
             epoch,
             transaction_id.unwrap_or(TransactionId::SYSTEM),
@@ -5364,7 +5449,7 @@ impl Session {
     #[must_use]
     pub fn get_edge(&self, id: EdgeId) -> Option<Edge> {
         let (epoch, transaction_id) = self.get_transaction_context();
-        self.active_lpg_store().get_edge_versioned(
+        self.direct_store().get_edge_versioned(
             id,
             epoch,
             transaction_id.unwrap_or(TransactionId::SYSTEM),
@@ -5399,9 +5484,7 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[must_use]
     pub fn get_neighbors_outgoing(&self, node: NodeId) -> Vec<(NodeId, EdgeId)> {
-        self.active_lpg_store()
-            .edges_from(node, Direction::Outgoing)
-            .collect()
+        self.direct_store().edges_from(node, Direction::Outgoing)
     }
 
     /// Gets incoming neighbors of a node directly, bypassing query planning.
@@ -5415,9 +5498,7 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[must_use]
     pub fn get_neighbors_incoming(&self, node: NodeId) -> Vec<(NodeId, EdgeId)> {
-        self.active_lpg_store()
-            .edges_from(node, Direction::Incoming)
-            .collect()
+        self.direct_store().edges_from(node, Direction::Incoming)
     }
 
     /// Gets outgoing neighbors filtered by edge type, bypassing query planning.
@@ -5438,8 +5519,9 @@ impl Session {
         node: NodeId,
         edge_type: &str,
     ) -> Vec<(NodeId, EdgeId)> {
-        self.active_lpg_store()
+        self.direct_store()
             .edges_from(node, Direction::Outgoing)
+            .into_iter()
             .filter(|(_, edge_id)| {
                 self.get_edge(*edge_id)
                     .is_some_and(|e| e.edge_type.as_str() == edge_type)
@@ -5472,7 +5554,7 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[must_use]
     pub fn get_degree(&self, node: NodeId) -> (usize, usize) {
-        let active = self.active_lpg_store();
+        let active = self.direct_store();
         let out = active.out_degree(node);
         let in_degree = active.in_degree(node);
         (out, in_degree)
@@ -5492,7 +5574,7 @@ impl Session {
     pub fn get_nodes_batch(&self, ids: &[NodeId]) -> Vec<Option<Node>> {
         let (epoch, transaction_id) = self.get_transaction_context();
         let tx = transaction_id.unwrap_or(TransactionId::SYSTEM);
-        let active = self.active_lpg_store();
+        let active = self.direct_store();
         ids.iter()
             .map(|&id| active.get_node_versioned(id, epoch, tx))
             .collect()
