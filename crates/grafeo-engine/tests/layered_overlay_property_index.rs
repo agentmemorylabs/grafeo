@@ -33,7 +33,7 @@ use std::path::Path;
 
 use grafeo_common::types::{NodeId, Value};
 use grafeo_engine::session::TransactionalNodeCreate;
-use grafeo_engine::{GrafeoDB, GraphStore, generation_build_request};
+use grafeo_engine::{GrafeoDB, generation_build_request};
 use tempfile::tempdir;
 
 const KEY: &str = "k";
