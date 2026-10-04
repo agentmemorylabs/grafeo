@@ -29,8 +29,9 @@ use grafeo_engine::GrafeoDB;
 /// ```text
 /// Documents:    dA, dB
 /// Occurrences:  o1 (doc A, x=1), o2 (doc A, x=2), o3 (doc B, x=1), o4 (doc B, no evidence)
-/// Evidence:     ev1->o1, ev2->o2, ev3->o3, ev4->o3   (EVIDENCE_FOR_OCCURRENCE)
-/// IN_DOC:       o1->dA, o2->dA, o3->dB, o4->dB
+/// Evidence:     ev1->o1, ev2->o2, ev3->o3, ev4->o3   (EVIDENCE_FOR_OCCURRENCE, all w=1)
+/// IN_DOC:       o1->dA (w=1), o2->dA (w=2), o3->dB (w=1), o4->dB (w=1)
+/// ev1 also carries the label `Extra`.
 /// ```
 fn fixture() -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
@@ -40,16 +41,16 @@ fn fixture() -> GrafeoDB {
          (o2:SymbolOccurrence {name: 'o2', document_id: 'A', x: 2}), \
          (o3:SymbolOccurrence {name: 'o3', document_id: 'B', x: 1}), \
          (o4:SymbolOccurrence {name: 'o4', document_id: 'B', x: 3}), \
-         (ev1:RelationshipEvidence {name: 'ev1'}), \
+         (ev1:RelationshipEvidence:Extra {name: 'ev1'}), \
          (ev2:RelationshipEvidence {name: 'ev2'}), \
          (ev3:RelationshipEvidence {name: 'ev3'}), \
          (ev4:RelationshipEvidence {name: 'ev4'}), \
-         (ev1)-[:EVIDENCE_FOR_OCCURRENCE]->(o1), \
-         (ev2)-[:EVIDENCE_FOR_OCCURRENCE]->(o2), \
-         (ev3)-[:EVIDENCE_FOR_OCCURRENCE]->(o3), \
-         (ev4)-[:EVIDENCE_FOR_OCCURRENCE]->(o3), \
-         (o1)-[:IN_DOC]->(dA), (o2)-[:IN_DOC]->(dA), \
-         (o3)-[:IN_DOC]->(dB), (o4)-[:IN_DOC]->(dB)",
+         (ev1)-[:EVIDENCE_FOR_OCCURRENCE {w: 1}]->(o1), \
+         (ev2)-[:EVIDENCE_FOR_OCCURRENCE {w: 1}]->(o2), \
+         (ev3)-[:EVIDENCE_FOR_OCCURRENCE {w: 1}]->(o3), \
+         (ev4)-[:EVIDENCE_FOR_OCCURRENCE {w: 1}]->(o3), \
+         (o1)-[:IN_DOC {w: 1}]->(dA), (o2)-[:IN_DOC {w: 2}]->(dA), \
+         (o3)-[:IN_DOC {w: 1}]->(dB), (o4)-[:IN_DOC {w: 1}]->(dB)",
     )
     .expect("create fixture");
     db
@@ -518,4 +519,165 @@ fn bound_variable_repeated_within_later_pattern() {
         None,
     );
     assert_eq!(got, vec![vec![s("ev3"), s("ev4")]]);
+}
+
+// ============================================================================
+// Review follow-ups
+// ============================================================================
+
+/// An OPTIONAL MATCH can leave the bound variable NULL. A later MATCH that
+/// anchors on it must drop that row (a node pattern never matches NULL), not
+/// fail the query.
+#[test]
+fn null_optional_bound_anchor_drops_row() {
+    let db = fixture();
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence) \
+         OPTIONAL MATCH (o)<-[:EVIDENCE_FOR_OCCURRENCE]-(ev) \
+         MATCH (y:SymbolOccurrence)<-[:EVIDENCE_FOR_OCCURRENCE]-(ev) \
+         RETURN o.name, ev.name, y.name",
+        None,
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![s("o1"), s("ev1"), s("o1")],
+            vec![s("o2"), s("ev2"), s("o2")],
+            vec![s("o3"), s("ev3"), s("o3")],
+            vec![s("o3"), s("ev4"), s("o3")],
+        ]
+    );
+}
+
+/// Same, with the NULL-able variable at the start of the later pattern.
+#[test]
+fn null_optional_bound_start_drops_row() {
+    let db = fixture();
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence) \
+         OPTIONAL MATCH (o)<-[:EVIDENCE_FOR_OCCURRENCE]-(ev) \
+         MATCH (ev)-[:EVIDENCE_FOR_OCCURRENCE]->(y) \
+         RETURN o.name, ev.name",
+        None,
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![s("o1"), s("ev1")],
+            vec![s("o2"), s("ev2")],
+            vec![s("o3"), s("ev3")],
+            vec![s("o3"), s("ev4")],
+        ]
+    );
+}
+
+#[test]
+fn end_bound_after_with_alias() {
+    let db = fixture();
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence) WHERE o.document_id IN $ids WITH o AS occ \
+         MATCH (ev:RelationshipEvidence)-[:EVIDENCE_FOR_OCCURRENCE]->(occ) \
+         RETURN ev.name, occ.name",
+        Some(ids_a()),
+    );
+    assert_eq!(got, vec![vec![s("ev1"), s("o1")], vec![s("ev2"), s("o2")]]);
+}
+
+/// A variable-length hop with an edge variable and a property map before the
+/// bound node. The planner keeps only the last hop's edge in `r`, and the map
+/// is checked on that edge: here the `IN_DOC` edge into `dA`, so ev1 (o1 -[w=1]->
+/// dA) matches and ev2 (o2 -[w=2]-> dA) does not. Walking the hop backward
+/// from `d` would make the evidence edge "last" and match both, so such a
+/// path must keep its written order and give the same rows as the pattern
+/// without the earlier MATCH.
+#[test]
+fn end_bound_variable_length_with_property_map() {
+    let db = fixture();
+    let unanchored = rows(
+        &db,
+        "MATCH (a:RelationshipEvidence)-[r*2..2 {w: 1}]->(d:Document {name: 'dA'}) \
+         RETURN a.name",
+        None,
+    );
+    let anchored = rows(
+        &db,
+        "MATCH (d:Document {name: 'dA'}) \
+         MATCH (a:RelationshipEvidence)-[r*2..2 {w: 1}]->(d) \
+         RETURN a.name",
+        None,
+    );
+    assert_eq!(unanchored, vec![vec![s("ev1")]]);
+    assert_eq!(anchored, unanchored);
+}
+
+/// A variable-length hop with an edge variable before the bound node must
+/// bind `r` exactly as the same pattern does without the earlier MATCH.
+#[test]
+fn end_bound_variable_length_with_edge_variable() {
+    let db = fixture();
+    let unanchored = rows(
+        &db,
+        "MATCH (a:RelationshipEvidence)-[r*2..2]->(d:Document {name: 'dA'}) \
+         RETURN a.name, r",
+        None,
+    );
+    let anchored = rows(
+        &db,
+        "MATCH (d:Document {name: 'dA'}) \
+         MATCH (a:RelationshipEvidence)-[r*2..2]->(d) \
+         RETURN a.name, r",
+        None,
+    );
+    assert_eq!(unanchored.len(), 2);
+    assert_eq!(anchored, unanchored);
+}
+
+/// Every label on a node reached by walking backward from the anchor is
+/// checked, not only the first.
+#[test]
+fn backward_reached_node_checks_all_labels() {
+    let db = fixture();
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence) \
+         MATCH (ev:RelationshipEvidence:Extra)-[:EVIDENCE_FOR_OCCURRENCE]->(o) \
+         RETURN ev.name",
+        None,
+    );
+    assert_eq!(got, vec![vec![s("ev1")]]);
+}
+
+/// The anchor is `o`; `d`, bound too, appears later in the path and must be
+/// joined on as well.
+#[test]
+fn anchor_plus_later_bound_node() {
+    let db = fixture();
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence {name: 'o1'}) \
+         MATCH (d:Document) \
+         MATCH (ev)-[:EVIDENCE_FOR_OCCURRENCE]->(o)-[:IN_DOC]->(d) \
+         RETURN ev.name, d.name",
+        None,
+    );
+    assert_eq!(got, vec![vec![s("ev1"), s("dA")]]);
+}
+
+/// A comma pattern that shares a variable with an earlier comma pattern is
+/// translated on its own and joined; it must also join on `o`, bound by the
+/// earlier MATCH clause.
+#[test]
+fn comma_pattern_joins_on_earlier_clause_variable() {
+    let db = fixture();
+    let got = rows(
+        &db,
+        "MATCH (o:SymbolOccurrence {name: 'o3'}) \
+         MATCH (ev:RelationshipEvidence), (ev)-[:EVIDENCE_FOR_OCCURRENCE]->(o) \
+         RETURN ev.name, o.name",
+        None,
+    );
+    assert_eq!(got, vec![vec![s("ev3"), s("o3")], vec![s("ev4"), s("o3")]]);
 }

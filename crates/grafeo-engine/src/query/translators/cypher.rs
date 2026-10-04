@@ -528,12 +528,29 @@ impl CypherTranslator {
             .clone()
             .unwrap_or_else(|| self.next_anon_var());
         let label = node.labels.first().cloned();
+        let rebinds = input
+            .as_ref()
+            .is_some_and(|plan| scope_variables(plan).contains(&variable));
 
         let mut plan = LogicalOperator::NodeScan(NodeScanOp {
             variable: variable.clone(),
             label,
             input: input.map(Box::new),
         });
+
+        // A node pattern on a variable that is already bound reuses its
+        // column. The value can be NULL (an OPTIONAL MATCH that found
+        // nothing); a node pattern never matches NULL, so drop those rows
+        // here rather than let an expand from it fail.
+        if rebinds {
+            plan = wrap_filter(
+                plan,
+                LogicalExpression::Unary {
+                    op: UnaryOp::IsNotNull,
+                    operand: Box::new(LogicalExpression::Variable(variable.clone())),
+                },
+            );
+        }
 
         // Add hasLabel filters for additional labels (AND semantics).
         // First label is used in NodeScan for scan-time filtering; remaining
@@ -635,8 +652,19 @@ impl CypherTranslator {
             let bound = scope_variables(input_plan);
             let is_bound =
                 |node: &ast::NodePattern| node.variable.as_ref().is_some_and(|v| bound.contains(v));
+            // A variable-length hop keeps only its last edge in the edge
+            // column, and its edge variable, property map and inline WHERE
+            // apply to that edge. Walking such a hop backward would make the
+            // other end's edge "last", so those paths keep the written order.
+            let reversible = |rel: &ast::RelationshipPattern| {
+                rel.length.is_none()
+                    || (rel.variable.is_none()
+                        && rel.properties.is_empty()
+                        && rel.where_clause.is_none())
+            };
             if !is_bound(&path.start)
                 && let Some(anchor) = path.chain.iter().position(|rel| is_bound(&rel.target))
+                && path.chain[..=anchor].iter().all(reversible)
                 && let Some(input) = input
             {
                 return self.translate_anchored_path(path, anchor, input);
