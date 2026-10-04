@@ -59,7 +59,10 @@ fn publish_indexed_base(root: &Path) {
 
 fn open(root: &Path) -> GrafeoDB {
     let db = GrafeoDB::open_generation_root(root, false).expect("open generation root");
-    assert!(db.layered_store().is_some(), "generation root opens layered");
+    assert!(
+        db.layered_store().is_some(),
+        "generation root opens layered"
+    );
     assert!(
         db.has_property_index(KEY),
         "the base generation's property index is registered after open"
@@ -136,7 +139,14 @@ fn expected(after_second_session: bool) -> Vec<(&'static str, Vec<&'static str>)
         ("n3", vec!["n3"]),     // (a) created via GrafeoDB::create_node_with_props
         ("n4", vec![]),         // (d) created then deleted after reopen
         // created only after the replayed reopen
-        ("n5", if after_second_session { vec!["n5"] } else { vec![] }),
+        (
+            "n5",
+            if after_second_session {
+                vec!["n5"]
+            } else {
+                vec![]
+            },
+        ),
     ]
 }
 
@@ -325,7 +335,10 @@ fn batch_created_overlay_node_found_by_in_lookup_after_reopen() {
         "index IN lookup finds the replayed overlay node after reopen"
     );
     let mut params = HashMap::new();
-    params.insert("ids".to_string(), Value::from(vec![Value::from("z1"), Value::from("b1")]));
+    params.insert(
+        "ids".to_string(),
+        Value::from(vec![Value::from("z1"), Value::from("b1")]),
+    );
     let both = db
         .session()
         .execute_language(

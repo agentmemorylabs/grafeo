@@ -1359,9 +1359,29 @@ impl GraphStore for LayeredStore {
     }
 
     fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
+        let overlay = self.overlay.load();
+
+        // D5: a property index restored from a generation's PropertyIndex
+        // section is a mapped (immutable) index on the overlay; writes since
+        // the open live in its heap write delta. Neither half is trustworthy
+        // alone: the mapped postings still carry old values of base nodes
+        // updated or deleted since, and the delta holds only the overlay's
+        // writes. Union both and keep the candidates whose value in the
+        // merged base+overlay view still equals `value`. No LayeredStore lock
+        // is held across the verification (`get_node_property` takes them).
+        if let Some(candidates) = overlay.mapped_property_index_candidates(property, value) {
+            let key = PropertyKey::new(property);
+            return candidates
+                .into_iter()
+                .filter(|id| {
+                    self.get_node_property(*id, &key)
+                        .is_some_and(|stored| stored == *value)
+                })
+                .collect();
+        }
+
         let deleted = self.deleted_from_base_nodes.read();
         let dirty = self.dirty_node_ids.read();
-        let overlay = self.overlay.load();
 
         // G-E1.RO: after compact, create_property_index / mapped PropertyIndex
         // restore store full base+overlay postings on the overlay. Merging a
@@ -1406,7 +1426,13 @@ impl GraphStore for LayeredStore {
             if !overlay.has_property_index(prop) {
                 continue;
             }
-            let hits = overlay.find_nodes_by_property(prop, value);
+            // Mapped index (D5): mapped postings + write delta, unverified —
+            // every condition is verified on the merged view below. The
+            // overlay's own `find_nodes_by_property` cannot be used for a
+            // mapped key: it cannot see base values.
+            let hits = overlay
+                .mapped_property_index_candidates(prop, value)
+                .unwrap_or_else(|| overlay.find_nodes_by_property(prop, value));
             if seed.as_ref().is_some_and(|best| best.len() <= hits.len()) {
                 continue;
             }

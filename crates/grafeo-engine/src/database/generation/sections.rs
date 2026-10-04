@@ -421,7 +421,8 @@ impl GrafeoDB {
         }
 
         // PropertyIndex: install postings (mapped set; heap copy on writable
-        // opens, matching load_from_sections).
+        // opens, matching load_from_sections). The installed index keeps a
+        // heap write delta that replay and later writes maintain (D5).
         if let Some(bytes) = lease.property_index_bytes() {
             let mapped_set = if read_only {
                 grafeo_core::index::property::parse_property_index_section(bytes)?
