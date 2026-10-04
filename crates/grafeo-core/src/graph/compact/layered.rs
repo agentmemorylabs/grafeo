@@ -1202,13 +1202,18 @@ impl GraphStore for LayeredStore {
         // to skip the base: `ensure_in_overlay` promotes a node's labels
         // and properties but never copies its adjacency, so base edges
         // remain authoritative for any dirty node that originated in the
-        // snapshot. Per-edge deletions are still respected via
-        // `deleted_from_base_edges` inside `edges_from`-style call sites,
-        // and `dedup` below collapses any overlap with promoted overlay
-        // adjacency.
+        // snapshot. Walk base *edges* rather than base neighbors so the
+        // same per-edge filter as `edges_from` applies: deleted base edges
+        // and dirty (overlay-owned) edges are not reported from the base.
+        // `dedup` below collapses any overlap with overlay adjacency.
         if !deleted_nodes.contains(&node) {
-            for nid in self.base.load().neighbors(node, direction) {
-                if !deleted_nodes.contains(&nid) {
+            let deleted_edges = self.deleted_from_base_edges.read();
+            let dirty_edges = self.dirty_edge_ids.read();
+            for (nid, eid) in self.base.load().edges_from(node, direction) {
+                if !deleted_nodes.contains(&nid)
+                    && !deleted_edges.contains(&eid)
+                    && !dirty_edges.contains(&eid)
+                {
                     results.push(nid);
                 }
             }
@@ -1244,10 +1249,17 @@ impl GraphStore for LayeredStore {
         // pre-existing snapshot edges. Promoted edges (those in both
         // tiers because their properties were modified) live at the same
         // `EdgeId` in base and overlay and are folded together by the
-        // dedup-by-eid pass below.
+        // dedup-by-eid pass below. A dirty edge is owned by the overlay
+        // (its promoted copy, or nothing once that copy is deleted), so it
+        // is skipped here and reported, if still live, by the overlay pass;
+        // otherwise a promoted-then-deleted edge would resurrect from base.
         if !deleted_nodes.contains(&node) {
+            let dirty_edges = self.dirty_edge_ids.read();
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
+                if !deleted_nodes.contains(&target)
+                    && !deleted_edges.contains(&eid)
+                    && !dirty_edges.contains(&eid)
+                {
                     results.push((target, eid));
                 }
             }
@@ -4399,8 +4411,7 @@ mod tests {
         let first = persons[0];
 
         // Capture the base-tier outgoing edges before any promotion.
-        let base_outgoing: Vec<(NodeId, EdgeId)> =
-            layered.edges_from(first, Direction::Outgoing);
+        let base_outgoing: Vec<(NodeId, EdgeId)> = layered.edges_from(first, Direction::Outgoing);
         assert!(
             !base_outgoing.is_empty(),
             "test fixture should give the first Person a base edge"
@@ -4426,12 +4437,42 @@ mod tests {
         // source node becomes dirty.
         for (target, eid) in &base_outgoing {
             assert!(
-                outgoing
-                    .iter()
-                    .any(|(t, e)| t == target && e == eid),
+                outgoing.iter().any(|(t, e)| t == target && e == eid),
                 "base edge {eid:?} (→ {target:?}) must remain visible after promotion"
             );
         }
+    }
+
+    /// A base edge promoted into the overlay (by an edge-property write) and
+    /// then deleted there must not resurrect from the base copy now that the
+    /// base is consulted for dirty endpoints; and a plain base-edge delete
+    /// must be honoured by `neighbors` as well as `edges_from`.
+    #[test]
+    fn test_promoted_then_deleted_base_edge_stays_deleted() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let (alix, gus) = (persons[0], persons[1]);
+        let amsterdam = layered.nodes_by_label("City")[0];
+        let (_, e_alix) = layered.edges_from(alix, Direction::Outgoing)[0];
+        let (_, e_gus) = layered.edges_from(gus, Direction::Outgoing)[0];
+
+        // Promote then delete alix's edge; plain-delete gus's edge.
+        layered.set_edge_property(e_alix, "since", Value::Int64(1999));
+        assert!(layered.is_edge_dirty(e_alix));
+        assert!(layered.delete_edge(e_alix));
+        assert!(layered.delete_edge(e_gus));
+
+        for node in [alix, gus] {
+            assert!(layered.edges_from(node, Direction::Outgoing).is_empty());
+            assert!(layered.neighbors(node, Direction::Outgoing).is_empty());
+        }
+        assert!(
+            layered
+                .edges_from(amsterdam, Direction::Incoming)
+                .is_empty()
+        );
+        assert!(layered.neighbors(amsterdam, Direction::Incoming).is_empty());
+        assert!(layered.get_edge(e_alix).is_none());
     }
 
     /// Regression for property-anchored edge lookups across the snapshot
@@ -4486,7 +4527,9 @@ mod tests {
             .expect("pre-promotion fixture has a base LIVES_IN edge");
 
         assert!(
-            post_out.iter().any(|(t, e)| *t == amsterdam && *e == base_eid),
+            post_out
+                .iter()
+                .any(|(t, e)| *t == amsterdam && *e == base_eid),
             "base LIVES_IN edge must remain visible via edges_from(src, Outgoing) after src is promoted"
         );
         assert!(
