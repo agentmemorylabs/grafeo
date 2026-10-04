@@ -445,13 +445,18 @@ impl super::GrafeoDB {
         // replays the records the old image is missing. The WAL position is
         // captured before the snapshot so records that race with it (or land
         // in a log file rotated out meanwhile) are still replayed.
+        //
+        // `rotate()` bumps the sequence before it swaps in the new log file,
+        // so `current_sequence()` can read S+1 while a commit still lands in
+        // file S. Step back one file: recovery then replays file S as well.
+        // At worst that replays one extra, already-snapshotted log file.
         #[cfg(feature = "grafeo-file")]
         if let Some(ref fm) = self.file_manager {
             #[cfg(feature = "wal")]
             let covered_sequence = match self.wal {
                 Some(ref wal) => {
                     wal.sync()?;
-                    Some(wal.current_sequence())
+                    Some(wal.current_sequence().saturating_sub(1))
                 }
                 None => None,
             };

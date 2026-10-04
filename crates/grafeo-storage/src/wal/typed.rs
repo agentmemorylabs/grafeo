@@ -101,11 +101,15 @@ impl<R: WalEntry> TypedWal<R> {
     }
 
     /// Like [`checkpoint`](Self::checkpoint), for a snapshot taken when the
-    /// WAL was at log sequence `covered_sequence` (from
-    /// [`current_sequence`](Self::current_sequence), read before the
-    /// snapshot). Recovery will still replay every log file from that
-    /// sequence on, so records written while the snapshot was being taken
-    /// are not skipped even if the WAL rotated meanwhile.
+    /// WAL was at log sequence `covered_sequence`, read before the snapshot.
+    /// Recovery will still replay every log file from that sequence on, so
+    /// records written while the snapshot was being taken are not skipped
+    /// even if the WAL rotated meanwhile.
+    ///
+    /// Pass `current_sequence().saturating_sub(1)`, not
+    /// [`current_sequence`](Self::current_sequence) itself: rotation bumps
+    /// the sequence before it swaps in the new log file, so the value read
+    /// can be one ahead of the file that is still receiving writes.
     ///
     /// Call this only after the snapshot is durable.
     ///

@@ -577,7 +577,10 @@ impl WalManager {
     /// Returns the current WAL log sequence number.
     ///
     /// Each log file has a sequence number embedded in its name
-    /// (`wal_XXXXXXXX.log`). This returns the sequence of the active log file.
+    /// (`wal_XXXXXXXX.log`). This returns the sequence of the active log file,
+    /// except while [`rotate`](Self::rotate) is in progress: the sequence is
+    /// bumped before the new file is swapped in, so it can be one ahead of
+    /// the file still receiving writes.
     #[must_use]
     pub fn current_sequence(&self) -> u64 {
         self.current_sequence.load(Ordering::Relaxed)
@@ -962,6 +965,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(wal.checkpoint_epoch(), Some(EpochId::new(10)));
+    }
+
+    /// `rotate()` bumps the sequence before it swaps in the new log file. A
+    /// checkpointer that reads `current_sequence()` inside that window sees
+    /// S+1 while a racing commit still lands in file S. Covering
+    /// `current_sequence() - 1` keeps file S in recovery; covering the raw
+    /// value skips it and loses the commit.
+    #[test]
+    fn checkpoint_covering_previous_sequence_keeps_commit_written_mid_rotation() {
+        use crate::wal::WalRecovery;
+
+        for (step_back, expect_recovered) in [(1, true), (0, false)] {
+            let dir = tempdir().unwrap();
+            let wal = WalManager::open(dir.path()).unwrap();
+
+            // Simulate rotate() between its sequence bump and its file swap.
+            wal.current_sequence.fetch_add(1, Ordering::SeqCst);
+            let covered = wal.current_sequence().saturating_sub(step_back);
+
+            // A commit that races with the snapshot still lands in the old file.
+            wal.log(&WalRecord::CreateNode {
+                id: NodeId::new(7),
+                labels: vec![],
+            })
+            .unwrap();
+            wal.log(&WalRecord::TransactionCommit {
+                transaction_id: TransactionId::new(7),
+            })
+            .unwrap();
+
+            wal.log(&WalRecord::Checkpoint {
+                transaction_id: TransactionId::new(7),
+            })
+            .unwrap();
+            wal.complete_checkpoint(TransactionId::new(7), EpochId::new(1), Some(covered))
+                .unwrap();
+            drop(wal);
+
+            let records = WalRecovery::new(dir.path()).recover().unwrap();
+            let recovered = records
+                .iter()
+                .any(|r| matches!(r, WalRecord::CreateNode { id, .. } if *id == NodeId::new(7)));
+            assert_eq!(recovered, expect_recovered, "step_back={step_back}");
+        }
     }
 
     // ── H-ADOPT.3 Phase C: truncate_active_tail ──────────────────────────
