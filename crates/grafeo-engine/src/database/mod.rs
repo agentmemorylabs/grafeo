@@ -3456,22 +3456,24 @@ impl GrafeoDB {
                 .last_assigned_transaction_id()
                 .unwrap_or_else(|| self.transaction_manager.begin());
 
-            // Log a TransactionCommit to mark all pending records as committed
-            wal.log(&WalRecord::TransactionCommit {
-                transaction_id: commit_tx,
-            })?;
-
-            // Pair the blanket commit with an EpochAdvance: generation-root
-            // replay (H-ADOPT.3) requires an EpochAdvance after EVERY
-            // TransactionCommit, and a second unpaired close-time commit
-            // otherwise poisons the stream (commit-while-awaiting-epoch =>
-            // NonRecoverable), making the root unopenable after two clean
-            // closes. Legacy directory-format recovery treats EpochAdvance as
-            // metadata pass-through (wal/recovery.rs), so this changes
-            // nothing for existing recovery behavior.
-            wal.log(&WalRecord::EpochAdvance {
-                epoch: self.transaction_manager.current_epoch(),
-            })?;
+            // Log a TransactionCommit to mark all pending records as committed,
+            // paired with an EpochAdvance: generation-root replay (H-ADOPT.3)
+            // requires an EpochAdvance right after EVERY TransactionCommit, and
+            // a second unpaired close-time commit otherwise poisons the stream
+            // (commit-while-awaiting-epoch => NonRecoverable), making the root
+            // unopenable after two clean closes. Written as one atomic append
+            // so no other record can land between them. Legacy directory-format
+            // recovery treats EpochAdvance as metadata pass-through
+            // (wal/recovery.rs), so this changes nothing for existing recovery
+            // behavior.
+            wal.log_atomic(&[
+                WalRecord::TransactionCommit {
+                    transaction_id: commit_tx,
+                },
+                WalRecord::EpochAdvance {
+                    epoch: self.transaction_manager.current_epoch(),
+                },
+            ])?;
 
             wal.sync()?;
         }

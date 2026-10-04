@@ -85,6 +85,28 @@ impl<R: WalEntry> TypedWal<R> {
         self.manager.write_frame(&data, force_sync)
     }
 
+    /// Logs several records as adjacent frames: no other writer's record can
+    /// land between them. Fsyncs (in sync durability mode) when any of them
+    /// [requires it](WalEntry::requires_sync).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or writing fails; nothing is written
+    /// when serialization fails.
+    pub fn log_atomic(&self, records: &[R]) -> Result<()> {
+        let mut encoded = Vec::with_capacity(records.len());
+        let mut force_sync = false;
+        for record in records {
+            encoded.push(
+                bincode::serde::encode_to_vec(record, bincode::config::standard())
+                    .map_err(|e| Error::Serialization(e.to_string()))?,
+            );
+            force_sync |= record.requires_sync();
+        }
+        let frames: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+        self.manager.write_frames(&frames, force_sync)
+    }
+
     /// Writes a checkpoint marker and persists checkpoint metadata.
     ///
     /// Creates a checkpoint record via [`WalEntry::make_checkpoint`], logs it,
