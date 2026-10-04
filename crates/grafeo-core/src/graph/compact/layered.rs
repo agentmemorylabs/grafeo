@@ -990,6 +990,19 @@ impl LayeredStore {
         self.deleted_from_base_nodes.read().contains(&id)
     }
 
+    /// Whether a node that exists in the base is no longer visible: deleted
+    /// from the base directly, or promoted into the overlay and deleted there.
+    fn base_node_gone(&self, id: NodeId) -> bool {
+        self.is_node_deleted_from_base(id)
+            || (self.is_node_dirty(id) && self.overlay.load().get_node(id).is_none())
+    }
+
+    /// Edge counterpart of [`base_node_gone`](Self::base_node_gone).
+    fn base_edge_gone(&self, id: EdgeId) -> bool {
+        self.is_edge_deleted_from_base(id)
+            || (self.is_edge_dirty(id) && self.overlay.load().get_edge(id).is_none())
+    }
+
     /// Checks whether an edge ID is in the overlay (dirty or deleted).
     #[inline]
     fn is_edge_dirty(&self, id: EdgeId) -> bool {
@@ -1194,45 +1207,29 @@ impl GraphStore for LayeredStore {
     }
 
     fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
-        let deleted_nodes = self.deleted_from_base_nodes.read();
-
-        let mut results = Vec::new();
-
-        // Base neighbors (minus deleted).
-        if !deleted_nodes.contains(&node) && !self.is_node_dirty(node) {
-            for nid in self.base.load().neighbors(node, direction) {
-                if !deleted_nodes.contains(&nid) {
-                    results.push(nid);
-                }
-            }
-        }
-
-        // Overlay neighbors — always consulted. An edge created after
-        // `compact()` whose src is a base node records the base id in
-        // the overlay's adjacency even though the overlay has no
-        // corresponding node object; gating on `overlay.get_node(node)`
-        // would miss that case.
-        for nid in self.overlay.load().neighbors(node, direction) {
-            if !deleted_nodes.contains(&nid) {
-                results.push(nid);
-            }
-        }
-
+        // Derived from `edges_from` so both share one visibility rule (a base
+        // edge deleted on its own must not leave its endpoint as a neighbour).
+        let mut results: Vec<NodeId> = self
+            .edges_from(node, direction)
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect();
         results.sort_unstable();
         results.dedup();
         results
     }
 
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
-        let deleted_nodes = self.deleted_from_base_nodes.read();
-        let deleted_edges = self.deleted_from_base_edges.read();
-
         let mut results = Vec::new();
 
-        // Base edges (minus deleted).
-        if !deleted_nodes.contains(&node) && !self.is_node_dirty(node) {
+        // Base edges (minus deleted). A promoted (dirty) node keeps its base
+        // adjacency: promotion copies the node's labels and properties into
+        // the overlay but not its edges, so skipping base edges for dirty
+        // nodes would hide every un-promoted base edge of a node as soon as
+        // one of its properties is written.
+        if !self.base_node_gone(node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
+                if !self.base_node_gone(target) && !self.base_edge_gone(eid) {
                     results.push((target, eid));
                 }
             }
@@ -1245,6 +1242,8 @@ impl GraphStore for LayeredStore {
         // `LpgStore::edges_from` returns empty for ids with no outgoing
         // edges, so the unconditional call is cheap when there's nothing
         // to report.
+        let deleted_nodes = self.deleted_from_base_nodes.read();
+        let deleted_edges = self.deleted_from_base_edges.read();
         for (target, eid) in self.overlay.load().edges_from(node, direction) {
             if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
                 results.push((target, eid));
