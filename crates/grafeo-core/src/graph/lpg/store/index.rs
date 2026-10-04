@@ -210,6 +210,13 @@ impl LpgStore {
     }
 
     /// Snapshot all heap property-index postings for section serialization.
+    ///
+    /// For a key with a restored mapped index this decodes every mapped
+    /// posting (cost proportional to the section) and passes through ids this
+    /// store holds no record of without checking them. On a layered overlay
+    /// those are base rows, possibly deleted or changed since; the generation
+    /// writers therefore rebuild postings from the layered graph instead of
+    /// calling this.
     #[must_use]
     pub fn property_index_snapshot_entries(
         &self,

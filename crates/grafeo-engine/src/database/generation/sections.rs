@@ -295,30 +295,34 @@ fn capture_property_index(
     db: &GrafeoDB,
     store: &Arc<LpgStore>,
 ) -> Result<Option<SerializedSection>> {
-    let mut snaps = store.property_index_snapshot_entries();
+    // Postings are rebuilt from the full layered graph for every registered
+    // key, so base rows are included. The overlay's own postings are not read:
+    // for a restored mapped index they would be a base-sized decode that is
+    // thrown away here anyway.
     let keys = store.property_index_keys();
     if keys.is_empty() {
         return Ok(None);
     }
     let graph = db.graph_store();
-    let mut by_name: std::collections::BTreeMap<String, PropertyIndexSnapshot> =
-        snaps.drain(..).map(|s| (s.name.clone(), s)).collect();
-    for prop in keys {
-        let entry = by_name
-            .entry(prop.clone())
-            .or_insert_with(|| PropertyIndexSnapshot {
-                name: prop.clone(),
-                entries: Vec::new(),
-            });
-        entry.entries.clear();
-        let prop_key = grafeo_common::types::PropertyKey::new(&prop);
-        for node_id in graph.node_ids() {
-            if let Some(value) = graph.get_node_property(node_id, &prop_key) {
-                entry.entries.push((value, node_id));
+    let node_ids = graph.node_ids();
+    let snaps: Vec<PropertyIndexSnapshot> = keys
+        .into_iter()
+        .map(|prop| {
+            let prop_key = grafeo_common::types::PropertyKey::new(&prop);
+            let entries = node_ids
+                .iter()
+                .filter_map(|&node_id| {
+                    graph
+                        .get_node_property(node_id, &prop_key)
+                        .map(|value| (value, node_id))
+                })
+                .collect();
+            PropertyIndexSnapshot {
+                name: prop,
+                entries,
             }
-        }
-    }
-    snaps = by_name.into_values().collect();
+        })
+        .collect();
     let section = PropertyIndexSection::from_snapshots(snaps);
     Ok(Some(SerializedSection {
         bytes: section.serialize()?,
@@ -420,21 +424,14 @@ impl GrafeoDB {
             }
         }
 
-        // PropertyIndex: install postings (mapped set; heap copy on writable
-        // opens, matching load_from_sections). The installed index keeps a
-        // heap write delta that replay and later writes maintain (D5).
+        // PropertyIndex: install the mapped postings zero-copy on every open,
+        // read-only or writable. The `Bytes` own the section mapping, so the
+        // postings stay file-backed for as long as the index exists, with no
+        // heap copy proportional to the base. Writable opens stay correct
+        // because the installed index keeps a heap write delta that WAL
+        // replay and later writes maintain (D5).
         if let Some(bytes) = lease.property_index_bytes() {
-            let mapped_set = if read_only {
-                grafeo_core::index::property::parse_property_index_section(bytes)?
-            } else {
-                let mut section = PropertyIndexSection::empty();
-                section.deserialize(&bytes)?;
-                section.take_mapped().ok_or_else(|| {
-                    Error::Serialization(
-                        "PropertyIndex section deserialized without mapped set".into(),
-                    )
-                })?
-            };
+            let mapped_set = grafeo_core::index::property::parse_property_index_section(bytes)?;
             for idx in mapped_set.indexes() {
                 store.install_mapped_property_index(Arc::new(idx.clone()));
             }

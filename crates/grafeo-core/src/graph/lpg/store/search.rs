@@ -194,6 +194,12 @@ impl LpgStore {
     /// If the property is indexed, this is O(1). Otherwise, it scans all nodes
     /// which is O(n). Use [`Self::create_property_index`] for frequently queried properties.
     ///
+    /// With a restored mapped index, hits for nodes this store holds are
+    /// re-checked against their current value, but ids it holds no record of
+    /// (a layered store's base rows) are returned unchecked. On a layered
+    /// overlay, query through the `LayeredStore` instead, which checks every
+    /// hit against the merged base + overlay view.
+    ///
     /// # Example
     ///
     /// ```
