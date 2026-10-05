@@ -297,6 +297,45 @@ struct SavepointState {
     layered_position: usize,
 }
 
+/// What [`Session::abort_transaction`] could not finish. The abort itself
+/// always completes in memory; these are reported after it.
+#[cfg(feature = "lpg")]
+struct AbortOutcome {
+    /// The transaction manager's abort.
+    aborted: Result<()>,
+    /// Why the `TransactionAbort` marker could not be appended (layered
+    /// databases only; the WAL is poisoned by then).
+    marker_error: Option<String>,
+    /// Layered base changes the undo could no longer restore.
+    unrestored: usize,
+}
+
+#[cfg(feature = "lpg")]
+impl AbortOutcome {
+    /// The result of an explicit rollback, after everything else is done.
+    fn into_rollback_result(self, transaction_id: TransactionId) -> Result<()> {
+        self.aborted?;
+        // Built (and logged) even when the marker error is the one returned.
+        #[cfg(feature = "compact-store")]
+        let incomplete = (self.unrestored > 0)
+            .then(|| Session::incomplete_rollback_error(transaction_id, self.unrestored, false));
+        #[cfg(not(feature = "compact-store"))]
+        let _ = (transaction_id, self.unrestored);
+        if let Some(marker) = self.marker_error {
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "transaction rolled back in memory, but its WAL abort marker could not be \
+                 written ({marker}); the WAL refuses further writes until the database is \
+                 reopened"
+            )));
+        }
+        #[cfg(feature = "compact-store")]
+        if let Some(e) = incomplete {
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
 impl Session {
     /// Creates a new session with adaptive execution configuration.
     #[cfg(feature = "lpg")]
@@ -4264,32 +4303,21 @@ impl Session {
         let commit_epoch = match self.transaction_manager.commit(transaction_id) {
             Ok(epoch) => epoch,
             Err(e) => {
-                // Conflict detected: rollback the data changes
-                for graph_name in &touched {
-                    let store = self.resolve_store(graph_name);
-                    store.rollback_transaction_properties(transaction_id);
-                }
-                // The conflict error is what the caller gets; an incomplete
-                // layered undo is only logged here.
+                // Conflict detected: abort the transaction completely so its
+                // entities are released and its versions discarded (#409).
+                // The caller gets the conflict error, unless the layered undo
+                // could not restore every base change: a caller that retries
+                // conflicts would then commit on top of them, so it gets the
+                // "rollback incomplete" error instead. A lost abort marker has
+                // poisoned a layered WAL (later writes fail with its reason).
+                #[cfg_attr(not(feature = "compact-store"), allow(unused_variables))]
+                let outcome = self.abort_transaction(transaction_id, &touched);
                 #[cfg(all(feature = "compact-store", feature = "lpg"))]
-                {
-                    let unrestored = self.rollback_layered_bookkeeping(transaction_id);
-                    if unrestored > 0 {
-                        let _ = Self::incomplete_rollback_error(transaction_id, unrestored, false);
-                    }
-                }
-                #[cfg(feature = "triple-store")]
-                self.rollback_rdf_transaction(transaction_id);
-                // Discard buffered CDC events on conflict rollback
-                #[cfg(feature = "cdc")]
-                if let Some(ref pending) = self.cdc_pending_events {
-                    pending.lock().clear();
-                }
-                #[cfg(all(feature = "lpg", feature = "vector-index"))]
-                self.clear_vector_intents();
-                *self.read_only_tx.lock() = self.db_read_only;
-                self.savepoints.lock().clear();
-                self.touched_graphs.lock().clear();
+                let e = if outcome.unrestored > 0 {
+                    Self::incomplete_rollback_error(transaction_id, outcome.unrestored, false)
+                } else {
+                    e
+                };
                 #[cfg(feature = "metrics")]
                 {
                     crate::metrics::record_metric!(self.metrics, tx_active, dec);
@@ -4500,55 +4528,11 @@ impl Session {
             )
         })?;
 
-        // Reset read-only flag
-        *self.read_only_tx.lock() = self.db_read_only;
-
-        // Discard uncommitted versions in ALL touched LPG stores (cross-graph atomicity).
-        let touched = self.touched_graphs.lock().clone();
-        for graph_name in &touched {
-            let store = self.resolve_store(graph_name);
-            store.discard_uncommitted_versions(transaction_id);
-        }
-        // Then lift the layered store's base tombstones and copy-ups (after
-        // the overlay discard, so no rolled-back edge still references a
-        // copy-up when it is purged).
-        #[cfg(all(feature = "compact-store", feature = "lpg"))]
-        let unrestored = self.rollback_layered_bookkeeping(transaction_id);
-
-        // Discard pending operations in the RDF store
-        #[cfg(feature = "triple-store")]
-        self.rollback_rdf_transaction(transaction_id);
-
-        // Discard buffered CDC events on rollback
-        #[cfg(feature = "cdc")]
-        if let Some(ref pending) = self.cdc_pending_events {
-            pending.lock().clear();
-        }
-        #[cfg(all(feature = "lpg", feature = "vector-index"))]
-        self.clear_vector_intents();
-
-        // Clear savepoints and touched graphs
-        self.savepoints.lock().clear();
-        self.touched_graphs.lock().clear();
-
-        // Mark transaction as aborted in the manager
-        let result = self.transaction_manager.abort(transaction_id);
-
-        // Log transaction abort to WAL so recovery clears any data records
-        // emitted during this transaction (e.g. via session-direct mutation
-        // APIs). Without this marker, recovery's per-transaction buffer
-        // would carry the rolled-back records into the next
-        // `TransactionCommit` and resurrect them on reopen.
-        #[cfg(feature = "wal")]
-        if let Some(ref wal) = self.wal {
-            use grafeo_storage::wal::WalRecord;
-            if let Err(e) = wal.log(&WalRecord::TransactionAbort { transaction_id }) {
-                grafeo_warn!("Failed to log transaction abort to WAL: {}", e);
-            }
-        }
+        let touched = std::mem::take(&mut *self.touched_graphs.lock());
+        let outcome = self.abort_transaction(transaction_id, &touched);
 
         #[cfg(feature = "metrics")]
-        if result.is_ok() {
+        if outcome.aborted.is_ok() {
             crate::metrics::record_metric!(self.metrics, tx_active, dec);
             crate::metrics::record_metric!(self.metrics, tx_rolled_back, inc);
             #[cfg(not(target_arch = "wasm32"))]
@@ -4558,18 +4542,107 @@ impl Session {
             }
         }
 
-        // Everything else is rolled back and the transaction has ended; now
-        // surface base changes the layered undo could not restore.
-        #[cfg(all(feature = "compact-store", feature = "lpg"))]
-        if result.is_ok() && unrestored > 0 {
-            return Err(Self::incomplete_rollback_error(
-                transaction_id,
-                unrestored,
-                false,
-            ));
-        }
+        outcome.into_rollback_result(transaction_id)
+    }
 
-        result
+    /// Aborts a transaction that has already been taken out of
+    /// `current_transaction`: discards its versions in every touched graph,
+    /// undoes its layered base changes, its RDF changes and buffered CDC and
+    /// vector-index updates, clears the session's transaction state, logs the
+    /// abort to the WAL and then marks it aborted in the transaction manager
+    /// (which releases its entities).
+    ///
+    /// Shared by rollback and by a commit that fails validation, so a failed
+    /// commit leaves no active transaction holding its entities (#409).
+    #[cfg(feature = "lpg")]
+    fn abort_transaction(
+        &self,
+        transaction_id: TransactionId,
+        touched: &[Option<String>],
+    ) -> AbortOutcome {
+        *self.read_only_tx.lock() = self.db_read_only;
+
+        // Discard uncommitted versions in ALL touched LPG stores (cross-graph atomicity).
+        for graph_name in touched {
+            let store = self.resolve_store(graph_name);
+            store.discard_uncommitted_versions(transaction_id);
+        }
+        // Then lift the layered store's base tombstones and copy-ups (after
+        // the overlay discard, so no rolled-back edge still references a
+        // copy-up when it is purged).
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        let unrestored = self.rollback_layered_bookkeeping(transaction_id);
+        #[cfg(not(all(feature = "compact-store", feature = "lpg")))]
+        let unrestored = 0;
+
+        #[cfg(feature = "triple-store")]
+        self.rollback_rdf_transaction(transaction_id);
+
+        #[cfg(feature = "cdc")]
+        if let Some(ref pending) = self.cdc_pending_events {
+            pending.lock().clear();
+        }
+        #[cfg(all(feature = "lpg", feature = "vector-index"))]
+        self.clear_vector_intents();
+
+        self.savepoints.lock().clear();
+        self.touched_graphs.lock().clear();
+        *self.transaction_nesting_depth.lock() = 0;
+
+        // Log the abort before the manager releases the entities: once they
+        // are released another session can write them and append its commit
+        // pair, which would settle this transaction's records on replay if
+        // it landed ahead of the abort marker.
+        let marker_error = self.log_transaction_abort(transaction_id);
+        let aborted = self.transaction_manager.abort(transaction_id);
+
+        AbortOutcome {
+            aborted,
+            marker_error,
+            unrestored,
+        }
+    }
+
+    /// Logs `TransactionAbort` so recovery clears any data records emitted
+    /// during the transaction. Without this marker, recovery's
+    /// per-transaction buffer would carry the aborted records into the next
+    /// `TransactionCommit` and resurrect them on reopen.
+    ///
+    /// On a layered database a failed append poisons the WAL (as a failed
+    /// commit marker does), since a later commit marker would otherwise
+    /// settle the aborted records on replay, and the failure is returned.
+    /// A WAL that was already poisoned refuses the append; that is not a
+    /// new failure, because the poison already refuses every later append.
+    #[cfg(feature = "lpg")]
+    fn log_transaction_abort(&self, transaction_id: TransactionId) -> Option<String> {
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal {
+            use grafeo_storage::wal::WalRecord;
+            let already_poisoned = wal.poisoned_reason().is_some();
+            let record = [WalRecord::TransactionAbort { transaction_id }];
+            #[cfg(feature = "compact-store")]
+            let layered = self.layered_store.is_some();
+            #[cfg(not(feature = "compact-store"))]
+            let layered = false;
+            let logged = if layered {
+                wal.log_atomic_or_poison(&record)
+            } else {
+                wal.log(&record[0])
+            };
+            if let Err(e) = logged {
+                grafeo_warn!("Failed to log transaction abort to WAL: {}", e);
+                if layered && !already_poisoned {
+                    // `log_atomic_or_poison` poisons on a write failure but
+                    // not on a serialization error; poison either way, so
+                    // the error below is true.
+                    wal.poison(format!("WAL abort marker could not be written: {e}"));
+                    return Some(e.to_string());
+                }
+            }
+        }
+        #[cfg(not(feature = "wal"))]
+        let _ = transaction_id;
+        None
     }
 
     /// Creates a named savepoint within the current transaction.
