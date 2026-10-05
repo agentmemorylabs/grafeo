@@ -750,7 +750,11 @@ fn concurrent_direct_writes_leave_a_root_that_reopens() {
                         // Two implicit transactions writing the same node can
                         // conflict; that is ordinary MVCC and not under test.
                         if session
-                            .set_node_property(id, "w", Value::from((t * WRITES + i) as i64))
+                            .set_node_property(
+                                id,
+                                "w",
+                                Value::from(i64::try_from(t * WRITES + i).unwrap()),
+                            )
                             .is_ok()
                         {
                             ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -780,7 +784,7 @@ fn copy_ups_and_concurrent_creates_get_distinct_ids() {
         let source = GrafeoDB::new_in_memory();
         for i in 0..BASE {
             source
-                .create_node_with_props(&["B"], [("i", Value::from(i as i64))])
+                .create_node_with_props(&["B"], [("i", Value::from(i64::try_from(i).unwrap()))])
                 .expect("base node");
         }
         source
