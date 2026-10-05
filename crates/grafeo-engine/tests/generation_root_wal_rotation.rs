@@ -31,7 +31,7 @@ use tempfile::tempdir;
 /// Small enough that a rotation lands after almost every append group.
 const TINY_MAX_LOG_SIZE: u64 = 256;
 /// Statements per transaction (each logs at least one WAL record).
-const RECORDS_PER_TX: usize = 30;
+const RECORDS_PER_TX: i64 = 30;
 
 fn tiny_wal() {
     GENERATION_ROOT_WAL_MAX_LOG_SIZE.store(TINY_MAX_LOG_SIZE, Ordering::Release);
@@ -72,7 +72,7 @@ fn wal_file_count(root: &Path) -> usize {
 }
 
 /// One explicit transaction of `RECORDS_PER_TX` inserts with `label`.
-fn explicit_tx(db: &GrafeoDB, label: &str, tag: usize, commit: bool) {
+fn explicit_tx(db: &GrafeoDB, label: &str, tag: i64, commit: bool) {
     let session = db.session();
     session.execute("START TRANSACTION").expect("begin");
     for i in 0..RECORDS_PER_TX {
@@ -117,13 +117,13 @@ fn transaction_straddling_size_rotation_survives_reopen() {
             wal_file_count(&root) >= files_before + 2,
             "the transaction must cross at least two size rotations"
         );
-        assert_eq!(count(&db, "Batch"), RECORDS_PER_TX as i64);
+        assert_eq!(count(&db, "Batch"), RECORDS_PER_TX);
     }
 
     for read_only in [false, true, false] {
         let db = GrafeoDB::open_generation_root(&root, read_only)
             .unwrap_or_else(|e| panic!("reopen (read_only={read_only}) failed: {e}"));
-        assert_eq!(count(&db, "Batch"), RECORDS_PER_TX as i64);
+        assert_eq!(count(&db, "Batch"), RECORDS_PER_TX);
         assert_eq!(count(&db, "Person"), 2);
     }
 }
@@ -135,7 +135,7 @@ fn concurrent_writer_sessions_straddling_rotations_survive_reopen() {
     let root = dir.path().join("concurrent.grafeo.d");
     publish_base(&root, "concurrent-g1");
 
-    const TXS_PER_WRITER: usize = 3;
+    const TXS_PER_WRITER: i64 = 3;
     {
         let db = GrafeoDB::open_generation_root(&root, false).expect("open writable");
         std::thread::scope(|scope| {
@@ -148,27 +148,15 @@ fn concurrent_writer_sessions_straddling_rotations_survive_reopen() {
                 });
             }
         });
-        assert_eq!(
-            count(&db, "WriterA"),
-            (TXS_PER_WRITER * RECORDS_PER_TX) as i64
-        );
-        assert_eq!(
-            count(&db, "WriterB"),
-            (TXS_PER_WRITER * RECORDS_PER_TX) as i64
-        );
+        assert_eq!(count(&db, "WriterA"), TXS_PER_WRITER * RECORDS_PER_TX);
+        assert_eq!(count(&db, "WriterB"), TXS_PER_WRITER * RECORDS_PER_TX);
     }
 
     for read_only in [false, true] {
         let db = GrafeoDB::open_generation_root(&root, read_only)
             .unwrap_or_else(|e| panic!("reopen (read_only={read_only}) failed: {e}"));
-        assert_eq!(
-            count(&db, "WriterA"),
-            (TXS_PER_WRITER * RECORDS_PER_TX) as i64
-        );
-        assert_eq!(
-            count(&db, "WriterB"),
-            (TXS_PER_WRITER * RECORDS_PER_TX) as i64
-        );
+        assert_eq!(count(&db, "WriterA"), TXS_PER_WRITER * RECORDS_PER_TX);
+        assert_eq!(count(&db, "WriterB"), TXS_PER_WRITER * RECORDS_PER_TX);
     }
 }
 
@@ -196,7 +184,7 @@ fn straddling_transaction_open_at_active_end_stays_uncommitted() {
 
     {
         let db = GrafeoDB::open_generation_root(&copy, false).expect("open the copy writable");
-        assert_eq!(count(&db, "Committed"), RECORDS_PER_TX as i64);
+        assert_eq!(count(&db, "Committed"), RECORDS_PER_TX);
         assert_eq!(
             count(&db, "Open"),
             0,
@@ -206,7 +194,7 @@ fn straddling_transaction_open_at_active_end_stays_uncommitted() {
         explicit_tx(&db, "After", 3, true);
     }
     let db = GrafeoDB::open_generation_root(&copy, false).expect("second reopen");
-    assert_eq!(count(&db, "Committed"), RECORDS_PER_TX as i64);
+    assert_eq!(count(&db, "Committed"), RECORDS_PER_TX);
     assert_eq!(count(&db, "Open"), 0);
-    assert_eq!(count(&db, "After"), RECORDS_PER_TX as i64);
+    assert_eq!(count(&db, "After"), RECORDS_PER_TX);
 }
