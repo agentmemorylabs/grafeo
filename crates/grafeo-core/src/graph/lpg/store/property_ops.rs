@@ -544,6 +544,31 @@ impl LpgStore {
         }
     }
 
+    /// Drops the property- and text-index entries of the current values of
+    /// `props`. Paired with [`Self::reindex_node_properties`] around a
+    /// temporal rollback, which rewinds the values without going through the
+    /// index-maintaining setters.
+    #[cfg(feature = "temporal")]
+    fn unindex_node_properties<'a>(&self, props: impl Iterator<Item = &'a (NodeId, PropertyKey)>) {
+        for (node_id, key) in props {
+            self.update_property_index_on_remove(*node_id, key);
+            #[cfg(feature = "text-index")]
+            self.update_text_index_on_remove(*node_id, key.as_str());
+        }
+    }
+
+    /// Indexes the current (restored) values of `props`.
+    #[cfg(feature = "temporal")]
+    fn reindex_node_properties<'a>(&self, props: impl Iterator<Item = &'a (NodeId, PropertyKey)>) {
+        for (node_id, key) in props {
+            if let Some(value) = self.node_properties.get(*node_id, key) {
+                self.update_property_index_on_set(*node_id, key, &value);
+                #[cfg(feature = "text-index")]
+                self.update_text_index_on_set(*node_id, key.as_str(), &value);
+            }
+        }
+    }
+
     /// Rolls back property/label changes by removing PENDING entries from
     /// version logs, and replays entity deletions from the undo log.
     ///
@@ -601,14 +626,20 @@ impl LpgStore {
                 }
             }
 
-            // Remove PENDING entries from affected property version logs
+            // Remove PENDING entries from affected property version logs,
+            // moving index postings from the transaction's values back to
+            // the restored ones.
             if !node_props.is_empty() {
-                let mut columns = self.node_properties.columns_write();
-                for (node_id, key) in &node_props {
-                    if let Some(col) = columns.get_mut(key) {
-                        col.remove_pending_for(*node_id);
+                self.unindex_node_properties(node_props.iter());
+                {
+                    let mut columns = self.node_properties.columns_write();
+                    for (node_id, key) in &node_props {
+                        if let Some(col) = columns.get_mut(key) {
+                            col.remove_pending_for(*node_id);
+                        }
                     }
                 }
+                self.reindex_node_properties(node_props.iter());
             }
 
             if !edge_props.is_empty() {
@@ -823,14 +854,19 @@ impl LpgStore {
                 }
             }
 
-            // Pop PENDING entries from node property version logs
+            // Pop PENDING entries from node property version logs (index
+            // postings follow, as in `rollback_transaction_properties`).
             if !node_prop_counts.is_empty() {
-                let mut columns = self.node_properties.columns_write();
-                for ((node_id, key), count) in &node_prop_counts {
-                    if let Some(col) = columns.get_mut(key) {
-                        col.pop_n_pending_for(*node_id, *count);
+                self.unindex_node_properties(node_prop_counts.keys());
+                {
+                    let mut columns = self.node_properties.columns_write();
+                    for ((node_id, key), count) in &node_prop_counts {
+                        if let Some(col) = columns.get_mut(key) {
+                            col.pop_n_pending_for(*node_id, *count);
+                        }
                     }
                 }
+                self.reindex_node_properties(node_prop_counts.keys());
             }
 
             // Pop PENDING entries from edge property version logs
