@@ -708,8 +708,34 @@ mod generation_root {
         assert_counts(&db, 4, 3, "after handoff install");
 
         // The absorbed edge, through a query.
+        let node_id = |query: &str| match &db.execute(query).expect(query).rows()[0][0] {
+            Value::Int64(id) => grafeo_common::types::NodeId::new(u64::try_from(*id).expect("id")),
+            other => panic!("expected an integer id, got {other:?}"),
+        };
+        let a = node_id("MATCH (n:P {name: 'a'}) RETURN id(n)");
+        let d_id = node_id("MATCH (n:R {name: 'd'}) RETURN id(n)");
+        let layered = db.layered_store().expect("layered");
+        assert!(
+            layered
+                .neighbors(a, grafeo_core::graph::Direction::Outgoing)
+                .contains(&d_id),
+            "a -> d before the delete"
+        );
         run_writes(&db, &["MATCH ()-[r:L]->() DELETE r"]);
         assert_counts(&db, 4, 2, "after deleting the absorbed edge");
+        // `neighbors` must hide the tombstoned edge as `edges_from` does.
+        assert!(
+            !layered
+                .neighbors(a, grafeo_core::graph::Direction::Outgoing)
+                .contains(&d_id),
+            "neighbors(a) still lists d through the deleted absorbed edge"
+        );
+        assert!(
+            !layered
+                .neighbors(d_id, grafeo_core::graph::Direction::Incoming)
+                .contains(&a),
+            "neighbors(d, Incoming) still lists a through the deleted absorbed edge"
+        );
 
         // The absorbed node, through the direct API.
         let d = match &db
