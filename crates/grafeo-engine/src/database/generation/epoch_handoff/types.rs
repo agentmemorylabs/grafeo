@@ -153,6 +153,10 @@ pub struct EpochHandoffReport {
 pub(super) struct HandoffSlot {
     pub(super) phase: EpochHandoffPhase,
     pub(super) handle: Option<FrozenEpochHandle>,
+    /// Live generation-root backups currently running. A freeze refuses to
+    /// start while this is non-zero (checked under the slot lock), so no
+    /// publication or WAL truncation can run during a backup.
+    pub(super) backups_in_progress: u32,
 }
 
 impl Default for EpochHandoffPhase {
@@ -174,7 +178,47 @@ impl Default for EpochHandoffCoordinator {
     }
 }
 
+/// True when a freeze is held and not yet fully retired/cancelled/failed.
+fn phase_is_active(phase: EpochHandoffPhase) -> bool {
+    !matches!(
+        phase,
+        EpochHandoffPhase::Idle
+            | EpochHandoffPhase::EpochRetired
+            | EpochHandoffPhase::Cancelled
+            | EpochHandoffPhase::Failed
+    )
+}
+
+/// RAII registration of a running live-root backup; see
+/// [`EpochHandoffCoordinator::begin_backup`].
+pub(crate) struct BackupGateGuard<'a> {
+    coordinator: &'a EpochHandoffCoordinator,
+}
+
+impl Drop for BackupGateGuard<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.coordinator.slot.lock();
+        slot.backups_in_progress = slot.backups_in_progress.saturating_sub(1);
+    }
+}
+
 impl EpochHandoffCoordinator {
+    /// Register a live-root backup, or refuse when a handoff is in flight.
+    ///
+    /// The check and the registration happen under the same slot lock that
+    /// `freeze_epoch_for_handoff` holds for its whole capture, so exactly one
+    /// of "handoff first" / "backup first" wins and the loser is refused
+    /// cleanly. While the guard lives no freeze can start, hence no
+    /// publication (manifest write) and no WAL truncation.
+    pub(crate) fn begin_backup(&self) -> Result<BackupGateGuard<'_>, EpochHandoffPhase> {
+        let mut slot = self.slot.lock();
+        if phase_is_active(slot.phase) {
+            return Err(slot.phase);
+        }
+        slot.backups_in_progress += 1;
+        Ok(BackupGateGuard { coordinator: self })
+    }
+
     /// Creates an idle coordinator.
     #[must_use]
     pub fn new() -> Self {
@@ -190,12 +234,6 @@ impl EpochHandoffCoordinator {
     /// True when a freeze is held and not yet fully retired/cancelled.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        !matches!(
-            self.phase(),
-            EpochHandoffPhase::Idle
-                | EpochHandoffPhase::EpochRetired
-                | EpochHandoffPhase::Cancelled
-                | EpochHandoffPhase::Failed
-        )
+        phase_is_active(self.phase())
     }
 }

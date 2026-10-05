@@ -97,10 +97,80 @@ pub struct LayeredStore {
     /// generation build consumes the materialized freeze snapshot owned
     /// by the engine handoff coordinator.
     handoff: RwLock<Option<OverlayHandoffLive>>,
-    /// Serializes first-time copy-ups (`ensure_in_overlay` /
-    /// `ensure_edge_in_overlay`) so two writers promoting the same base
-    /// entity cannot both insert it. Entities already in the overlay skip it.
-    promote_lock: parking_lot::Mutex<()>,
+    /// Undo journal for the layered bookkeeping that open transactions
+    /// changed outside the overlay's own MVCC: base tombstones and copy-ups.
+    /// See [`TxnLayerJournal`].
+    txn_journal: parking_lot::Mutex<TxnLayerJournal>,
+    /// `true` while `txn_journal` holds at least one pending change. Lets
+    /// commit, rollback and savepoint-position calls skip the mutex when no
+    /// transaction has anything pending. Write paths always take the mutex,
+    /// and read paths never consult the journal.
+    txn_journal_pending: AtomicBool,
+    /// Total journal entries dropped while their transaction was open (see
+    /// [`LayeredStore::forgotten_layer_changes`]).
+    txn_journal_forgotten: std::sync::atomic::AtomicU64,
+}
+
+/// A change to the layered bookkeeping (outside the overlay `LpgStore`'s own
+/// MVCC) that a transaction made and a rollback must undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LayerChange {
+    /// A base node was tombstoned (`deleted_from_base_nodes`).
+    BaseNodeTombstone(NodeId),
+    /// A base edge was tombstoned (`deleted_from_base_edges`).
+    BaseEdgeTombstone(EdgeId),
+    /// A base node was copied up into the overlay and marked dirty.
+    NodeCopyUp(NodeId),
+    /// A base edge was copied up into the overlay and marked dirty.
+    EdgeCopyUp(EdgeId),
+}
+
+/// Per-transaction undo journal for [`LayerChange`]s.
+///
+/// The overlay `LpgStore` versions its own rows by transaction id, so
+/// `discard_uncommitted_versions` already undoes overlay-native creates and
+/// (via its undo log) property/label writes. The layered store's base
+/// tombstones and copy-ups are plain sets, so without this journal a rollback
+/// left them in place until reopen.
+///
+/// A change can be shared: once pending, any other write that relies on it
+/// (another transaction SETting a node an open transaction copied up, a
+/// second delete of the same base node) joins its owner list. The change
+/// becomes permanent when any owner commits or a non-transactional write
+/// touches it, and is undone only when its last owner rolls back.
+#[derive(Debug, Default)]
+struct TxnLayerJournal {
+    /// Changes per open transaction, in the order they were made.
+    by_txn: FxHashMap<TransactionId, Vec<LayerChange>>,
+    /// Open transactions owning each pending change.
+    owners: FxHashMap<LayerChange, Vec<TransactionId>>,
+    /// Per open transaction: how many of its pending changes an overlay
+    /// reset / merge dropped (reported by its rollback).
+    forgotten: FxHashMap<TransactionId, usize>,
+}
+
+type JournalGuard<'a> = parking_lot::MutexGuard<'a, TxnLayerJournal>;
+
+/// Whether a dirty-dispatched read found the entity (see `get_node`).
+trait ReadHit {
+    fn found(&self) -> bool;
+}
+
+impl<T> ReadHit for Option<T> {
+    fn found(&self) -> bool {
+        self.is_some()
+    }
+}
+
+impl ReadHit for bool {
+    fn found(&self) -> bool {
+        *self
+    }
+}
+
+#[inline]
+fn hit_found(hit: &impl ReadHit) -> bool {
+    hit.found()
 }
 
 /// Live dual-epoch handoff bookkeeping on the layered store (G-EM0.5c).
@@ -227,7 +297,9 @@ impl LayeredStore {
             merge_guard: RwLock::new(()),
             admission_slot: RwLock::new(None),
             handoff: RwLock::new(None),
-            promote_lock: parking_lot::Mutex::new(()),
+            txn_journal: parking_lot::Mutex::new(TxnLayerJournal::default()),
+            txn_journal_pending: AtomicBool::new(false),
+            txn_journal_forgotten: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -243,7 +315,9 @@ impl LayeredStore {
             merge_guard: RwLock::new(()),
             admission_slot: RwLock::new(None),
             handoff: RwLock::new(None),
-            promote_lock: parking_lot::Mutex::new(()),
+            txn_journal: parking_lot::Mutex::new(TxnLayerJournal::default()),
+            txn_journal_pending: AtomicBool::new(false),
+            txn_journal_forgotten: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -317,8 +391,8 @@ impl LayeredStore {
         edge_type: &str,
     ) -> Result<(), grafeo_common::memory::AllocError> {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(src);
-        self.ensure_in_overlay(dst);
+        self.ensure_in_overlay(src, None);
+        self.ensure_in_overlay(dst, None);
         self.overlay
             .load()
             .create_edge_with_id(id, src, dst, edge_type)?;
@@ -733,6 +807,9 @@ impl LayeredStore {
         self.deleted_from_base_nodes.write().clear();
         self.deleted_from_base_edges.write().clear();
         self.deletions_dirty.store(false, Ordering::Release);
+        // The bookkeeping the journal could undo is gone (or, after a merge,
+        // baked into the new base), so nothing is pending any more.
+        self.forget_pending_layer_changes();
     }
 
     /// Publish a newly-built whole-graph generation as the live base and reset
@@ -1058,6 +1135,285 @@ impl LayeredStore {
             self.deletions_dirty.store(true, Ordering::Release);
         }
     }
+
+    // ── Transaction-scoped layered bookkeeping ─────────────────────
+    //
+    // Concurrency contract: every write that creates a journaled change, or
+    // relies on one that may still be pending, does its check-and-register
+    // step while holding `txn_journal`; an undo runs entirely under the same
+    // lock. So a writer either registers as an owner before the undo decides
+    // (and the change is kept) or observes the undone state afterwards (and
+    // makes its own copy-up / tombstone). Lock order: `merge_guard` →
+    // `txn_journal` → the dirty / tombstone sets and the overlay.
+
+    /// Commits the layered bookkeeping of `transaction_id`: every base
+    /// tombstone and copy-up it made (or shares) becomes permanent.
+    ///
+    /// Called by the session after the overlay commit. Cheap no-op when the
+    /// transaction changed nothing outside the overlay.
+    pub fn commit_transaction_layers(&self, transaction_id: TransactionId) {
+        if !self.txn_journal_pending.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut journal = self.txn_journal.lock();
+        if let Some(changes) = journal.by_txn.remove(&transaction_id) {
+            for change in changes {
+                journal.owners.remove(&change);
+            }
+        }
+        journal.forgotten.remove(&transaction_id);
+        self.refresh_journal_pending(&journal);
+    }
+
+    /// Undoes the layered bookkeeping of `transaction_id`: base tombstones
+    /// are lifted and copy-ups are removed from the overlay (and undirtied),
+    /// so the live store reads exactly as before the transaction.
+    ///
+    /// Called by the session after the overlay's own
+    /// `discard_uncommitted_versions`. A change shared with another open
+    /// transaction stays until its last owner rolls back.
+    ///
+    /// Returns how many of this transaction's changes could NOT be undone
+    /// because an overlay reset / merge dropped them from the journal while
+    /// the transaction was open (see [`Self::forgotten_layer_changes`]); the
+    /// caller should report a non-zero count.
+    pub fn rollback_transaction_layers(&self, transaction_id: TransactionId) -> usize {
+        if !self.txn_journal_pending.load(Ordering::SeqCst) {
+            return 0;
+        }
+        let _guard = self.merge_guard.read();
+        let mut journal = self.txn_journal.lock();
+        self.undo_layers_locked(&mut journal, transaction_id, 0);
+        journal.by_txn.remove(&transaction_id);
+        let forgotten = journal.forgotten.remove(&transaction_id).unwrap_or(0);
+        self.refresh_journal_pending(&journal);
+        forgotten
+    }
+
+    /// Journal position of `transaction_id`, captured by a savepoint and
+    /// passed back to [`Self::rollback_transaction_layers_to`].
+    #[must_use]
+    pub fn transaction_layer_position(&self, transaction_id: TransactionId) -> usize {
+        if !self.txn_journal_pending.load(Ordering::SeqCst) {
+            return 0;
+        }
+        self.txn_journal
+            .lock()
+            .by_txn
+            .get(&transaction_id)
+            .map_or(0, Vec::len)
+    }
+
+    /// Undoes the layered changes `transaction_id` made after journal
+    /// position `since` (savepoint rollback), newest first.
+    ///
+    /// Returns how many of this transaction's changes an overlay reset /
+    /// merge has dropped (see [`Self::rollback_transaction_layers`]). Some of
+    /// them may predate the savepoint, but once they are dropped the saved
+    /// position is stale and the restore cannot be shown to be exact, so any
+    /// loss is reported. The count stays recorded for the full rollback.
+    pub fn rollback_transaction_layers_to(
+        &self,
+        transaction_id: TransactionId,
+        since: usize,
+    ) -> usize {
+        if !self.txn_journal_pending.load(Ordering::SeqCst) {
+            return 0;
+        }
+        let _guard = self.merge_guard.read();
+        let mut journal = self.txn_journal.lock();
+        self.undo_layers_locked(&mut journal, transaction_id, since);
+        let forgotten = journal.forgotten.get(&transaction_id).copied().unwrap_or(0);
+        self.refresh_journal_pending(&journal);
+        forgotten
+    }
+
+    /// Total journal entries dropped by overlay resets / merges while their
+    /// transaction was still open. Each such entry is a change a later
+    /// rollback can no longer undo (it was baked into the new base or
+    /// discarded with the old overlay). Non-zero means a rollback was not
+    /// exact; the session also logs it per transaction.
+    #[must_use]
+    pub fn forgotten_layer_changes(&self) -> u64 {
+        self.txn_journal_forgotten.load(Ordering::Relaxed)
+    }
+
+    /// Undo step shared by full and savepoint rollback. Runs with the
+    /// journal locked for the whole undo (see the concurrency contract).
+    fn undo_layers_locked(
+        &self,
+        journal: &mut TxnLayerJournal,
+        transaction_id: TransactionId,
+        since: usize,
+    ) {
+        let Some(changes) = journal.by_txn.get_mut(&transaction_id) else {
+            return;
+        };
+        if since >= changes.len() {
+            return;
+        }
+        let tail = changes.split_off(since);
+        let overlay = self.overlay.load();
+        let mut deletions_changed = false;
+        for change in tail.into_iter().rev() {
+            let Some(owners) = journal.owners.get_mut(&change) else {
+                continue; // already permanent (committed or non-txn write)
+            };
+            owners.retain(|t| *t != transaction_id);
+            if !owners.is_empty() {
+                continue; // still relied on by another open transaction
+            }
+            journal.owners.remove(&change);
+            match change {
+                LayerChange::BaseNodeTombstone(id) => {
+                    deletions_changed |= self.deleted_from_base_nodes.write().remove(&id);
+                }
+                LayerChange::BaseEdgeTombstone(id) => {
+                    deletions_changed |= self.deleted_from_base_edges.write().remove(&id);
+                }
+                // Undirty before purging: a lock-free reader then falls
+                // through to the base (same values) instead of seeing the
+                // id vanish between the two steps.
+                LayerChange::NodeCopyUp(id) => {
+                    self.dirty_node_ids.write().remove(&id);
+                    overlay.purge_copied_node(id);
+                }
+                LayerChange::EdgeCopyUp(id) => {
+                    self.dirty_edge_ids.write().remove(&id);
+                    overlay.purge_edge(id);
+                }
+            }
+        }
+        if deletions_changed {
+            // A checkpoint may already have persisted the pending tombstone;
+            // make the next one rewrite the section without it.
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Maps the trait's transaction id to a journal owner: `SYSTEM` is the
+    /// id non-transactional writes use, and those are permanent at once.
+    #[inline]
+    fn journal_owner(transaction_id: TransactionId) -> Option<TransactionId> {
+        (transaction_id != TransactionId::SYSTEM).then_some(transaction_id)
+    }
+
+    /// Dirty check that is consistent with concurrent undo: taken under the
+    /// journal lock, so the caller's register step (or copy-up) cannot
+    /// interleave with an undo. There is no lock-free shortcut: a copy-up and
+    /// its full rollback can both land between two unlocked loads, so
+    /// "nothing pending, node dirty" proves nothing.
+    fn node_dirty_guarded(&self, id: NodeId) -> (bool, JournalGuard<'_>) {
+        let guard = self.txn_journal.lock();
+        (self.is_node_dirty(id), guard)
+    }
+
+    /// Edge variant of [`Self::node_dirty_guarded`].
+    fn edge_dirty_guarded(&self, id: EdgeId) -> (bool, JournalGuard<'_>) {
+        let guard = self.txn_journal.lock();
+        (self.is_edge_dirty(id), guard)
+    }
+
+    /// Records a change this write just made, under the journal lock taken by
+    /// [`Self::node_dirty_guarded`] / [`Self::edge_dirty_guarded`].
+    fn journal_new(
+        &self,
+        journal: &mut TxnLayerJournal,
+        owner: Option<TransactionId>,
+        change: LayerChange,
+    ) {
+        let Some(tx) = owner else {
+            return;
+        };
+        let owners = journal.owners.entry(change).or_default();
+        if !owners.contains(&tx) {
+            owners.push(tx);
+            journal.by_txn.entry(tx).or_default().push(change);
+        }
+        self.refresh_journal_pending(journal);
+    }
+
+    /// Records that this write relies on a change already in the layered
+    /// bookkeeping. If that change is still pending, a transactional write
+    /// joins its owners (so another transaction's rollback cannot pull it
+    /// away) and a non-transactional write makes it permanent.
+    fn journal_touch(
+        &self,
+        journal: &mut TxnLayerJournal,
+        owner: Option<TransactionId>,
+        change: LayerChange,
+    ) {
+        let TxnLayerJournal { by_txn, owners, .. } = &mut *journal;
+        let Some(list) = owners.get_mut(&change) else {
+            return;
+        };
+        match owner {
+            Some(tx) => {
+                if !list.contains(&tx) {
+                    list.push(tx);
+                    by_txn.entry(tx).or_default().push(change);
+                }
+            }
+            None => {
+                owners.remove(&change);
+            }
+        }
+        self.refresh_journal_pending(journal);
+    }
+
+    /// Records a base tombstone write: a fresh insert is a new change, an
+    /// existing tombstone is touched.
+    fn journal_tombstone(
+        &self,
+        journal: &mut TxnLayerJournal,
+        owner: Option<TransactionId>,
+        change: LayerChange,
+        fresh: bool,
+    ) {
+        if fresh {
+            self.journal_new(journal, owner, change);
+        } else {
+            self.journal_touch(journal, owner, change);
+        }
+    }
+
+    fn refresh_journal_pending(&self, journal: &TxnLayerJournal) {
+        self.txn_journal_pending.store(
+            !journal.owners.is_empty()
+                || !journal.by_txn.is_empty()
+                || !journal.forgotten.is_empty(),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Drops every pending change (see [`Self::reset_overlay_with_watermark`]).
+    ///
+    /// The changes cannot be undone any more, so this is counted
+    /// ([`Self::forgotten_layer_changes`]) and remembered per transaction:
+    /// that transaction's rollback reports it instead of silently doing
+    /// nothing.
+    fn forget_pending_layer_changes(&self) {
+        let mut journal = self.txn_journal.lock();
+        let TxnLayerJournal {
+            by_txn,
+            owners,
+            forgotten,
+        } = &mut *journal;
+        let mut total = 0u64;
+        for (tx, changes) in by_txn.drain() {
+            let pending = changes.iter().filter(|c| owners.contains_key(*c)).count();
+            if pending > 0 {
+                *forgotten.entry(tx).or_default() += pending;
+                total += pending as u64;
+            }
+        }
+        owners.clear();
+        if total > 0 {
+            self.txn_journal_forgotten
+                .fetch_add(total, Ordering::Relaxed);
+        }
+        self.refresh_journal_pending(&journal);
+    }
 }
 
 // ── GraphStore implementation ──────────────────────────────────────
@@ -1068,7 +1424,18 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_node_dirty(id) {
-            return self.overlay.load().get_node(id);
+            let hit = self.overlay.load().get_node(id);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // An overlay miss on a dirty id can be a copy-up that a concurrent
+            // rollback is undoing (undirtied first, then purged): if the id is
+            // no longer dirty, fall through to the base. If it is still dirty,
+            // read the overlay once more — the copy may have been undone and
+            // redone by another writer in between. Hits pay nothing extra.
+            if self.is_node_dirty(id) {
+                return self.overlay.load().get_node(id);
+            }
         }
         // dirty_node_ids only tracks modified base nodes; new overlay nodes fall through here.
         self.base
@@ -1082,7 +1449,14 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_edge_dirty(id) {
-            return self.overlay.load().get_edge(id);
+            let hit = self.overlay.load().get_edge(id);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_edge_dirty(id) {
+                return self.overlay.load().get_edge(id);
+            }
         }
         // Edges created after `compact()` live only in the overlay; fall
         // through when the base doesn't recognise the id.
@@ -1102,10 +1476,20 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_node_dirty(id) {
-            return self
+            let hit = self
                 .overlay
                 .load()
                 .get_node_versioned(id, epoch, transaction_id);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_node_dirty(id) {
+                return self
+                    .overlay
+                    .load()
+                    .get_node_versioned(id, epoch, transaction_id);
+            }
         }
         // `dirty_node_ids` only tracks overlay modifications of *base* nodes.
         // Overlay-only nodes (post-`compact()` writes) fall through to here;
@@ -1129,10 +1513,20 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_edge_dirty(id) {
-            return self
+            let hit = self
                 .overlay
                 .load()
                 .get_edge_versioned(id, epoch, transaction_id);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_edge_dirty(id) {
+                return self
+                    .overlay
+                    .load()
+                    .get_edge_versioned(id, epoch, transaction_id);
+            }
         }
         self.base.load().get_edge(id).or_else(|| {
             self.overlay
@@ -1146,7 +1540,14 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_node_dirty(id) {
-            return self.overlay.load().get_node_at_epoch(id, epoch);
+            let hit = self.overlay.load().get_node_at_epoch(id, epoch);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_node_dirty(id) {
+                return self.overlay.load().get_node_at_epoch(id, epoch);
+            }
         }
         self.base
             .load()
@@ -1159,7 +1560,14 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_edge_dirty(id) {
-            return self.overlay.load().get_edge_at_epoch(id, epoch);
+            let hit = self.overlay.load().get_edge_at_epoch(id, epoch);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_edge_dirty(id) {
+                return self.overlay.load().get_edge_at_epoch(id, epoch);
+            }
         }
         self.base
             .load()
@@ -1172,7 +1580,14 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_node_dirty(id) {
-            return self.overlay.load().get_node_property(id, key);
+            let hit = self.overlay.load().get_node_property(id, key);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_node_dirty(id) {
+                return self.overlay.load().get_node_property(id, key);
+            }
         }
         self.base
             .load()
@@ -1185,7 +1600,14 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_edge_dirty(id) {
-            return self.overlay.load().get_edge_property(id, key);
+            let hit = self.overlay.load().get_edge_property(id, key);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_edge_dirty(id) {
+                return self.overlay.load().get_edge_property(id, key);
+            }
         }
         self.base
             .load()
@@ -1428,7 +1850,14 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_edge_dirty(id) {
-            return self.overlay.load().edge_type(id);
+            let hit = self.overlay.load().edge_type(id);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_edge_dirty(id) {
+                return self.overlay.load().edge_type(id);
+            }
         }
         self.base
             .load()
@@ -1749,7 +2178,14 @@ impl GraphStore for LayeredStore {
             return false;
         }
         if self.is_node_dirty(id) {
-            return self.overlay.load().is_node_visible_at_epoch(id, epoch);
+            let hit = self.overlay.load().is_node_visible_at_epoch(id, epoch);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_node_dirty(id) {
+                return self.overlay.load().is_node_visible_at_epoch(id, epoch);
+            }
         }
         // `dirty_node_ids` only tracks overlay *modifications of base nodes*
         // — overlay-only nodes (e.g. post-`compact()` writes) fall through
@@ -1777,10 +2213,20 @@ impl GraphStore for LayeredStore {
             return false;
         }
         if self.is_node_dirty(id) {
-            return self
+            let hit = self
                 .overlay
                 .load()
                 .is_node_visible_versioned(id, epoch, transaction_id);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_node_dirty(id) {
+                return self
+                    .overlay
+                    .load()
+                    .is_node_visible_versioned(id, epoch, transaction_id);
+            }
         }
         let base = self.base.load();
         if base.get_node(id).is_some() {
@@ -1797,7 +2243,14 @@ impl GraphStore for LayeredStore {
             return false;
         }
         if self.is_edge_dirty(id) {
-            return self.overlay.load().is_edge_visible_at_epoch(id, epoch);
+            let hit = self.overlay.load().is_edge_visible_at_epoch(id, epoch);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_edge_dirty(id) {
+                return self.overlay.load().is_edge_visible_at_epoch(id, epoch);
+            }
         }
         let base = self.base.load();
         if base.get_edge(id).is_some() {
@@ -1817,10 +2270,20 @@ impl GraphStore for LayeredStore {
             return false;
         }
         if self.is_edge_dirty(id) {
-            return self
+            let hit = self
                 .overlay
                 .load()
                 .is_edge_visible_versioned(id, epoch, transaction_id);
+            if hit_found(&hit) {
+                return hit;
+            }
+            // Miss on a dirty id: see `get_node`.
+            if self.is_edge_dirty(id) {
+                return self
+                    .overlay
+                    .load()
+                    .is_edge_visible_versioned(id, epoch, transaction_id);
+            }
         }
         let base = self.base.load();
         if base.get_edge(id).is_some() {
@@ -2003,8 +2466,8 @@ impl GraphStoreMut for LayeredStore {
     fn create_edge(&self, src: NodeId, dst: NodeId, edge_type: &str) -> EdgeId {
         let _guard = self.merge_guard.read();
         // Promote base-only endpoints into the overlay.
-        self.ensure_in_overlay(src);
-        self.ensure_in_overlay(dst);
+        self.ensure_in_overlay(src, None);
+        self.ensure_in_overlay(dst, None);
         let id = self.overlay.load().create_edge(src, dst, edge_type);
         self.mark_dirty_edge(id);
         self.charge_retained(
@@ -2023,8 +2486,9 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> EdgeId {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(src);
-        self.ensure_in_overlay(dst);
+        let owner = Self::journal_owner(transaction_id);
+        self.ensure_in_overlay(src, owner);
+        self.ensure_in_overlay(dst, owner);
         let id =
             self.overlay
                 .load()
@@ -2049,10 +2513,13 @@ impl GraphStoreMut for LayeredStore {
         }
         let mut tracked: Vec<NodeId> = Vec::new();
         for nid in endpoints {
-            if self.is_node_dirty(nid) {
+            let (dirty, mut journal) = self.node_dirty_guarded(nid);
+            if dirty {
+                self.journal_touch(&mut journal, None, LayerChange::NodeCopyUp(nid));
                 tracked.push(nid);
             } else {
-                self.ensure_in_overlay(nid);
+                drop(journal);
+                self.ensure_in_overlay(nid, None);
             }
         }
         if !tracked.is_empty() {
@@ -2120,12 +2587,16 @@ impl GraphStoreMut for LayeredStore {
             endpoints.insert(e.source);
             endpoints.insert(e.target);
         }
+        let owner = Self::journal_owner(transaction_id);
         let mut tracked: Vec<NodeId> = Vec::new();
         for nid in endpoints {
-            if self.is_node_dirty(nid) {
+            let (dirty, mut journal) = self.node_dirty_guarded(nid);
+            if dirty {
+                self.journal_touch(&mut journal, owner, LayerChange::NodeCopyUp(nid));
                 tracked.push(nid);
             } else {
-                self.ensure_in_overlay(nid);
+                drop(journal);
+                self.ensure_in_overlay(nid, owner);
             }
         }
         if !tracked.is_empty()
@@ -2155,29 +2626,7 @@ impl GraphStoreMut for LayeredStore {
 
     fn delete_node(&self, id: NodeId) -> bool {
         let _guard = self.merge_guard.read();
-        // Serialized with copy-ups: see `ensure_in_overlay`.
-        let _promote = self.promote_lock.lock();
-        if self.is_node_dirty(id) {
-            // Node is in the overlay: delete from overlay. Record the
-            // post-freeze deletion so `swap_base_and_repair_overlay` keeps
-            // the id out of the absorbed (undirty) class — otherwise a
-            // frozen entity deleted at N+1 would resurrect from the new
-            // base.
-            self.record_post_freeze_node(id);
-            self.note_promoted_node_delete(id);
-            return self.overlay.load().delete_node(id);
-        }
-        if self.base.load().get_node(id).is_some() {
-            if self.deleted_from_base_nodes.write().insert(id) {
-                self.deletions_dirty.store(true, Ordering::Release);
-                self.charge_retained(
-                    RetainedCategory::DeletionSets,
-                    overlay_cost::deletion_entry_retained_bytes(),
-                );
-            }
-            return true;
-        }
-        false
+        self.delete_node_layered(id, None, |overlay| overlay.delete_node(id))
     }
 
     fn delete_node_versioned(
@@ -2187,32 +2636,16 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> bool {
         let _guard = self.merge_guard.read();
-        let _promote = self.promote_lock.lock();
-        if self.is_node_dirty(id) {
-            // See `delete_node`: record the N+1 deletion for the repair swap.
-            self.record_post_freeze_node(id);
-            self.note_promoted_node_delete(id);
-            return self
-                .overlay
-                .load()
-                .delete_node_versioned(id, epoch, transaction_id);
-        }
-        if self.base.load().get_node(id).is_some() {
-            if self.deleted_from_base_nodes.write().insert(id) {
-                self.deletions_dirty.store(true, Ordering::Release);
-                self.charge_retained(
-                    RetainedCategory::DeletionSets,
-                    overlay_cost::deletion_entry_retained_bytes(),
-                );
-            }
-            return true;
-        }
-        false
+        self.delete_node_layered(id, Self::journal_owner(transaction_id), |overlay| {
+            overlay.delete_node_versioned(id, epoch, transaction_id)
+        })
     }
 
     fn delete_node_edges(&self, node_id: NodeId) {
         let _guard = self.merge_guard.read();
-        let _promote = self.promote_lock.lock();
+        // Held across the dirty check and the touches below so they are
+        // atomic with a concurrent undo (see `node_dirty_guarded`).
+        let mut journal = self.txn_journal.lock();
         // Delete overlay edges.
         if self.is_node_dirty(node_id) {
             let overlay = self.overlay.load();
@@ -2230,17 +2663,30 @@ impl GraphStoreMut for LayeredStore {
                     }
                 }
             }
+            // Non-transactional: pending copy-ups this relies on become
+            // permanent.
+            self.journal_touch(&mut journal, None, LayerChange::NodeCopyUp(node_id));
+            for eid in &incident {
+                self.journal_touch(&mut journal, None, LayerChange::EdgeCopyUp(*eid));
+            }
             overlay.delete_node_edges(node_id);
         }
         // Mark base edges as deleted.
         let mut newly_deleted = 0usize;
         let mut edges = self.deleted_from_base_edges.write();
+        let mut already_deleted = Vec::new();
         for (_, eid) in self.base.load().edges_from(node_id, Direction::Both) {
             if edges.insert(eid) {
                 newly_deleted += 1;
+            } else {
+                already_deleted.push(eid);
             }
         }
         drop(edges);
+        for eid in already_deleted {
+            self.journal_touch(&mut journal, None, LayerChange::BaseEdgeTombstone(eid));
+        }
+        drop(journal);
         if newly_deleted > 0 {
             self.deletions_dirty.store(true, Ordering::Release);
             self.charge_retained(
@@ -2252,25 +2698,7 @@ impl GraphStoreMut for LayeredStore {
 
     fn delete_edge(&self, id: EdgeId) -> bool {
         let _guard = self.merge_guard.read();
-        // Serialized with copy-ups: see `ensure_in_overlay`.
-        let _promote = self.promote_lock.lock();
-        if self.is_edge_dirty(id) {
-            // See `delete_node`: record the N+1 deletion for the repair swap.
-            self.record_post_freeze_edge(id);
-            self.note_promoted_edge_delete(id);
-            return self.overlay.load().delete_edge(id);
-        }
-        if self.base.load().get_edge(id).is_some() {
-            if self.deleted_from_base_edges.write().insert(id) {
-                self.deletions_dirty.store(true, Ordering::Release);
-                self.charge_retained(
-                    RetainedCategory::DeletionSets,
-                    overlay_cost::deletion_entry_retained_bytes(),
-                );
-            }
-            return true;
-        }
-        false
+        self.delete_edge_layered(id, None, |overlay| overlay.delete_edge(id))
     }
 
     fn delete_edge_versioned(
@@ -2280,33 +2708,15 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> bool {
         let _guard = self.merge_guard.read();
-        let _promote = self.promote_lock.lock();
-        if self.is_edge_dirty(id) {
-            // See `delete_node`: record the N+1 deletion for the repair swap.
-            self.record_post_freeze_edge(id);
-            self.note_promoted_edge_delete(id);
-            return self
-                .overlay
-                .load()
-                .delete_edge_versioned(id, epoch, transaction_id);
-        }
-        if self.base.load().get_edge(id).is_some() {
-            if self.deleted_from_base_edges.write().insert(id) {
-                self.deletions_dirty.store(true, Ordering::Release);
-                self.charge_retained(
-                    RetainedCategory::DeletionSets,
-                    overlay_cost::deletion_entry_retained_bytes(),
-                );
-            }
-            return true;
-        }
-        false
+        self.delete_edge_layered(id, Self::journal_owner(transaction_id), |overlay| {
+            overlay.delete_edge_versioned(id, epoch, transaction_id)
+        })
     }
 
     fn set_node_property(&self, id: NodeId, key: &str, value: Value) {
         let _guard = self.merge_guard.read();
         let cost = overlay_cost::property_retained_bytes(key, &value);
-        self.ensure_in_overlay(id);
+        self.ensure_in_overlay(id, None);
         self.overlay.load().set_node_property(id, key, value);
         self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
@@ -2320,7 +2730,7 @@ impl GraphStoreMut for LayeredStore {
     ) {
         let _guard = self.merge_guard.read();
         let cost = overlay_cost::property_retained_bytes(key, &value);
-        self.ensure_in_overlay(id);
+        self.ensure_in_overlay(id, Self::journal_owner(transaction_id));
         self.overlay
             .load()
             .set_node_property_versioned(id, key, value, transaction_id);
@@ -2330,7 +2740,7 @@ impl GraphStoreMut for LayeredStore {
     fn set_edge_property(&self, id: EdgeId, key: &str, value: Value) {
         let _guard = self.merge_guard.read();
         let cost = overlay_cost::property_retained_bytes(key, &value);
-        self.ensure_edge_in_overlay(id);
+        self.ensure_edge_in_overlay(id, None);
         self.overlay.load().set_edge_property(id, key, value);
         self.charge_retained(RetainedCategory::MutationPayload, cost);
     }
@@ -2344,7 +2754,7 @@ impl GraphStoreMut for LayeredStore {
     ) {
         let _guard = self.merge_guard.read();
         let cost = overlay_cost::property_retained_bytes(key, &value);
-        self.ensure_edge_in_overlay(id);
+        self.ensure_edge_in_overlay(id, Self::journal_owner(transaction_id));
         self.overlay
             .load()
             .set_edge_property_versioned(id, key, value, transaction_id);
@@ -2353,7 +2763,7 @@ impl GraphStoreMut for LayeredStore {
 
     fn remove_node_property(&self, id: NodeId, key: &str) -> Option<Value> {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(id);
+        self.ensure_in_overlay(id, None);
         self.overlay.load().remove_node_property(id, key)
     }
 
@@ -2364,7 +2774,7 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> Option<Value> {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(id);
+        self.ensure_in_overlay(id, Self::journal_owner(transaction_id));
         self.overlay
             .load()
             .remove_node_property_versioned(id, key, transaction_id)
@@ -2372,7 +2782,7 @@ impl GraphStoreMut for LayeredStore {
 
     fn remove_edge_property(&self, id: EdgeId, key: &str) -> Option<Value> {
         let _guard = self.merge_guard.read();
-        self.ensure_edge_in_overlay(id);
+        self.ensure_edge_in_overlay(id, None);
         self.overlay.load().remove_edge_property(id, key)
     }
 
@@ -2383,7 +2793,7 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> Option<Value> {
         let _guard = self.merge_guard.read();
-        self.ensure_edge_in_overlay(id);
+        self.ensure_edge_in_overlay(id, Self::journal_owner(transaction_id));
         self.overlay
             .load()
             .remove_edge_property_versioned(id, key, transaction_id)
@@ -2391,7 +2801,7 @@ impl GraphStoreMut for LayeredStore {
 
     fn add_label(&self, node_id: NodeId, label: &str) -> bool {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(node_id);
+        self.ensure_in_overlay(node_id, None);
         self.overlay.load().add_label(node_id, label)
     }
 
@@ -2402,7 +2812,7 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> bool {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(node_id);
+        self.ensure_in_overlay(node_id, Self::journal_owner(transaction_id));
         self.overlay
             .load()
             .add_label_versioned(node_id, label, transaction_id)
@@ -2410,7 +2820,7 @@ impl GraphStoreMut for LayeredStore {
 
     fn remove_label(&self, node_id: NodeId, label: &str) -> bool {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(node_id);
+        self.ensure_in_overlay(node_id, None);
         self.overlay.load().remove_label(node_id, label)
     }
 
@@ -2421,7 +2831,7 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> bool {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(node_id);
+        self.ensure_in_overlay(node_id, Self::journal_owner(transaction_id));
         self.overlay
             .load()
             .remove_label_versioned(node_id, label, transaction_id)
@@ -2433,28 +2843,31 @@ impl GraphStoreMut for LayeredStore {
 impl LayeredStore {
     /// Ensures a node exists in the overlay. If the node is base-only,
     /// copies its labels and properties into the overlay and marks it dirty.
-    fn ensure_in_overlay(&self, id: NodeId) {
-        if self.is_node_dirty(id) {
+    ///
+    /// `owner` is the writing transaction (`None` for non-transactional
+    /// writes). The copy is created at epoch 0 by the system transaction so
+    /// every snapshot keeps seeing the base values, and journaled so a
+    /// rollback of `owner` removes it again.
+    ///
+    /// The whole step runs under the journal lock, which base deletes also
+    /// take (`delete_*_layered`, `delete_node_edges`): it serializes copy-ups
+    /// of the same entity and orders them against deletes, so a delete that
+    /// won the race is never followed by a copy-up.
+    fn ensure_in_overlay(&self, id: NodeId, owner: Option<TransactionId>) {
+        let (dirty, mut journal) = self.node_dirty_guarded(id);
+        if dirty {
             // Already overlay-tracked. During an active handoff this mutation
             // is an epoch-N+1 write on an entity that may itself be frozen —
             // record it so `swap_base_and_repair_overlay` can retain dirty
             // for it (the dirty mark itself was set pre- or post-freeze and
             // is not re-inserted here).
             self.record_post_freeze_node(id);
+            self.journal_touch(&mut journal, owner, LayerChange::NodeCopyUp(id));
             return;
         }
+        // Checked under the journal lock (see above).
         if self.is_node_deleted_from_base(id) {
             return; // deleted: never copy it back
-        }
-        let _promote = self.promote_lock.lock();
-        if self.is_node_dirty(id) {
-            self.record_post_freeze_node(id);
-            return; // another writer promoted it meanwhile
-        }
-        // Base deletes take `promote_lock` too: check again under it, so a
-        // delete that won the race is never followed by a copy-up.
-        if self.is_node_deleted_from_base(id) {
-            return;
         }
         let Some(base_node) = self.base.load().get_node(id) else {
             return; // not in base either (new node case handled by caller)
@@ -2475,25 +2888,28 @@ impl LayeredStore {
         }
 
         // Copy properties. With `temporal`, also record them at epoch 0 so
-        // historical reads of the epoch-0 row see them; the plain setter keeps
-        // the overlay's property and text indexes up to date.
+        // historical reads of the epoch-0 row see them, but only where the
+        // property has no history yet: an append behind a later entry would
+        // break the log's epoch order. The plain setter keeps the overlay's
+        // property and text indexes up to date.
         for (key, value) in base_node.properties.iter() {
             #[cfg(feature = "temporal")]
-            overlay.set_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
+            overlay.seed_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
             overlay.set_node_property(id, key.as_str(), value.clone());
         }
 
+        // Register the owner before the dirty mark publishes the copy.
+        self.journal_new(&mut journal, owner, LayerChange::NodeCopyUp(id));
         self.mark_dirty_node(id);
     }
 
-    /// Ensures an edge exists in the overlay.
-    fn ensure_edge_in_overlay(&self, id: EdgeId) {
-        if self.is_edge_dirty(id) {
-            // Already overlay-tracked: see `ensure_in_overlay` — record the
-            // epoch-N+1 mutation for the repair swap.
-            self.record_post_freeze_edge(id);
+    /// Ensures an edge exists in the overlay. See [`Self::ensure_in_overlay`]
+    /// for `owner`.
+    fn ensure_edge_in_overlay(&self, id: EdgeId, owner: Option<TransactionId>) {
+        if self.touch_if_edge_dirty(id, owner) {
             return;
         }
+        // Fast path; checked again under the journal lock below.
         if self.is_edge_deleted_from_base(id) {
             return; // deleted: never copy it back
         }
@@ -2501,18 +2917,21 @@ impl LayeredStore {
             return;
         };
 
-        // Ensure endpoints are in the overlay first (takes `promote_lock`
-        // itself, so call it before taking it here).
-        self.ensure_in_overlay(base_edge.src);
-        self.ensure_in_overlay(base_edge.dst);
+        // Ensure endpoints are in the overlay first (each takes the journal
+        // lock itself, so it is not held here).
+        self.ensure_in_overlay(base_edge.src, owner);
+        self.ensure_in_overlay(base_edge.dst, owner);
 
-        let _promote = self.promote_lock.lock();
-        if self.is_edge_dirty(id) {
+        // Re-check under the lock: another writer may have copied the edge
+        // up meanwhile.
+        let (dirty, mut journal) = self.edge_dirty_guarded(id);
+        if dirty {
             self.record_post_freeze_edge(id);
-            return; // another writer promoted it meanwhile
+            self.journal_touch(&mut journal, owner, LayerChange::EdgeCopyUp(id));
+            return;
         }
-        // Second check, after the endpoints are prepared and under the lock
-        // base deletes take: see `ensure_in_overlay`.
+        // Second check, after the endpoints are prepared and under the
+        // journal lock base deletes take: see `ensure_in_overlay`.
         if self.is_edge_deleted_from_base(id) {
             return;
         }
@@ -2535,11 +2954,113 @@ impl LayeredStore {
         // Copy properties (see `ensure_in_overlay` for `temporal`).
         for (key, value) in base_edge.properties.iter() {
             #[cfg(feature = "temporal")]
-            overlay.set_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
+            overlay.seed_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
             overlay.set_edge_property(id, key.as_str(), value.clone());
         }
 
+        self.journal_new(&mut journal, owner, LayerChange::EdgeCopyUp(id));
         self.mark_dirty_edge(id);
+    }
+
+    /// If the edge is already overlay-tracked, records this write against it
+    /// (post-freeze identity + journal touch) and returns `true`.
+    fn touch_if_edge_dirty(&self, id: EdgeId, owner: Option<TransactionId>) -> bool {
+        let (dirty, mut journal) = self.edge_dirty_guarded(id);
+        if dirty {
+            // Already overlay-tracked: see `ensure_in_overlay` — record the
+            // epoch-N+1 mutation for the repair swap.
+            self.record_post_freeze_edge(id);
+            self.journal_touch(&mut journal, owner, LayerChange::EdgeCopyUp(id));
+        }
+        dirty
+    }
+
+    /// Shared body of `delete_node` / `delete_node_versioned`.
+    fn delete_node_layered(
+        &self,
+        id: NodeId,
+        owner: Option<TransactionId>,
+        overlay_delete: impl FnOnce(&LpgStore) -> bool,
+    ) -> bool {
+        let (dirty, mut journal) = self.node_dirty_guarded(id);
+        if dirty {
+            // Node is in the overlay: delete from overlay. Record the
+            // post-freeze deletion so `swap_base_and_repair_overlay` keeps
+            // the id out of the absorbed (undirty) class — otherwise a
+            // frozen entity deleted at N+1 would resurrect from the new
+            // base.
+            self.record_post_freeze_node(id);
+            // #15: the base copy dies with the overlay copy; flag the
+            // deletion log so the next checkpoint re-emits it.
+            self.note_promoted_node_delete(id);
+            self.journal_touch(&mut journal, owner, LayerChange::NodeCopyUp(id));
+            // Hold the journal through the overlay delete, as `promote_lock`
+            // did before (#13): journal -> overlay store is the copy-up order.
+            let deleted = overlay_delete(&self.overlay.load());
+            drop(journal);
+            return deleted;
+        }
+        if self.base.load().get_node(id).is_some() {
+            // Transaction-scoped tombstone: inserted and journaled under the
+            // journal lock so a rollback lifts exactly what it owns.
+            let fresh = self.deleted_from_base_nodes.write().insert(id);
+            if fresh {
+                self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
+            }
+            self.journal_tombstone(
+                &mut journal,
+                owner,
+                LayerChange::BaseNodeTombstone(id),
+                fresh,
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Shared body of `delete_edge` / `delete_edge_versioned`.
+    fn delete_edge_layered(
+        &self,
+        id: EdgeId,
+        owner: Option<TransactionId>,
+        overlay_delete: impl FnOnce(&LpgStore) -> bool,
+    ) -> bool {
+        let (dirty, mut journal) = self.edge_dirty_guarded(id);
+        if dirty {
+            // See `delete_node_layered`: record the N+1 deletion for the
+            // repair swap.
+            self.record_post_freeze_edge(id);
+            // #15: see `delete_node_layered`.
+            self.note_promoted_edge_delete(id);
+            self.journal_touch(&mut journal, owner, LayerChange::EdgeCopyUp(id));
+            // Hold the journal through the overlay delete, as `promote_lock`
+            // did before (#13): journal -> overlay store is the copy-up order.
+            let deleted = overlay_delete(&self.overlay.load());
+            drop(journal);
+            return deleted;
+        }
+        if self.base.load().get_edge(id).is_some() {
+            let fresh = self.deleted_from_base_edges.write().insert(id);
+            if fresh {
+                self.deletions_dirty.store(true, Ordering::Release);
+                self.charge_retained(
+                    RetainedCategory::DeletionSets,
+                    overlay_cost::deletion_entry_retained_bytes(),
+                );
+            }
+            self.journal_tombstone(
+                &mut journal,
+                owner,
+                LayerChange::BaseEdgeTombstone(id),
+                fresh,
+            );
+            return true;
+        }
+        false
     }
 }
 
@@ -5098,6 +5619,267 @@ mod tests {
         assert!(!layered.has_property_index("age"));
     }
 
+    // ── Transaction-scoped layered bookkeeping ─────────────────────
+
+    /// Everything a reader sees, for before/after comparisons.
+    fn visible_state(layered: &LayeredStore) -> (usize, usize, Vec<String>) {
+        let mut rows = Vec::new();
+        let mut ids = layered.node_ids();
+        ids.sort_unstable();
+        for id in ids {
+            let node = layered.get_node(id).expect("listed node");
+            let mut props: Vec<String> = node
+                .properties
+                .iter()
+                .map(|(k, v)| format!("{}={v:?}", k.as_str()))
+                .collect();
+            props.sort_unstable();
+            let mut out = layered.edges_from(id, Direction::Outgoing);
+            out.sort_unstable();
+            let mut inc = layered.edges_from(id, Direction::Incoming);
+            inc.sort_unstable();
+            rows.push(format!(
+                "{id:?} {:?} {props:?} out={out:?} in={inc:?} dirty={}",
+                node.labels,
+                layered.is_node_dirty(id)
+            ));
+        }
+        (layered.node_count(), layered.edge_count(), rows)
+    }
+
+    /// Rolls back like `Session::rollback`: overlay MVCC first, then layers.
+    fn rollback(layered: &LayeredStore, tx: TransactionId) {
+        layered.overlay_store().discard_uncommitted_versions(tx);
+        layered.rollback_transaction_layers(tx);
+    }
+
+    #[test]
+    fn rollback_undoes_base_tombstones_copy_ups_and_sets() {
+        let layered = build_test_layered();
+        let before = visible_state(&layered);
+        let (alix, gus, amsterdam) = (NodeId::new(0), NodeId::new(1), NodeId::new(2));
+        let tx = TransactionId::new(7);
+        let epoch = layered.current_epoch();
+
+        // DETACH DELETE alix, SET + label on gus, new edge onto amsterdam,
+        // SET on a base edge (edge copy-up).
+        assert!(layered.delete_edge_versioned(EdgeId::new(0), epoch, tx));
+        assert!(layered.delete_node_versioned(alix, epoch, tx));
+        layered.set_node_property_versioned(gus, "age", Value::Int64(99), tx);
+        layered.add_label_versioned(gus, "Renamed", tx);
+        let tmp = layered.create_node_versioned(&["Temp"], epoch, tx);
+        layered.create_edge_versioned(tmp, amsterdam, "NEAR", epoch, tx);
+        layered.set_edge_property_versioned(EdgeId::new(1), "since", Value::Int64(1), tx);
+        assert_ne!(visible_state(&layered), before);
+
+        rollback(&layered, tx);
+        assert_eq!(visible_state(&layered), before);
+        assert!(layered.snapshot_deleted_node_ids().is_empty());
+        assert!(layered.snapshot_deleted_edge_ids().is_empty());
+        // The base edge's copy-up is undirtied. (The rolled-back overlay-native
+        // NEAR edge keeps a dirty mark, as on d63e3708; reads skip it because
+        // the overlay no longer has the edge.)
+        assert!(!layered.is_edge_dirty(EdgeId::new(1)));
+        assert!(!layered.txn_journal_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn commit_keeps_layer_changes_and_clears_journal() {
+        let layered = build_test_layered();
+        let tx = TransactionId::new(7);
+        let epoch = layered.current_epoch();
+        assert!(layered.delete_node_versioned(NodeId::new(0), epoch, tx));
+        layered.set_node_property_versioned(NodeId::new(1), "age", Value::Int64(99), tx);
+        layered.overlay_store().finalize_version_epochs(tx, epoch);
+        layered.overlay_store().commit_transaction_properties(tx);
+        layered.commit_transaction_layers(tx);
+        assert!(!layered.txn_journal_pending.load(Ordering::Acquire));
+
+        // A late rollback call for the committed id must be a no-op.
+        layered.rollback_transaction_layers(tx);
+        assert!(layered.get_node(NodeId::new(0)).is_none());
+        assert_eq!(
+            layered.get_node_property(NodeId::new(1), &PropertyKey::new("age")),
+            Some(Value::Int64(99))
+        );
+    }
+
+    #[test]
+    fn savepoint_rollback_undoes_only_later_layer_changes() {
+        let layered = build_test_layered();
+        let tx = TransactionId::new(7);
+        let epoch = layered.current_epoch();
+        assert!(layered.delete_node_versioned(NodeId::new(0), epoch, tx));
+        let pos = layered.transaction_layer_position(tx);
+        let undo_pos = layered.overlay_store().property_undo_log_position(tx);
+        layered.set_node_property_versioned(NodeId::new(1), "age", Value::Int64(99), tx);
+
+        layered
+            .overlay_store()
+            .rollback_transaction_properties_to(tx, undo_pos);
+        layered.rollback_transaction_layers_to(tx, pos);
+        assert!(
+            layered.get_node(NodeId::new(0)).is_none(),
+            "pre-savepoint delete stays"
+        );
+        assert!(
+            !layered.is_node_dirty(NodeId::new(1)),
+            "post-savepoint copy-up undone"
+        );
+        assert_eq!(
+            layered.get_node_property(NodeId::new(1), &PropertyKey::new("age")),
+            Some(Value::Int64(25))
+        );
+
+        rollback(&layered, tx);
+        assert!(layered.get_node(NodeId::new(0)).is_some());
+    }
+
+    #[test]
+    fn shared_copy_up_survives_one_owners_rollback() {
+        let layered = build_test_layered();
+        let gus = NodeId::new(1);
+        let (t1, t2) = (TransactionId::new(7), TransactionId::new(8));
+        layered.set_node_property_versioned(gus, "age", Value::Int64(40), t1);
+        layered.set_node_property_versioned(gus, "city", Value::from("Paris"), t2);
+
+        rollback(&layered, t1);
+        assert!(layered.is_node_dirty(gus), "t2 still relies on the copy-up");
+        assert_eq!(
+            layered.get_node_property(gus, &PropertyKey::new("city")),
+            Some(Value::from("Paris"))
+        );
+
+        layered.overlay_store().commit_transaction_properties(t2);
+        layered.commit_transaction_layers(t2);
+        assert!(!layered.txn_journal_pending.load(Ordering::Acquire));
+        assert_eq!(
+            layered.get_node_property(gus, &PropertyKey::new("age")),
+            Some(Value::Int64(25))
+        );
+    }
+
+    #[test]
+    fn non_transactional_write_makes_pending_copy_up_permanent() {
+        let layered = build_test_layered();
+        let gus = NodeId::new(1);
+        let tx = TransactionId::new(7);
+        layered.set_node_property_versioned(gus, "age", Value::Int64(40), tx);
+        layered.set_node_property(gus, "city", Value::from("Paris"));
+        rollback(&layered, tx);
+        assert_eq!(
+            layered.get_node_property(gus, &PropertyKey::new("city")),
+            Some(Value::from("Paris")),
+            "a rollback must not discard a non-transactional write"
+        );
+    }
+
+    #[test]
+    fn system_transaction_writes_are_not_journaled() {
+        let layered = build_test_layered();
+        let epoch = layered.current_epoch();
+        assert!(layered.delete_node_versioned(NodeId::new(0), epoch, TransactionId::SYSTEM));
+        assert!(!layered.txn_journal_pending.load(Ordering::Acquire));
+    }
+
+    /// Review finding (concurrency): a rollback that undoes a copy-up must not
+    /// race with another transaction writing the same node. Thread `rb`
+    /// repeatedly copies gus up inside a transaction and rolls it back; the
+    /// main thread does the same with its own transactions and checks that
+    /// its write is visible before its own rollback; a reader must never see
+    /// gus vanish.
+    #[test]
+    fn rollback_of_copy_up_does_not_race_other_writers() {
+        use std::sync::atomic::AtomicBool;
+        let layered = Arc::new(build_test_layered());
+        let gus = NodeId::new(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let vanished = Arc::new(AtomicBool::new(false));
+
+        let rb = {
+            let layered = Arc::clone(&layered);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut n = 1_000_000u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let tx = TransactionId::new(n);
+                    n += 1;
+                    layered.set_node_property_versioned(gus, "a", Value::Int64(1), tx);
+                    rollback(&layered, tx);
+                }
+            })
+        };
+        let reader = {
+            let layered = Arc::clone(&layered);
+            let stop = Arc::clone(&stop);
+            let vanished = Arc::clone(&vanished);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if layered.get_node(gus).is_none() {
+                        vanished.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        let mut lost = 0usize;
+        for j in 0..20_000i64 {
+            let tx = TransactionId::new(10 + j as u64);
+            layered.set_node_property_versioned(gus, "b", Value::Int64(j), tx);
+            if layered.get_node_property(gus, &PropertyKey::new("b")) != Some(Value::Int64(j)) {
+                lost += 1;
+            }
+            rollback(&layered, tx);
+        }
+        stop.store(true, Ordering::Relaxed);
+        rb.join().unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(
+            lost, 0,
+            "a write was purged by another transaction's rollback"
+        );
+        assert!(
+            !vanished.load(Ordering::Relaxed),
+            "a reader saw gus vanish mid-undo"
+        );
+        assert_eq!(
+            layered.get_node_property(gus, &PropertyKey::new("age")),
+            Some(Value::Int64(25))
+        );
+    }
+
+    /// Review finding: dropping pending journal entries (overlay reset /
+    /// merge while a transaction is open) must be visible, not silent.
+    #[test]
+    fn forgetting_pending_layer_changes_is_counted() {
+        let layered = build_test_layered();
+        let tx = TransactionId::new(7);
+        let epoch = layered.current_epoch();
+        assert!(layered.delete_node_versioned(NodeId::new(0), epoch, tx));
+        assert_eq!(layered.forgotten_layer_changes(), 0);
+        layered.reset_overlay();
+        assert_eq!(layered.forgotten_layer_changes(), 1);
+        // The later rollback finds nothing to undo and reports the loss.
+        assert_eq!(layered.rollback_transaction_layers(tx), 1);
+        assert_eq!(layered.rollback_transaction_layers(tx), 0, "reported once");
+        assert_eq!(layered.forgotten_layer_changes(), 1);
+    }
+
+    /// Review round 2: a savepoint rollback after a reset dropped the
+    /// transaction's entries must report the loss too (its saved journal
+    /// position is stale), and the full rollback still reports it.
+    #[test]
+    fn savepoint_rollback_after_forget_reports_loss() {
+        let layered = build_test_layered();
+        let tx = TransactionId::new(7);
+        let epoch = layered.current_epoch();
+        let pos = layered.transaction_layer_position(tx);
+        assert!(layered.delete_node_versioned(NodeId::new(0), epoch, tx));
+        layered.reset_overlay();
+        assert_eq!(layered.rollback_transaction_layers_to(tx, pos), 1);
+        assert_eq!(layered.rollback_transaction_layers(tx), 1);
+    }
+
     // ── Copy-up review round 2 (fork PR #13) ─────────────────────────
 
     /// With `temporal`, a copy-up's properties must be readable at the same
@@ -5135,6 +5917,59 @@ mod tests {
             .get_edge_at_epoch(edge, EpochId::new(1))
             .expect("copied-up edge visible at an older epoch");
         assert_eq!(old.get_property("since"), Some(&Value::Int64(2020)));
+    }
+
+    /// A copy-up rolled back at a later epoch, then copied up again, must
+    /// not append its epoch-0 property history after the purge's history:
+    /// that trips `VersionLog::append`'s ascending-epoch assertion (debug)
+    /// or leaves the log out of order (release).
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn temporal_copy_up_after_rolled_back_copy_up() {
+        let layered = build_test_layered();
+        let gus = NodeId::new(1);
+        let age = PropertyKey::new("age");
+        let base_age = layered.get_node_property(gus, &age).expect("base age");
+
+        layered.overlay.load().sync_epoch(EpochId::new(5));
+        let tx = TransactionId::new(7);
+        layered.set_node_property_versioned(gus, "age", Value::Int64(99), tx);
+        rollback(&layered, tx);
+        assert!(!layered.is_node_dirty(gus));
+
+        layered.overlay.load().sync_epoch(EpochId::new(6));
+        let tx2 = TransactionId::new(8);
+        layered.set_node_property_versioned(gus, "age", Value::Int64(40), tx2);
+        assert!(layered.is_node_dirty(gus), "second copy-up registered");
+        let old = layered
+            .get_node_at_epoch(gus, EpochId::new(1))
+            .expect("copied-up row visible at an older epoch");
+        assert_eq!(old.get_property("age"), Some(&base_age));
+    }
+
+    /// Edge variant of [`temporal_copy_up_after_rolled_back_copy_up`].
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn temporal_edge_copy_up_after_rolled_back_copy_up() {
+        let layered = build_test_layered();
+        let edge = EdgeId::new(1);
+        let since = PropertyKey::new("since");
+        let base_since = layered.get_edge_property(edge, &since).expect("base since");
+
+        layered.overlay.load().sync_epoch(EpochId::new(5));
+        let tx = TransactionId::new(7);
+        layered.set_edge_property_versioned(edge, "since", Value::Int64(1), tx);
+        rollback(&layered, tx);
+        assert!(!layered.is_edge_dirty(edge));
+
+        layered.overlay.load().sync_epoch(EpochId::new(6));
+        let tx2 = TransactionId::new(8);
+        layered.set_edge_property_versioned(edge, "since", Value::Int64(2), tx2);
+        assert!(layered.is_edge_dirty(edge), "second copy-up registered");
+        let old = layered
+            .get_edge_at_epoch(edge, EpochId::new(1))
+            .expect("copied-up edge visible at an older epoch");
+        assert_eq!(old.get_property("since"), Some(&base_since));
     }
 
     /// A base delete racing a first write to the same base node must never

@@ -147,6 +147,36 @@ impl super::GrafeoDB {
             }
         }
 
+        // Auto-insert into matching vector indexes for the new node
+        #[cfg(feature = "vector-index")]
+        if let Some(node) = self.lpg_store().get_node(id) {
+            for label in &node.labels {
+                for (prop_key, prop_val) in &node.properties {
+                    let grafeo_common::types::Value::Vector(vector) = prop_val else {
+                        continue;
+                    };
+                    let Some(index) = self
+                        .lpg_store()
+                        .get_vector_index(label.as_str(), prop_key.as_ref())
+                    else {
+                        continue;
+                    };
+                    if vector.len() != index.config().dimensions {
+                        grafeo_warn!(
+                            "Node {} property '{}' has {} dimensions, index expects {}; skipping vector index insert",
+                            id.as_u64(),
+                            prop_key.as_ref(),
+                            vector.len(),
+                            index.config().dimensions
+                        );
+                        continue;
+                    }
+                    let accessor = self.make_vector_accessor(label.as_str(), prop_key.as_ref());
+                    index.insert(id, vector, &accessor);
+                }
+            }
+        }
+
         Ok(id)
     }
 
