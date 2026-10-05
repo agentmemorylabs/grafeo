@@ -1,0 +1,63 @@
+name: Trunk
+
+# Trimmed CI for the fork's real trunk. ci.yml only triggers on main and
+# release/*, and its full matrix (3 OSes, language bindings, miri, coverage,
+# benchmarks) is too large for a fork-trunk gate. This builds and tests only
+# the feature sets this fork actually uses.
+
+on:
+  push:
+    branches: [fix/root-mount-covers-nested]
+  pull_request:
+    branches: [fix/root-mount-covers-nested]
+  workflow_dispatch:
+
+concurrency:
+  group: trunk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  FEATURES: generation,generation-streaming,compact-store,lpg,wal,mmap,cypher,vector-index,text-index
+
+jobs:
+  trunk:
+    name: Build and test (trunk feature set)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build -p grafeo-engine --features "$FEATURES"
+
+      - name: Core lib tests
+        run: cargo test -p grafeo-core --lib --features "lpg,mmap,compact-store,generation-streaming,vector-index,text-index"
+
+      - name: Engine lib tests
+        run: cargo test -p grafeo-engine --lib --features "$FEATURES"
+
+      - name: Engine integration tests (generation, layered, compact_store, wal, recovery)
+        run: |
+          set -eu
+          targets=""
+          for f in crates/grafeo-engine/tests/*.rs; do
+            n=$(basename "$f" .rs)
+            case "$n" in
+              generation_*|layered_*|compact_store_*|*wal*|*recovery*|epoch_handoff_*)
+                targets="$targets --test $n" ;;
+            esac
+          done
+          echo "targets:$targets"
+          cargo test -p grafeo-engine --features "$FEATURES" $targets
