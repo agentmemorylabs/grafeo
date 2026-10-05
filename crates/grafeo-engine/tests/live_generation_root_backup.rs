@@ -226,6 +226,25 @@ fn dir_entries(path: &Path) -> Vec<String> {
     names
 }
 
+/// Restore `backup_dir` again, open it **writable** (so the torn-tail
+/// truncation path runs on a cut taken under load), write a marker, reopen,
+/// and check the prefix plus the new write.
+fn assert_writable_after_restore(backup_dir: &Path, dir: &TempDir, name: &str, at_least: usize) {
+    let new_root = dir.path().join(name);
+    drop(restore_generation_root(backup_dir, &new_root).expect("restore backup"));
+    {
+        let db = GrafeoDB::open_generation_root(&new_root, false).expect("open writable");
+        db.session()
+            .execute("INSERT (:Marker {seq: 777777777})")
+            .expect("write to restored root");
+    }
+    let reopened = GrafeoDB::open_generation_root(&new_root, true).expect("reopen");
+    let items = item_seqs(&reopened);
+    let (marker, prefix): (Vec<i64>, Vec<i64>) = items.iter().partition(|s| **s == 777_777_777);
+    assert_eq!(marker.len(), 1, "the post-restore write survives a reopen");
+    assert_prefix(&prefix, at_least, "writable restore");
+}
+
 /// Back up a live root while another thread writes, restore it, and compare.
 fn concurrent_writer_backup(durability: DurabilityMode) {
     let dir = TempDir::new().expect("temp dir");
@@ -277,6 +296,7 @@ fn concurrent_writer_backup(durability: DurabilityMode) {
     writer.join().expect("writer thread");
 
     assert!(receipt.wal_files >= 1, "WAL captured: {receipt:?}");
+    assert_writable_after_restore(&receipt.backup_dir, &dir, "restored-writable", acked_before);
     let restored = restore_and_open(&receipt.backup_dir, &dir, "restored");
 
     // Every write acknowledged before the call is present; nothing partial.
@@ -553,4 +573,114 @@ fn non_generation_root_database_is_refused() {
         db.backup_generation_root(dir.path(), "x"),
         Err(RetirementError::NotGenerationRoot)
     ));
+}
+
+/// WAL rotation racing the cut: another thread keeps rotating the live WAL
+/// while two sessions write and backups run. Every backup completes and then
+/// restores and opens (read-only and writable) holding everything
+/// acknowledged before it started.
+///
+/// Rotation is only issued between transactions (writers hold a read lock for
+/// each statement, the rotator the write lock). A rotation in the middle of
+/// a transaction leaves the *live* log with a rotated file ending in an open
+/// transaction, which replay rejects regardless of any backup; that is a
+/// separate WAL issue, and the backup's replay check refuses such a cut.
+#[test]
+fn backup_cut_survives_concurrent_wal_rotation_and_two_writers() {
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().join("live.grafeo.d");
+    std::fs::create_dir_all(&root).expect("create root");
+    publish_base(&root);
+    let db = Arc::new(open_live(&root, DurabilityMode::Sync));
+    // Two writers, each owning a disjoint seq range: A even, B odd.
+    let acked = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+    let stop = Arc::new(AtomicBool::new(false));
+    let between_txns = Arc::new(std::sync::RwLock::new(()));
+    let mut threads = Vec::new();
+    for (lane, acked) in acked.iter().enumerate() {
+        let (db, acked, stop, gate) = (
+            Arc::clone(&db),
+            Arc::clone(acked),
+            Arc::clone(&stop),
+            Arc::clone(&between_txns),
+        );
+        threads.push(std::thread::spawn(move || {
+            let session = db.session();
+            let mut n = 0i64;
+            while !stop.load(Ordering::Relaxed) {
+                let seq = n * 2 + i64::try_from(lane).expect("lane");
+                let _between = gate.read().expect("gate");
+                session
+                    .execute(&format!("INSERT (:Item {{seq: {seq}}})"))
+                    .expect("write");
+                n += 1;
+                acked.store(usize::try_from(n).expect("fits"), Ordering::SeqCst);
+            }
+        }));
+    }
+    {
+        let (db, stop, gate) = (
+            Arc::clone(&db),
+            Arc::clone(&stop),
+            Arc::clone(&between_txns),
+        );
+        threads.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                {
+                    let _quiet = gate.write().expect("gate");
+                    db.wal().expect("wal").rotate().expect("rotate");
+                }
+                std::thread::sleep(Duration::from_micros(300));
+            }
+        }));
+    }
+
+    std::thread::sleep(Duration::from_millis(30));
+    let dest = dir.path().join("backups");
+    let mut kept = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut n = 0usize;
+    while Instant::now() < deadline {
+        let before = (
+            acked[0].load(Ordering::SeqCst),
+            acked[1].load(Ordering::SeqCst),
+        );
+        let receipt = db
+            .backup_generation_root(&dest, &format!("rot-{n}"))
+            .expect("backup under rotation must complete");
+        kept.push((before, receipt.backup_dir));
+        n += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for t in threads {
+        t.join().expect("thread");
+    }
+    assert!(kept.len() >= 3, "only {} backups taken", kept.len());
+
+    for (i, ((a, b), backup_dir)) in kept.iter().enumerate() {
+        let restored = restore_and_open(backup_dir, &dir, &format!("rot-restored-{i}"));
+        let seqs = item_seqs(&restored);
+        // Each lane's acknowledged writes are present, and each lane is an
+        // unbroken prefix of its own sequence.
+        for (lane, acked_before) in [(0i64, *a), (1i64, *b)] {
+            let mine: Vec<i64> = seqs.iter().copied().filter(|s| s % 2 == lane).collect();
+            let expected: Vec<i64> = (0..i64::try_from(mine.len()).expect("len"))
+                .map(|k| k * 2 + lane)
+                .collect();
+            assert_eq!(mine, expected, "backup {i} lane {lane}: broken prefix");
+            assert!(
+                mine.len() >= acked_before,
+                "backup {i} lane {lane}: {acked_before} acknowledged, {} restored",
+                mine.len()
+            );
+        }
+        if i % 4 == 0 {
+            let w = dir.path().join(format!("rot-writable-{i}"));
+            drop(restore_generation_root(backup_dir, &w).expect("restore"));
+            let wdb = GrafeoDB::open_generation_root(&w, false).expect("open writable");
+            wdb.session()
+                .execute("INSERT (:Marker {seq: 1})")
+                .expect("write");
+        }
+    }
 }

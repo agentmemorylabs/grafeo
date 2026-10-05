@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use grafeo_storage::file::generation_writer::{GenerationFileOps, OsGenerationFileOps};
 use grafeo_storage::generation::manifest::{self, ManifestSlot};
+use grafeo_storage::generation::wal_cursor::{WalReplayCursor, validate_replayable};
 use serde::{Deserialize, Serialize};
 
 use super::super::ownership::RootOwnership;
@@ -133,12 +134,15 @@ pub fn backup_generation_root(
 ///
 /// Same pin / validate / stage / publish sequence as
 /// [`backup_generation_root`], except that the WAL is captured as a
-/// **consistent cut** instead of whole files: `sync_wal` is called first
-/// (flush + fsync the live WAL), and only then are the `wal_*.log` files from
-/// the manifest boundary onward listed and their lengths recorded. Each file
-/// is copied up to its recorded length, so bytes appended while the copy runs
-/// are not part of the backup. The caller must already exclude publication
-/// (epoch handoff) for the whole call; see `GrafeoDB::backup_generation_root`.
+/// **consistent cut** instead of whole files: `wal_cut` flushes and fsyncs
+/// the live WAL under its own append lock and reports the active file's
+/// sequence and length. Every lower sequence is final at that moment. Files
+/// from the manifest boundary through the active sequence are copied, the
+/// active one only up to the reported length, so bytes appended (or files
+/// created by a rotation) while the copy runs are not part of the backup.
+/// The staged WAL is replay-validated before publication. The caller must
+/// already exclude publication (epoch handoff) for the whole call; see
+/// `GrafeoDB::backup_generation_root`.
 #[cfg(all(
     feature = "wal",
     feature = "lpg",
@@ -152,25 +156,25 @@ pub(crate) fn backup_live_generation_root(
     ownership: &RootOwnership,
     destination_dir: &Path,
     backup_name: &str,
-    sync_wal: &dyn Fn() -> Result<(), RetirementError>,
+    wal_cut: &LiveWalCutFn<'_>,
 ) -> Result<GenerationBackupReceipt, RetirementError> {
-    backup_root_inner(
-        auth,
-        ownership,
-        destination_dir,
-        backup_name,
-        Some(sync_wal),
-    )
+    backup_root_inner(auth, ownership, destination_dir, backup_name, Some(wal_cut))
 }
 
-/// Shared body. `live_wal_sync` is `Some` for a live root (consistent-cut WAL
+/// Takes the live WAL cut: flushes and fsyncs the WAL under its append lock
+/// and returns `(active sequence, active file length)`, or `None` when the
+/// database has no WAL of its own (nothing is appended, so the files on disk
+/// are final).
+pub(crate) type LiveWalCutFn<'a> = dyn Fn() -> Result<Option<(u64, u64)>, RetirementError> + 'a;
+
+/// Shared body. `live_wal_cut` is `Some` for a live root (consistent-cut WAL
 /// capture) and `None` for an offline root (every WAL file copied whole).
 fn backup_root_inner(
     auth: &RetirementAuthority,
     ownership: &RootOwnership,
     destination_dir: &Path,
     backup_name: &str,
-    live_wal_sync: Option<&dyn Fn() -> Result<(), RetirementError>>,
+    live_wal_cut: Option<&LiveWalCutFn<'_>>,
 ) -> Result<GenerationBackupReceipt, RetirementError> {
     let root = ownership.canonical_root();
     if auth.root() != root {
@@ -186,6 +190,7 @@ fn backup_root_inner(
     if canonical_dest.starts_with(root) {
         return Err(RetirementError::DestinationInsideRoot);
     }
+    sweep_dead_staging_dirs(&canonical_dest);
     let final_dir = canonical_dest.join(backup_name);
     if final_dir.exists() {
         return Err(RetirementError::ValidationFailed(format!(
@@ -227,15 +232,13 @@ fn backup_root_inner(
         ));
     }
 
-    // The consistency point of a live backup: flush + fsync the WAL, then
-    // record the length of every WAL file at or after the manifest boundary.
-    // Everything acknowledged before this point is inside the recorded
-    // lengths; the files are append-only, so a prefix is a valid log.
-    let wal_cut = match live_wal_sync {
-        Some(sync) => {
-            sync()?;
-            WalSelection::Cut(capture_wal_cut(root, slot.wal_log_sequence)?)
-        }
+    // The consistency point of a live backup: the WAL is flushed and fsynced
+    // under its own append lock, which also yields the active file's length.
+    // Everything acknowledged before this point is inside the cut; the files
+    // are append-only, so a prefix ending at an append-group boundary is a
+    // valid log.
+    let wal_cut = match live_wal_cut {
+        Some(cut) => WalSelection::Cut(capture_wal_cut(root, slot.wal_log_sequence, cut()?)?),
         None => WalSelection::All,
     };
 
@@ -247,30 +250,52 @@ fn backup_root_inner(
     );
     let temp_dir = canonical_dest.join(&temp_name);
     let temp_wal = temp_dir.join("wal");
-    std::fs::create_dir_all(&temp_wal)?;
 
-    let (manifest_record, mut copied_bytes) =
-        match stage_backup(ops, root, &slot, &wal_cut, &temp_dir, &temp_wal) {
-            Ok(staged) => staged,
-            Err(e) => {
-                // Fail closed: remove the incomplete staging dir, release the pin.
-                let _ = std::fs::remove_dir_all(&temp_dir);
-                return Err(e);
-            }
-        };
+    // Stage, validate and publish. Any failure removes the staging dir, so a
+    // failed (say, disk-full) backup never leaks a partial copy; the pin is
+    // released when `pin` drops.
+    let published = (|| -> Result<(GenerationBackupManifest, u64), RetirementError> {
+        std::fs::create_dir_all(&temp_wal)?;
+        let (manifest_record, mut copied_bytes) =
+            stage_backup(ops, root, &slot, &wal_cut, &temp_dir, &temp_wal)?;
 
-    // Publish: write the backup manifest, fsync, atomic rename, parent fsync.
-    let manifest_data =
-        bincode::serde::encode_to_vec(&manifest_record, bincode::config::standard())
-            .map_err(|e| RetirementError::BackupManifest(format!("encode: {e}")))?;
-    copied_bytes += manifest_data.len() as u64;
-    let manifest_out = temp_dir.join(BACKUP_MANIFEST_NAME);
-    std::fs::write(&manifest_out, &manifest_data)?;
-    ops.sync_path(&manifest_out)?;
-    ops.sync_dir(&temp_dir)?;
+        // A live cut must replay from the manifest boundary exactly as
+        // restore + open will; refuse here rather than at restore time.
+        if matches!(wal_cut, WalSelection::Cut(_)) {
+            let cursor = WalReplayCursor {
+                log_sequence: slot.wal_log_sequence,
+                byte_offset: slot.wal_byte_offset,
+                epoch: slot.overlay_epoch,
+                transaction_id: slot.transaction_id,
+            };
+            validate_replayable(&temp_wal, &cursor).map_err(|e| {
+                RetirementError::ValidationFailed(format!(
+                    "staged WAL cut does not replay from the manifest boundary: {e}"
+                ))
+            })?;
+        }
 
-    ops.rename(&temp_dir, &final_dir)?;
-    ops.sync_dir(&canonical_dest)?;
+        // Publish: write the backup manifest, fsync, atomic rename, parent fsync.
+        let manifest_data =
+            bincode::serde::encode_to_vec(&manifest_record, bincode::config::standard())
+                .map_err(|e| RetirementError::BackupManifest(format!("encode: {e}")))?;
+        copied_bytes += manifest_data.len() as u64;
+        let manifest_out = temp_dir.join(BACKUP_MANIFEST_NAME);
+        std::fs::write(&manifest_out, &manifest_data)?;
+        ops.sync_path(&manifest_out)?;
+        ops.sync_dir(&temp_dir)?;
+
+        ops.rename(&temp_dir, &final_dir)?;
+        ops.sync_dir(&canonical_dest)?;
+        Ok((manifest_record, copied_bytes))
+    })();
+    let (manifest_record, copied_bytes) = match published {
+        Ok(done) => done,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(e);
+        }
+    };
 
     // The pin is released here (guard drop), after the copy is durable.
     drop(pin);
@@ -370,6 +395,10 @@ fn stage_backup(
         }
     }
 
+    // The WAL files' directory entries must be durable before the backup is
+    // published, or a power loss could leave a published backup without them.
+    ops.sync_dir(temp_wal)?;
+
     Ok((
         GenerationBackupManifest {
             version: BACKUP_FORMAT_VERSION,
@@ -403,16 +432,19 @@ enum WalSelection {
     Cut(Vec<(String, u64)>),
 }
 
-/// List `wal_<seq>.log` files with sequence >= `from_sequence`, sorted by
-/// sequence, with their current lengths.
+/// Choose the WAL files of a live cut and their byte lengths.
 ///
-/// All names are listed first and lengths read afterwards. If the WAL
-/// rotates in between, a listed file that was active is only longer than
-/// before, and a file created after the listing is simply not part of the
-/// cut. Either way the result is a prefix of the append-only log stream, and
-/// every file but the last is already rotated (final) at the moment of the
-/// listing.
-fn capture_wal_cut(root: &Path, from_sequence: u64) -> Result<Vec<(String, u64)>, RetirementError> {
+/// With `active = Some((sequence, length))` (from the WAL's own cut under its
+/// append lock) the cut is the files `from_sequence..=sequence`: every lower
+/// file is final and taken whole, the active one only up to `length`. A file
+/// above `sequence` (created by a rotation after the cut) is ignored. With
+/// `None` (no live WAL in this process) every file from `from_sequence` on is
+/// final and taken whole. The sequences must be contiguous.
+fn capture_wal_cut(
+    root: &Path,
+    from_sequence: u64,
+    active: Option<(u64, u64)>,
+) -> Result<Vec<(String, u64)>, RetirementError> {
     let wal_dir = root.join("wal");
     let mut listed: Vec<(u64, String)> = Vec::new();
     for entry in std::fs::read_dir(&wal_dir)? {
@@ -424,24 +456,68 @@ fn capture_wal_cut(root: &Path, from_sequence: u64) -> Result<Vec<(String, u64)>
             .and_then(|n| n.parse::<u64>().ok());
         if let Some(seq) = seq
             && seq >= from_sequence
+            && active.is_none_or(|(active_seq, _)| seq <= active_seq)
             && entry.file_type()?.is_file()
         {
             listed.push((seq, name));
         }
     }
     listed.sort_unstable();
-    if listed.first().map(|(seq, _)| *seq) != Some(from_sequence) {
+    for (index, (seq, _)) in listed.iter().enumerate() {
+        let expected = from_sequence + index as u64;
+        if *seq != expected {
+            return Err(RetirementError::ValidationFailed(format!(
+                "WAL sequence {expected} is missing (found {seq}); the log from the \
+                 manifest boundary (sequence {from_sequence}) is not contiguous"
+            )));
+        }
+    }
+    if let Some((active_seq, _)) = active
+        && listed.last().map(|(seq, _)| *seq) != Some(active_seq)
+    {
+        return Err(RetirementError::ValidationFailed(format!(
+            "active WAL file (sequence {active_seq}) is missing from {}",
+            wal_dir.display()
+        )));
+    }
+    if listed.is_empty() {
         return Err(RetirementError::ValidationFailed(format!(
             "WAL file for the manifest boundary (sequence {from_sequence}) is missing"
         )));
     }
     listed
         .into_iter()
-        .map(|(_, name)| {
-            let len = std::fs::metadata(wal_dir.join(&name))?.len();
+        .map(|(seq, name)| {
+            let len = match active {
+                Some((active_seq, active_len)) if seq == active_seq => active_len,
+                _ => std::fs::metadata(wal_dir.join(&name))?.len(),
+            };
             Ok((name, len))
         })
         .collect()
+}
+
+/// Remove `.tmp-gbackup-<pid>-*` staging directories left by a backup whose
+/// process died (Linux `/proc` check; elsewhere nothing is swept).
+fn sweep_dead_staging_dirs(dest: &Path) {
+    if !Path::new("/proc/self").exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dest) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(".tmp-gbackup-") else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !Path::new("/proc").join(pid.to_string()).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Copy exactly the first `len` bytes of `src` to a new file `dst`
@@ -500,4 +576,53 @@ pub(super) fn is_safe_component(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wal_dir_with(files: &[(u64, usize)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wal = dir.path().join("wal");
+        std::fs::create_dir_all(&wal).expect("wal dir");
+        for (seq, len) in files {
+            std::fs::write(wal.join(format!("wal_{seq:08}.log")), vec![7u8; *len])
+                .expect("write wal file");
+        }
+        dir
+    }
+
+    #[test]
+    fn live_cut_ignores_files_created_after_the_cut_and_uses_the_active_length() {
+        // wal_5 is active with 10 bytes at the cut; wal_6 appeared from a
+        // rotation just after it and must not be part of the backup; wal_5 on
+        // disk is already longer than the cut.
+        let dir = wal_dir_with(&[(4, 100), (5, 40), (6, 3)]);
+        let cut = capture_wal_cut(dir.path(), 4, Some((5, 10))).expect("cut");
+        assert_eq!(
+            cut,
+            vec![
+                ("wal_00000004.log".to_string(), 100),
+                ("wal_00000005.log".to_string(), 10)
+            ]
+        );
+    }
+
+    #[test]
+    fn cut_refuses_a_sequence_gap_or_a_missing_active_file() {
+        let gap = wal_dir_with(&[(4, 1), (6, 1)]);
+        assert!(capture_wal_cut(gap.path(), 4, Some((6, 1))).is_err());
+        let missing_active = wal_dir_with(&[(4, 1)]);
+        assert!(capture_wal_cut(missing_active.path(), 4, Some((5, 1))).is_err());
+        let missing_boundary = wal_dir_with(&[(5, 1)]);
+        assert!(capture_wal_cut(missing_boundary.path(), 4, None).is_err());
+    }
+
+    #[test]
+    fn cut_without_a_live_wal_takes_every_file_whole() {
+        let dir = wal_dir_with(&[(4, 9), (5, 11)]);
+        let cut = capture_wal_cut(dir.path(), 4, None).expect("cut");
+        assert_eq!(cut.iter().map(|(_, l)| *l).collect::<Vec<_>>(), vec![9, 11]);
+    }
 }

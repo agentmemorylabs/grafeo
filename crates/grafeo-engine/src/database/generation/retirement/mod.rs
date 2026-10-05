@@ -132,6 +132,10 @@ pub enum RetirementError {
     /// through this API.
     #[error("database is not an open generation root")]
     NotGenerationRoot,
+    /// The live WAL is poisoned: a transaction in memory may not be in the
+    /// log, so a backup would silently lack it. Nothing was copied.
+    #[error("WAL is poisoned ({0}); refusing to back up a database whose log is incomplete")]
+    WalPoisoned(String),
     /// The backup manifest could not be encoded or decoded.
     #[error("backup manifest: {0}")]
     BackupManifest(String),

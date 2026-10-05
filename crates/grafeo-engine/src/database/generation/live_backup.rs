@@ -20,10 +20,17 @@
 //!    [`RetirementError::HandoffInProgress`] before anything is read.
 //! 2. The selected slot is read and its generation pinned (GC cannot delete
 //!    it) and re-validated against the slot's length and SHA-256.
-//! 3. The live WAL is flushed and fsynced. This is **the cut**: every commit
-//!    that returned before the backup call reached this point is inside it.
-//! 4. The `wal_*.log` files from the boundary onward are listed and their
-//!    lengths recorded; each is copied up to that length.
+//! 3. The live WAL is flushed and fsynced **under its own append lock**, which
+//!    also reports the active file's sequence and length. This is **the
+//!    cut**: every commit that returned before the cut is inside it, and the
+//!    reported length is on an append-group boundary. Every lower sequence is
+//!    already final (rotation swaps the file under the same lock). The cut is
+//!    taken at or after the call, after the generation hash check.
+//! 4. The `wal_*.log` files from the boundary through the active sequence are
+//!    copied, the active one only up to the reported length. Files created by
+//!    a rotation after the cut are ignored.
+//! 5. The staged WAL is replay-validated from the manifest boundary before
+//!    the backup is published, so a bad cut is refused at backup time.
 //!
 //! Writers are never blocked. A commit that is in flight during the cut may
 //! or may not be included, and the last file can end inside a frame or an
@@ -59,8 +66,15 @@ impl GrafeoDB {
     /// handoff is running, this returns [`RetirementError::HandoffInProgress`]
     /// without copying anything; while a backup runs,
     /// [`GrafeoDB::freeze_epoch_for_handoff`] returns an error and can be
-    /// retried afterwards. Both cases are clean refusals, never a torn
-    /// backup or a torn publication.
+    /// retried afterwards. Both are clean refusals, never a torn backup or a
+    /// torn publication. (The check briefly waits on the handoff slot lock
+    /// while a freeze is capturing; the wait is bounded by the capture.)
+    ///
+    /// A poisoned WAL is refused with [`RetirementError::WalPoisoned`].
+    ///
+    /// `wal_checkpoint` is not gated: a checkpoint that deletes old log files
+    /// during a backup makes the backup fail (missing file) rather than
+    /// publish a hole.
     ///
     /// Live-root GC must be run through
     /// [`GrafeoDB::retirement_authority`] so that it sees this backup's pin.
@@ -86,18 +100,21 @@ impl GrafeoDB {
             .begin_backup()
             .map_err(|phase| RetirementError::HandoffInProgress(phase.name()))?;
 
-        let sync_wal = || -> Result<(), RetirementError> {
-            if let Some(wal) = self.wal.as_ref() {
-                wal.sync()?;
+        let take_wal_cut = || -> Result<Option<(u64, u64)>, RetirementError> {
+            let Some(wal) = self.wal.as_ref() else {
+                return Ok(None);
+            };
+            if let Some(reason) = wal.poisoned_reason() {
+                return Err(RetirementError::WalPoisoned(reason));
             }
-            Ok(())
+            Ok(Some(wal.manager().flush_for_cut()?))
         };
         backup_live_generation_root(
             root.retirement(),
             root.ownership(),
             destination_dir.as_ref(),
             backup_name,
-            &sync_wal,
+            &take_wal_cut,
         )
     }
 
