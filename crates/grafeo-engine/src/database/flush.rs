@@ -61,8 +61,11 @@ pub(crate) fn is_generation_root(_path: &Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FlushReason {
-    /// Periodic checkpoint (timer-driven) or database close.
-    #[allow(dead_code)] // Used by async_ops (async-storage feature)
+    /// Dirty-only flush: serializes only the sections whose `is_dirty()` is
+    /// set. Not used by any caller: the container writer replaces the whole
+    /// file with exactly the sections it is given, so a dirty-only image would
+    /// drop every clean section. Every write path uses `Explicit`.
+    #[allow(dead_code)]
     Checkpoint,
     /// User-initiated `CHECKPOINT` command or `wal_checkpoint()` API.
     Explicit,

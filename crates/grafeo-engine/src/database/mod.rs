@@ -3911,34 +3911,30 @@ impl GrafeoDB {
             // PropertyIndex: prefer layered graph scan so base postings are
             // captured (overlay-only create_property_index misses base rows).
             {
-                let mut snaps = overlay.property_index_snapshot_entries();
-                // For every registered property index, ensure base nodes are
-                // included by scanning the layered graph when the overlay
-                // heap snapshot is empty or under-filled.
+                // Every registered key is rebuilt from the full layered graph,
+                // so base rows are included. The overlay's own postings are not
+                // read: for a restored mapped index that would be a base-sized
+                // decode that the rebuild throws away.
                 let keys = overlay.property_index_keys();
+                let mut snaps = Vec::with_capacity(keys.len());
                 if !keys.is_empty() {
                     let graph = self.graph_store();
-                    let mut by_name: std::collections::BTreeMap<
-                        String,
-                        grafeo_core::index::property::PropertyIndexSnapshot,
-                    > = snaps.drain(..).map(|s| (s.name.clone(), s)).collect();
+                    let node_ids = graph.node_ids();
                     for prop in keys {
-                        let entry = by_name.entry(prop.clone()).or_insert_with(|| {
-                            grafeo_core::index::property::PropertyIndexSnapshot {
-                                name: prop.clone(),
-                                entries: Vec::new(),
-                            }
-                        });
-                        // Rebuild from full layered graph for durable fidelity.
-                        entry.entries.clear();
                         let prop_key = grafeo_common::types::PropertyKey::new(&prop);
-                        for node_id in graph.node_ids() {
-                            if let Some(value) = graph.get_node_property(node_id, &prop_key) {
-                                entry.entries.push((value, node_id));
-                            }
-                        }
+                        let entries = node_ids
+                            .iter()
+                            .filter_map(|&node_id| {
+                                graph
+                                    .get_node_property(node_id, &prop_key)
+                                    .map(|value| (value, node_id))
+                            })
+                            .collect();
+                        snaps.push(grafeo_core::index::property::PropertyIndexSnapshot {
+                            name: prop,
+                            entries,
+                        });
                     }
-                    snaps = by_name.into_values().collect();
                 }
                 if !snaps.is_empty() {
                     sections.push(Box::new(
