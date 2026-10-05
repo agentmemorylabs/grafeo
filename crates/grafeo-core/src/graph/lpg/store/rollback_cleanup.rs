@@ -29,6 +29,13 @@ impl LpgStore {
     /// Removes every secondary structure entry published for nodes that were
     /// created inside `transaction_id` and are therefore fully discarded.
     pub(super) fn cleanup_discarded_node_secondaries(&self, node_ids: &[NodeId]) {
+        self.cleanup_node_secondaries(node_ids, true);
+    }
+
+    /// Body of [`Self::cleanup_discarded_node_secondaries`]. With
+    /// `remove_index_postings == false` the property-index postings are kept
+    /// (see [`Self::purge_copied_node`]).
+    fn cleanup_node_secondaries(&self, node_ids: &[NodeId], remove_index_postings: bool) {
         if node_ids.is_empty() {
             return;
         }
@@ -75,7 +82,7 @@ impl LpgStore {
         }
 
         // Property indexes, then property columns.
-        {
+        if remove_index_postings {
             let indexes = self.property_indexes.read();
             for (id, props) in &prop_maps {
                 for (key, value) in props {
@@ -220,22 +227,29 @@ impl LpgStore {
 }
 
 impl LpgStore {
-    /// Removes a node outright, whatever transaction wrote it: its version
-    /// chain plus every secondary entry (labels, label index, property
-    /// columns/indexes, live counter).
+    /// Removes the overlay copy of a base node outright, whatever
+    /// transaction wrote it: its version chain, labels, label index entries,
+    /// property columns and live counter.
     ///
-    /// Used by `LayeredStore` to undo a rolled-back copy-up of a base node:
-    /// the copy was written non-versioned (so concurrent readers keep seeing
-    /// the base values), so the MVCC discard cannot remove it. Returns whether
-    /// the node existed.
+    /// Used by `LayeredStore` to undo a rolled-back copy-up: the copy was
+    /// written non-versioned (so concurrent readers keep seeing the base
+    /// values), so the MVCC discard cannot remove it. Returns whether the
+    /// node existed.
+    ///
+    /// Property-index postings are deliberately KEPT: on a layered store the
+    /// overlay's property indexes also carry the base nodes' postings
+    /// (`GrafeoDB::create_property_index` builds them from the merged view)
+    /// and are the only path lookups use. By the time of the purge the
+    /// overlay's undo has restored the copy to the base values, so its
+    /// postings are exactly the base node's.
     #[doc(hidden)]
-    pub fn purge_node(&self, id: NodeId) -> bool {
+    pub fn purge_copied_node(&self, id: NodeId) -> bool {
         #[cfg(not(feature = "tiered-storage"))]
         let existed = self.nodes.write().remove(&id).is_some();
         #[cfg(feature = "tiered-storage")]
         let existed = self.node_versions.write().remove(&id).is_some();
         if existed {
-            self.cleanup_discarded_node_secondaries(&[id]);
+            self.cleanup_node_secondaries(&[id], false);
             self.needs_stats_recompute.store(true, Ordering::Relaxed);
         }
         existed

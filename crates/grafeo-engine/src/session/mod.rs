@@ -381,6 +381,24 @@ impl Session {
         self.layered_store = Some(layered);
     }
 
+    /// Undoes the layered store's base tombstones and copy-ups for a rolled
+    /// back transaction, and reports changes it could no longer undo (an
+    /// overlay reset or merge baked them in while the transaction was open).
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    fn rollback_layered_bookkeeping(&self, transaction_id: TransactionId) {
+        if let Some(ref layered) = self.layered_store {
+            let forgotten = layered.rollback_transaction_layers(transaction_id);
+            if forgotten > 0 {
+                grafeo_warn!(
+                    "rollback of {:?} could not undo {} layered base change(s): an overlay \
+                     reset or merge absorbed them while the transaction was open",
+                    transaction_id,
+                    forgotten
+                );
+            }
+        }
+    }
+
     /// Sets the WAL for this session (shared with the database).
     ///
     /// This also wraps `graph_store` in a [`WalGraphStore`] so that mutation
@@ -4086,9 +4104,7 @@ impl Session {
                     store.rollback_transaction_properties(transaction_id);
                 }
                 #[cfg(all(feature = "compact-store", feature = "lpg"))]
-                if let Some(ref layered) = self.layered_store {
-                    layered.rollback_transaction_layers(transaction_id);
-                }
+                self.rollback_layered_bookkeeping(transaction_id);
                 #[cfg(feature = "triple-store")]
                 self.rollback_rdf_transaction(transaction_id);
                 // Discard buffered CDC events on conflict rollback
@@ -4292,9 +4308,7 @@ impl Session {
         // the overlay discard, so no rolled-back edge still references a
         // copy-up when it is purged).
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
-        if let Some(ref layered) = self.layered_store {
-            layered.rollback_transaction_layers(transaction_id);
-        }
+        self.rollback_layered_bookkeeping(transaction_id);
 
         // Discard pending operations in the RDF store
         #[cfg(feature = "triple-store")]
