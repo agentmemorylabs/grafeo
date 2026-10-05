@@ -76,6 +76,50 @@ mod inner {
         CRASH_ENABLED.with(|e| e.set(false));
         CRASH_COUNTER.with(|c| c.set(u64::MAX));
     }
+
+    thread_local! {
+        static IO_FAILURE_COUNTER: Cell<u64> = const { Cell::new(u64::MAX) };
+        static IO_FAILURE_ENABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Like [`maybe_crash`], but returns an I/O error instead of panicking,
+    /// so the caller's error path runs (a disk-full or failed write).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`std::io::ErrorKind::Other`] error when I/O failure
+    /// injection is enabled on this thread and its counter reaches zero.
+    #[inline]
+    pub fn maybe_fail_io(point: &'static str) -> std::io::Result<()> {
+        IO_FAILURE_ENABLED.with(|enabled| {
+            if !enabled.get() {
+                return Ok(());
+            }
+            IO_FAILURE_COUNTER.with(|counter| {
+                let prev = counter.get();
+                counter.set(prev.wrapping_sub(1));
+                if prev == 1 {
+                    Err(std::io::Error::other(format!(
+                        "injected I/O failure at: {point}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+        })
+    }
+
+    /// Make the `count`-th call to [`maybe_fail_io`] on this thread fail.
+    pub fn enable_io_failure_at(count: u64) {
+        IO_FAILURE_COUNTER.with(|c| c.set(count));
+        IO_FAILURE_ENABLED.with(|e| e.set(true));
+    }
+
+    /// Disable I/O failure injection on this thread.
+    pub fn disable_io_failure() {
+        IO_FAILURE_ENABLED.with(|e| e.set(false));
+        IO_FAILURE_COUNTER.with(|c| c.set(u64::MAX));
+    }
 }
 
 #[cfg(not(feature = "testing-crash-injection"))]
@@ -89,6 +133,22 @@ mod inner {
 
     /// No-op when crash injection is disabled.
     pub fn disable_crash() {}
+
+    /// No-op when crash injection is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Never fails when crash injection is disabled.
+    #[inline(always)]
+    pub fn maybe_fail_io(_point: &'static str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// No-op when crash injection is disabled.
+    pub fn enable_io_failure_at(_count: u64) {}
+
+    /// No-op when crash injection is disabled.
+    pub fn disable_io_failure() {}
 }
 
 pub use inner::*;

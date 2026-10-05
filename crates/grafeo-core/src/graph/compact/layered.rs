@@ -4722,4 +4722,76 @@ mod tests {
         assert!(layered.has_property_index("name"));
         assert!(!layered.has_property_index("age"));
     }
+
+    // ── Copy-up review round 2 (fork PR #13) ─────────────────────────
+
+    /// With `temporal`, a copy-up's properties must be readable at the same
+    /// older epochs as its epoch-0 row.
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn test_copy_up_properties_visible_at_older_epochs() {
+        let layered = build_test_layered();
+        let alix = layered
+            .nodes_by_label("Person")
+            .into_iter()
+            .find(|id| {
+                layered.get_node_property(*id, &PropertyKey::new("name"))
+                    == Some(Value::from("Alix"))
+            })
+            .unwrap();
+        layered.overlay.load().sync_epoch(EpochId::new(5));
+        layered.set_node_property(alix, "city", Value::from("Berlin"));
+        let old = layered
+            .get_node_at_epoch(alix, EpochId::new(1))
+            .expect("copied-up row visible at an older epoch");
+        assert_eq!(
+            old.get_property("name"),
+            Some(&Value::from("Alix")),
+            "base properties of a copy-up visible at an older epoch"
+        );
+
+        let edge = layered
+            .edges_from(alix, Direction::Outgoing)
+            .first()
+            .map(|(_, eid)| *eid)
+            .unwrap();
+        layered.set_edge_property(edge, "note", Value::from("x"));
+        let old = layered
+            .get_edge_at_epoch(edge, EpochId::new(1))
+            .expect("copied-up edge visible at an older epoch");
+        assert_eq!(old.get_property("since"), Some(&Value::Int64(2020)));
+    }
+
+    /// A base delete racing a first write to the same base node must never
+    /// leave a copied-up row behind a tombstone (hidden from `get_node` but
+    /// still listed by `node_ids`).
+    #[test]
+    fn test_concurrent_delete_and_copy_up_never_resurrect() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..2_000 {
+            let layered = Arc::new(build_test_layered());
+            let city = layered.nodes_by_label("City")[0];
+            let barrier = Arc::new(Barrier::new(2));
+            let (l1, b1) = (Arc::clone(&layered), Arc::clone(&barrier));
+            let deleter = std::thread::spawn(move || {
+                b1.wait();
+                l1.delete_node(city)
+            });
+            let (l2, b2) = (Arc::clone(&layered), Arc::clone(&barrier));
+            let writer = std::thread::spawn(move || {
+                b2.wait();
+                l2.set_node_property(city, "x", Value::Int64(1));
+            });
+            assert!(deleter.join().unwrap());
+            writer.join().unwrap();
+            assert!(
+                layered.get_node(city).is_none(),
+                "deleted node stays hidden"
+            );
+            assert!(
+                !layered.node_ids().contains(&city),
+                "deleted node must not be listed by node_ids"
+            );
+        }
+    }
 }

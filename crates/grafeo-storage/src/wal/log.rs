@@ -239,6 +239,9 @@ impl WalManager {
                 .as_mut()
                 .ok_or_else(|| Error::Internal("WAL writer not available".to_string()))?;
 
+            // Test hook: fail the whole append before any byte is written.
+            grafeo_common::testing::crash::maybe_fail_io("wal_write")?;
+
             for data in frames.iter().copied() {
                 maybe_crash("wal_before_write");
 

@@ -908,3 +908,223 @@ fn transaction_sees_its_own_new_typed_edge() {
         1
     );
 }
+
+// ── Review round 2 (PR #13) ───────────────────────────────────────────
+
+/// Item 1: on a layered database the handle's write methods must report a
+/// WAL failure instead of applying the write and returning success.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn handle_writes_report_wal_failures() {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+    let (_dir, root) = fresh_root();
+    let db = open_root(&root);
+    let ids = base_ids(&db);
+
+    // The data record's append fails: an error, and nothing applied.
+    enable_io_failure_at(1);
+    let r = db.set_node_property(ids.ada, "source_hash", Value::from("e1"));
+    disable_io_failure();
+    assert!(r.is_err(), "failed data-record append must be reported");
+    assert_eq!(cypher_ada_hash(&db), Some(Value::from("h0")));
+
+    // The commit marker's append fails: still an error.
+    enable_io_failure_at(2);
+    let r = db.set_node_property(ids.ada, "source_hash", Value::from("e2"));
+    disable_io_failure();
+    assert!(r.is_err(), "failed commit-marker append must be reported");
+
+    // delete_node keeps its error channel.
+    enable_io_failure_at(1);
+    let r = db.delete_node(ids.linus);
+    disable_io_failure();
+    assert!(r.is_err(), "failed delete append must be reported");
+    assert_eq!(
+        cypher_count(&db, "MATCH (n:Person {name: 'Linus'}) RETURN count(n)"),
+        1,
+        "and the delete must not be applied"
+    );
+}
+
+/// The `wal_<seq>.log` files of a root and every complete frame in them.
+fn wal_frames(root: &Path) -> Vec<grafeo_storage::generation::wal_cursor::ReplayFrame> {
+    use grafeo_storage::generation::wal_cursor::{WalReplayCursor, replay_stream_from};
+    let dir = root.join("wal");
+    let first = std::fs::read_dir(&dir)
+        .expect("wal dir")
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_prefix("wal_")?
+                .strip_suffix(".log")?
+                .parse::<u64>()
+                .ok()
+        })
+        .min()
+        .expect("a wal file");
+    let cursor = WalReplayCursor {
+        log_sequence: first,
+        byte_offset: 0,
+        epoch: 0,
+        transaction_id: 0,
+    };
+    replay_stream_from(&dir, &cursor)
+        .expect("stream")
+        .map(|f| f.expect("frame"))
+        .collect()
+}
+
+fn truncate_wal(root: &Path, seq: u64, len: u64) {
+    let path = root.join("wal").join(format!("wal_{seq:08}.log"));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open wal file");
+    file.set_len(len).expect("truncate");
+}
+
+/// Item 2: a crash between a commit frame and its epoch frame. The commit is
+/// incomplete, so replay must not apply it, and the root must keep opening
+/// after later writes and clean closes.
+fn commit_without_epoch_recovers(cut_inside_epoch: bool) {
+    use grafeo_storage::wal::WalRecord;
+    let (_dir, root) = fresh_root();
+    {
+        let db = open_root(&root);
+        let ids = base_ids(&db);
+        db.session()
+            .set_node_property(ids.ada, "source_hash", Value::from("c1"))
+            .expect("write");
+        db.close().expect("close");
+    }
+    let frames = wal_frames(&root);
+    let data = frames
+        .iter()
+        .position(|f| {
+            matches!(&f.record, WalRecord::SetNodeProperty { value, .. }
+                if *value == Value::from("c1"))
+        })
+        .expect("data record");
+    let commit = (data..frames.len())
+        .find(|&k| matches!(frames[k].record, WalRecord::TransactionCommit { .. }))
+        .expect("its commit");
+    let epoch = &frames[commit + 1];
+    assert!(matches!(epoch.record, WalRecord::EpochAdvance { .. }));
+    assert_eq!(epoch.log_sequence, frames[commit].log_sequence);
+    let cut = if cut_inside_epoch {
+        epoch.byte_offset + 3
+    } else {
+        epoch.byte_offset
+    };
+    truncate_wal(&root, epoch.log_sequence, cut);
+
+    {
+        let db = GrafeoDB::open_generation_root(&root, false)
+            .expect("reopen after a crash between commit and epoch frames");
+        assert_eq!(
+            cypher_ada_hash(&db),
+            Some(Value::from("h0")),
+            "a commit without its epoch frame is not applied"
+        );
+        let ids = base_ids(&db);
+        db.session()
+            .set_node_property(ids.ada, "source_hash", Value::from("c2"))
+            .expect("write after recovery");
+        db.close().expect("close");
+    }
+    let db = GrafeoDB::open_generation_root(&root, false)
+        .expect("root reopens after recovery, a write and a clean close");
+    assert_eq!(cypher_ada_hash(&db), Some(Value::from("c2")));
+}
+
+#[test]
+fn crash_right_after_commit_frame_recovers() {
+    commit_without_epoch_recovers(false);
+}
+
+#[test]
+fn crash_inside_epoch_frame_recovers() {
+    commit_without_epoch_recovers(true);
+}
+
+/// Item 2 (same mechanism): uncommitted records left by a crash must stay
+/// discarded once a later transaction commits.
+#[test]
+fn uncommitted_tail_stays_discarded_after_a_later_commit() {
+    use grafeo_storage::wal::WalRecord;
+    let (_dir, root) = fresh_root();
+    {
+        let db = open_root(&root);
+        let ids = base_ids(&db);
+        let mut session = db.session();
+        session.begin_transaction().expect("begin");
+        session
+            .set_node_property(ids.ada, "source_hash", Value::from("u1"))
+            .expect("write in tx");
+        session.rollback().expect("rollback");
+        db.close().expect("close");
+    }
+    // Simulate a crash right after the uncommitted data record.
+    let frames = wal_frames(&root);
+    let data = frames
+        .iter()
+        .position(|f| {
+            matches!(&f.record, WalRecord::SetNodeProperty { value, .. }
+                if *value == Value::from("u1"))
+        })
+        .expect("data record");
+    let next = &frames[data + 1];
+    truncate_wal(&root, next.log_sequence, next.byte_offset);
+
+    {
+        let db = open_root(&root);
+        assert_eq!(cypher_ada_hash(&db), Some(Value::from("h0")));
+        let ids = base_ids(&db);
+        db.session()
+            .set_node_property(ids.grace, "source_hash", Value::from("g1"))
+            .expect("later committed write");
+        db.close().expect("close");
+    }
+    let db = open_root(&root);
+    assert_eq!(
+        cypher_ada_hash(&db),
+        Some(Value::from("h0")),
+        "the crashed transaction's record must not ride a later commit"
+    );
+}
+
+/// Item 5: a direct write whose vector-index update is invalid must fail
+/// before it commits, not after.
+#[cfg(feature = "vector-index")]
+#[test]
+fn invalid_vector_write_fails_before_commit() {
+    let (_dir, root) = fresh_root();
+    {
+        let db = open_root(&root);
+        let ids = base_ids(&db);
+        db.create_vector_index("Person", "emb", Some(3), None, None, None, None)
+            .expect("vector index");
+        let session = db.session();
+        let r = session.set_node_property(ids.ada, "emb", Value::Vector(vec![1.0_f32, 2.0].into()));
+        assert!(r.is_err(), "dimension mismatch must fail the write");
+        assert!(!session.in_transaction());
+        assert_eq!(
+            session
+                .get_node(ids.ada)
+                .and_then(|n| n.get_property("emb").cloned()),
+            None,
+            "a failed write is not committed"
+        );
+        db.close().expect("close");
+    }
+    let db = open_root(&root);
+    let ids = base_ids(&db);
+    assert_eq!(
+        db.session()
+            .get_node(ids.ada)
+            .and_then(|n| n.get_property("emb").cloned()),
+        None,
+        "nor made durable"
+    );
+}
