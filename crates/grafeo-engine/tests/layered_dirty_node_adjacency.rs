@@ -561,7 +561,8 @@ fn deleted_promoted_node_not_listed_by_node_ids() {
 #[test]
 fn rolled_back_delete_of_touched_base_entities_keeps_them() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("d4-rollback.grafeo");
+    std::fs::create_dir_all(dir.path().join("live")).expect("live dir");
+    let path = dir.path().join("live").join("d4-rollback.grafeo");
     {
         let mut db = GrafeoDB::with_config(Config::persistent(&path)).expect("create");
         cypher(
@@ -584,6 +585,19 @@ fn rolled_back_delete_of_touched_base_entities_keeps_them() {
         session
             .execute_cypher("MATCH (k:Symbol {name: 'Keep'}) DELETE k")
             .expect("delete node");
+
+        // Checkpoint while the DELETEs are still open: the uncommitted
+        // deletes must not reach the persisted deletion log. Open a copy of
+        // the on-disk state at this moment (what a crash here would leave).
+        db.wal_checkpoint().expect("checkpoint mid-transaction");
+        let mid = dir.path().join("mid-tx-copy");
+        copy_db_files(dir.path().join("live").as_path(), &mid);
+        {
+            let copy = GrafeoDB::with_config(Config::persistent(mid.join("d4-rollback.grafeo")))
+                .expect("open mid-transaction copy");
+            assert_rollback_kept(&copy, "copy taken mid-transaction");
+        }
+
         session.rollback().expect("rollback");
         drop(session);
 
@@ -617,5 +631,112 @@ fn assert_rollback_kept(db: &GrafeoDB, ctx: &str) {
         ),
         1,
         "{ctx}: Cypher Keep"
+    );
+}
+
+/// Copies every file of a closed-or-open single-file database (the `.grafeo`
+/// plus any sidecars next to it) into `to`: the state a crash at this moment
+/// would leave on disk, opened without a graceful close.
+fn copy_db_files(from_dir: &Path, to_dir: &Path) {
+    std::fs::create_dir_all(to_dir).expect("create copy dir");
+    for entry in std::fs::read_dir(from_dir).expect("read db dir") {
+        let entry = entry.expect("dir entry");
+        let src = entry.path();
+        let dst = to_dir.join(entry.file_name());
+        if src.is_dir() {
+            copy_db_files(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).expect("copy db file");
+        }
+    }
+}
+
+/// `async_write_snapshot` must write a complete image. It flushed only the
+/// dirty sections, but the container writer replaces the whole file with
+/// exactly the sections it is given, so a snapshot taken right after a
+/// promoted DELETE (which marks only the deletion log dirty) left a file
+/// holding just the deletion log: no CompactStore base, no overlay, no
+/// catalog. Opened without a graceful close (a copy of the on-disk state;
+/// `Drop` would checkpoint everything again), the database comes back without
+/// its compacted base and depends entirely on the WAL tail.
+#[cfg(feature = "async-storage")]
+#[test]
+fn async_snapshot_after_promoted_delete_keeps_base() {
+    use grafeo_common::storage::SectionType;
+
+    let dir = tempdir().expect("temp dir");
+    let live = dir.path().join("live");
+    std::fs::create_dir_all(&live).expect("live dir");
+    let path = live.join("d4-async.grafeo");
+    let db = std::sync::Arc::new({
+        let mut db = GrafeoDB::with_config(Config::persistent(&path)).expect("create");
+        cypher(
+            &db,
+            "CREATE (s:Symbol {name: 'S'})-[:USES {w: 0}]->(:Symbol {name: 'T'}), \
+             (s)-[:USES {w: 0}]->(:Symbol {name: 'T2'})",
+        );
+        db.compact().expect("compact");
+        db
+    });
+    // Full image on disk: every section is now clean.
+    db.wal_checkpoint().expect("explicit checkpoint");
+
+    cypher(
+        &db,
+        "MATCH (:Symbol {name: 'S'})-[r:USES]->(:Symbol {name: 'T'}) SET r.w = 7",
+    );
+    cypher(
+        &db,
+        "MATCH (:Symbol {name: 'S'})-[r:USES]->(:Symbol {name: 'T'}) DELETE r",
+    );
+    tokio::runtime::Runtime::new()
+        .expect("tokio runtime")
+        .block_on(db.async_write_snapshot())
+        .expect("async snapshot");
+
+    let crashed = dir.path().join("crashed");
+    copy_db_files(&live, &crashed);
+    drop(db);
+
+    let copy_path = crashed.join("d4-async.grafeo");
+    let sections: Vec<SectionType> = {
+        let fm = grafeo_storage::file::GrafeoFileManager::open_read_only(&copy_path)
+            .expect("open copy read-only");
+        fm.read_section_directory()
+            .expect("read section directory")
+            .expect("a section directory")
+            .entries()
+            .iter()
+            .map(|e| e.section_type)
+            .collect()
+    };
+    for wanted in [
+        SectionType::CompactStore,
+        SectionType::LpgStore,
+        SectionType::Catalog,
+        SectionType::OverlayDeletions,
+    ] {
+        assert!(
+            sections.contains(&wanted),
+            "snapshot image lacks {wanted:?}; it holds {sections:?}"
+        );
+    }
+
+    let reopened = GrafeoDB::with_config(Config::persistent(&copy_path)).expect("reopen copy");
+    assert!(
+        reopened.layered_store().is_some(),
+        "the compacted base must load from the snapshot image"
+    );
+    assert_eq!(
+        cypher_count(&reopened, "MATCH (n:Symbol) RETURN count(n)"),
+        3
+    );
+    assert_eq!(
+        cypher_count(
+            &reopened,
+            "MATCH (:Symbol {name: 'S'})-[r]->() RETURN count(r)"
+        ),
+        1,
+        "only S->T2 survives"
     );
 }
