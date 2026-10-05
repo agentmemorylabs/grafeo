@@ -30,17 +30,46 @@ pub struct TierChainView {
 }
 
 impl TierChainView {
+    /// Builds the view, computing each tier's node id range (see
+    /// [`node_range`](Self::node_range)).
     pub fn new(tiers: Vec<Arc<CompactStore>>, overlay: Arc<LpgStore>) -> Self {
-        let mut tier_ranges = Vec::with_capacity(tiers.len());
-        for t in &tiers {
-            let min = tier_min_node_id(t);
-            let max = tier_max_node_id(t);
-            tier_ranges.push((min, max));
-        }
+        let tier_ranges = tiers.iter().map(|t| Self::node_range(t)).collect();
         Self {
             tiers,
             overlay,
             tier_ranges,
+        }
+    }
+
+    /// Builds the view from tiers whose node id ranges were computed when
+    /// each tier was installed (see [`node_range`](Self::node_range)), so
+    /// building a view does not enumerate the tiers' node ids again.
+    /// `tier_ranges[i]` must be `node_range(&tiers[i])`.
+    pub fn with_ranges(
+        tiers: Vec<Arc<CompactStore>>,
+        tier_ranges: Vec<(u64, u64)>,
+        overlay: Arc<LpgStore>,
+    ) -> Self {
+        debug_assert_eq!(tiers.len(), tier_ranges.len());
+        Self {
+            tiers,
+            overlay,
+            tier_ranges,
+        }
+    }
+
+    /// The `[min, max]` node id range of one tier, used for routing.
+    /// Enumerates the tier's node ids once; an empty tier gets
+    /// `(u64::MAX, u64::MAX)`.
+    #[must_use]
+    pub fn node_range(store: &CompactStore) -> (u64, u64) {
+        if store.total_nodes() == 0 {
+            return (u64::MAX, u64::MAX);
+        }
+        let ids = store.node_ids();
+        match (ids.first(), ids.last()) {
+            (Some(min), Some(max)) => (min.as_u64(), max.as_u64()),
+            _ => (u64::MAX, 0),
         }
     }
 
@@ -77,28 +106,6 @@ impl TierChainView {
         }
         None
     }
-}
-
-fn tier_min_node_id(store: &CompactStore) -> u64 {
-    if store.total_nodes() == 0 {
-        return u64::MAX;
-    }
-    store
-        .node_ids()
-        .first()
-        .map(|id| id.as_u64())
-        .unwrap_or(u64::MAX)
-}
-
-fn tier_max_node_id(store: &CompactStore) -> u64 {
-    if store.total_nodes() == 0 {
-        return u64::MAX;
-    }
-    store
-        .node_ids()
-        .last()
-        .map(|id| id.as_u64())
-        .unwrap_or(0)
 }
 
 fn tier_edge_range(store: &CompactStore) -> (u64, u64) {
@@ -631,5 +638,33 @@ impl GraphStoreSearch for TierChainView {
         _metric: DistanceMetric,
     ) -> Vec<(NodeId, f64)> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::compact::from_graph_store_preserving_ids;
+
+    #[test]
+    fn with_ranges_routes_like_new() {
+        let source = LpgStore::new().unwrap();
+        let a = source.create_node(&["Person"]);
+        let _ = source.create_node(&["Person"]);
+        let c = source.create_node(&["City"]);
+        let tier = Arc::new(from_graph_store_preserving_ids(&source).unwrap());
+        assert_eq!(TierChainView::node_range(&tier), (a.as_u64(), c.as_u64()));
+
+        let overlay = Arc::new(LpgStore::new().unwrap());
+        let fresh = TierChainView::new(vec![Arc::clone(&tier)], Arc::clone(&overlay));
+        let cached = TierChainView::with_ranges(
+            vec![Arc::clone(&tier)],
+            vec![TierChainView::node_range(&tier)],
+            overlay,
+        );
+        assert_eq!(cached.node_count(), fresh.node_count());
+        assert_eq!(cached.node_count(), 3);
+        assert!(cached.get_node(a).is_some());
+        assert!(cached.get_node(c).is_some());
     }
 }

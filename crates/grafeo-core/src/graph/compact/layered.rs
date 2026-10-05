@@ -4799,19 +4799,29 @@ mod tests {
     }
 
     /// `delete_node_edges` tombstones base edges that are also dirty (copied
-    /// up). Each excluded base edge must be subtracted once: with both base
-    /// edges copied up and then cut, `2 - 2 - 2 + 0` underflowed.
+    /// up). Each excluded base edge must be subtracted once; the old formula
+    /// subtracted it as deleted and again as promoted.
     #[test]
     fn test_edge_count_excludes_a_deleted_promoted_base_edge_once() {
         let layered = build_test_layered();
-        let (alix, _gus, amsterdam, e1) = fixture_ids(&layered);
+        let (alix, _gus, _amsterdam, e1) = fixture_ids(&layered);
 
         layered.set_edge_property(e1, "since", Value::Int64(2024));
         layered.delete_node_edges(alix);
         assert_eq!(layered.edge_count(), 1, "only gus -> amsterdam is left");
+        assert_eq!(layered.node_count(), 3);
+    }
 
-        let (_, e2) = layered.edges_from(amsterdam, Direction::Incoming)[0];
-        layered.set_edge_property(e2, "since", Value::Int64(2025));
+    /// With both base edges copied up and then cut, the old formula computed
+    /// `2 - 2 - 2 + 0` and underflowed (a panic in debug builds).
+    #[test]
+    fn test_edge_count_does_not_underflow_when_all_cut_edges_were_promoted() {
+        let layered = build_test_layered();
+        let (_alix, _gus, amsterdam, _e1) = fixture_ids(&layered);
+
+        for (_, eid) in layered.edges_from(amsterdam, Direction::Incoming) {
+            layered.set_edge_property(eid, "since", Value::Int64(2025));
+        }
         layered.delete_node_edges(amsterdam);
         assert_eq!(layered.edge_count(), 0, "no edges are left");
         assert_eq!(layered.node_count(), 3);

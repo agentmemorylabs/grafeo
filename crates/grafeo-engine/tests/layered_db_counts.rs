@@ -484,9 +484,11 @@ fn copy_dir(from: &Path, to: &Path) {
 
 const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Lets several timer checkpoints run.
+/// Lets several timer checkpoints run. The timer wakes on a 100 ms poll and
+/// checkpoints once the interval has passed, so one second gives it about
+/// ten chances; without the fix a single one drops the base.
 fn let_timer_run() {
-    std::thread::sleep(TIMER_INTERVAL * 15);
+    std::thread::sleep(std::time::Duration::from_secs(1));
 }
 
 /// After a timer checkpoint the files on disk still hold the base.

@@ -335,13 +335,18 @@ pub struct GrafeoDB {
         feature = "generation-streaming"
     ))]
     epoch_handoff: generation::EpochHandoffCoordinator,
-    /// Builder-scoped mid-build tiers (G-MIDFLUSH.1 M2).
+    /// Builder-scoped mid-build tiers (G-MIDFLUSH.1 M2), each with its node
+    /// id range computed once when the tier was pushed.
     ///
     /// Empty in normal serving; non-empty during builder mid-build drains.
     /// `graph_store()` returns a `TierChainView` when this is non-empty.
     #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
-    mid_build_tiers:
-        parking_lot::RwLock<Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>>>,
+    mid_build_tiers: parking_lot::RwLock<
+        Vec<(
+            std::sync::Arc<grafeo_core::graph::compact::CompactStore>,
+            (u64, u64),
+        )>,
+    >,
     /// 1-based count of *committed* mid-build drains for this database.
     /// Incremented only after write + reopen + overlay reset + tier push.
     /// Process-wide statics are forbidden (two DBs / two tests must not share a counter).
@@ -2830,10 +2835,7 @@ impl GrafeoDB {
             // raw LayeredStore (merges base + overlay).
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             let read_store: Arc<dyn GraphStoreSearch> = if !self.mid_build_tiers.read().is_empty() {
-                let tiers = self.mid_build_tiers.read().clone();
-                let ov = layered.overlay_store();
-                let view = grafeo_core::graph::compact::tier_chain::TierChainView::new(tiers, ov);
-                Arc::new(view) as Arc<dyn GraphStoreSearch>
+                Arc::new(self.mid_build_view(layered.overlay_store())) as Arc<dyn GraphStoreSearch>
             } else {
                 Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>
             };
@@ -3191,10 +3193,7 @@ impl GrafeoDB {
         {
             if !self.mid_build_tiers.read().is_empty() {
                 if let Some(layered) = self.layered_store.as_ref() {
-                    let tiers = self.mid_build_tiers.read().clone();
-                    let overlay = layered.overlay_store();
-                    let view =
-                        grafeo_core::graph::compact::tier_chain::TierChainView::new(tiers, overlay);
+                    let view = self.mid_build_view(layered.overlay_store());
                     return Arc::new(view) as Arc<dyn GraphStoreSearch>;
                 }
             }
@@ -3217,7 +3216,28 @@ impl GrafeoDB {
     pub fn mid_build_tiers(
         &self,
     ) -> Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>> {
-        self.mid_build_tiers.read().clone()
+        self.mid_build_tiers
+            .read()
+            .iter()
+            .map(|(tier, _)| Arc::clone(tier))
+            .collect()
+    }
+
+    /// Builds the tier chain view (mid-build tiers + `overlay`) from the
+    /// ranges cached at push time, so neither queries nor the public counts
+    /// enumerate the tiers' node ids per call.
+    #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+    pub(super) fn mid_build_view(
+        &self,
+        overlay: Arc<grafeo_core::graph::lpg::LpgStore>,
+    ) -> grafeo_core::graph::compact::tier_chain::TierChainView {
+        let (tiers, ranges) = self
+            .mid_build_tiers
+            .read()
+            .iter()
+            .map(|(tier, range)| (Arc::clone(tier), *range))
+            .unzip();
+        grafeo_core::graph::compact::tier_chain::TierChainView::with_ranges(tiers, ranges, overlay)
     }
 
     /// Returns the writable graph store, if available.
