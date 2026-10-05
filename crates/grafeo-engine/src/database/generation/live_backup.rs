@@ -72,6 +72,10 @@ impl GrafeoDB {
     ///
     /// A poisoned WAL is refused with [`RetirementError::WalPoisoned`].
     ///
+    /// `destination_dir` must not be shared between machines or PID
+    /// namespaces: a backup removes staging directories whose owning process
+    /// id is not alive locally, which could hit another host's live one.
+    ///
     /// `wal_checkpoint` is not gated: a checkpoint that deletes old log files
     /// during a backup makes the backup fail (missing file) rather than
     /// publish a hole.

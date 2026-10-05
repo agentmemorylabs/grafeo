@@ -672,6 +672,11 @@ impl WalManager {
                     "WAL has no active log file to cut".to_string(),
                 ));
             };
+            // Same order as an append: a poison set before this point is seen
+            // here, so a poisoned log is never cut.
+            if let Some(reason) = self.poisoned_reason() {
+                return Err(Self::poisoned_error(&reason));
+            }
             log_file.writer.flush()?;
             let sequence = Self::sequence_from_path(&log_file.path).ok_or_else(|| {
                 grafeo_common::utils::error::Error::Internal(format!(
