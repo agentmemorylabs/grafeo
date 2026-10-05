@@ -3249,6 +3249,23 @@ impl GrafeoDB {
         self.layered_store.as_ref()
     }
 
+    /// Returns the store that database-level counts read.
+    ///
+    /// In layered mode (after [`compact()`](Self::compact), or on a reopened
+    /// compacted file or generation root) `lpg_store()` is the overlay alone;
+    /// this returns the `LayeredStore`, the same view queries read. Its node
+    /// and edge counts take the base's known row counts and walk only the
+    /// overlay's copied-up ids, never the base rows. Otherwise this is the
+    /// built-in `LpgStore`.
+    #[cfg(feature = "lpg")]
+    pub(super) fn count_store(&self) -> &dyn grafeo_core::graph::GraphStore {
+        #[cfg(feature = "compact-store")]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.as_ref();
+        }
+        &**self.lpg_store()
+    }
+
     /// Returns the disk-backed tier wrapper for the compact base, if
     /// [`compact()`](Self::compact) has been called and `mmap` is enabled.
     #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
@@ -4174,7 +4191,11 @@ impl GrafeoDB {
         let section_refs: Vec<&dyn grafeo_common::storage::Section> =
             sections.iter().map(|s| s.as_ref()).collect();
         #[cfg(feature = "lpg")]
-        let context = flush::build_context(self.lpg_store(), &self.transaction_manager);
+        let context = flush::build_context(
+            self.lpg_store(),
+            self.count_store(),
+            &self.transaction_manager,
+        );
         #[cfg(not(feature = "lpg"))]
         let context = flush::build_context_minimal(&self.transaction_manager);
 
