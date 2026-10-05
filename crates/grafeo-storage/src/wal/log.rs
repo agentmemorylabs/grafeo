@@ -229,153 +229,202 @@ impl WalManager {
     /// rejects any record between the two). Durability and rotation are
     /// handled once for the whole group, as for a single frame.
     pub(crate) fn write_frames(&self, frames: &[&[u8]], force_sync: bool) -> Result<()> {
+        self.write_frames_inner(frames, force_sync, false)
+    }
+
+    /// [`write_frames`](Self::write_frames) for a group whose failure leaves
+    /// the log in an unknown state for its writer (a commit marker): any
+    /// failure poisons the WAL before the active-log lock is released, so no
+    /// other writer can append after the failed group. The fsync, when
+    /// needed, runs under that lock too.
+    pub(crate) fn write_frames_or_poison(&self, frames: &[&[u8]], force_sync: bool) -> Result<()> {
+        self.write_frames_inner(frames, force_sync, true)
+    }
+
+    fn poisoned_error(reason: &str) -> Error {
+        Error::Internal(format!(
+            "WAL refuses appends until the database is reopened: {reason}"
+        ))
+    }
+
+    fn write_frames_inner(
+        &self,
+        frames: &[&[u8]],
+        force_sync: bool,
+        poison_on_error: bool,
+    ) -> Result<()> {
         use grafeo_common::testing::crash::maybe_crash;
 
-        if let Some(reason) = self.poisoned.lock().as_ref() {
-            return Err(Error::Internal(format!(
-                "WAL refuses appends until the database is reopened: {reason}"
-            )));
+        if let Err(e) = self.ensure_active_log() {
+            if poison_on_error {
+                self.poison(format!("WAL could not be opened for a commit marker: {e}"));
+            }
+            return Err(e);
         }
-        self.ensure_active_log()?;
 
         // Phase 1: write frame data and flush buffer while holding the lock.
         // Determine whether an fsync is needed, and if so clone the file handle
         // so we can release the lock before the (potentially slow) sync_all().
+        // The poison check runs under the same lock, so no append can slip in
+        // after a writer poisoned the log.
         let (needs_rotation, sync_file, synced_records) = {
             let mut guard = self.active_log.lock();
-            let log_file = guard
-                .as_mut()
-                .ok_or_else(|| Error::Internal("WAL writer not available".to_string()))?;
+            if let Some(reason) = self.poisoned.lock().as_ref() {
+                return Err(Self::poisoned_error(reason));
+            }
+            let phase1 = (|| -> Result<(bool, Option<File>, u64)> {
+                let log_file = guard
+                    .as_mut()
+                    .ok_or_else(|| Error::Internal("WAL writer not available".to_string()))?;
 
-            // Test hook: fail the whole append before any byte is written.
-            grafeo_common::testing::crash::maybe_fail_io("wal_write")?;
+                // Test hook: fail the whole append before any byte is written.
+                grafeo_common::testing::crash::maybe_fail_io("wal_write")?;
 
-            for data in frames.iter().copied() {
-                maybe_crash("wal_before_write");
+                for data in frames.iter().copied() {
+                    maybe_crash("wal_before_write");
 
-                // Encrypt or write plaintext depending on encryption configuration.
-                // Encrypted frame: [len:4][nonce(12) || ciphertext || tag(16)]
-                // Plaintext frame:  [len:4][data][crc32:4]
-                #[cfg(feature = "encryption")]
-                let (frame_data, record_size) = if let Some(ref enc) = self.encryptor {
-                    let file_seq = self.current_sequence.load(Ordering::Relaxed);
-                    // Use the file byte offset as the nonce counter, not the ephemeral
-                    // record count. The byte offset survives restarts (file is append-only)
-                    // and is unique per record within a file. Combined with the file sequence,
-                    // this guarantees nonce uniqueness even after crash + restart.
-                    //
-                    // The nonce high word is 4 bytes, so the file sequence must fit in u32.
-                    // With one rotation per ~64 MB of WAL, this allows ~256 exabytes of
-                    // total WAL writes before exhaustion, which is effectively unlimited.
-                    let seq_u32 = u32::try_from(file_seq).map_err(|_| {
-                        Error::Internal(
+                    // Encrypt or write plaintext depending on encryption configuration.
+                    // Encrypted frame: [len:4][nonce(12) || ciphertext || tag(16)]
+                    // Plaintext frame:  [len:4][data][crc32:4]
+                    #[cfg(feature = "encryption")]
+                    let (frame_data, record_size) = if let Some(ref enc) = self.encryptor {
+                        let file_seq = self.current_sequence.load(Ordering::Relaxed);
+                        // Use the file byte offset as the nonce counter, not the ephemeral
+                        // record count. The byte offset survives restarts (file is append-only)
+                        // and is unique per record within a file. Combined with the file sequence,
+                        // this guarantees nonce uniqueness even after crash + restart.
+                        //
+                        // The nonce high word is 4 bytes, so the file sequence must fit in u32.
+                        // With one rotation per ~64 MB of WAL, this allows ~256 exabytes of
+                        // total WAL writes before exhaustion, which is effectively unlimited.
+                        let seq_u32 = u32::try_from(file_seq).map_err(|_| {
+                            Error::Internal(
                             "WAL file sequence exceeds u32::MAX: encryption nonce space exhausted"
                                 .to_string(),
                         )
-                    })?;
-                    let byte_offset = log_file.size;
-                    let nonce = grafeo_common::encryption::build_nonce(seq_u32, byte_offset);
-                    let aad = b"grafeo-wal";
-                    let encrypted = enc
-                        .encrypt(data, &nonce, aad)
-                        .map_err(|e| Error::Internal(format!("WAL encryption failed: {e}")))?;
-                    // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
-                    #[allow(clippy::cast_possible_truncation)]
-                    let len = encrypted.len() as u32;
-                    log_file.writer.write_all(&len.to_le_bytes())?;
-                    log_file.writer.write_all(&encrypted)?;
-                    let size = 4 + encrypted.len() as u64;
-                    (true, size)
-                } else {
-                    (false, 0u64)
-                };
+                        })?;
+                        let byte_offset = log_file.size;
+                        let nonce = grafeo_common::encryption::build_nonce(seq_u32, byte_offset);
+                        let aad = b"grafeo-wal";
+                        let encrypted = enc
+                            .encrypt(data, &nonce, aad)
+                            .map_err(|e| Error::Internal(format!("WAL encryption failed: {e}")))?;
+                        // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
+                        #[allow(clippy::cast_possible_truncation)]
+                        let len = encrypted.len() as u32;
+                        log_file.writer.write_all(&len.to_le_bytes())?;
+                        log_file.writer.write_all(&encrypted)?;
+                        let size = 4 + encrypted.len() as u64;
+                        (true, size)
+                    } else {
+                        (false, 0u64)
+                    };
 
-                #[cfg(feature = "encryption")]
-                if !frame_data {
-                    // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
-                    #[allow(clippy::cast_possible_truncation)]
-                    let len = data.len() as u32;
-                    log_file.writer.write_all(&len.to_le_bytes())?;
-                    log_file.writer.write_all(data)?;
-                    let checksum = crc32fast::hash(data);
-                    log_file.writer.write_all(&checksum.to_le_bytes())?;
-                }
-
-                #[cfg(not(feature = "encryption"))]
-                {
-                    // Write length prefix
-                    // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
-                    #[allow(clippy::cast_possible_truncation)]
-                    let len = data.len() as u32;
-                    log_file.writer.write_all(&len.to_le_bytes())?;
-
-                    // Write data
-                    log_file.writer.write_all(data)?;
-
-                    // Write checksum
-                    let checksum = crc32fast::hash(data);
-                    log_file.writer.write_all(&checksum.to_le_bytes())?;
-                }
-
-                maybe_crash("wal_after_write");
-
-                // Update size tracking
-                #[cfg(feature = "encryption")]
-                let record_size = if frame_data {
-                    record_size
-                } else {
-                    4 + data.len() as u64 + 4
-                };
-                #[cfg(not(feature = "encryption"))]
-                let record_size = 4 + data.len() as u64 + 4; // length + data + checksum
-                log_file.size += record_size;
-
-                self.total_record_count.fetch_add(1, Ordering::Relaxed);
-                self.records_since_sync.fetch_add(1, Ordering::Relaxed);
-            }
-
-            let needs_rotation = log_file.size >= self.config.max_log_size;
-
-            // Decide whether we need to fsync based on durability mode.
-            // Always flush the BufWriter so data reaches the OS page cache.
-            let needs_sync = match &self.config.durability {
-                DurabilityMode::Sync => {
-                    if force_sync {
-                        maybe_crash("wal_before_flush");
+                    #[cfg(feature = "encryption")]
+                    if !frame_data {
+                        // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
+                        #[allow(clippy::cast_possible_truncation)]
+                        let len = data.len() as u32;
+                        log_file.writer.write_all(&len.to_le_bytes())?;
+                        log_file.writer.write_all(data)?;
+                        let checksum = crc32fast::hash(data);
+                        log_file.writer.write_all(&checksum.to_le_bytes())?;
                     }
-                    force_sync
+
+                    #[cfg(not(feature = "encryption"))]
+                    {
+                        // Write length prefix
+                        // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
+                        #[allow(clippy::cast_possible_truncation)]
+                        let len = data.len() as u32;
+                        log_file.writer.write_all(&len.to_le_bytes())?;
+
+                        // Write data
+                        log_file.writer.write_all(data)?;
+
+                        // Write checksum
+                        let checksum = crc32fast::hash(data);
+                        log_file.writer.write_all(&checksum.to_le_bytes())?;
+                    }
+
+                    maybe_crash("wal_after_write");
+
+                    // Update size tracking
+                    #[cfg(feature = "encryption")]
+                    let record_size = if frame_data {
+                        record_size
+                    } else {
+                        4 + data.len() as u64 + 4
+                    };
+                    #[cfg(not(feature = "encryption"))]
+                    let record_size = 4 + data.len() as u64 + 4; // length + data + checksum
+                    log_file.size += record_size;
+
+                    self.total_record_count.fetch_add(1, Ordering::Relaxed);
+                    self.records_since_sync.fetch_add(1, Ordering::Relaxed);
                 }
-                DurabilityMode::Batch {
-                    max_delay_ms,
-                    max_records,
-                } => {
-                    let records = self.records_since_sync.load(Ordering::Relaxed);
-                    let elapsed = self.last_sync.lock().elapsed();
-                    records >= *max_records || elapsed >= Duration::from_millis(*max_delay_ms)
+
+                let needs_rotation = log_file.size >= self.config.max_log_size;
+
+                // Decide whether we need to fsync based on durability mode.
+                // Always flush the BufWriter so data reaches the OS page cache.
+                let needs_sync = match &self.config.durability {
+                    DurabilityMode::Sync => {
+                        if force_sync {
+                            maybe_crash("wal_before_flush");
+                        }
+                        force_sync
+                    }
+                    DurabilityMode::Batch {
+                        max_delay_ms,
+                        max_records,
+                    } => {
+                        let records = self.records_since_sync.load(Ordering::Relaxed);
+                        let elapsed = self.last_sync.lock().elapsed();
+                        records >= *max_records || elapsed >= Duration::from_millis(*max_delay_ms)
+                    }
+                    DurabilityMode::Adaptive { .. } | DurabilityMode::NoSync => false,
+                };
+
+                // Flush the BufWriter while holding the lock (pushes data to OS).
+                log_file.writer.flush()?;
+
+                // Snapshot the record count while holding the lock so we can
+                // subtract exactly this amount after sync, preserving any
+                // concurrent increments that arrive between lock release and sync.
+                let synced_records = if needs_sync {
+                    self.records_since_sync.load(Ordering::Relaxed)
+                } else {
+                    0
+                };
+
+                // Clone the file handle for out-of-lock sync if needed.
+                let mut sync_file = if needs_sync {
+                    Some(log_file.writer.get_ref().try_clone()?)
+                } else {
+                    None
+                };
+
+                // Poison mode: fsync under the lock, so a failure is known before
+                // any other writer can append.
+                if poison_on_error && let Some(file) = sync_file.take() {
+                    file.sync_all()?;
+                    self.records_since_sync
+                        .fetch_sub(synced_records, Ordering::Relaxed);
+                    *self.last_sync.lock() = Instant::now();
                 }
-                DurabilityMode::Adaptive { .. } | DurabilityMode::NoSync => false,
-            };
 
-            // Flush the BufWriter while holding the lock (pushes data to OS).
-            log_file.writer.flush()?;
-
-            // Snapshot the record count while holding the lock so we can
-            // subtract exactly this amount after sync, preserving any
-            // concurrent increments that arrive between lock release and sync.
-            let synced_records = if needs_sync {
-                self.records_since_sync.load(Ordering::Relaxed)
-            } else {
-                0
-            };
-
-            // Clone the file handle for out-of-lock sync if needed.
-            let sync_file = if needs_sync {
-                Some(log_file.writer.get_ref().try_clone()?)
-            } else {
-                None
-            };
-
-            (needs_rotation, sync_file, synced_records)
+                Ok((needs_rotation, sync_file, synced_records))
+            })();
+            match phase1 {
+                Ok(done) => done,
+                Err(e) => {
+                    if poison_on_error {
+                        self.set_poisoned(format!("a commit marker could not be written: {e}"));
+                    }
+                    return Err(e);
+                }
+            }
             // guard dropped here: active_log lock released
         };
 
@@ -402,6 +451,15 @@ impl WalManager {
     /// a later commit or abort settle that transaction the wrong way on
     /// replay. The first reason is kept.
     pub fn poison(&self, reason: impl Into<String>) {
+        // Taken in the same order as an append (active log, then poison), so
+        // an append either completes before this or sees the poison.
+        let _active = self.active_log.lock();
+        self.set_poisoned(reason);
+    }
+
+    /// Sets the poison reason (first one wins). The caller holds the
+    /// active-log lock.
+    fn set_poisoned(&self, reason: impl Into<String>) {
         let mut poisoned = self.poisoned.lock();
         if poisoned.is_none() {
             *poisoned = Some(reason.into());
@@ -877,6 +935,48 @@ mod tests {
     use super::*;
     use grafeo_common::types::NodeId;
     use tempfile::tempdir;
+
+    /// A commit-marker append that fails poisons the WAL by itself, inside
+    /// the failing append, and every later append is refused.
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn test_failing_commit_marker_append_poisons_the_wal() {
+        use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+        let dir = tempdir().unwrap();
+        let wal = WalManager::open(dir.path()).unwrap();
+
+        enable_io_failure_at(1);
+        let failed = wal.write_frames_or_poison(&[b"commit".as_slice()], true);
+        disable_io_failure();
+        assert!(failed.is_err());
+        assert!(
+            wal.poisoned_reason().is_some(),
+            "poisoned by the failing append"
+        );
+
+        let record = WalRecord::CreateNode {
+            id: NodeId::new(1),
+            labels: vec!["Person".to_string()],
+        };
+        assert!(wal.log(&record).is_err(), "later appends are refused");
+        assert_eq!(wal.record_count(), 0);
+    }
+
+    /// A plain append that fails does not poison the WAL.
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn test_failing_plain_append_does_not_poison() {
+        use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+        let dir = tempdir().unwrap();
+        let wal = WalManager::open(dir.path()).unwrap();
+
+        enable_io_failure_at(1);
+        let failed = wal.write_frames(&[b"data".as_slice()], false);
+        disable_io_failure();
+        assert!(failed.is_err());
+        assert!(wal.poisoned_reason().is_none());
+        assert!(wal.write_frames(&[b"data".as_slice()], false).is_ok());
+    }
 
     #[test]
     fn test_wal_write() {

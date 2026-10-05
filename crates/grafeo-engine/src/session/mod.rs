@@ -128,10 +128,10 @@ pub struct Session {
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
     /// Set when the last commit could not write its commit marker to the WAL
-    /// (`commit_inner` only warns): the error, transaction and commit epoch.
-    /// The direct-write path retries the marker and reports the outcome.
+    /// (`commit_inner` only warns); the direct-write path reports it. On a
+    /// layered database that failure also poisoned the WAL.
     #[cfg(all(feature = "wal", feature = "lpg"))]
-    commit_wal_error: parking_lot::Mutex<Option<(String, TransactionId, EpochId)>>,
+    commit_wal_error: parking_lot::Mutex<Option<String>>,
     /// The raw layered store (compact base + overlay) of a layered database,
     /// which the direct node/edge APIs use for the default graph; `store` is
     /// only the overlay there. `None` for every other database.
@@ -781,6 +781,7 @@ impl Session {
         store: &direct_store::DirectStore,
         write: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        self.check_wal_writable()?;
         if !store.is_layered() {
             return write();
         }
@@ -800,10 +801,12 @@ impl Session {
             Ok(value) => match self.commit_inner() {
                 Ok(()) => {
                     #[cfg(feature = "wal")]
-                    if let Some((error, transaction_id, epoch)) =
-                        self.commit_wal_error.lock().take()
-                    {
-                        self.retry_commit_marker(&error, transaction_id, epoch)?;
+                    if let Some(error) = self.commit_wal_error.lock().take() {
+                        return Err(grafeo_common::utils::error::Error::Internal(format!(
+                            "write applied in memory; durability unconfirmed (it may have \
+                             committed): its WAL commit marker failed ({error}); the WAL \
+                             refuses further writes until the database is reopened"
+                        )));
                     }
                     Ok(value)
                 }
@@ -823,44 +826,21 @@ impl Session {
         }
     }
 
-    /// Writes a direct write's commit marker again after `commit_inner`
-    /// failed to (it only warns), so the WAL and memory agree.
-    ///
-    /// The write is already applied in memory. Writing the
-    /// `TransactionCommit` + `EpochAdvance` pair again is safe even if the
-    /// first attempt did reach the file (an fsync or rotation error after the
-    /// frames): replay then sees a second commit with nothing pending. If the
-    /// retry fails too, it is unknown whether the first pair reached the
-    /// disk, and any later commit or abort could settle this transaction's
-    /// records the wrong way on replay, so the WAL is poisoned: every later
-    /// append fails until the database is reopened.
-    #[cfg(all(feature = "wal", feature = "lpg"))]
-    fn retry_commit_marker(
-        &self,
-        error: &str,
-        transaction_id: TransactionId,
-        epoch: EpochId,
-    ) -> Result<()> {
-        use grafeo_storage::wal::WalRecord;
-        let Some(ref wal) = self.wal else {
-            return Ok(());
-        };
-        match wal.log_atomic(&[
-            WalRecord::TransactionCommit { transaction_id },
-            WalRecord::EpochAdvance { epoch },
-        ]) {
-            Ok(()) => Ok(()),
-            Err(retry) => {
-                let message = format!(
-                    "write applied in memory; durability unconfirmed (it may have \
-                     committed): the WAL commit marker failed ({error}) and its retry \
-                     failed ({retry}); further writes are refused until the database \
-                     is reopened"
-                );
-                wal.poison(message.clone());
-                Err(grafeo_common::utils::error::Error::Internal(message))
-            }
+    /// Refuses a write once the WAL is poisoned (a commit marker could not be
+    /// written): a later commit or abort could otherwise settle that
+    /// transaction's records the wrong way on replay, and the write itself
+    /// could not be logged. Checked before anything is mutated.
+    #[cfg(feature = "lpg")]
+    fn check_wal_writable(&self) -> Result<()> {
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "WAL refuses writes until the database is reopened: {reason}"
+            )));
         }
+        Ok(())
     }
 
     /// Resolves a graph name to a concrete `LpgStore`.
@@ -4221,6 +4201,13 @@ impl Session {
             }
         }
 
+        // A poisoned WAL cannot record this commit: roll back instead of
+        // committing in memory only.
+        if let Err(e) = self.check_wal_writable() {
+            let _ = self.rollback_inner();
+            return Err(e);
+        }
+
         // Check the buffered vector-index updates before anything is
         // finalized: they are applied after the commit, where a failure
         // would report an error for a transaction that already committed.
@@ -4319,15 +4306,28 @@ impl Session {
         if let Some(ref wal) = self.wal {
             use grafeo_storage::wal::WalRecord;
             // One atomic append: generation-root replay rejects any record
-            // (another session's data, commit or abort) between the two.
-            if let Err(e) = wal.log_atomic(&[
+            // (another session's data, commit or abort) between the two. On a
+            // layered database a failure poisons the WAL inside that append:
+            // the transaction is applied in memory but its marker may or may
+            // not be on disk, and any later commit or abort could settle its
+            // records the wrong way on replay.
+            let pair = [
                 WalRecord::TransactionCommit { transaction_id },
                 WalRecord::EpochAdvance {
                     epoch: commit_epoch,
                 },
-            ]) {
+            ];
+            #[cfg(feature = "compact-store")]
+            let logged = if self.layered_store.is_some() {
+                wal.log_atomic_or_poison(&pair)
+            } else {
+                wal.log_atomic(&pair)
+            };
+            #[cfg(not(feature = "compact-store"))]
+            let logged = wal.log_atomic(&pair);
+            if let Err(e) = logged {
                 grafeo_warn!("Failed to log transaction commit to WAL: {}", e);
-                *self.commit_wal_error.lock() = Some((e.to_string(), transaction_id, commit_epoch));
+                *self.commit_wal_error.lock() = Some(e.to_string());
             }
         }
 
@@ -4775,6 +4775,9 @@ impl Session {
     where
         F: FnOnce() -> Result<QueryResult>,
     {
+        if has_mutations {
+            self.check_wal_writable()?;
+        }
         if self.needs_auto_commit(has_mutations) {
             self.begin_transaction_inner(false, None)?;
             match body() {
