@@ -255,7 +255,7 @@ impl LpgStore {
         existed
     }
 
-    /// Edge variant of [`Self::purge_node`]: removes the version chain, both
+    /// Edge variant of [`Self::purge_copied_node`]: removes the version chain, both
     /// adjacency entries, the edge-type count and the property columns.
     #[doc(hidden)]
     pub fn purge_edge(&self, id: EdgeId) -> bool {

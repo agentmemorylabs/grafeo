@@ -382,21 +382,33 @@ impl Session {
     }
 
     /// Undoes the layered store's base tombstones and copy-ups for a rolled
-    /// back transaction, and reports changes it could no longer undo (an
+    /// back transaction. Returns how many changes it could no longer undo (an
     /// overlay reset or merge baked them in while the transaction was open).
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
-    fn rollback_layered_bookkeeping(&self, transaction_id: TransactionId) {
-        if let Some(ref layered) = self.layered_store {
-            let forgotten = layered.rollback_transaction_layers(transaction_id);
-            if forgotten > 0 {
-                grafeo_warn!(
-                    "rollback of {:?} could not undo {} layered base change(s): an overlay \
-                     reset or merge absorbed them while the transaction was open",
-                    transaction_id,
-                    forgotten
-                );
-            }
-        }
+    fn rollback_layered_bookkeeping(&self, transaction_id: TransactionId) -> usize {
+        self.layered_store.as_ref().map_or(0, |layered| {
+            layered.rollback_transaction_layers(transaction_id)
+        })
+    }
+
+    /// The error a rollback returns, after completing everything else, when
+    /// `unrestored` layered base changes could not be undone. It is an
+    /// error rather than only a log line so embedders that compile out
+    /// `tracing` still see it.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    fn incomplete_rollback_error(
+        transaction_id: TransactionId,
+        unrestored: usize,
+    ) -> grafeo_common::utils::error::Error {
+        let msg = format!(
+            "rollback incomplete: {unrestored} layered base change(s) of {transaction_id:?} \
+             could not be undone because an overlay reset or merge absorbed them while the \
+             transaction was open; reopen the database to restore the committed state"
+        );
+        grafeo_warn!("{}", msg);
+        grafeo_common::utils::error::Error::Transaction(
+            grafeo_common::utils::error::TransactionError::InvalidState(msg),
+        )
     }
 
     /// Sets the WAL for this session (shared with the database).
@@ -4103,8 +4115,15 @@ impl Session {
                     let store = self.resolve_store(graph_name);
                     store.rollback_transaction_properties(transaction_id);
                 }
+                // The conflict error is what the caller gets; an incomplete
+                // layered undo is only logged here.
                 #[cfg(all(feature = "compact-store", feature = "lpg"))]
-                self.rollback_layered_bookkeeping(transaction_id);
+                {
+                    let unrestored = self.rollback_layered_bookkeeping(transaction_id);
+                    if unrestored > 0 {
+                        let _ = Self::incomplete_rollback_error(transaction_id, unrestored);
+                    }
+                }
                 #[cfg(feature = "triple-store")]
                 self.rollback_rdf_transaction(transaction_id);
                 // Discard buffered CDC events on conflict rollback
@@ -4308,7 +4327,7 @@ impl Session {
         // the overlay discard, so no rolled-back edge still references a
         // copy-up when it is purged).
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
-        self.rollback_layered_bookkeeping(transaction_id);
+        let unrestored = self.rollback_layered_bookkeeping(transaction_id);
 
         // Discard pending operations in the RDF store
         #[cfg(feature = "triple-store")]
@@ -4351,6 +4370,13 @@ impl Session {
                 let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
                 crate::metrics::record_metric!(self.metrics, tx_duration, observe duration_ms);
             }
+        }
+
+        // Everything else is rolled back and the transaction has ended; now
+        // surface base changes the layered undo could not restore.
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if result.is_ok() && unrestored > 0 {
+            return Err(Self::incomplete_rollback_error(transaction_id, unrestored));
         }
 
         result
@@ -4488,9 +4514,9 @@ impl Session {
 
         // Undo layered tombstones / copy-ups made after the savepoint.
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
-        if let Some(ref layered) = self.layered_store {
-            layered.rollback_transaction_layers_to(transaction_id, sp_state.layered_position);
-        }
+        let unrestored = self.layered_store.as_ref().map_or(0, |layered| {
+            layered.rollback_transaction_layers_to(transaction_id, sp_state.layered_position)
+        });
 
         // Truncate CDC event buffer to the savepoint position.
         #[cfg(feature = "cdc")]
@@ -4507,6 +4533,14 @@ impl Session {
             if !touched.contains(&gs.graph_name) {
                 touched.push(gs.graph_name.clone());
             }
+        }
+        drop(touched);
+
+        // The transaction stays open; the caller learns that the savepoint
+        // state could not be fully restored.
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if unrestored > 0 {
+            return Err(Self::incomplete_rollback_error(transaction_id, unrestored));
         }
 
         Ok(())

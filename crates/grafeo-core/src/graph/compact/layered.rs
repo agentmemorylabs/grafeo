@@ -1155,14 +1155,26 @@ impl LayeredStore {
 
     /// Undoes the layered changes `transaction_id` made after journal
     /// position `since` (savepoint rollback), newest first.
-    pub fn rollback_transaction_layers_to(&self, transaction_id: TransactionId, since: usize) {
+    ///
+    /// Returns how many of this transaction's changes an overlay reset /
+    /// merge has dropped (see [`Self::rollback_transaction_layers`]). Some of
+    /// them may predate the savepoint, but once they are dropped the saved
+    /// position is stale and the restore cannot be shown to be exact, so any
+    /// loss is reported. The count stays recorded for the full rollback.
+    pub fn rollback_transaction_layers_to(
+        &self,
+        transaction_id: TransactionId,
+        since: usize,
+    ) -> usize {
         if !self.txn_journal_pending.load(Ordering::SeqCst) {
-            return;
+            return 0;
         }
         let _guard = self.merge_guard.read();
         let mut journal = self.txn_journal.lock();
         self.undo_layers_locked(&mut journal, transaction_id, since);
+        let forgotten = journal.forgotten.get(&transaction_id).copied().unwrap_or(0);
         self.refresh_journal_pending(&journal);
+        forgotten
     }
 
     /// Total journal entries dropped by overlay resets / merges while their
