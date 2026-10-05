@@ -55,6 +55,9 @@ jobs:
           for f in crates/grafeo-engine/tests/*.rs; do
             n=$(basename "$f" .rs)
             case "$n" in
+              # Does not compile with generation-streaming: it imports the eager
+              # generate_compact_store, which that feature seals (pub(crate)).
+              compact_store_generation_contract) continue ;;
               generation_*|layered_*|compact_store_*|*wal*|*recovery*|epoch_handoff_*)
                 targets="$targets --test $n" ;;
             esac
