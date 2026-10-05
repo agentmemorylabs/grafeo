@@ -60,15 +60,11 @@ impl GrafeoDB {
         // No transaction here: each statement's WAL records are written as
         // one implicit group once it has run.
         #[cfg(feature = "wal")]
-        let wal_buffer = self.wal.as_ref().map(|wal| {
-            Arc::new(crate::transaction::wal_buffer::WalBuffer::new(Arc::clone(
-                wal,
-            )))
-        });
+        let wal_buffer = self.new_wal_buffer();
         #[cfg(feature = "wal")]
         let flush_wal = || {
             if let Some(ref buffer) = wal_buffer
-                && let Err(e) = buffer.flush_implicit()
+                && let Err(e) = buffer.flush_implicit(self.transaction_manager.current_epoch())
             {
                 grafeo_common::grafeo_warn!("Failed to write SPARQL update to WAL: {}", e);
             }

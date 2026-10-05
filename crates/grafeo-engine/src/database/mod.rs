@@ -242,6 +242,11 @@ pub struct GrafeoDB {
     /// Write-ahead log manager (if durability is enabled).
     #[cfg(feature = "wal")]
     pub(super) wal: Option<Arc<LpgWal>>,
+    /// Orders WAL groups like their commits: held by a session from its
+    /// commit validation until its group is in the WAL, so a transaction
+    /// that saw another's committed writes always lands after it (#411).
+    #[cfg(feature = "wal")]
+    pub(super) wal_commit_order: Arc<parking_lot::Mutex<()>>,
     /// Query cache for parsed and optimized plans.
     pub(super) query_cache: Arc<QueryCache>,
     /// Shared commit counter for auto-GC across sessions.
@@ -824,6 +829,7 @@ impl GrafeoDB {
             #[cfg(feature = "wal")]
             wal,
             #[cfg(feature = "wal")]
+            wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1074,6 +1080,8 @@ impl GrafeoDB {
             buffer_manager,
             #[cfg(feature = "wal")]
             wal: None,
+            #[cfg(feature = "wal")]
+            wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1244,6 +1252,18 @@ impl GrafeoDB {
                 wal.log(&WalRecord::TransactionAbort {
                     transaction_id: report.max_transaction_id,
                 })?;
+                wal.sync()?;
+            }
+            // A log written before the #411 port can end inside a named
+            // graph. New groups start in the default graph, so switch back
+            // first, as a committed group of its own (replay requires the
+            // epoch advance after the commit).
+            if report.ends_in_named_graph {
+                let mut group = vec![WalRecord::SwitchGraph { name: None }];
+                group.extend(crate::transaction::wal_buffer::implicit_markers(
+                    report.final_epoch,
+                ));
+                wal.log_atomic_or_poison(&group)?;
                 wal.sync()?;
             }
             db.wal = Some(wal);
@@ -1421,6 +1441,7 @@ impl GrafeoDB {
             #[cfg(feature = "wal")]
             wal: None,
             #[cfg(feature = "wal")]
+            wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1541,6 +1562,7 @@ impl GrafeoDB {
             #[cfg(feature = "wal")]
             wal: None,
             #[cfg(feature = "wal")]
+            wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -2841,11 +2863,7 @@ impl GrafeoDB {
             // (H-ADOPT.3 Phase C, D1). The wrapper records into the session's
             // WAL buffer, which the session writes as one group at commit.
             #[cfg(feature = "wal")]
-            let wal_buffer = self.wal.as_ref().map(|wal| {
-                Arc::new(crate::transaction::wal_buffer::WalBuffer::new(Arc::clone(
-                    wal,
-                )))
-            });
+            let wal_buffer = self.new_wal_buffer();
             #[cfg(feature = "wal")]
             let write_store: Arc<dyn GraphStoreMut> = if let Some(ref buffer) = wal_buffer {
                 let wal_store = Arc::new(crate::database::wal_store::WalGraphStore::new(
@@ -2892,8 +2910,8 @@ impl GrafeoDB {
                 .expect("session creation for non-lpg build");
 
         #[cfg(all(feature = "wal", feature = "lpg"))]
-        if let Some(ref wal) = self.wal {
-            session.set_wal(Arc::clone(wal));
+        if let Some(buffer) = self.new_wal_buffer() {
+            session.set_wal(buffer);
         }
 
         #[cfg(feature = "cdc")]
@@ -3559,6 +3577,26 @@ impl GrafeoDB {
         }
         let _ = api;
         false
+    }
+
+    /// A WAL buffer for one session or one database-level statement, or
+    /// `None` without a WAL. Buffers of one database share its commit order;
+    /// on a layered database a group that fails to append poisons the WAL,
+    /// as the commit marker did before (#13).
+    #[cfg(feature = "wal")]
+    pub(crate) fn new_wal_buffer(&self) -> Option<Arc<crate::transaction::wal_buffer::WalBuffer>> {
+        let wal = self.wal.as_ref()?;
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        let layered = self.layered_store.is_some();
+        #[cfg(not(all(feature = "compact-store", feature = "lpg")))]
+        let layered = false;
+        Some(Arc::new(
+            crate::transaction::wal_buffer::WalBuffer::for_database(
+                Arc::clone(wal),
+                Arc::clone(&self.wal_commit_order),
+                layered,
+            ),
+        ))
     }
 
     /// Logs a WAL record if WAL is enabled.

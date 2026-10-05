@@ -70,6 +70,11 @@ pub struct ReplayReport {
     pub final_epoch: EpochId,
     /// Maximum of the boundary transaction ID and replayed commit IDs.
     pub max_transaction_id: TransactionId,
+    /// Whether the replayed records leave the graph cursor on a named graph.
+    /// A log written before the #411 port can end there (its graph context
+    /// was shared across writers); every new group assumes it starts in the
+    /// default graph, so a writable open must switch back first.
+    pub ends_in_named_graph: bool,
 }
 
 /// Failure scanning or applying a generation WAL tail.
@@ -752,6 +757,7 @@ pub fn replay_generation_wal(
         tail,
         final_epoch,
         max_transaction_id,
+        ends_in_named_graph: cursor.current_graph.is_some(),
     })
 }
 

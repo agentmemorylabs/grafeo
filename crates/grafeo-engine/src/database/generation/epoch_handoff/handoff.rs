@@ -103,16 +103,18 @@ impl GrafeoDB {
     /// # Writers must be drained first
     ///
     /// The caller must stop admitting writes and let every outstanding
-    /// mutation, WAL append and transaction commit or abort finish before
-    /// calling this. The freeze holds the layered store's merge-guard write
-    /// barrier, but that only excludes a store mutation in progress: a
-    /// `WalGraphStore` write appends its WAL record after the store mutation
-    /// has released the guard, and a session commit writes its markers
-    /// separately. So an append or an open transaction can straddle the WAL
-    /// cut. A transaction that appended before the cut and commits after it
-    /// leaves the pre-boundary log ending mid-transaction, which recovery
-    /// from the previous manifest rejects as incomplete. (Downstream drains
-    /// writers in its maintenance window before handing off.)
+    /// mutation and transaction commit or abort finish before calling this.
+    /// The freeze holds the layered store's merge-guard write barrier, but
+    /// that only excludes a store mutation in progress, not an open
+    /// transaction. Since the #411 port a transaction's WAL records are
+    /// written as one group at its commit, in one append that the cut's
+    /// rotation cannot split, so the pre-boundary log no longer ends
+    /// mid-transaction. But an open transaction's base tombstones and
+    /// copy-ups are already in the live layered store and can be captured
+    /// into G(N), while its group (if it commits) lands after the cut and is
+    /// replayed on top of G(N), and if it rolls back G(N) keeps them.
+    /// (Downstream drains writers in its maintenance window before handing
+    /// off.)
     ///
     /// # Errors
     ///
@@ -152,11 +154,10 @@ impl GrafeoDB {
         // concurrent GraphStoreMut store mutation (each holds the guard as
         // `.read()` while it mutates the store) can interleave with the
         // capture: a store mutation is either captured into G(N) or lands in
-        // epoch N+1. This does NOT order WAL records: `WalGraphStore` appends
-        // after the store mutation, outside the guard, and session commits
-        // write their markers separately, so an append or an open
-        // transaction can still straddle the cut. That is why callers must
-        // drain writers first (see this function's docs). The barrier is
+        // epoch N+1. It does not exclude an open transaction, whose WAL group
+        // is written at its commit, after the cut, while its layered changes
+        // can be captured now. That is why callers must drain writers first
+        // (see this function's docs). The barrier is
         // dropped right after the handoff install (build/publish stay
         // concurrent — only the capture must be atomic).
         let _barrier = self
@@ -260,8 +261,8 @@ impl GrafeoDB {
         }
 
         // Freeze capture + install complete: release the writer barrier so
-        // N+1 store mutations proceed after the capture. (WAL ordering
-        // relative to the cut still relies on drained writers.)
+        // N+1 store mutations proceed after the capture. (Open transactions
+        // relative to the cut still rely on drained writers.)
         drop(_barrier);
 
         let handle = FrozenEpochHandle {

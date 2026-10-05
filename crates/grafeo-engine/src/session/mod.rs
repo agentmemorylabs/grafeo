@@ -458,13 +458,13 @@ impl Session {
 
     /// Sets the WAL for this session (shared with the database).
     ///
-    /// The session gets its own [`WalBuffer`](crate::transaction::wal_buffer::WalBuffer),
-    /// and `graph_store` is wrapped in a [`WalGraphStore`] so that mutation
+    /// The session gets its own [`WalBuffer`](crate::transaction::wal_buffer::WalBuffer)
+    /// (built by the database, which shares its commit order between its
+    /// sessions), and `graph_store` is wrapped in a [`WalGraphStore`] so that mutation
     /// operators (INSERT, DELETE, SET via queries) record into it. The buffer
     /// is written to the WAL as one group per transaction.
     #[cfg(all(feature = "wal", feature = "lpg"))]
-    pub(crate) fn set_wal(&mut self, wal: Arc<grafeo_storage::wal::LpgWal>) {
-        let buffer = Arc::new(crate::transaction::wal_buffer::WalBuffer::new(wal));
+    pub(crate) fn set_wal(&mut self, buffer: Arc<crate::transaction::wal_buffer::WalBuffer>) {
         let wal_store = Arc::new(crate::database::wal_store::WalGraphStore::new(
             Arc::clone(&self.store) as Arc<dyn GraphStoreMut>,
             Arc::clone(&buffer),
@@ -502,7 +502,7 @@ impl Session {
     fn flush_wal_outside_transaction(&self) {
         if let Some(ref wal) = self.wal
             && self.current_transaction.lock().is_none()
-            && let Err(e) = wal.flush_implicit()
+            && let Err(e) = wal.flush_implicit(self.transaction_manager.current_epoch())
         {
             grafeo_warn!("Session: failed to write WAL records: {}", e);
         }
@@ -1455,14 +1455,11 @@ impl Session {
     /// written as its own committed group instead of joining the transaction.
     #[cfg(feature = "wal")]
     fn log_schema_wal(&self, record: &grafeo_storage::wal::WalRecord) {
-        use grafeo_storage::wal::WalRecord;
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.wal().log_batch(&[
-                record.clone(),
-                WalRecord::TransactionCommit {
-                    transaction_id: TransactionId::SYSTEM,
-                },
-            ])
+            && let Err(e) = wal.write_implicit_group(
+                std::slice::from_ref(record),
+                self.transaction_manager.current_epoch(),
+            )
         {
             grafeo_warn!("Failed to log schema change to WAL: {}", e);
         }
@@ -4196,7 +4193,7 @@ impl Session {
         // `flush_wal_outside_transaction`.)
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.flush_implicit()
+            && let Err(e) = wal.flush_implicit(self.transaction_manager.current_epoch())
         {
             grafeo_warn!("Session: failed to write WAL records: {}", e);
         }
@@ -4307,9 +4304,15 @@ impl Session {
         // track_graph_touch() for this transaction (it checks current_transaction
         // first), so this is safe.
         let touched = std::mem::take(&mut *self.touched_graphs.lock());
+        // Held until this transaction's group is in the WAL, so groups reach
+        // the WAL in commit order (see `WalBuffer::commit_order`).
+        #[cfg(feature = "wal")]
+        let commit_order = self.wal.as_ref().map(|wal| wal.commit_order());
         let commit_epoch = match self.transaction_manager.commit(transaction_id) {
             Ok(epoch) => epoch,
             Err(e) => {
+                #[cfg(feature = "wal")]
+                drop(commit_order);
                 // Conflict detected: abort the transaction completely so its
                 // entities are released and its versions discarded (#409).
                 // The caller gets the conflict error, unless the layered undo
@@ -4395,24 +4398,18 @@ impl Session {
                     epoch: commit_epoch,
                 },
             ];
-            #[cfg(feature = "compact-store")]
-            let logged = if self.layered_store.is_some() {
-                wal.flush_or_poison(&markers)
-            } else {
-                wal.flush(&markers)
-            };
-            #[cfg(not(feature = "compact-store"))]
-            let logged = wal.flush(&markers);
-            if let Err(e) = logged {
+            if let Err(e) = wal.flush(&markers) {
                 grafeo_warn!("Failed to write transaction to WAL: {}", e);
                 // A layered database poisoned its WAL above: report the
                 // commit as unconfirmed once the in-memory commit finishes.
                 #[cfg(feature = "compact-store")]
-                if self.layered_store.is_some() {
+                if wal.poisons_on_failure() {
                     durability_error = Some(e.to_string());
                 }
             }
         }
+        #[cfg(feature = "wal")]
+        drop(commit_order);
 
         // Sync epoch for all touched graphs so that convenience lookups
         // (edge_type, get_edge, get_node) can see versions at the latest epoch.

@@ -16,10 +16,16 @@
 //! before records of another graph and switches back to the default graph
 //! before its markers, so replay of every group starts and ends in the
 //! default graph.
+//!
+//! Fork additions: every group ends with a `TransactionCommit` followed by an
+//! `EpochAdvance`, implicit groups included, because generation-root replay
+//! rejects a commit without its epoch advance. On a layered database a group
+//! that fails to append poisons the WAL (#13). Sessions of one database share
+//! a commit-order lock, so groups reach the WAL in commit order.
 
 use std::sync::Arc;
 
-use grafeo_common::types::TransactionId;
+use grafeo_common::types::{EpochId, TransactionId};
 use grafeo_common::utils::error::Result;
 use grafeo_storage::wal::{LpgWal, WalRecord};
 use parking_lot::Mutex;
@@ -67,15 +73,53 @@ type PendingRecord = (Option<String>, WalRecord);
 pub(crate) struct WalBuffer {
     wal: Arc<LpgWal>,
     pending: Mutex<Vec<PendingRecord>>,
+    /// Shared by every session of the database (see
+    /// [`commit_order`](Self::commit_order)).
+    commit_order: Arc<Mutex<()>>,
+    /// Whether a failed group append poisons the WAL (layered databases).
+    poison_on_failure: bool,
 }
 
 impl WalBuffer {
-    /// Creates an empty buffer writing to `wal`.
+    /// Creates an empty buffer writing to `wal`, with its own commit-order
+    /// lock and without poisoning.
+    #[cfg(test)]
     pub(crate) fn new(wal: Arc<LpgWal>) -> Self {
+        Self::for_database(wal, Arc::new(Mutex::new(())), false)
+    }
+
+    /// Creates an empty buffer writing to `wal` for a session of a database
+    /// whose sessions share `commit_order`. With `poison_on_failure` (a
+    /// layered database) a group that fails to append poisons the WAL before
+    /// any other writer can append after it.
+    pub(crate) fn for_database(
+        wal: Arc<LpgWal>,
+        commit_order: Arc<Mutex<()>>,
+        poison_on_failure: bool,
+    ) -> Self {
         Self {
             wal,
             pending: Mutex::new(Vec::new()),
+            commit_order,
+            poison_on_failure,
         }
+    }
+
+    /// Locks the database's commit order. A committing session holds it from
+    /// before its commit validation until its group is written, so a
+    /// transaction that saw another one's committed writes (an edge onto its
+    /// new node, a later SET of its property) is always written after it, and
+    /// replay applies them in that order. Records are only written at
+    /// commit, so without it the second transaction's group could reach the
+    /// WAL first.
+    pub(crate) fn commit_order(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.commit_order.lock()
+    }
+
+    /// Whether a failed group append poisons the WAL.
+    #[cfg(feature = "compact-store")]
+    pub(crate) fn poisons_on_failure(&self) -> bool {
+        self.poison_on_failure
     }
 
     /// The WAL this buffer writes to.
@@ -114,34 +158,42 @@ impl WalBuffer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the WAL write fails. The buffered records are
-    /// dropped either way.
+    /// Returns an error if the WAL write fails or the WAL is poisoned. On a
+    /// layered database the failure has poisoned the WAL by then (see
+    /// `TypedWal::log_atomic_or_poison`). The buffered records are dropped
+    /// either way.
     pub(crate) fn flush(&self, markers: &[WalRecord]) -> Result<()> {
         let pending = std::mem::take(&mut *self.pending.lock());
         let group = build_group(pending, markers);
-        if group.is_empty() {
-            return Ok(());
-        }
-        self.wal.log_batch(&group)
+        self.append(&group)
     }
 
-    /// [`flush`](Self::flush) whose failure poisons the WAL before any other
-    /// writer can append (see `TypedWal::log_atomic_or_poison`), for a commit
-    /// on a layered database: the transaction is applied in memory, so a
-    /// group that may be partly on disk must not be followed by anything.
+    /// Writes `records` (default graph) right away as their own implicit
+    /// group, leaving the buffer alone: for schema changes, which take effect
+    /// immediately and are not undone by a rollback.
     ///
     /// # Errors
     ///
-    /// Returns an error if the WAL write fails or the WAL is poisoned. The
-    /// buffered records are dropped either way.
-    #[cfg(feature = "compact-store")]
-    pub(crate) fn flush_or_poison(&self, markers: &[WalRecord]) -> Result<()> {
-        let pending = std::mem::take(&mut *self.pending.lock());
-        let group = build_group(pending, markers);
+    /// Returns an error if the WAL write fails or the WAL is poisoned.
+    // reason: only the query languages' schema statements call it, so a build
+    // without any of them has no caller.
+    #[allow(dead_code)]
+    pub(crate) fn write_implicit_group(&self, records: &[WalRecord], epoch: EpochId) -> Result<()> {
+        let pending = records.iter().map(|r| (None, r.clone())).collect();
+        self.append(&build_group(pending, &implicit_markers(epoch)))
+    }
+
+    /// Appends a built group in one write (poisoning on failure when
+    /// configured).
+    fn append(&self, group: &[WalRecord]) -> Result<()> {
         if group.is_empty() {
             return Ok(());
         }
-        self.wal.log_atomic_or_poison(&group)
+        if self.poison_on_failure {
+            self.wal.log_atomic_or_poison(group)
+        } else {
+            self.wal.log_batch(group)
+        }
     }
 
     /// Writes buffered records from outside a transaction as an implicit
@@ -150,14 +202,26 @@ impl WalBuffer {
     /// # Errors
     ///
     /// Returns an error if the WAL write fails.
-    pub(crate) fn flush_implicit(&self) -> Result<()> {
+    pub(crate) fn flush_implicit(&self, epoch: EpochId) -> Result<()> {
         if self.is_empty() {
             return Ok(());
         }
-        self.flush(&[WalRecord::TransactionCommit {
-            transaction_id: TransactionId::SYSTEM,
-        }])
+        self.flush(&implicit_markers(epoch))
     }
+}
+
+/// Markers closing an implicit group (writes and schema changes outside a
+/// transaction): a system commit, and the epoch advance generation-root
+/// replay requires right after every commit. `epoch` is the current epoch;
+/// replay keeps the highest epoch it reads, and plain WAL recovery treats the
+/// advance as metadata.
+pub(crate) fn implicit_markers(epoch: EpochId) -> [WalRecord; 2] {
+    [
+        WalRecord::TransactionCommit {
+            transaction_id: TransactionId::SYSTEM,
+        },
+        WalRecord::EpochAdvance { epoch },
+    ]
 }
 
 /// Builds a group: the records with `SwitchGraph` wherever the graph changes,
@@ -184,7 +248,7 @@ fn build_group(pending: Vec<PendingRecord>, markers: &[WalRecord]) -> Vec<WalRec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafeo_common::types::{EpochId, NodeId};
+    use grafeo_common::types::NodeId;
 
     fn create(id: u64) -> WalRecord {
         WalRecord::CreateNode {
@@ -269,7 +333,7 @@ mod tests {
         buffer.clear();
         assert!(buffer.is_empty());
         // Nothing buffered: an implicit flush writes nothing.
-        buffer.flush_implicit().unwrap();
+        buffer.flush_implicit(EpochId::new(1)).unwrap();
         assert_eq!(buffer.wal().record_count(), 0);
     }
 }
