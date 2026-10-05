@@ -1465,16 +1465,22 @@ impl GraphStore for LayeredStore {
                 .iter()
                 .map(|(prop, value)| (PropertyKey::new(*prop), value.clone()))
                 .collect();
-            // Deleted-set snapshot taken under a SHORT-LIVED read guard: the
-            // long per-candidate merged scan below holds no LayeredStore
-            // locks, so index writers are not blocked for the whole scan.
-            // (`get_node_property` additionally re-checks deletion against
-            // live state, so the snapshot is an optimization, not the
-            // correctness boundary.)
-            let deleted_snapshot = self.deleted_from_base_nodes.read().clone();
+            // Deleted base nodes are dropped under a SHORT-LIVED read guard,
+            // O(candidates) without cloning the deleted set (which grows with
+            // base deletions since the last handoff). The per-candidate
+            // merged scan below holds no LayeredStore locks, so index writers
+            // are not blocked for the whole scan. (`get_node_property`
+            // additionally re-checks deletion against live state, so this
+            // pass is an optimization, not the correctness boundary.)
+            let candidates: Vec<NodeId> = {
+                let deleted = self.deleted_from_base_nodes.read();
+                candidates
+                    .into_iter()
+                    .filter(|id| !deleted.contains(id))
+                    .collect()
+            };
             return candidates
                 .into_iter()
-                .filter(|id| !deleted_snapshot.contains(id))
                 .filter(|id| {
                     keyed_conditions
                         .iter()
