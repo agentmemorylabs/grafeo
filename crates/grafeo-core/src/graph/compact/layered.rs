@@ -1396,43 +1396,52 @@ impl GraphStore for LayeredStore {
     }
 
     fn node_count(&self) -> usize {
+        // Counts exactly what `node_ids` lists: base nodes that are neither
+        // deleted from the base nor dirty (owned by the overlay), plus live
+        // overlay nodes, an id once. Walks the deleted, dirty and overlay id
+        // sets with id-only base lookups, never the base rows.
         let base = self.base.load();
-        // A base node is hidden when it is deleted from the base or promoted
-        // (its live copy, if any, is counted in the overlay). An id can be
-        // both, so count the union once. Walks only these small sets, never
-        // the base rows.
+        let overlay = self.overlay.load();
         let deleted = self.deleted_from_base_nodes.read();
-        let promoted_only = self
-            .dirty_node_ids
-            .read()
-            .iter()
-            .filter(|id| !deleted.contains(*id) && base.get_node(**id).is_some())
-            .count();
+        let dirty = self.dirty_node_ids.read();
+        // Base rows hidden by a tombstone or a copy-up. After a handoff
+        // install a tombstone can name a row the new base no longer has, and
+        // an id can be both deleted and dirty: count each base row once.
         let hidden = deleted
             .iter()
-            .filter(|id| base.get_node(**id).is_some())
-            .count()
-            + promoted_only;
-        base.node_count().saturating_sub(hidden) + self.overlay.load().node_count()
+            .chain(dirty.iter().filter(|id| !deleted.contains(*id)))
+            .filter(|id| base.contains_node(**id))
+            .count();
+        let overlay_ids = overlay.node_ids();
+        // Live overlay rows the base also lists: after a handoff install the
+        // new base absorbed them while they stay (not dirty) in the overlay.
+        let in_both = overlay_ids
+            .iter()
+            .filter(|id| !deleted.contains(*id) && !dirty.contains(*id))
+            .filter(|id| base.contains_node(**id))
+            .count();
+        (base.node_count().saturating_sub(hidden) + overlay_ids.len()).saturating_sub(in_both)
     }
 
     fn edge_count(&self) -> usize {
+        // See `node_count`; `delete_node_edges` tombstones base edges that
+        // are also dirty, so the deleted and dirty sets overlap.
         let base = self.base.load();
-        // See `node_count`: `delete_node_edges` tombstones base edges that
-        // are also promoted, so the two sets overlap.
+        let overlay = self.overlay.load();
         let deleted = self.deleted_from_base_edges.read();
-        let promoted_only = self
-            .dirty_edge_ids
-            .read()
-            .iter()
-            .filter(|id| !deleted.contains(*id) && base.get_edge(**id).is_some())
-            .count();
+        let dirty = self.dirty_edge_ids.read();
         let hidden = deleted
             .iter()
-            .filter(|id| base.get_edge(**id).is_some())
-            .count()
-            + promoted_only;
-        base.edge_count().saturating_sub(hidden) + self.overlay.load().edge_count()
+            .chain(dirty.iter().filter(|id| !deleted.contains(*id)))
+            .filter(|id| base.contains_edge(**id))
+            .count();
+        let overlay_ids = overlay.edge_ids();
+        let in_both = overlay_ids
+            .iter()
+            .filter(|id| !deleted.contains(*id) && !dirty.contains(*id))
+            .filter(|id| base.contains_edge(**id))
+            .count();
+        (base.edge_count().saturating_sub(hidden) + overlay_ids.len()).saturating_sub(in_both)
     }
 
     fn edge_type(&self, id: EdgeId) -> Option<ArcStr> {

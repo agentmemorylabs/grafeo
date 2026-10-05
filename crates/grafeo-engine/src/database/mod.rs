@@ -2201,8 +2201,27 @@ impl GrafeoDB {
             .as_ref()
             .ok_or_else(|| Error::Internal("wire_layered_after_load: no LpgStore".into()))?;
 
-        // Adopt the loaded base + the loaded overlay (id allocator state
-        // is preserved on the overlay during deserialization).
+        // The deserialized overlay's allocators are restored from its own
+        // rows only (the LPG section does not persist them), so an overlay
+        // whose largest id is below the base's would hand out base ids. A new
+        // node would hide its base twin, and `with_overlay` would treat it as
+        // a copy-up on the next reopen. Raise both allocators above the
+        // base's preserved id maxima, as `wire_generation_layered` does;
+        // never lower them.
+        if let Some(max) = compact_base.max_preserved_node_id() {
+            let next = max.saturating_add(1);
+            if overlay_store.next_node_id() < next {
+                overlay_store.set_next_node_id(next);
+            }
+        }
+        if let Some(max) = compact_base.max_preserved_edge_id() {
+            let next = max.saturating_add(1);
+            if overlay_store.next_edge_id() < next {
+                overlay_store.set_next_edge_id(next);
+            }
+        }
+
+        // Adopt the loaded base + the loaded overlay.
         let layered = Arc::new(LayeredStore::with_overlay(
             Arc::clone(&compact_base),
             Arc::clone(overlay_store),
