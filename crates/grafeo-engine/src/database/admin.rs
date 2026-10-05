@@ -421,6 +421,26 @@ impl super::GrafeoDB {
             return Ok(());
         }
 
+        // Generation root: the published base plus the WAL from the manifest's
+        // boundary on is the only copy of the overlay, and reopen replays every
+        // file from that boundary. Checkpoint metadata and the legacy log
+        // truncation would delete WAL no base contains (the next open then
+        // fails with a missing file or sequence gap). Only sync here; old WAL
+        // is deleted by publication, below its own boundary.
+        #[cfg(all(
+            feature = "generation",
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "mmap"
+        ))]
+        if self.generation_root.is_some() {
+            #[cfg(feature = "wal")]
+            if let Some(ref wal) = self.wal {
+                wal.sync()?;
+            }
+            return Ok(());
+        }
+
         #[cfg(feature = "wal")]
         let wal_mark = |covered_sequence: Option<u64>| -> Result<()> {
             if let Some(ref wal) = self.wal {
