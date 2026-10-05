@@ -100,6 +100,20 @@ impl HandoffRootLock<'_> {
 impl GrafeoDB {
     /// Freeze epoch N at WAL boundary B and open bounded epoch N+1 for writes.
     ///
+    /// # Writers must be drained first
+    ///
+    /// The caller must stop admitting writes and let every outstanding
+    /// mutation, WAL append and transaction commit or abort finish before
+    /// calling this. The freeze holds the layered store's merge-guard write
+    /// barrier, but that only excludes a store mutation in progress: a
+    /// `WalGraphStore` write appends its WAL record after the store mutation
+    /// has released the guard, and a session commit writes its markers
+    /// separately. So an append or an open transaction can straddle the WAL
+    /// cut. A transaction that appended before the cut and commits after it
+    /// leaves the pre-boundary log ending mid-transaction, which recovery
+    /// from the previous manifest rejects as incomplete. (Downstream drains
+    /// writers in its maintenance window before handing off.)
+    ///
     /// # Errors
     ///
     /// Returns when the root lock cannot be acquired, the WAL cut fails, a
@@ -133,16 +147,18 @@ impl GrafeoDB {
         let generation_root = std::fs::canonicalize(generation_root)
             .map_err(|e| Error::Internal(format!("canonicalize generation root: {e}")))?;
 
-        // MAJOR-1: freeze must be a writer linearization point. Hold the
-        // layered store's merge-guard WRITE barrier across WAL cut → epoch
-        // sync → payload capture → begin_epoch_handoff so no concurrent
-        // GraphStoreMut mutation (each holds the guard as `.read()` for the
-        // whole operation) can interleave. A writer is therefore either
-        // entirely before the freeze (WAL record ≤ B and captured into G(N))
-        // or entirely after it (epoch N+1, excluded from G(N)) — no torn or
-        // duplicated entity. The barrier is dropped right after the handoff
-        // install so N+1 writers proceed once the freeze is fully installed
-        // (build/publish stay concurrent — only the capture must be atomic).
+        // MAJOR-1: hold the layered store's merge-guard WRITE barrier across
+        // WAL cut → epoch sync → payload capture → begin_epoch_handoff so no
+        // concurrent GraphStoreMut store mutation (each holds the guard as
+        // `.read()` while it mutates the store) can interleave with the
+        // capture: a store mutation is either captured into G(N) or lands in
+        // epoch N+1. This does NOT order WAL records: `WalGraphStore` appends
+        // after the store mutation, outside the guard, and session commits
+        // write their markers separately, so an append or an open
+        // transaction can still straddle the cut. That is why callers must
+        // drain writers first (see this function's docs). The barrier is
+        // dropped right after the handoff install (build/publish stay
+        // concurrent — only the capture must be atomic).
         let _barrier = self
             .layered_store
             .as_ref()
@@ -163,7 +179,7 @@ impl GrafeoDB {
             // handoff's `truncate_before`. A private manager is used only
             // when this database has no WAL in `wal_dir` (e.g. an in-memory
             // database freezing into a root).
-            let cut = match self.own_wal_in(&wal_dir) {
+            let cut = match self.own_wal_in(&wal_dir)? {
                 Some(own) => cut_generation_boundary(own),
                 None => cut_generation_boundary(&WalManager::open(&wal_dir)?),
             }
@@ -244,7 +260,8 @@ impl GrafeoDB {
         }
 
         // Freeze capture + install complete: release the writer barrier so
-        // N+1 writers proceed strictly after the freeze linearization point.
+        // N+1 store mutations proceed after the capture. (WAL ordering
+        // relative to the cut still relies on drained writers.)
         drop(_barrier);
 
         let handle = FrozenEpochHandle {
@@ -344,28 +361,34 @@ impl GrafeoDB {
     }
 
     /// This database's own WAL manager when it writes to `wal_dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either directory cannot be resolved, rather
+    /// than guessing: a wrong "not ours" answer would cut the boundary on a
+    /// private manager and lose every later write on reopen.
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
-    fn own_wal_in(&self, wal_dir: &Path) -> Option<&WalManager> {
+    fn own_wal_in(&self, wal_dir: &Path) -> Result<Option<&WalManager>> {
         #[cfg(feature = "wal")]
-        {
-            let wal = self.wal.as_ref()?;
-            let same = match (
-                std::fs::canonicalize(wal.dir()),
-                std::fs::canonicalize(wal_dir),
-            ) {
-                (Ok(own), Ok(dir)) => own == dir,
-                _ => false,
+        if let Some(wal) = self.wal.as_ref() {
+            let resolve = |path: &Path| {
+                std::fs::canonicalize(path).map_err(|e| {
+                    Error::Internal(format!("resolve WAL directory {}: {e}", path.display()))
+                })
             };
-            if same {
-                return Some(wal.manager());
+            if resolve(wal.dir())? == resolve(wal_dir)? {
+                return Ok(Some(wal.manager()));
             }
         }
         #[cfg(not(feature = "wal"))]
         let _ = wal_dir;
-        None
+        Ok(None)
     }
 
     /// One-shot freeze → build → publish → retire.
+    ///
+    /// Writers must be drained first; see
+    /// [`GrafeoDB::freeze_epoch_for_handoff`].
     ///
     /// # Errors
     ///

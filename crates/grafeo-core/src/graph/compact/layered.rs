@@ -551,15 +551,17 @@ impl LayeredStore {
     /// (G-EM0.5c MAJOR-1).
     ///
     /// Every [`GraphStoreMut`] overlay mutation holds the merge guard as
-    /// `.read()` for the duration of the whole operation (see
-    /// [`Self::merge_guard`]). Holding `.write()` here — across the WAL
-    /// boundary cut, the epoch sync, the freeze payload capture, and the
-    /// `begin_epoch_handoff` install — makes the freeze a writer
-    /// linearization point: no mutation can land between the cut and the
-    /// capture, so G(N) can neither duplicate a frozen entity (record > B)
-    /// nor include an N+1-epoch entity. The caller MUST drop the returned
-    /// guard before the freeze returns so N+1 writers proceed only after the
-    /// handoff is fully installed.
+    /// `.read()` while it mutates the store (see [`Self::merge_guard`]).
+    /// Holding `.write()` here — across the WAL boundary cut, the epoch sync,
+    /// the freeze payload capture, and the `begin_epoch_handoff` install —
+    /// keeps store mutations out of the capture: G(N) cannot include an
+    /// N+1-epoch entity. It does not order WAL records against the cut: a
+    /// WAL-backed store appends its record after the store mutation has
+    /// released the guard, and transaction commit markers are written
+    /// separately. Callers must drain writers before the freeze (see
+    /// `GrafeoDB::freeze_epoch_for_handoff`). The caller MUST drop the
+    /// returned guard before the freeze returns so N+1 writers proceed only
+    /// after the handoff is fully installed.
     pub fn freeze_write_barrier(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
         self.merge_guard.write()
     }
