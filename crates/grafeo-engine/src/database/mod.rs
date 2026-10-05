@@ -3511,6 +3511,22 @@ impl GrafeoDB {
         self.wal.as_ref()
     }
 
+    /// Returns `true` (after a warning) when the WAL is poisoned, so a write
+    /// API that cannot return an error refuses before mutating anything.
+    pub(super) fn refuse_write_if_wal_poisoned(&self, api: &str) -> bool {
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            grafeo_warn!(
+                "{api} refused: WAL refuses writes until the database is reopened: {reason}"
+            );
+            return true;
+        }
+        let _ = api;
+        false
+    }
+
     /// Logs a WAL record if WAL is enabled.
     #[cfg(feature = "wal")]
     pub(super) fn log_wal(&self, record: &WalRecord) -> Result<()> {

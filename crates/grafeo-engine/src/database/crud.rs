@@ -1043,6 +1043,7 @@ impl super::GrafeoDB {
     /// # Returns
     ///
     /// Vector of created `NodeId`s in the same order as the input vectors.
+    /// Empty, with nothing created, once the WAL is poisoned.
     pub fn batch_create_nodes(
         &self,
         label: &str,
@@ -1050,6 +1051,10 @@ impl super::GrafeoDB {
         vectors: Vec<Vec<f32>>,
     ) -> Vec<grafeo_common::types::NodeId> {
         use grafeo_common::types::{PropertyKey, Value};
+
+        if self.refuse_write_if_wal_poisoned("batch_create_nodes") {
+            return Vec::new();
+        }
 
         let prop_key = PropertyKey::new(property);
         let labels: &[&str] = &[label];
@@ -1131,6 +1136,7 @@ impl super::GrafeoDB {
     /// # Returns
     ///
     /// Vector of created `NodeId`s in the same order as the input.
+    /// Empty, with nothing created, once the WAL is poisoned.
     pub fn batch_create_nodes_with_props(
         &self,
         label: &str,
@@ -1143,6 +1149,10 @@ impl super::GrafeoDB {
     ) -> Vec<grafeo_common::types::NodeId> {
         #[cfg(any(feature = "vector-index", feature = "text-index"))]
         use grafeo_common::types::Value;
+
+        if self.refuse_write_if_wal_poisoned("batch_create_nodes_with_props") {
+            return Vec::new();
+        }
 
         let labels: &[&str] = &[label];
 

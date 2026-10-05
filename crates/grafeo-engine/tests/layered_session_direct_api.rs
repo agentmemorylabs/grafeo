@@ -1229,3 +1229,105 @@ fn poisoned_wal_refuses_query_writes_and_commits() {
     assert_eq!(cypher_count(&db, "MATCH (n:InTx) RETURN count(n)"), 0);
     assert_eq!(cypher_ada_hash(&db), Some(Value::from("h0")));
 }
+
+// ── Review round 5 (PR #13) ───────────────────────────────────────────
+
+/// A query write whose own commit marker fails reports the commit as
+/// unconfirmed (auto-commit and an explicit `commit()` alike) instead of
+/// success, and the WAL refuses writes from then on.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn query_commit_whose_marker_fails_reports_unconfirmed() {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_from};
+    {
+        let (_dir, root) = fresh_root();
+        let db = open_root(&root);
+        // Append 1 is the CreateNode record, append 2 the commit pair.
+        enable_io_failure_from(2);
+        let r = db.session().execute_cypher("CREATE (:AutoPoison {n: 1})");
+        disable_io_failure();
+        let message = r.expect_err("auto-commit marker failed").to_string();
+        assert!(
+            message.contains("durability unconfirmed"),
+            "auto-commit must not report success: {message}"
+        );
+        assert!(
+            db.session().execute_cypher("CREATE (:After)").is_err(),
+            "the WAL is poisoned"
+        );
+    }
+    {
+        let (_dir, root) = fresh_root();
+        let db = open_root(&root);
+        let mut session = db.session();
+        session.begin_transaction().expect("begin");
+        session
+            .execute_cypher("CREATE (:TxPoison {n: 1})")
+            .expect("write in the transaction");
+        // The commit pair is the next append.
+        enable_io_failure_from(1);
+        let r = session.commit();
+        disable_io_failure();
+        let message = r.expect_err("commit marker failed").to_string();
+        assert!(
+            message.contains("durability unconfirmed"),
+            "commit() must not report success: {message}"
+        );
+        assert!(
+            session.begin_transaction().is_ok() && session.rollback().is_ok(),
+            "no transaction is left open behind the failed commit"
+        );
+        assert!(
+            db.session().execute_cypher("CREATE (:After)").is_err(),
+            "the WAL is poisoned"
+        );
+    }
+}
+
+/// The direct create and batch create APIs (which cannot return an error)
+/// and the RDF query paths refuse before mutating anything once the WAL is
+/// poisoned.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn poisoned_wal_refuses_direct_and_batch_creates() {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_from};
+    let (_dir, root) = fresh_root();
+    let db = open_root(&root);
+    let ids = base_ids(&db);
+    enable_io_failure_from(2);
+    let r = db.set_node_property(ids.ada, "source_hash", Value::from("p1"));
+    disable_io_failure();
+    assert!(r.is_err(), "commit marker failed");
+
+    let session = db.session();
+    assert_eq!(session.create_node(&["Refused"]), NodeId::INVALID);
+    assert_eq!(
+        session.create_edge(ids.ada, ids.grace, "REFUSED"),
+        EdgeId::INVALID
+    );
+    assert!(
+        db.batch_create_nodes("Refused", "emb", vec![vec![1.0, 0.0]])
+            .is_empty()
+    );
+    let mut props = std::collections::HashMap::new();
+    props.insert(
+        grafeo_common::types::PropertyKey::new("n"),
+        Value::from(1_i64),
+    );
+    assert!(
+        db.batch_create_nodes_with_props("Refused", vec![props])
+            .is_empty()
+    );
+    assert_eq!(
+        cypher_count(&db, "MATCH (n:Refused) RETURN count(n)"),
+        0,
+        "nothing was applied in memory"
+    );
+
+    #[cfg(all(feature = "sparql", feature = "triple-store"))]
+    {
+        let insert = "INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> }";
+        assert!(session.execute_sparql(insert).is_err());
+        assert!(session.execute_language(insert, "sparql", None).is_err());
+    }
+}

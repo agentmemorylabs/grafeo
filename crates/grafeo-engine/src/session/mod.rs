@@ -127,11 +127,6 @@ pub struct Session {
     graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
-    /// Set when the last commit could not write its commit marker to the WAL
-    /// (`commit_inner` only warns); the direct-write path reports it. On a
-    /// layered database that failure also poisoned the WAL.
-    #[cfg(all(feature = "wal", feature = "lpg"))]
-    commit_wal_error: parking_lot::Mutex<Option<String>>,
     /// The raw layered store (compact base + overlay) of a layered database,
     /// which the direct node/edge APIs use for the default graph; `store` is
     /// only the overlay there. `None` for every other database.
@@ -310,8 +305,6 @@ impl Session {
             graph_store_mut,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
-            #[cfg(all(feature = "wal", feature = "lpg"))]
-            commit_wal_error: parking_lot::Mutex::new(None),
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -512,8 +505,6 @@ impl Session {
             graph_store_mut: write_store,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
-            #[cfg(all(feature = "wal", feature = "lpg"))]
-            commit_wal_error: parking_lot::Mutex::new(None),
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -794,22 +785,10 @@ impl Session {
             return write();
         }
         self.check_no_active_streams("write")?;
-        #[cfg(feature = "wal")]
-        self.commit_wal_error.lock().take();
         self.begin_transaction_inner(false, None)?;
         match write() {
             Ok(value) => match self.commit_inner() {
-                Ok(()) => {
-                    #[cfg(feature = "wal")]
-                    if let Some(error) = self.commit_wal_error.lock().take() {
-                        return Err(grafeo_common::utils::error::Error::Internal(format!(
-                            "write applied in memory; durability unconfirmed (it may have \
-                             committed): its WAL commit marker failed ({error}); the WAL \
-                             refuses further writes until the database is reopened"
-                        )));
-                    }
-                    Ok(value)
-                }
+                Ok(()) => Ok(value),
                 Err(e) => {
                     // `commit_inner` already rolls back on most failures;
                     // make sure nothing is left open when it did not.
@@ -830,7 +809,6 @@ impl Session {
     /// written): a later commit or abort could otherwise settle that
     /// transaction's records the wrong way on replay, and the write itself
     /// could not be logged. Checked before anything is mutated.
-    #[cfg(feature = "lpg")]
     fn check_wal_writable(&self) -> Result<()> {
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal
@@ -4302,6 +4280,8 @@ impl Session {
         // recovery can identify committed transactions and their epoch
         // boundaries. Without these markers, WAL recovery discards all
         // records as uncommitted (fixes #252 for the crash scenario).
+        #[cfg(all(feature = "wal", feature = "compact-store"))]
+        let mut durability_error: Option<String> = None;
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal {
             use grafeo_storage::wal::WalRecord;
@@ -4327,7 +4307,12 @@ impl Session {
             let logged = wal.log_atomic(&pair);
             if let Err(e) = logged {
                 grafeo_warn!("Failed to log transaction commit to WAL: {}", e);
-                *self.commit_wal_error.lock() = Some(e.to_string());
+                // A layered database poisoned its WAL above: report the
+                // commit as unconfirmed once the in-memory commit finishes.
+                #[cfg(feature = "compact-store")]
+                if self.layered_store.is_some() {
+                    durability_error = Some(e.to_string());
+                }
             }
         }
 
@@ -4386,6 +4371,15 @@ impl Session {
                 let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
                 crate::metrics::record_metric!(self.metrics, tx_duration, observe duration_ms);
             }
+        }
+
+        #[cfg(all(feature = "wal", feature = "compact-store"))]
+        if let Some(error) = durability_error {
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "transaction applied in memory; durability unconfirmed (it may have \
+                 committed): its WAL commit marker failed ({error}); the WAL refuses \
+                 further writes until the database is reopened"
+            )));
         }
 
         Ok(())
@@ -5240,8 +5234,14 @@ impl Session {
     ///
     /// This is a low-level API for testing and direct manipulation.
     /// If a transaction is active, the node will be versioned with the transaction ID.
+    /// Once the WAL is poisoned nothing is created and [`NodeId::INVALID`] is
+    /// returned.
     #[cfg(feature = "lpg")]
     pub fn create_node(&self, labels: &[&str]) -> NodeId {
+        if let Err(e) = self.check_wal_writable() {
+            grafeo_warn!("Session: create_node refused: {e}");
+            return NodeId::INVALID;
+        }
         let (epoch, transaction_id) = self.get_transaction_context();
         let id = self.active_lpg_store().create_node_versioned(
             labels,
@@ -5336,6 +5336,8 @@ impl Session {
     ///
     /// This is a low-level API for testing and direct manipulation.
     /// If a transaction is active, the edge will be versioned with the transaction ID.
+    /// Once the WAL is poisoned nothing is created and `EdgeId::INVALID` is
+    /// returned.
     #[cfg(feature = "lpg")]
     pub fn create_edge(
         &self,
@@ -5343,6 +5345,10 @@ impl Session {
         dst: NodeId,
         edge_type: &str,
     ) -> grafeo_common::types::EdgeId {
+        if let Err(e) = self.check_wal_writable() {
+            grafeo_warn!("Session: create_edge refused: {e}");
+            return grafeo_common::types::EdgeId::INVALID;
+        }
         let (epoch, transaction_id) = self.get_transaction_context();
         let eid = self.active_lpg_store().create_edge_versioned(
             src,

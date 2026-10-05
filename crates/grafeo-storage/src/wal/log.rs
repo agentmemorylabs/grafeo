@@ -437,8 +437,14 @@ impl WalManager {
         }
 
         // Rotate if needed
-        if needs_rotation {
-            self.rotate()?;
+        if needs_rotation && let Err(e) = self.rotate() {
+            // The group itself is durable by now, but the writer reports this
+            // error as an unconfirmed commit marker and says further writes
+            // are refused: poison so that holds.
+            if poison_on_error {
+                self.poison(format!("WAL rotation failed after a commit marker: {e}"));
+            }
+            return Err(e);
         }
 
         Ok(())

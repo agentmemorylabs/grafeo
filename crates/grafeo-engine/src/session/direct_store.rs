@@ -13,12 +13,12 @@
 use std::sync::Arc;
 
 use grafeo_common::types::{EdgeId, EpochId, NodeId, TransactionId, Value};
-use grafeo_core::graph::Direction;
+#[cfg(feature = "compact-store")]
+use grafeo_core::graph::GraphStoreSearch;
 #[cfg(feature = "compact-store")]
 use grafeo_core::graph::compact::layered::LayeredStore;
 use grafeo_core::graph::lpg::{Edge, LpgStore, Node};
-#[cfg(feature = "compact-store")]
-use grafeo_core::graph::{GraphStoreMut, GraphStoreSearch};
+use grafeo_core::graph::{Direction, GraphStoreMut};
 
 /// Target of a direct node/edge API call.
 pub(super) enum DirectStore {
