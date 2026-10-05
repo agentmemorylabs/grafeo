@@ -4777,6 +4777,25 @@ mod tests {
         assert_eq!(layered.neighbors(amsterdam, Direction::Incoming), vec![gus]);
     }
 
+    /// `delete_node_edges` tombstones base edges that are also dirty (copied
+    /// up). Each excluded base edge must be subtracted once: with both base
+    /// edges copied up and then cut, `2 - 2 - 2 + 0` underflowed.
+    #[test]
+    fn test_edge_count_excludes_a_deleted_promoted_base_edge_once() {
+        let layered = build_test_layered();
+        let (alix, _gus, amsterdam, e1) = fixture_ids(&layered);
+
+        layered.set_edge_property(e1, "since", Value::Int64(2024));
+        layered.delete_node_edges(alix);
+        assert_eq!(layered.edge_count(), 1, "only gus -> amsterdam is left");
+
+        let (_, e2) = layered.edges_from(amsterdam, Direction::Incoming)[0];
+        layered.set_edge_property(e2, "since", Value::Int64(2025));
+        layered.delete_node_edges(amsterdam);
+        assert_eq!(layered.edge_count(), 0, "no edges are left");
+        assert_eq!(layered.node_count(), 3);
+    }
+
     /// A dirty base id whose overlay copy was deleted is reported for the
     /// persisted deletion log, hidden from `node_ids`, and counted once.
     #[test]

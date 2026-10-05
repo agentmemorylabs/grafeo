@@ -78,6 +78,18 @@ const SCENARIOS: &[Scenario] = &[
         nodes: 2,
         edges: 1,
     },
+    // A SET on a base edge copies the edge and both endpoints up; the DETACH
+    // DELETE of its source then tombstones the base edge while its id is
+    // still marked dirty. The base edge must be excluded once, not twice.
+    Scenario {
+        name: "edge copy-up then detach delete of its source",
+        writes: &[
+            "MATCH (:P {name: 'a'})-[r:K]->(:P {name: 'b'}) SET r.w = 1",
+            "MATCH (n:P {name: 'a'}) DETACH DELETE n",
+        ],
+        nodes: 2,
+        edges: 1,
+    },
 ];
 
 fn count(db: &GrafeoDB, query: &str) -> usize {
@@ -246,6 +258,11 @@ fn single_file_counts_after_copy_up_then_delete() {
     single_file(&SCENARIOS[4]);
 }
 
+#[test]
+fn single_file_counts_after_edge_copy_up_then_source_delete() {
+    single_file(&SCENARIOS[5]);
+}
+
 /// Writes made in a reopened session (on the mapped base) are counted too.
 ///
 /// Leaves out "overlay creates": on a reopened compacted file whose overlay
@@ -293,6 +310,131 @@ fn single_file_counts_after_writes_in_a_reopened_session() {
         );
         db.close().expect("close");
     }
+}
+
+/// `GraphStoreMut::delete_node_edges` tombstones every base edge of the node,
+/// including one that a property write already copied up. The layered edge
+/// count then subtracted that edge twice: once as deleted from the base and
+/// once as promoted (with a single-edge base, `1 - 1 - 1 + 0` underflows).
+#[test]
+fn single_file_counts_after_delete_node_edges_of_a_copied_up_edge() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("delete-node-edges.grafeo");
+    {
+        let mut db = open_file(&path);
+        build_base(&db);
+        db.compact().expect("compact");
+        let row = db
+            .execute("MATCH (a:P {name: 'a'})-[r:K]->() RETURN id(a), id(r)")
+            .expect("ids")
+            .rows()[0]
+            .clone();
+        let (Value::Int64(a), Value::Int64(r)) = (&row[0], &row[1]) else {
+            panic!("expected integer ids, got {row:?}");
+        };
+        let a = grafeo_common::types::NodeId::new(u64::try_from(*a).expect("id"));
+        let r = grafeo_common::types::EdgeId::new(u64::try_from(*r).expect("id"));
+        let store = db.graph_store_mut().expect("layered write store");
+        store.set_edge_property(r, "w", Value::from(1i64));
+        store.delete_node_edges(a);
+        assert_counts(&db, 3, 1, "after delete_node_edges");
+        db.close().expect("close");
+    }
+    assert_eq!(header_counts(&path), (3, 1), "checkpoint header counts");
+    for reopen in 1..=2 {
+        let db = open_file(&path);
+        assert_counts(&db, 3, 1, &format!("reopen #{reopen}"));
+        db.close().expect("close");
+    }
+}
+
+// ── Periodic checkpoint timer ─────────────────────────────────────────
+
+/// Copies every file of `from` (the container and its sidecar WAL) into
+/// `to`, as a crash at this instant would leave them.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create copy dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
+
+const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Lets several timer checkpoints run.
+fn let_timer_run() {
+    std::thread::sleep(TIMER_INTERVAL * 15);
+}
+
+/// After a timer checkpoint the files on disk still hold the base.
+fn assert_crash_copy_keeps_base(dir: &Path, file_name: &str, nodes: usize, ctx: &str) {
+    let copy = tempdir().expect("copy dir");
+    copy_dir(dir, copy.path());
+    let db = open_file(&copy.path().join(file_name));
+    assert_eq!(
+        count(&db, "MATCH (n) RETURN count(n)"),
+        nodes,
+        "{ctx}: MATCH (n) on a crash copy taken after timer checkpoints"
+    );
+    assert_eq!(
+        db.node_count(),
+        nodes,
+        "{ctx}: node_count on the crash copy"
+    );
+}
+
+/// The periodic checkpoint timer snapshots the LpgStore alone. On a reopened
+/// compacted file that is the overlay, and a timer checkpoint replaced the
+/// whole container with an image that has no CompactStore section.
+#[test]
+fn checkpoint_timer_keeps_the_base_of_a_reopened_compacted_file() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("timer.grafeo");
+    {
+        let mut db = open_file(&path);
+        build_base(&db);
+        db.compact().expect("compact");
+        db.close().expect("close");
+    }
+    let db =
+        GrafeoDB::with_config(Config::persistent(&path).with_checkpoint_interval(TIMER_INTERVAL))
+            .expect("reopen with checkpoint timer");
+    assert_counts(&db, 3, 2, "reopened with timer");
+    let_timer_run();
+    assert_crash_copy_keeps_base(dir.path(), "timer.grafeo", 3, "reopened with timer");
+    db.close().expect("close");
+}
+
+/// Guard for `compact()` while the timer is already running: the timer holds
+/// the pre-compact LpgStore, and a timer checkpoint must never replace the
+/// layered checkpoint (base + overlay, including writes made after
+/// `compact()`).
+#[test]
+fn checkpoint_timer_keeps_writes_after_compact_in_session() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("timer-compact.grafeo");
+    let mut db =
+        GrafeoDB::with_config(Config::persistent(&path).with_checkpoint_interval(TIMER_INTERVAL))
+            .expect("open with checkpoint timer");
+    build_base(&db);
+    db.compact().expect("compact");
+    run_writes(&db, &["INSERT (:R {name: 'd'})"]);
+    db.wal_checkpoint().expect("layered checkpoint");
+    assert_crash_copy_keeps_base(
+        dir.path(),
+        "timer-compact.grafeo",
+        4,
+        "checkpoint after compact",
+    );
+    let_timer_run();
+    assert_crash_copy_keeps_base(dir.path(), "timer-compact.grafeo", 4, "compact under timer");
+    db.close().expect("close");
 }
 
 // ── Generation root ───────────────────────────────────────────────────
@@ -371,5 +513,73 @@ mod generation_root {
     #[test]
     fn generation_root_counts_after_copy_up_then_delete() {
         generation_root(&SCENARIOS[4]);
+    }
+
+    #[test]
+    fn generation_root_counts_after_edge_copy_up_then_source_delete() {
+        generation_root(&SCENARIOS[5]);
+    }
+
+    /// A base whose nodes carry more than one label stores the extra labels
+    /// in the label-membership segment. `label_count` must see them.
+    #[test]
+    fn generation_root_label_count_includes_extra_labels() {
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path().join("multi-label.grafeo.d");
+        std::fs::create_dir_all(&root).expect("create generation root");
+        {
+            let source = GrafeoDB::new_in_memory();
+            let a = source
+                .create_node_with_props(&["P", "Extra"], [("name", Value::from("a"))])
+                .expect("a");
+            let b = source
+                .create_node_with_props(&["Q", "Other"], [("name", Value::from("b"))])
+                .expect("b");
+            source.create_edge(a, b, "K");
+            source
+                .build_and_publish_generation(generation_build_request(&root, "multi-g1"))
+                .expect("publish base generation");
+        }
+        for reopen in 1..=2 {
+            let db = open_root(&root);
+            assert_eq!(
+                count(&db, "MATCH (n:Extra) RETURN count(n)"),
+                1,
+                "reopen #{reopen}: MATCH (n:Extra)"
+            );
+            let mut labels = db.layered_store().expect("layered").all_labels();
+            labels.sort();
+            assert_eq!(
+                labels,
+                ["Extra", "Other", "P", "Q"],
+                "reopen #{reopen}: all_labels"
+            );
+            assert_eq!(db.label_count(), 4, "reopen #{reopen}: label_count");
+            db.close().expect("close");
+        }
+    }
+
+    /// While a mid-build drain has tiers installed, queries read the tier
+    /// chain; the database-level counts must read the same view.
+    #[test]
+    fn counts_match_queries_after_a_mid_build_drain() {
+        let dir = tempdir().expect("temp dir");
+        let mut db = GrafeoDB::new_in_memory();
+        db.compact().expect("compact");
+        let n = db
+            .create_node_with_props(&["Person"], [("name", Value::from("drained"))])
+            .expect("create node");
+        let m = db.create_node(&["Item"]).expect("create item");
+        db.create_edge(n, m, "OWNS");
+        db.drain_overlay_to_tier(&dir.path().join("tiers"), "counts-drain")
+            .expect("drain");
+        db.create_node(&["Person"]).expect("create node");
+
+        let nodes = count(&db, "MATCH (n) RETURN count(n)");
+        let edges = count(&db, "MATCH ()-[r]->() RETURN count(r)");
+        assert_eq!(nodes, 3, "MATCH (n) after drain");
+        assert_eq!(db.node_count(), nodes, "node_count after drain");
+        assert_eq!(db.edge_count(), edges, "edge_count after drain");
+        assert_eq!(db.info().node_count, nodes, "info().node_count after drain");
     }
 }
