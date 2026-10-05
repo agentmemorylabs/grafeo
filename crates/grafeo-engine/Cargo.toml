@@ -168,6 +168,16 @@ path = "tests/generation_build_orchestration.rs"
 required-features = ["generation", "compact-store", "lpg"]
 
 [[test]]
+name = "generation_root_wal_checkpoint"
+path = "tests/generation_root_wal_checkpoint.rs"
+required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
+
+[[test]]
+name = "generation_root_overlay_indexes"
+path = "tests/generation_root_overlay_indexes.rs"
+required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher", "vector-index", "text-index"]
+
+[[test]]
 name = "epoch_handoff_wal_boundary"
 path = "tests/epoch_handoff_wal_boundary.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
@@ -216,6 +226,11 @@ required-features = ["generation", "compact-store", "lpg", "generation-streaming
 name = "generation_budget_peaks"
 path = "tests/generation_budget_peaks.rs"
 required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap"]
+
+[[test]]
+name = "live_generation_root_backup"
+path = "tests/live_generation_root_backup.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index", "gql"]
 
 [[test]]
 name = "generation_sections"

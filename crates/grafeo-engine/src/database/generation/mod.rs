@@ -39,6 +39,15 @@
 pub mod epoch_handoff;
 #[cfg(feature = "mmap")]
 pub mod lease;
+#[cfg(all(
+    feature = "wal",
+    feature = "lpg",
+    feature = "generation",
+    feature = "compact-store",
+    feature = "generation-streaming",
+    feature = "mmap"
+))]
+mod live_backup;
 pub mod manifest;
 pub mod ownership;
 pub mod publication;
