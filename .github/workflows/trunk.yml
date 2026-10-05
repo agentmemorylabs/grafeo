@@ -77,7 +77,10 @@ jobs:
           #   which the AMH feature set does not enable.
           # section_directory_versions: fails on the base branch (reported in #19);
           #   re-enable once fixed.
-          skip='^(compact_store_generation_contract|query_correctness|section_directory_versions)$'
+          # n_vs_4n_peak_memory: asserts a 128 MiB peak RssAnon budget, which a debug
+          #   build exceeds (143628 kB on the hosted runner). Runs in release in the
+          #   "peak-memory-release" job below instead.
+          skip='^(compact_store_generation_contract|query_correctness|section_directory_versions|n_vs_4n_peak_memory)$'
           targets=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="grafeo-engine") | .targets[]
                      | select(.kind | index("test")) | .name' \
@@ -97,3 +100,16 @@ jobs:
           key: no-streaming
       - name: Run the eager-path contract test
         run: cargo test -p grafeo-engine --features "generation,compact-store,lpg,wal,mmap" --test compact_store_generation_contract
+
+  peak-memory-release:
+    name: n_vs_4n_peak_memory (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: peak-memory-release
+      - name: Run the peak-memory acceptance test in release
+        run: cargo test --release -p grafeo-engine --features "$FEATURES" --test n_vs_4n_peak_memory
