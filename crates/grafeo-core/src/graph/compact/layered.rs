@@ -5917,6 +5917,59 @@ mod tests {
         assert_eq!(old.get_property("since"), Some(&Value::Int64(2020)));
     }
 
+    /// A copy-up rolled back at a later epoch, then copied up again, must
+    /// not append its epoch-0 property history after the purge's history:
+    /// that trips `VersionLog::append`'s ascending-epoch assertion (debug)
+    /// or leaves the log out of order (release).
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn temporal_copy_up_after_rolled_back_copy_up() {
+        let layered = build_test_layered();
+        let gus = NodeId::new(1);
+        let age = PropertyKey::new("age");
+        let base_age = layered.get_node_property(gus, &age).expect("base age");
+
+        layered.overlay.load().sync_epoch(EpochId::new(5));
+        let tx = TransactionId::new(7);
+        layered.set_node_property_versioned(gus, "age", Value::Int64(99), tx);
+        rollback(&layered, tx);
+        assert!(!layered.is_node_dirty(gus));
+
+        layered.overlay.load().sync_epoch(EpochId::new(6));
+        let tx2 = TransactionId::new(8);
+        layered.set_node_property_versioned(gus, "age", Value::Int64(40), tx2);
+        assert!(layered.is_node_dirty(gus), "second copy-up registered");
+        let old = layered
+            .get_node_at_epoch(gus, EpochId::new(1))
+            .expect("copied-up row visible at an older epoch");
+        assert_eq!(old.get_property("age"), Some(&base_age));
+    }
+
+    /// Edge variant of [`temporal_copy_up_after_rolled_back_copy_up`].
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn temporal_edge_copy_up_after_rolled_back_copy_up() {
+        let layered = build_test_layered();
+        let edge = EdgeId::new(1);
+        let since = PropertyKey::new("since");
+        let base_since = layered.get_edge_property(edge, &since).expect("base since");
+
+        layered.overlay.load().sync_epoch(EpochId::new(5));
+        let tx = TransactionId::new(7);
+        layered.set_edge_property_versioned(edge, "since", Value::Int64(1), tx);
+        rollback(&layered, tx);
+        assert!(!layered.is_edge_dirty(edge));
+
+        layered.overlay.load().sync_epoch(EpochId::new(6));
+        let tx2 = TransactionId::new(8);
+        layered.set_edge_property_versioned(edge, "since", Value::Int64(2), tx2);
+        assert!(layered.is_edge_dirty(edge), "second copy-up registered");
+        let old = layered
+            .get_edge_at_epoch(edge, EpochId::new(1))
+            .expect("copied-up edge visible at an older epoch");
+        assert_eq!(old.get_property("since"), Some(&base_since));
+    }
+
     /// A base delete racing a first write to the same base node must never
     /// leave a copied-up row behind a tombstone (hidden from `get_node` but
     /// still listed by `node_ids`).
