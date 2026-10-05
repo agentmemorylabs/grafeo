@@ -76,9 +76,10 @@ impl GrafeoDB {
     /// namespaces: a backup removes staging directories whose owning process
     /// id is not alive locally, which could hit another host's live one.
     ///
-    /// `wal_checkpoint` is not gated: a checkpoint that deletes old log files
-    /// during a backup makes the backup fail (missing file) rather than
-    /// publish a hole.
+    /// `wal_checkpoint` on a generation root only syncs the WAL (see #23), so
+    /// it cannot shorten a backup's WAL. Without that change, a checkpoint
+    /// that deleted old log files during a backup would make the backup fail
+    /// (missing file) rather than publish a hole.
     ///
     /// Live-root GC must be run through
     /// [`GrafeoDB::retirement_authority`] so that it sees this backup's pin.
