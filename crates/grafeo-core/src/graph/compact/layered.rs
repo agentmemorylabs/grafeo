@@ -965,6 +965,39 @@ impl LayeredStore {
             .collect()
     }
 
+    /// Base node ids that were copied into the overlay (dirty) and whose
+    /// overlay copy has since been deleted. Deleting a dirty node only
+    /// removes the overlay copy, so nothing else records that the base copy
+    /// is dead; the persistence layer adds these to the `OverlayDeletions`
+    /// section, because a reopen through [`Self::with_overlay`] rebuilds the
+    /// dirty set from live overlay entities and would otherwise serve the
+    /// base copy again. Derived here rather than tombstoned at delete time so
+    /// a rolled-back delete (which restores the overlay copy) needs no undo.
+    #[must_use]
+    pub fn snapshot_deleted_promoted_node_ids(&self) -> Vec<NodeId> {
+        let base = self.base.load();
+        let overlay = self.overlay.load();
+        self.dirty_node_ids
+            .read()
+            .iter()
+            .copied()
+            .filter(|id| overlay.get_node(*id).is_none() && base.get_node(*id).is_some())
+            .collect()
+    }
+
+    /// Edge counterpart of [`Self::snapshot_deleted_promoted_node_ids`].
+    #[must_use]
+    pub fn snapshot_deleted_promoted_edge_ids(&self) -> Vec<EdgeId> {
+        let base = self.base.load();
+        let overlay = self.overlay.load();
+        self.dirty_edge_ids
+            .read()
+            .iter()
+            .copied()
+            .filter(|id| overlay.get_edge(*id).is_none() && base.get_edge(*id).is_some())
+            .collect()
+    }
+
     /// Snapshot of base edge ids deleted-but-not-merged. See
     /// [`Self::snapshot_deleted_node_ids`].
     #[must_use]
@@ -1083,6 +1116,22 @@ impl LayeredStore {
     #[inline]
     fn is_edge_deleted_from_base(&self, id: EdgeId) -> bool {
         self.deleted_from_base_edges.read().contains(&id)
+    }
+
+    /// Deleting a dirty node that also exists in the base kills the base
+    /// copy too; flag the deletion log so the next checkpoint re-emits it
+    /// (see [`Self::snapshot_deleted_promoted_node_ids`]).
+    fn note_promoted_node_delete(&self, id: NodeId) {
+        if self.base.load().get_node(id).is_some() {
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Edge counterpart of [`Self::note_promoted_node_delete`].
+    fn note_promoted_edge_delete(&self, id: EdgeId) {
+        if self.base.load().get_edge(id).is_some() {
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
     }
 
     // ── Transaction-scoped layered bookkeeping ─────────────────────
@@ -1623,14 +1672,21 @@ impl GraphStore for LayeredStore {
 
     fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
         let deleted_nodes = self.deleted_from_base_nodes.read();
+        let deleted_edges = self.deleted_from_base_edges.read();
 
         let mut results = Vec::new();
 
-        // Base neighbors (minus deleted).
-        if !deleted_nodes.contains(&node) && !self.is_node_dirty(node) {
-            for nid in self.base.load().neighbors(node, direction) {
-                if !deleted_nodes.contains(&nid) {
-                    results.push(nid);
+        // Base neighbors, read even when `node` is dirty: `ensure_in_overlay`
+        // copies labels and properties but not adjacency. Derived from base
+        // edges so per-edge deletions apply; dirty (promoted) edges are
+        // skipped because the overlay copy is authoritative for them.
+        if !deleted_nodes.contains(&node) {
+            for (target, eid) in self.base.load().edges_from(node, direction) {
+                if !deleted_nodes.contains(&target)
+                    && !deleted_edges.contains(&eid)
+                    && !self.is_edge_dirty(eid)
+                {
+                    results.push(target);
                 }
             }
         }
@@ -1657,10 +1713,16 @@ impl GraphStore for LayeredStore {
 
         let mut results = Vec::new();
 
-        // Base edges (minus deleted).
-        if !deleted_nodes.contains(&node) && !self.is_node_dirty(node) {
+        // Base edges, read even when `node` is dirty: `ensure_in_overlay`
+        // copies labels and properties but not adjacency. Dirty (promoted)
+        // edges are skipped: the overlay copy is authoritative, and deleting
+        // a promoted edge only removes that copy.
+        if !deleted_nodes.contains(&node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
+                if !deleted_nodes.contains(&target)
+                    && !deleted_edges.contains(&eid)
+                    && !self.is_edge_dirty(eid)
+                {
                     results.push((target, eid));
                 }
             }
@@ -1700,13 +1762,17 @@ impl GraphStore for LayeredStore {
 
     fn node_ids(&self) -> Vec<NodeId> {
         let deleted = self.deleted_from_base_nodes.read();
+        let dirty = self.dirty_node_ids.read();
 
+        // A dirty id is owned by the overlay (as in `nodes_by_label`): it is
+        // listed below if its overlay copy is live, and not from the base, so
+        // a base node copied into the overlay and then deleted stays gone.
         let mut ids: Vec<NodeId> = self
             .base
             .load()
             .node_ids()
             .into_iter()
-            .filter(|id| !deleted.contains(id))
+            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
         ids.extend(self.overlay.load().node_ids());
         ids.sort_unstable();
@@ -1794,9 +1860,29 @@ impl GraphStore for LayeredStore {
     }
 
     fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
+        let overlay = self.overlay.load();
+
+        // D5: a property index restored from a generation's PropertyIndex
+        // section is a mapped (immutable) index on the overlay; writes since
+        // the open live in its heap write delta. Neither half is trustworthy
+        // alone: the mapped postings still carry old values of base nodes
+        // updated or deleted since, and the delta holds only the overlay's
+        // writes. Union both and keep the candidates whose value in the
+        // merged base+overlay view still equals `value`. No LayeredStore lock
+        // is held across the verification (`get_node_property` takes them).
+        if let Some(candidates) = overlay.mapped_property_index_candidates(property, value) {
+            let key = PropertyKey::new(property);
+            return candidates
+                .into_iter()
+                .filter(|id| {
+                    self.get_node_property(*id, &key)
+                        .is_some_and(|stored| stored == *value)
+                })
+                .collect();
+        }
+
         let deleted = self.deleted_from_base_nodes.read();
         let dirty = self.dirty_node_ids.read();
-        let overlay = self.overlay.load();
 
         // G-E1.RO: after compact, create_property_index / mapped PropertyIndex
         // restore store full base+overlay postings on the overlay. Merging a
@@ -1841,7 +1927,13 @@ impl GraphStore for LayeredStore {
             if !overlay.has_property_index(prop) {
                 continue;
             }
-            let hits = overlay.find_nodes_by_property(prop, value);
+            // Mapped index (D5): mapped postings + write delta, unverified —
+            // every condition is verified on the merged view below. The
+            // overlay's own `find_nodes_by_property` cannot be used for a
+            // mapped key: it cannot see base values.
+            let hits = overlay
+                .mapped_property_index_candidates(prop, value)
+                .unwrap_or_else(|| overlay.find_nodes_by_property(prop, value));
             if seed.as_ref().is_some_and(|best| best.len() <= hits.len()) {
                 continue;
             }
@@ -1874,16 +1966,22 @@ impl GraphStore for LayeredStore {
                 .iter()
                 .map(|(prop, value)| (PropertyKey::new(*prop), value.clone()))
                 .collect();
-            // Deleted-set snapshot taken under a SHORT-LIVED read guard: the
-            // long per-candidate merged scan below holds no LayeredStore
-            // locks, so index writers are not blocked for the whole scan.
-            // (`get_node_property` additionally re-checks deletion against
-            // live state, so the snapshot is an optimization, not the
-            // correctness boundary.)
-            let deleted_snapshot = self.deleted_from_base_nodes.read().clone();
+            // Deleted base nodes are dropped under a SHORT-LIVED read guard,
+            // O(candidates) without cloning the deleted set (which grows with
+            // base deletions since the last handoff). The per-candidate
+            // merged scan below holds no LayeredStore locks, so index writers
+            // are not blocked for the whole scan. (`get_node_property`
+            // additionally re-checks deletion against live state, so this
+            // pass is an optimization, not the correctness boundary.)
+            let candidates: Vec<NodeId> = {
+                let deleted = self.deleted_from_base_nodes.read();
+                candidates
+                    .into_iter()
+                    .filter(|id| !deleted.contains(id))
+                    .collect()
+            };
             return candidates
                 .into_iter()
-                .filter(|id| !deleted_snapshot.contains(id))
                 .filter(|id| {
                     keyed_conditions
                         .iter()
@@ -2833,6 +2931,9 @@ impl LayeredStore {
             // frozen entity deleted at N+1 would resurrect from the new
             // base.
             self.record_post_freeze_node(id);
+            // #15: the base copy dies with the overlay copy; flag the
+            // deletion log so the next checkpoint re-emits it.
+            self.note_promoted_node_delete(id);
             self.journal_touch(&mut journal, owner, LayerChange::NodeCopyUp(id));
             drop(journal);
             return overlay_delete(&self.overlay.load());
@@ -2871,6 +2972,8 @@ impl LayeredStore {
             // See `delete_node_layered`: record the N+1 deletion for the
             // repair swap.
             self.record_post_freeze_edge(id);
+            // #15: see `delete_node_layered`.
+            self.note_promoted_edge_delete(id);
             self.journal_touch(&mut journal, owner, LayerChange::EdgeCopyUp(id));
             drop(journal);
             return overlay_delete(&self.overlay.load());
@@ -4337,13 +4440,26 @@ mod tests {
         layered.set_node_property(paris, "name", Value::from("Paris"));
         let _ = layered.create_edge(first, paris, "VISITS");
 
-        // Neighbors should include BOTH the original Amsterdam and the new Paris.
-        // Once the node is dirty, base neighbors are not re-read (ensure_in_overlay
-        // copied them), so both endpoints come from the overlay.
+        // Neighbors should include BOTH the original Amsterdam (a base edge
+        // that pre-dates promotion) and the new Paris (an overlay edge added
+        // after promotion). `ensure_in_overlay` only copies the node's labels
+        // and properties — never its adjacency — so the base layer remains
+        // authoritative for pre-promotion edges and must be merged with the
+        // overlay's post-promotion edges.
         let outgoing = layered.neighbors(first, Direction::Outgoing);
         assert!(
             outgoing.contains(&paris),
             "overlay-created edge target should appear in neighbors"
+        );
+        let cities = layered.nodes_by_label("City");
+        let amsterdam = cities
+            .iter()
+            .copied()
+            .find(|&c| c != paris)
+            .expect("base City Amsterdam should still be present");
+        assert!(
+            outgoing.contains(&amsterdam),
+            "base edge target should still appear in neighbors after promotion"
         );
     }
 
@@ -4907,20 +5023,240 @@ mod tests {
         let persons = layered.nodes_by_label("Person");
         let first = persons[0];
 
-        // Promote first to the overlay and add a new outgoing overlay edge.
+        // Capture the base-tier outgoing edges before any promotion.
+        let base_outgoing: Vec<(NodeId, EdgeId)> = layered.edges_from(first, Direction::Outgoing);
+        assert!(
+            !base_outgoing.is_empty(),
+            "test fixture should give the first Person a base edge"
+        );
+
+        // Promote `first` into the overlay (ensure_in_overlay copies labels and
+        // properties only — never adjacency) and add a fresh overlay-only edge.
         layered.set_node_property(first, "city", Value::from("Berlin"));
         let prague = layered.create_node(&["City"]);
         layered.create_edge(first, prague, "VISITS");
 
         let outgoing = layered.edges_from(first, Direction::Outgoing);
-        // Original base edge was promoted during ensure_in_overlay? No: only the
-        // node is promoted, so the base edge is still served by base. But because
-        // the source is now dirty, the base-edge branch is skipped in edges_from.
-        // Only the overlay edge is returned.
+
+        // The new overlay edge must be visible …
         assert!(
             outgoing.iter().any(|(target, _)| *target == prague),
             "new overlay edge should appear in edges_from"
         );
+
+        // … and every pre-promotion base edge must remain visible. ensure_in_overlay
+        // only promotes the node; base adjacency is still authoritative for edges
+        // that pre-date the promotion, and must not silently disappear once the
+        // source node becomes dirty.
+        for (target, eid) in &base_outgoing {
+            assert!(
+                outgoing.iter().any(|(t, e)| t == target && e == eid),
+                "base edge {eid:?} (→ {target:?}) must remain visible after promotion"
+            );
+        }
+    }
+
+    /// Regression for property-anchored edge lookups across the snapshot
+    /// boundary: when a base node is promoted into the overlay (e.g. by
+    /// `set_node_property` or by becoming the endpoint of a new overlay
+    /// edge), its pre-existing base-tier edges must remain reachable via
+    /// `neighbors` and `edges_from` in BOTH directions. Otherwise GQL
+    /// patterns like `MATCH (a {id: $x})-[:T]->(b {id: $y})` start
+    /// returning zero rows once any overlay write has touched either
+    /// endpoint, which the planner uses to walk the edge from.
+    #[test]
+    fn test_base_edge_visible_from_promoted_endpoint() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let cities = layered.nodes_by_label("City");
+        let alix = persons[0];
+        let amsterdam = cities[0];
+
+        // Sanity: the base edge alix -LIVES_IN-> amsterdam exists pre-promotion.
+        let pre_out = layered.edges_from(alix, Direction::Outgoing);
+        let pre_in = layered.edges_from(amsterdam, Direction::Incoming);
+        let pre_neigh_out = layered.neighbors(alix, Direction::Outgoing);
+        let pre_neigh_in = layered.neighbors(amsterdam, Direction::Incoming);
+        assert!(pre_out.iter().any(|(t, _)| *t == amsterdam));
+        assert!(pre_in.iter().any(|(t, _)| *t == alix));
+        assert!(pre_neigh_out.contains(&amsterdam));
+        assert!(pre_neigh_in.contains(&alix));
+
+        // Promote BOTH endpoints into the overlay by way of an unrelated
+        // overlay write. The new edge intentionally points at a brand-new
+        // overlay node so the LIVES_IN edge between alix and amsterdam is
+        // not touched in any way.
+        let oslo = layered.create_node(&["City"]);
+        layered.create_edge(alix, oslo, "VISITS"); // promotes alix
+        layered.set_node_property(amsterdam, "touched", Value::Bool(true)); // promotes amsterdam
+
+        // Both endpoints are now dirty.
+        assert!(layered.is_node_dirty(alix));
+        assert!(layered.is_node_dirty(amsterdam));
+
+        // The pre-existing base edge must still be reachable from either side,
+        // both as an edge (with its original EdgeId) and as a neighbor.
+        let post_out = layered.edges_from(alix, Direction::Outgoing);
+        let post_in = layered.edges_from(amsterdam, Direction::Incoming);
+        let post_neigh_out = layered.neighbors(alix, Direction::Outgoing);
+        let post_neigh_in = layered.neighbors(amsterdam, Direction::Incoming);
+
+        let base_eid = pre_out
+            .iter()
+            .find(|(t, _)| *t == amsterdam)
+            .map(|(_, e)| *e)
+            .expect("pre-promotion fixture has a base LIVES_IN edge");
+
+        assert!(
+            post_out
+                .iter()
+                .any(|(t, e)| *t == amsterdam && *e == base_eid),
+            "base LIVES_IN edge must remain visible via edges_from(src, Outgoing) after src is promoted"
+        );
+        assert!(
+            post_in.iter().any(|(t, e)| *t == alix && *e == base_eid),
+            "base LIVES_IN edge must remain visible via edges_from(dst, Incoming) after dst is promoted"
+        );
+        assert!(
+            post_neigh_out.contains(&amsterdam),
+            "base neighbor must remain visible via neighbors(src, Outgoing) after src is promoted"
+        );
+        assert!(
+            post_neigh_in.contains(&alix),
+            "base neighbor must remain visible via neighbors(dst, Incoming) after dst is promoted"
+        );
+    }
+
+    /// Returns (alix, gus, amsterdam, alix's base LIVES_IN edge) from the fixture.
+    fn fixture_ids(layered: &LayeredStore) -> (NodeId, NodeId, NodeId, EdgeId) {
+        let persons = layered.nodes_by_label("Person");
+        let amsterdam = layered.nodes_by_label("City")[0];
+        let (alix, gus) = (persons[0], persons[1]);
+        let (_, eid) = layered.edges_from(alix, Direction::Outgoing)[0];
+        (alix, gus, amsterdam, eid)
+    }
+
+    #[test]
+    fn test_promoted_edge_listed_once_from_both_endpoints() {
+        let layered = build_test_layered();
+        let (alix, gus, amsterdam, eid) = fixture_ids(&layered);
+
+        // Setting an edge property promotes the edge and both endpoints.
+        layered.set_edge_property(eid, "since", Value::Int64(2024));
+        assert!(layered.is_edge_dirty(eid));
+
+        let out: Vec<_> = layered.edges_from(alix, Direction::Outgoing);
+        assert_eq!(
+            out,
+            vec![(amsterdam, eid)],
+            "promoted edge listed exactly once"
+        );
+        let incoming = layered.edges_from(amsterdam, Direction::Incoming);
+        assert_eq!(incoming.iter().filter(|(_, e)| *e == eid).count(), 1);
+        assert_eq!(
+            layered.neighbors(alix, Direction::Outgoing),
+            vec![amsterdam]
+        );
+        let mut expected = vec![alix, gus];
+        expected.sort_unstable();
+        assert_eq!(layered.neighbors(amsterdam, Direction::Incoming), expected);
+        assert_eq!(
+            layered.get_edge_property(eid, &PropertyKey::new("since")),
+            Some(Value::Int64(2024)),
+            "reads go to the overlay copy"
+        );
+    }
+
+    #[test]
+    fn test_deleted_promoted_edge_not_resurrected_from_base() {
+        let layered = build_test_layered();
+        let (alix, gus, amsterdam, eid) = fixture_ids(&layered);
+
+        layered.set_edge_property(eid, "since", Value::Int64(2024));
+        assert!(layered.delete_edge(eid));
+
+        // Only the overlay copy is deleted; the base copy must stay hidden.
+        assert!(layered.get_edge(eid).is_none());
+        assert!(layered.edges_from(alix, Direction::Outgoing).is_empty());
+        assert!(
+            !layered
+                .edges_from(amsterdam, Direction::Incoming)
+                .iter()
+                .any(|(_, e)| *e == eid)
+        );
+        assert!(layered.neighbors(alix, Direction::Outgoing).is_empty());
+        assert_eq!(layered.neighbors(amsterdam, Direction::Incoming), vec![gus]);
+        assert!(layered.neighbors(alix, Direction::Both).is_empty());
+        assert_eq!(layered.out_degree(alix), 0);
+    }
+
+    #[test]
+    fn test_deleted_promoted_edge_versioned_not_resurrected_from_base() {
+        let layered = build_test_layered();
+        let (alix, gus, amsterdam, eid) = fixture_ids(&layered);
+
+        layered.set_edge_property(eid, "since", Value::Int64(2024));
+        assert!(layered.delete_edge_versioned(eid, EpochId::from(1), TransactionId::from(1)));
+
+        assert!(layered.edges_from(alix, Direction::Outgoing).is_empty());
+        assert_eq!(layered.neighbors(amsterdam, Direction::Incoming), vec![gus]);
+    }
+
+    #[test]
+    fn test_deleted_base_edge_excluded_from_neighbors_when_nodes_survive() {
+        let layered = build_test_layered();
+        let (alix, gus, amsterdam, eid) = fixture_ids(&layered);
+
+        assert!(layered.delete_edge(eid));
+
+        // Both endpoints still exist; only the edge is gone.
+        assert!(layered.get_node(alix).is_some());
+        assert!(layered.get_node(amsterdam).is_some());
+        assert!(layered.neighbors(alix, Direction::Outgoing).is_empty());
+        assert!(layered.neighbors(alix, Direction::Both).is_empty());
+        assert_eq!(layered.neighbors(amsterdam, Direction::Incoming), vec![gus]);
+    }
+
+    #[test]
+    fn test_deleted_base_edge_stays_hidden_after_endpoint_promotion() {
+        let layered = build_test_layered();
+        let (alix, gus, amsterdam, eid) = fixture_ids(&layered);
+
+        assert!(layered.delete_edge(eid));
+        // Promote both endpoints after the deletion; the base read path is
+        // now taken for dirty nodes and must still honour the deletion.
+        layered.set_node_property(alix, "age", Value::Int64(31));
+        layered.set_node_property(amsterdam, "touched", Value::Bool(true));
+
+        assert!(layered.edges_from(alix, Direction::Outgoing).is_empty());
+        assert!(layered.neighbors(alix, Direction::Outgoing).is_empty());
+        assert_eq!(layered.neighbors(amsterdam, Direction::Incoming), vec![gus]);
+    }
+
+    /// A dirty base id whose overlay copy was deleted is reported for the
+    /// persisted deletion log, hidden from `node_ids`, and counted once.
+    #[test]
+    fn test_deleted_promoted_ids_reported_for_deletion_log() {
+        let layered = build_test_layered();
+        let (alix, gus, _amsterdam, eid) = fixture_ids(&layered);
+        assert!(layered.snapshot_deleted_promoted_node_ids().is_empty());
+
+        layered.set_edge_property(eid, "since", Value::Int64(2024));
+        layered.mark_deletions_clean();
+        assert!(layered.delete_edge(eid));
+        assert!(layered.deletions_dirty(), "deletion log must be re-emitted");
+        assert_eq!(layered.snapshot_deleted_promoted_edge_ids(), vec![eid]);
+        assert!(layered.snapshot_deleted_edge_ids().is_empty());
+
+        layered.set_node_property(gus, "age", Value::Int64(26));
+        layered.delete_node_edges(gus);
+        assert!(layered.delete_node(gus));
+        assert_eq!(layered.snapshot_deleted_promoted_node_ids(), vec![gus]);
+        assert!(!layered.node_ids().contains(&gus));
+        assert_eq!(layered.node_count(), layered.node_ids().len());
+        // A live dirty node is not reported.
+        assert!(layered.is_node_dirty(alix));
+        assert!(!layered.snapshot_deleted_promoted_node_ids().contains(&alix));
     }
 
     // ── Phase 5c: overlay reset + in-place merge ──────────────────────
