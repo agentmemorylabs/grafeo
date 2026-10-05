@@ -504,11 +504,13 @@ fn single_file_promoted_then_deleted_stays_deleted_after_reopen() {
         assert_single_file_deletions(&db, edge_id, gone_id, "before close");
         db.close().expect("close");
     }
-    // One reopen only: on d63e3708 a compacted single file already loses
-    // its base from Cypher's view on the *second* close + reopen even with no
-    // writes at all (separate pre-existing bug, reported on the PR).
-    let db = GrafeoDB::with_config(Config::persistent(&path)).expect("reopen");
-    assert_single_file_deletions(&db, edge_id, gone_id, "after reopen");
+    // Three reopens: each close re-serializes the mapped-loaded base, so the
+    // tombstones and the base id tables must both survive repeated cycles.
+    for cycle in 1..=3 {
+        let db = GrafeoDB::with_config(Config::persistent(&path)).expect("reopen");
+        assert_single_file_deletions(&db, edge_id, gone_id, &format!("after reopen #{cycle}"));
+        db.close().expect("close");
+    }
 }
 
 fn assert_single_file_deletions(db: &GrafeoDB, edge: EdgeId, gone: NodeId, ctx: &str) {
