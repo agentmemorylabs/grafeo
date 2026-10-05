@@ -893,11 +893,15 @@ fn failed_commit_whose_abort_marker_fails_poisons_the_wal() {
         );
         assert!(!loser.in_transaction());
         assert_snapshot_eq("live, abort marker failed", &snapshot(&db), &after_winner);
+        // Without the fix this write also fails, but with a conflict against
+        // the leaked transaction; the message tells the two apart.
+        let err = db
+            .session()
+            .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 43")
+            .expect_err("the WAL refuses writes after the abort marker failed");
         assert!(
-            db.session()
-                .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 43")
-                .is_err(),
-            "the WAL refuses writes after the abort marker failed"
+            err.to_string().contains("WAL refuses"),
+            "refused by the poisoned WAL, not by something else: {err}"
         );
         drop(loser);
         drop(db);
@@ -933,9 +937,12 @@ fn rollback_whose_abort_marker_fails_reports_an_error() {
     );
     assert!(!session.in_transaction(), "the transaction still ended");
     assert_snapshot_eq("live after rollback", &snapshot(&db), &before);
+    let err = session
+        .execute("INSERT (:After)")
+        .expect_err("the WAL is poisoned");
     assert!(
-        session.execute("INSERT (:After)").is_err(),
-        "the WAL is poisoned"
+        err.to_string().contains("WAL refuses"),
+        "refused by the poisoned WAL, not by something else: {err}"
     );
     // Rolling back once the WAL is already poisoned is not an error: the
     // poison already refuses every later append.

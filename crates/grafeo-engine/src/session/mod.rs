@@ -4308,6 +4308,7 @@ impl Session {
                 // The conflict error is what the caller gets. A lost abort
                 // marker has poisoned a layered WAL (later writes fail with
                 // its reason), and an incomplete layered undo is logged.
+                #[cfg_attr(not(feature = "compact-store"), allow(unused_variables))]
                 let outcome = self.abort_transaction(transaction_id, &touched);
                 #[cfg(all(feature = "compact-store", feature = "lpg"))]
                 if outcome.unrestored > 0 {
@@ -4584,11 +4585,16 @@ impl Session {
         self.touched_graphs.lock().clear();
         *self.transaction_nesting_depth.lock() = 0;
 
+        // Log the abort before the manager releases the entities: once they
+        // are released another session can write them and append its commit
+        // pair, which would settle this transaction's records on replay if
+        // it landed ahead of the abort marker.
+        let marker_error = self.log_transaction_abort(transaction_id);
         let aborted = self.transaction_manager.abort(transaction_id);
 
         AbortOutcome {
             aborted,
-            marker_error: self.log_transaction_abort(transaction_id),
+            marker_error,
             unrestored,
         }
     }
@@ -4622,6 +4628,10 @@ impl Session {
             if let Err(e) = logged {
                 grafeo_warn!("Failed to log transaction abort to WAL: {}", e);
                 if layered && !already_poisoned {
+                    // `log_atomic_or_poison` poisons on a write failure but
+                    // not on a serialization error; poison either way, so
+                    // the error below is true.
+                    wal.poison(format!("WAL abort marker could not be written: {e}"));
                     return Some(e.to_string());
                 }
             }
