@@ -947,7 +947,7 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(ws.node_count(), 2);
         // CreateNode per row (2) + SetNodeProperty per prop (2) = 4 records.
-        assert_eq!(wal.record_count(), 4);
+        assert_eq!(wal.len(), 4);
     }
 
     #[test]
@@ -956,7 +956,7 @@ mod tests {
         let a = ws.create_node(&["Node"]);
         let b = ws.create_node(&["Node"]);
         let c = ws.create_node(&["Node"]);
-        let before = wal.record_count();
+        let before = wal.len();
 
         let edges = [
             BatchEdgeCreate {
@@ -976,7 +976,7 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(ws.edge_count(), 2);
         // CreateEdge per row (2) + SetEdgeProperty per prop (1) = 3 records.
-        assert_eq!(wal.record_count(), before + 3);
+        assert_eq!(wal.len(), before + 3);
     }
 
     #[test]
