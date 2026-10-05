@@ -31,6 +31,18 @@ use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 use grafeo_engine::session::Session;
 
+/// Serializes the tests of this binary. The crash tests fork child
+/// processes, and a child briefly holds copies of the parent's open file
+/// descriptors (between fork and exec), including another test's root lock,
+/// which then fails a concurrent open with "root already locked".
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 const SCENARIO_VAR: &str = "GRAFEO_WAL_INTERLEAVE_SCENARIO";
 const PATH_VAR: &str = "GRAFEO_WAL_INTERLEAVE_PATH";
 const KIND_VAR: &str = "GRAFEO_WAL_INTERLEAVE_KIND";
@@ -291,31 +303,37 @@ fn check_crash_reopen(scenario: &str) {
 
 #[test]
 fn rollback_between_close_reopen() {
+    let _serial = serial();
     check_close_reopen("rollback_between");
 }
 
 #[test]
 fn commit_between_close_reopen() {
+    let _serial = serial();
     check_close_reopen("commit_between");
 }
 
 #[test]
 fn failed_commit_close_reopen() {
+    let _serial = serial();
     check_close_reopen("failed_commit");
 }
 
 #[test]
 fn rollback_between_crash_reopen() {
+    let _serial = serial();
     check_crash_reopen("rollback_between");
 }
 
 #[test]
 fn commit_between_crash_reopen() {
+    let _serial = serial();
     check_crash_reopen("commit_between");
 }
 
 #[test]
 fn failed_commit_crash_reopen() {
+    let _serial = serial();
     check_crash_reopen("failed_commit");
 }
 
@@ -373,6 +391,7 @@ mod old_format {
     /// after it replay too.
     #[test]
     fn generation_root_replays_pre_port_wal() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let root = Kind::GenerationRoot.create(dir.path());
         // Open once so the root's WAL directory exists, then close.
@@ -408,6 +427,7 @@ mod old_format {
     /// after it must replay into the default graph.
     #[test]
     fn generation_root_pre_port_wal_ending_in_a_named_graph() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let root = Kind::GenerationRoot.create(dir.path());
         Kind::GenerationRoot.open(&root).close().unwrap();
@@ -441,6 +461,7 @@ mod old_format {
     /// unfinished transaction, and a later commit does not pick it up.
     #[test]
     fn generation_root_pre_port_torn_tail() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let root = Kind::GenerationRoot.create(dir.path());
         Kind::GenerationRoot.open(&root).close().unwrap();
@@ -469,6 +490,7 @@ mod old_format {
 /// default-graph writes into that graph.
 #[test]
 fn wal_directory_replays_pre_port_wal() {
+    let _serial = serial();
     use grafeo_common::types::{EpochId, NodeId, TransactionId};
     use grafeo_engine::Config;
     use grafeo_engine::config::StorageFormat;
@@ -534,4 +556,95 @@ fn wal_directory_replays_pre_port_wal() {
     let session = db.session();
     session.use_graph("g");
     assert_eq!(names_in(&session), strings(&["mia"]), "graph g");
+}
+
+// ----------------------------------------------------------------------
+// Implicit groups on a generation root
+// ----------------------------------------------------------------------
+
+/// Writes outside a transaction form their own group with a system commit.
+/// Generation-root replay requires an `EpochAdvance` right after every
+/// commit, so these groups need one too, or the next group makes the root
+/// unopenable.
+#[cfg(all(feature = "generation", feature = "compact-store", feature = "mmap"))]
+mod implicit_groups {
+    use super::*;
+
+    fn reopen_twice(root: &Path, check: impl Fn(&GrafeoDB)) {
+        for round in 0..2 {
+            let db = GrafeoDB::open_generation_root(root, false)
+                .unwrap_or_else(|e| panic!("reopen {round}: {e}"));
+            check(&db);
+            db.close().unwrap();
+        }
+    }
+
+    /// A schema change outside a transaction, then a committed write.
+    #[test]
+    fn schema_change_then_commit_reopens() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = Kind::GenerationRoot.create(dir.path());
+        {
+            let db = Kind::GenerationRoot.open(&root);
+            db.session().execute("CREATE GRAPH g").unwrap();
+            insert(&db.session(), "alix");
+            db.close().unwrap();
+        }
+        reopen_twice(&root, |db| {
+            assert_eq!(db.list_graphs(), vec!["g".to_string()]);
+            assert_eq!(names(db), strings(&["alix"]));
+        });
+    }
+
+    /// A schema change inside a transaction that rolls back is applied
+    /// immediately and stays (as upstream's `schema_changes_in_a_rolled_back_
+    /// transaction_match_memory`), and a later commit still reopens.
+    #[test]
+    fn schema_change_in_rolled_back_transaction_then_commit_reopens() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = Kind::GenerationRoot.create(dir.path());
+        {
+            let db = Kind::GenerationRoot.open(&root);
+            let mut a = db.session();
+            a.begin_transaction().unwrap();
+            a.execute("CREATE GRAPH h").unwrap();
+            insert(&a, "gone");
+            a.rollback().unwrap();
+            insert(&db.session(), "gus");
+            db.close().unwrap();
+        }
+        reopen_twice(&root, |db| {
+            assert_eq!(db.list_graphs(), vec!["h".to_string()]);
+            assert_eq!(names(db), strings(&["gus"]));
+        });
+    }
+
+    /// A direct session write to a named graph (which lives in the overlay,
+    /// outside the layered store's implicit transactions), then a committed
+    /// default-graph write.
+    #[test]
+    fn named_graph_direct_write_then_commit_reopens() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = Kind::GenerationRoot.create(dir.path());
+        {
+            let db = Kind::GenerationRoot.open(&root);
+            db.session().execute("CREATE GRAPH g").unwrap();
+            let session = db.session();
+            session.use_graph("g");
+            session
+                .create_node_with_props(&["Person"], [("name", Value::from("hans"))])
+                .unwrap();
+            insert(&db.session(), "jules");
+            db.close().unwrap();
+        }
+        reopen_twice(&root, |db| {
+            assert_eq!(names(db), strings(&["jules"]), "default graph");
+            let session = db.session();
+            session.use_graph("g");
+            assert_eq!(names_in(&session), strings(&["hans"]), "graph g");
+        });
+    }
 }

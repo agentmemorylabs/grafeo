@@ -24,6 +24,41 @@ use grafeo_common::utils::error::Result;
 use grafeo_storage::wal::{LpgWal, WalRecord};
 use parking_lot::Mutex;
 
+/// Debug-only test seam: when set, the next committing transaction clears it
+/// and parks right before writing its WAL group (after its commit is applied
+/// in memory), with [`COMMIT_STALL_PARKED`] set until the test clears that.
+/// Lets a test commit a second transaction that saw the first one's writes
+/// while the first one's group is not written yet.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static COMMIT_STALL_BEFORE_GROUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// See [`COMMIT_STALL_BEFORE_GROUP`]: `true` while a commit is parked; the
+/// test clears it to release the commit.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static COMMIT_STALL_PARKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The [`COMMIT_STALL_BEFORE_GROUP`] seam.
+#[cfg(debug_assertions)]
+pub(crate) fn maybe_stall_before_group() {
+    use std::sync::atomic::Ordering;
+    if COMMIT_STALL_BEFORE_GROUP
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        COMMIT_STALL_PARKED.store(true, Ordering::Release);
+        while COMMIT_STALL_PARKED.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn maybe_stall_before_group() {}
+
 /// A record waiting for its group, with the named graph it applies to
 /// (`None` = default graph).
 type PendingRecord = (Option<String>, WalRecord);

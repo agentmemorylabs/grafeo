@@ -4383,6 +4383,7 @@ impl Session {
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal {
             use grafeo_storage::wal::WalRecord;
+            crate::transaction::wal_buffer::maybe_stall_before_group();
             // One atomic append: generation-root replay rejects any record
             // between the commit and its epoch advance. On a layered database
             // a failure poisons the WAL inside that append: the transaction

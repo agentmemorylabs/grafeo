@@ -912,41 +912,80 @@ fn transaction_sees_its_own_new_typed_edge() {
 // ── Review round 2 (PR #13) ───────────────────────────────────────────
 
 /// Item 1: on a layered database the handle's write methods must report a
-/// WAL failure instead of applying the write and returning success.
+/// WAL failure instead of returning success.
+///
+/// Since the #411 port a write's records and its commit pair are one WAL
+/// append at commit, so there is no separate data-record append that can
+/// fail cleanly any more: a failed append is the commit marker's failure
+/// (#13), reported as durability unconfirmed, and it poisons the WAL. Each
+/// case therefore runs on its own root, and the reopen shows that nothing
+/// reached the disk.
 #[cfg(feature = "testing-crash-injection")]
 #[test]
 fn handle_writes_report_wal_failures() {
     use grafeo_common::testing::crash::{
         disable_io_failure, enable_io_failure_at, enable_io_failure_from,
     };
-    let (_dir, root) = fresh_root();
-    let db = open_root(&root);
-    let ids = base_ids(&db);
 
-    // The data record's append fails: an error, and nothing applied.
-    enable_io_failure_at(1);
-    let r = db.set_node_property(ids.ada, "source_hash", Value::from("e1"));
-    disable_io_failure();
-    assert!(r.is_err(), "failed data-record append must be reported");
-    assert_eq!(cypher_ada_hash(&db), Some(Value::from("h0")));
+    fn assert_unconfirmed(r: Result<impl std::fmt::Debug, grafeo_common::utils::error::Error>) {
+        let message = r
+            .expect_err("a failed WAL append must be reported")
+            .to_string();
+        assert!(
+            message.contains("durability unconfirmed"),
+            "unexpected error: {message}"
+        );
+    }
+
+    // set_node_property: the group's only append fails.
+    {
+        let (_dir, root) = fresh_root();
+        {
+            let db = open_root(&root);
+            let ids = base_ids(&db);
+            enable_io_failure_at(1);
+            let r = db.set_node_property(ids.ada, "source_hash", Value::from("e1"));
+            disable_io_failure();
+            assert_unconfirmed(r);
+            assert!(
+                db.set_node_property(ids.ada, "source_hash", Value::from("e3"))
+                    .is_err(),
+                "the WAL is poisoned"
+            );
+        }
+        let db = open_root(&root);
+        assert_eq!(cypher_ada_hash(&db), Some(Value::from("h0")));
+    }
 
     // delete_node keeps its error channel.
-    enable_io_failure_at(1);
-    let r = db.delete_node(ids.linus);
-    disable_io_failure();
-    assert!(r.is_err(), "failed delete append must be reported");
-    assert_eq!(
-        cypher_count(&db, "MATCH (n:Person {name: 'Linus'}) RETURN count(n)"),
-        1,
-        "and the delete must not be applied"
-    );
+    {
+        let (_dir, root) = fresh_root();
+        {
+            let db = open_root(&root);
+            let ids = base_ids(&db);
+            enable_io_failure_at(1);
+            let r = db.delete_node(ids.linus);
+            disable_io_failure();
+            assert_unconfirmed(r);
+        }
+        let db = open_root(&root);
+        assert_eq!(
+            cypher_count(&db, "MATCH (n:Person {name: 'Linus'}) RETURN count(n)"),
+            1,
+            "the delete never reached the disk"
+        );
+    }
 
-    // The commit marker's append keeps failing (the retry too): still an
-    // error. This poisons the WAL, so it goes last.
-    enable_io_failure_from(2);
-    let r = db.set_node_property(ids.ada, "source_hash", Value::from("e2"));
-    disable_io_failure();
-    assert!(r.is_err(), "failed commit-marker append must be reported");
+    // The append keeps failing (the retry too): still an error.
+    {
+        let (_dir, root) = fresh_root();
+        let db = open_root(&root);
+        let ids = base_ids(&db);
+        enable_io_failure_from(1);
+        let r = db.set_node_property(ids.ada, "source_hash", Value::from("e2"));
+        disable_io_failure();
+        assert_unconfirmed(r);
+    }
 }
 
 /// The `wal_<seq>.log` files of a root and every complete frame in them.
@@ -1053,6 +1092,10 @@ fn crash_inside_epoch_frame_recovers() {
 
 /// Item 2 (same mechanism): uncommitted records left by a crash must stay
 /// discarded once a later transaction commits.
+///
+/// Since the #411 port an open or rolled-back transaction writes nothing, so
+/// the crash is simulated inside a group: the WAL is cut right after the
+/// group's data record, before its commit pair.
 #[test]
 fn uncommitted_tail_stays_discarded_after_a_later_commit() {
     use grafeo_storage::wal::WalRecord;
@@ -1065,10 +1108,10 @@ fn uncommitted_tail_stays_discarded_after_a_later_commit() {
         session
             .set_node_property(ids.ada, "source_hash", Value::from("u1"))
             .expect("write in tx");
-        session.rollback().expect("rollback");
+        session.commit().expect("commit");
         db.close().expect("close");
     }
-    // Simulate a crash right after the uncommitted data record.
+    // Simulate a crash right after the group's data record.
     let frames = wal_frames(&root);
     let data = frames
         .iter()
@@ -1078,6 +1121,11 @@ fn uncommitted_tail_stays_discarded_after_a_later_commit() {
         })
         .expect("data record");
     let next = &frames[data + 1];
+    assert!(
+        matches!(next.record, WalRecord::TransactionCommit { .. }),
+        "the group's commit marker follows its data record: {:?}",
+        next.record
+    );
     truncate_wal(&root, next.log_sequence, next.byte_offset);
 
     {
@@ -1146,7 +1194,8 @@ fn unrecoverable_commit_marker_failure_refuses_further_writes() {
     {
         let db = open_root(&root);
         let ids = base_ids(&db);
-        enable_io_failure_from(2);
+        // The write's group (data record and commit pair) is one append.
+        enable_io_failure_from(1);
         let r = db.set_node_property(ids.ada, "source_hash", Value::from("x1"));
         disable_io_failure();
         let message = r.expect_err("commit marker failed twice").to_string();
@@ -1198,8 +1247,8 @@ fn poisoned_wal_refuses_query_writes_and_commits() {
             .execute_cypher("CREATE (:InTx {n: 1})")
             .expect("write in the open transaction");
 
-        // Append 1 is the data record, append 2 the commit pair.
-        enable_io_failure_from(2);
+        // The write's group (data record and commit pair) is one append.
+        enable_io_failure_from(1);
         let r = db.set_node_property(ids.ada, "source_hash", Value::from("p1"));
         disable_io_failure();
         assert!(r.is_err(), "commit marker failed");
@@ -1242,8 +1291,8 @@ fn query_commit_whose_marker_fails_reports_unconfirmed() {
     {
         let (_dir, root) = fresh_root();
         let db = open_root(&root);
-        // Append 1 is the CreateNode record, append 2 the commit pair.
-        enable_io_failure_from(2);
+        // The CreateNode record and the commit pair are one append.
+        enable_io_failure_from(1);
         let r = db.session().execute_cypher("CREATE (:AutoPoison {n: 1})");
         disable_io_failure();
         let message = r.expect_err("auto-commit marker failed").to_string();
@@ -1264,7 +1313,7 @@ fn query_commit_whose_marker_fails_reports_unconfirmed() {
         session
             .execute_cypher("CREATE (:TxPoison {n: 1})")
             .expect("write in the transaction");
-        // The commit pair is the next append.
+        // The transaction's group is the next append.
         enable_io_failure_from(1);
         let r = session.commit();
         disable_io_failure();
@@ -1294,7 +1343,8 @@ fn poisoned_wal_refuses_direct_and_batch_creates() {
     let (_dir, root) = fresh_root();
     let db = open_root(&root);
     let ids = base_ids(&db);
-    enable_io_failure_from(2);
+    // The write's group (data record and commit pair) is one append.
+    enable_io_failure_from(1);
     let r = db.set_node_property(ids.ada, "source_hash", Value::from("p1"));
     disable_io_failure();
     assert!(r.is_err(), "commit marker failed");

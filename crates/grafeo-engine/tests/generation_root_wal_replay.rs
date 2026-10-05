@@ -150,15 +150,19 @@ fn observable_state(db: &GrafeoDB) -> (Vec<String>, usize, usize) {
 }
 
 /// Probe locking the explicit-transaction behavior the SIGKILL proof relies
-/// on: with `START TRANSACTION` open and the db still open — the exact state
-/// at SIGKILL time, when no Drop/close can run — the mutation's data records
-/// are already in the root WAL, but no `TransactionCommit`/
-/// `TransactionAbort`/`EpochAdvance` marker exists for them. (Drop/close do
-/// log markers, but SIGKILL preempts all destructors.) If this probe ever
-/// fails, the deterministic torn tail in [`sigkill_reopen_retains_committed`]
-/// needs another route.
+/// on: with `START TRANSACTION` open and the db still open (the exact state
+/// at SIGKILL time, when no Drop/close can run), nothing of the transaction
+/// is in the root WAL: no data record and no marker.
+///
+/// Before the #411 port the data records were already in the WAL here,
+/// without a commit marker, and [`sigkill_reopen_retains_committed`] used
+/// them as a deterministic torn tail. A transaction's records are now
+/// written as one group at its commit, so the open transaction is simply
+/// absent; a torn group is covered by `layered_session_direct_api`
+/// (`uncommitted_tail_stays_discarded_after_a_later_commit`,
+/// `crash_right_after_commit_frame_recovers`).
 #[test]
-fn explicit_transaction_write_is_wal_logged_without_commit_marker() {
+fn explicit_transaction_write_is_not_wal_logged_before_commit() {
     use grafeo_storage::generation::manifest::read_manifest;
     use grafeo_storage::generation::wal_cursor::{WalReplayCursor, replay_stream_from};
     use grafeo_storage::wal::WalRecord;
@@ -209,9 +213,9 @@ fn explicit_transaction_write_is_wal_logged_without_commit_marker() {
             _ => {}
         }
     }
-    assert!(
-        data_records > 0,
-        "explicit-tx mutation must log data records to the root WAL before COMMIT"
+    assert_eq!(
+        data_records, 0,
+        "an explicit-tx mutation must not reach the root WAL before COMMIT"
     );
     assert!(
         !saw_commit,
@@ -249,9 +253,9 @@ fn sigkill_reopen_retains_committed() {
                 .execute(&format!("INSERT (:Person {{name: 'crash-proof-{i}'}})"))
                 .unwrap_or_else(|e| panic!("child: committed insert {i} failed: {e}"));
         }
-        // Explicit transaction: mutations are logged as data records WITHOUT a
-        // commit marker, i.e. deterministic pending/torn-tail material
-        // (behavior locked by `explicit_transaction_write_is_wal_logged_without_commit_marker`).
+        // Explicit transaction: its mutation stays in the session's WAL buffer
+        // until COMMIT, so nothing of it reaches the WAL (behavior locked by
+        // `explicit_transaction_write_is_not_wal_logged_before_commit`).
         session
             .execute("START TRANSACTION")
             .expect("child: begin tx");
@@ -261,8 +265,8 @@ fn sigkill_reopen_retains_committed() {
             ))
             .expect("child: uncommitted insert");
         // Publish readiness, then hold db + the open transaction alive until
-        // the parent kills us. SIGKILL preempts all destructors, so no
-        // rollback/abort marker can be logged: a genuine torn tail.
+        // the parent kills us. SIGKILL preempts all destructors, so the open
+        // transaction is never written.
         println!("READY {}", std::process::id());
         std::io::stdout().flush().expect("child: flush stdout");
         let _keep_alive = (&db, &session);
@@ -349,9 +353,8 @@ fn sigkill_reopen_retains_committed() {
         }
     }
 
-    // Reopen: the constructor replays the committed tail and discards the torn
-    // (uncommitted) record. All N committed writes must be present; the
-    // uncommitted (N+1)th must be absent.
+    // Reopen: the constructor replays the committed tail. All N committed
+    // writes must be present; the uncommitted (N+1)th must be absent.
     let reopened =
         GrafeoDB::open_generation_root(&root, false).expect("reopen generation root after SIGKILL");
     let (names, node_count, edge_count) = observable_state(&reopened);
@@ -367,7 +370,7 @@ fn sigkill_reopen_retains_committed() {
     );
     assert!(
         !names.contains(&format!("crash-proof-{SIGKILL_COMMITTED}")),
-        "the uncommitted (torn) write must be discarded on replay"
+        "the uncommitted write must not be there after replay"
     );
     // Base contributed 2 nodes + 1 edge; the child added exactly N nodes.
     assert_eq!(
