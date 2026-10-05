@@ -526,11 +526,11 @@ impl GraphStore for CompactStore {
             .map(|s| s.to_string())
             .collect();
 
-        // Add membership labels from the global dictionary.
+        // Add membership labels from the global dictionary. The view keeps
+        // the distinct codes, so this never walks the per-node records.
         if let (Some(membership), Some(dict)) = (&self.label_membership, &self.global_dict) {
-            for i in 0..membership.len() {
-                let rec = membership.record_at(i);
-                if let Some(label_str) = dict.get(rec.label_code) {
+            for &code in membership.distinct_label_codes() {
+                if let Some(label_str) = dict.get(code) {
                     labels.insert(label_str.to_string());
                 }
             }

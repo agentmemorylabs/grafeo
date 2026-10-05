@@ -338,13 +338,18 @@ pub struct GrafeoDB {
         feature = "generation-streaming"
     ))]
     epoch_handoff: generation::EpochHandoffCoordinator,
-    /// Builder-scoped mid-build tiers (G-MIDFLUSH.1 M2).
+    /// Builder-scoped mid-build tiers (G-MIDFLUSH.1 M2), each with its node
+    /// id range computed once when the tier was pushed.
     ///
     /// Empty in normal serving; non-empty during builder mid-build drains.
     /// `graph_store()` returns a `TierChainView` when this is non-empty.
     #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
-    mid_build_tiers:
-        parking_lot::RwLock<Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>>>,
+    mid_build_tiers: parking_lot::RwLock<
+        Vec<(
+            std::sync::Arc<grafeo_core::graph::compact::CompactStore>,
+            (u64, u64),
+        )>,
+    >,
     /// 1-based count of *committed* mid-build drains for this database.
     /// Incremented only after write + reopen + overlay reset + tier push.
     /// Process-wide statics are forbidden (two DBs / two tests must not share a counter).
@@ -905,10 +910,14 @@ impl GrafeoDB {
         #[cfg(all(feature = "wal", feature = "lpg"))]
         db.reconcile_replayed_node_indexes(&replayed_writes);
 
-        // Start periodic checkpoint timer if configured
+        // Start periodic checkpoint timer if configured. Not on a layered
+        // (compacted) database: the timer checkpoints its LpgStore alone, the
+        // overlay here, and a checkpoint replaces the whole container, so it
+        // would drop the CompactStore base from the file.
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
         if let (Some(interval), Some(fm)) = (checkpoint_interval, &db.file_manager)
             && !is_read_only
+            && !db.is_layered()
         {
             *db.checkpoint_timer.lock() = Some(checkpoint_timer::CheckpointTimer::start(
                 interval,
@@ -1713,6 +1722,14 @@ impl GrafeoDB {
         self.query_cache = Arc::new(QueryCache::default());
         self.projections.write().clear();
 
+        // The periodic checkpoint timer snapshots the pre-compact LpgStore
+        // alone; from here on the file must hold the CompactStore base too,
+        // which only `checkpoint_to_file` writes. See `with_config`.
+        #[cfg(feature = "grafeo-file")]
+        if let Some(mut timer) = self.checkpoint_timer.lock().take() {
+            timer.stop();
+        }
+
         Ok(())
     }
 
@@ -2243,8 +2260,27 @@ impl GrafeoDB {
             .as_ref()
             .ok_or_else(|| Error::Internal("wire_layered_after_load: no LpgStore".into()))?;
 
-        // Adopt the loaded base + the loaded overlay (id allocator state
-        // is preserved on the overlay during deserialization).
+        // The deserialized overlay's allocators are restored from its own
+        // rows only (the LPG section does not persist them), so an overlay
+        // whose largest id is below the base's would hand out base ids. A new
+        // node would hide its base twin, and `with_overlay` would treat it as
+        // a copy-up on the next reopen. Raise both allocators above the
+        // base's preserved id maxima, as `wire_generation_layered` does;
+        // never lower them.
+        if let Some(max) = compact_base.max_preserved_node_id() {
+            let next = max.saturating_add(1);
+            if overlay_store.next_node_id() < next {
+                overlay_store.set_next_node_id(next);
+            }
+        }
+        if let Some(max) = compact_base.max_preserved_edge_id() {
+            let next = max.saturating_add(1);
+            if overlay_store.next_edge_id() < next {
+                overlay_store.set_next_edge_id(next);
+            }
+        }
+
+        // Adopt the loaded base + the loaded overlay.
         let layered = Arc::new(LayeredStore::with_overlay(
             Arc::clone(&compact_base),
             Arc::clone(overlay_store),
@@ -2853,10 +2889,7 @@ impl GrafeoDB {
             // raw LayeredStore (merges base + overlay).
             #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
             let read_store: Arc<dyn GraphStoreSearch> = if !self.mid_build_tiers.read().is_empty() {
-                let tiers = self.mid_build_tiers.read().clone();
-                let ov = layered.overlay_store();
-                let view = grafeo_core::graph::compact::tier_chain::TierChainView::new(tiers, ov);
-                Arc::new(view) as Arc<dyn GraphStoreSearch>
+                Arc::new(self.mid_build_view(layered.overlay_store())) as Arc<dyn GraphStoreSearch>
             } else {
                 Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>
             };
@@ -3214,10 +3247,7 @@ impl GrafeoDB {
         {
             if !self.mid_build_tiers.read().is_empty() {
                 if let Some(layered) = self.layered_store.as_ref() {
-                    let tiers = self.mid_build_tiers.read().clone();
-                    let overlay = layered.overlay_store();
-                    let view =
-                        grafeo_core::graph::compact::tier_chain::TierChainView::new(tiers, overlay);
+                    let view = self.mid_build_view(layered.overlay_store());
                     return Arc::new(view) as Arc<dyn GraphStoreSearch>;
                 }
             }
@@ -3240,7 +3270,28 @@ impl GrafeoDB {
     pub fn mid_build_tiers(
         &self,
     ) -> Vec<std::sync::Arc<grafeo_core::graph::compact::CompactStore>> {
-        self.mid_build_tiers.read().clone()
+        self.mid_build_tiers
+            .read()
+            .iter()
+            .map(|(tier, _)| Arc::clone(tier))
+            .collect()
+    }
+
+    /// Builds the tier chain view (mid-build tiers + `overlay`) from the
+    /// ranges cached at push time, so neither queries nor the public counts
+    /// enumerate the tiers' node ids per call.
+    #[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+    pub(super) fn mid_build_view(
+        &self,
+        overlay: Arc<grafeo_core::graph::lpg::LpgStore>,
+    ) -> grafeo_core::graph::compact::tier_chain::TierChainView {
+        let (tiers, ranges) = self
+            .mid_build_tiers
+            .read()
+            .iter()
+            .map(|(tier, range)| (Arc::clone(tier), *range))
+            .unzip();
+        grafeo_core::graph::compact::tier_chain::TierChainView::with_ranges(tiers, ranges, overlay)
     }
 
     /// Returns the writable graph store, if available.
@@ -3301,6 +3352,38 @@ impl GrafeoDB {
         &self,
     ) -> Option<&Arc<grafeo_core::graph::compact::layered::LayeredStore>> {
         self.layered_store.as_ref()
+    }
+
+    /// Returns the store whose counts a checkpoint header records.
+    ///
+    /// In layered mode (after [`compact()`](Self::compact), or on a reopened
+    /// compacted file or generation root) `lpg_store()` is the overlay alone;
+    /// this returns the `LayeredStore`, whose base and overlay are the
+    /// sections a checkpoint writes. Its node and edge counts take the base's
+    /// known row counts and walk only the deleted and copied-up ids, never
+    /// the base rows. Otherwise this is the built-in `LpgStore`. The public
+    /// count methods read [`graph_store()`](Self::graph_store) instead, which
+    /// also covers the tier chain of a mid-build drain.
+    #[cfg(feature = "lpg")]
+    pub(super) fn checkpoint_count_store(&self) -> &dyn grafeo_core::graph::GraphStore {
+        #[cfg(feature = "compact-store")]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.as_ref();
+        }
+        &**self.lpg_store()
+    }
+
+    /// Returns whether a `LayeredStore` (compact base + overlay) is installed.
+    #[cfg(feature = "lpg")]
+    fn is_layered(&self) -> bool {
+        #[cfg(feature = "compact-store")]
+        {
+            self.layered_store.is_some()
+        }
+        #[cfg(not(feature = "compact-store"))]
+        {
+            false
+        }
     }
 
     /// Returns the disk-backed tier wrapper for the compact base, if
@@ -4228,7 +4311,11 @@ impl GrafeoDB {
         let section_refs: Vec<&dyn grafeo_common::storage::Section> =
             sections.iter().map(|s| s.as_ref()).collect();
         #[cfg(feature = "lpg")]
-        let context = flush::build_context(self.lpg_store(), &self.transaction_manager);
+        let context = flush::build_context(
+            self.lpg_store(),
+            self.checkpoint_count_store(),
+            &self.transaction_manager,
+        );
         #[cfg(not(feature = "lpg"))]
         let context = flush::build_context_minimal(&self.transaction_manager);
 

@@ -159,7 +159,7 @@ impl CheckpointTimer {
         );
         let section_refs: Vec<&dyn grafeo_common::storage::Section> =
             sections.iter().map(|s| s.as_ref()).collect();
-        let context = flush::build_context(store, transaction_manager);
+        let context = flush::build_context(store, &**store, transaction_manager);
 
         flush::flush(
             file_manager,

@@ -163,9 +163,14 @@ pub(super) fn flush(
 }
 
 /// Builds the flush context from the current database state.
+///
+/// `store` supplies the epoch; `count_store` supplies the header's node and
+/// edge counts. They differ in layered mode, where `store` is the overlay
+/// and `count_store` the layered view the sections describe.
 #[cfg(feature = "lpg")]
 pub(super) fn build_context(
     store: &grafeo_core::graph::lpg::LpgStore,
+    count_store: &dyn grafeo_core::graph::GraphStore,
     transaction_manager: &crate::transaction::TransactionManager,
 ) -> FlushContext {
     FlushContext {
@@ -173,8 +178,8 @@ pub(super) fn build_context(
         transaction_id: transaction_manager
             .last_assigned_transaction_id()
             .map_or(0, |t| t.0),
-        node_count: store.node_count() as u64,
-        edge_count: store.edge_count() as u64,
+        node_count: count_store.node_count() as u64,
+        edge_count: count_store.edge_count() as u64,
     }
 }
 

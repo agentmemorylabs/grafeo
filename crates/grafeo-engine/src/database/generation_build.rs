@@ -564,14 +564,8 @@ impl GrafeoDB {
         {
             if !self.mid_build_tiers.read().is_empty() {
                 if let Some(layered) = self.layered_store.as_ref() {
-                    let tiers = self.mid_build_tiers.read().clone();
                     let overlay = layered.overlay_store();
-                    let chain = std::sync::Arc::new(
-                        grafeo_core::graph::compact::tier_chain::TierChainView::new(
-                            tiers,
-                            overlay.clone(),
-                        ),
-                    );
+                    let chain = std::sync::Arc::new(self.mid_build_view(overlay.clone()));
                     // Chain sources are self-contained: ChainNodeSource walks
                     // chain.node_ids() (tiers row-by-row + overlay) and fetches
                     // each node through the chain view; the external merge sort

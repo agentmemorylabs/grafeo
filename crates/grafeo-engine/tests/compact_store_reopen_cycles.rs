@@ -135,11 +135,11 @@ fn assert_graph(db: &GrafeoDB, ids: [NodeId; 3], c_n: i64, ctx: &str) {
             "{ctx}: get_node({name}).name"
         );
     }
-    // `GrafeoDB::node_count` reports the overlay LpgStore after a reopen, so
-    // read the counts from the layered store that serves the queries.
     let layered = db.layered_store().expect("compacted base is loaded");
-    assert_eq!(layered.node_count(), 3, "{ctx}: node_count");
-    assert_eq!(layered.edge_count(), 2, "{ctx}: edge_count");
+    assert_eq!(layered.node_count(), 3, "{ctx}: layered node_count");
+    assert_eq!(layered.edge_count(), 2, "{ctx}: layered edge_count");
+    assert_eq!(db.node_count(), 3, "{ctx}: node_count");
+    assert_eq!(db.edge_count(), 2, "{ctx}: edge_count");
 }
 
 fn reopen_cycles(path: &Path, ids: [NodeId; 3], c_n: i64) {
