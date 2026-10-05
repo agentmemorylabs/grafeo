@@ -40,12 +40,21 @@ impl GenerationBudget {
     }
 
     /// Linux acceptance configuration from the packet (D0.8.10 #7).
+    ///
+    /// Headroom invariant: `2 * sort_run_bytes + io_buffer_bytes +
+    /// spool_slack < max_anon_bytes`. Two concurrent sort arenas (the node
+    /// pass holds occ + id-index sinks at once) plus the 1 MiB I/O overlap
+    /// charge in `flush_run` (which holds the arena charge while reserving
+    /// I/O) must fit 128 MiB anon: 64 + 1 + 8 = 73 MiB. At 64 MiB runs the
+    /// packing was 128 + 1 > 128 and every handoff died with
+    /// `BudgetExceeded { requested: ~135266228, limit: 134217728 }`.
+    /// `max_anon_bytes` stays 128 MiB — the fixture is not raised.
     #[must_use]
     pub const fn acceptance_linux() -> Self {
         Self {
             max_anon_bytes: 128 * 1024 * 1024,
             max_temp_bytes: 4 * 1024 * 1024 * 1024,
-            sort_run_bytes: 64 * 1024 * 1024,
+            sort_run_bytes: 32 * 1024 * 1024,
             io_buffer_bytes: 1024 * 1024,
             merge_fan_in: 32,
             max_record_bytes: 8 * 1024 * 1024,
