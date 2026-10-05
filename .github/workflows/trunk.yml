@@ -65,6 +65,7 @@ jobs:
       # Every engine integration target runs, except the named exceptions below.
       # A skip-list (not an allow-list) so new tests are picked up automatically,
       # and every target is compiled, so one that stops compiling fails CI.
+      # --no-fail-fast so one failing target does not hide the rest.
       - name: Engine integration tests (all targets except named exceptions)
         if: ${{ !cancelled() }}
         run: |
@@ -82,7 +83,7 @@ jobs:
                      | select(.kind | index("test")) | .name' \
             | grep -Ev "$skip" | sed 's/^/--test /' | tr '\n' ' ')
           echo "targets: $targets"
-          cargo test -p grafeo-engine --features "$FEATURES" $targets
+          cargo test -p grafeo-engine --features "$FEATURES" --no-fail-fast $targets
 
   no-streaming:
     name: compact_store_generation_contract (without generation-streaming)
