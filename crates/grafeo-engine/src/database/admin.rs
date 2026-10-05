@@ -425,7 +425,9 @@ impl super::GrafeoDB {
 
     /// Forces a WAL checkpoint.
     ///
-    /// Flushes all pending WAL records to the main storage.
+    /// Flushes all pending WAL records to the main storage. On a generation
+    /// root it only syncs the WAL: it neither publishes a generation nor
+    /// bounds WAL growth (publication deletes WAL below its boundary).
     ///
     /// # Errors
     ///
@@ -434,6 +436,26 @@ impl super::GrafeoDB {
         // Read-only databases have no WAL and the on-disk file is already a
         // valid snapshot: nothing to checkpoint.
         if self.read_only {
+            return Ok(());
+        }
+
+        // Generation root: the published base plus the WAL from the manifest's
+        // boundary on is the only copy of the overlay, and reopen replays every
+        // file from that boundary. Checkpoint metadata and the legacy log
+        // truncation would delete WAL no base contains (the next open then
+        // fails with a missing file or sequence gap). Only sync here; old WAL
+        // is deleted by publication, below its own boundary.
+        #[cfg(all(
+            feature = "generation",
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "mmap"
+        ))]
+        if self.generation_root.is_some() {
+            #[cfg(feature = "wal")]
+            if let Some(ref wal) = self.wal {
+                wal.sync()?;
+            }
             return Ok(());
         }
 

@@ -44,6 +44,15 @@ pub use backup::{
     BACKUP_MANIFEST_NAME, BackedUpWalFile, GenerationBackupManifest, GenerationBackupReceipt,
     backup_generation_root,
 };
+#[cfg(all(
+    feature = "wal",
+    feature = "lpg",
+    feature = "generation",
+    feature = "compact-store",
+    feature = "generation-streaming",
+    feature = "mmap"
+))]
+pub(crate) use backup::backup_live_generation_root;
 pub use gc::{RetirementPlan, collect_retirement, plan_retirement};
 pub use pins::{BackupPin, BackupPinGuard};
 pub use restore::restore_generation_root;
@@ -115,6 +124,18 @@ pub enum RetirementError {
     /// container structure).
     #[error("validation failed: {0}")]
     ValidationFailed(String),
+    /// A publication (epoch handoff) is in flight, so a live-root backup
+    /// refused to start. Nothing was copied; retry after the handoff ends.
+    #[error("epoch handoff in phase {0} is active; retry the backup after it finishes")]
+    HandoffInProgress(&'static str),
+    /// The database is not a generation root, so there is nothing to back up
+    /// through this API.
+    #[error("database is not an open generation root")]
+    NotGenerationRoot,
+    /// The live WAL is poisoned: a transaction in memory may not be in the
+    /// log, so a backup would silently lack it. Nothing was copied.
+    #[error("WAL is poisoned ({0}); refusing to back up a database whose log is incomplete")]
+    WalPoisoned(String),
     /// The backup manifest could not be encoded or decoded.
     #[error("backup manifest: {0}")]
     BackupManifest(String),
