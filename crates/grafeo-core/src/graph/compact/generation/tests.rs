@@ -607,3 +607,55 @@ fn v5_segment_source_segment_count_ascending_kinds_and_bounded_bytes() {
     }
     assert_eq!(count, total);
 }
+
+/// `emit_v5_segments` must emit the same four id segments for a store loaded
+/// from a v5 payload (mapped id lookups, heap maps cleared) as for the heap
+/// store it came from; with `generation-streaming` off it used to read the
+/// heap maps only and emit empty id tables for a mapped store.
+#[test]
+fn emit_v5_segments_keeps_id_tables_of_a_mapped_store() {
+    let input = GenerationInput::new()
+        .node(GenerationNode::new(sparse_id(5), "N").with_prop("name", "a"))
+        .node(GenerationNode::new(sparse_id(3), "N").with_prop("name", "b"))
+        .edge(GenerationEdge::new(
+            sparse_id(9),
+            sparse_id(5),
+            sparse_id(3),
+            "E",
+        ));
+    let generated = generate_compact_store(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &input.rel_schemas,
+        &GenerationBudget::for_tests(),
+    )
+    .unwrap();
+    let payload = section_v5::serialize_v5(&generated.store).unwrap();
+    let mapped = section_v5::deserialize_v5(&Bytes::from(payload)).unwrap();
+    assert!(mapped.preserves_ids());
+
+    let id_kinds = [
+        SegmentKind::NodeIdLookup,
+        SegmentKind::EdgeIdLookup,
+        SegmentKind::NodeOriginalIds,
+        SegmentKind::EdgeOriginalIds,
+    ];
+    let id_segments = |store: &crate::graph::compact::CompactStore| -> Vec<(SegmentKind, Vec<u8>)> {
+        emit_v5_segments(store, &generated.global_strings)
+            .unwrap()
+            .into_iter()
+            .filter(|s| id_kinds.contains(&s.kind))
+            .map(|s| (s.kind, s.bytes))
+            .collect()
+    };
+    let from_heap = id_segments(&generated.store);
+    let from_mapped = id_segments(&mapped);
+    assert_eq!(from_heap.len(), 4);
+    for (kind, bytes) in &from_heap {
+        assert!(!bytes.is_empty(), "heap {kind:?} segment is empty");
+    }
+    assert_eq!(
+        from_mapped, from_heap,
+        "a mapped store must re-emit the same id segments"
+    );
+}
