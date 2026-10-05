@@ -1630,3 +1630,57 @@ fn test_clear() {
     assert_eq!(store.node_count(), 1);
     assert!(store.get_node(n3).is_some());
 }
+
+/// With `temporal`, discarding a rolled-back created node or edge after an
+/// earlier commit must not append the cleanup tombstone behind the
+/// transaction's PENDING property entries (a `VersionLog::append`
+/// ascending-epoch violation), and must leave no property history behind.
+#[cfg(feature = "temporal")]
+#[test]
+fn test_discard_created_entities_with_pending_properties_after_commit() {
+    let store = LpgStore::new().unwrap();
+    store.sync_epoch(EpochId::new(1));
+    let epoch = store.current_epoch();
+    let tx = TransactionId::new(42);
+
+    let a = store.create_node_versioned(&["Scratch"], epoch, tx);
+    let b = store.create_node_versioned(&["Scratch"], epoch, tx);
+    store.set_node_property_versioned(a, "n", Value::Int64(1), tx);
+    let e = store.create_edge_versioned(a, b, "LINK", epoch, tx);
+    store.set_edge_property_versioned(e, "w", Value::Int64(2), tx);
+
+    store.discard_uncommitted_versions(tx);
+    store.rollback_transaction_properties(tx);
+
+    assert!(store.get_node_versioned(a, epoch, tx).is_none());
+    assert!(store.node_property_history(a).is_empty());
+    assert!(store.edge_property_history(e).is_empty());
+}
+
+/// With `temporal`, rolling back an indexed SET (fully, or to a savepoint)
+/// must restore the property-index postings: the original value is found
+/// again and the rolled-back value is not.
+#[cfg(feature = "temporal")]
+#[test]
+fn test_temporal_rollback_restores_property_index_postings() {
+    let store = LpgStore::new().unwrap();
+    store.create_property_index("k");
+    let n = store.create_node_with_props(&["L"], [("k", Value::from("a"))]);
+    store.sync_epoch(EpochId::new(1));
+    let find = |v: &str| store.find_nodes_by_property("k", &Value::from(v));
+
+    let tx = TransactionId::new(42);
+    store.set_node_property_versioned(n, "k", Value::from("b"), tx);
+    assert_eq!(find("b"), vec![n]);
+    store.discard_uncommitted_versions(tx);
+    store.rollback_transaction_properties(tx);
+    assert_eq!(find("a"), vec![n], "original posting back after rollback");
+    assert!(find("b").is_empty(), "no rolled-back posting");
+
+    let tx2 = TransactionId::new(43);
+    let savepoint = store.property_undo_log_position(tx2);
+    store.set_node_property_versioned(n, "k", Value::from("c"), tx2);
+    store.rollback_transaction_properties_to(tx2, savepoint);
+    assert_eq!(find("a"), vec![n], "original posting back after savepoint rollback");
+    assert!(find("c").is_empty(), "no posting rolled back to the savepoint");
+}
