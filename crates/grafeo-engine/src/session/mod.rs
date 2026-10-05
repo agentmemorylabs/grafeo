@@ -127,6 +127,10 @@ pub struct Session {
     graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
+    /// Set when the last commit could not write its commit marker to the WAL
+    /// (`commit_inner` only warns); the direct-write path reports it.
+    #[cfg(all(feature = "wal", feature = "lpg"))]
+    commit_wal_error: parking_lot::Mutex<Option<String>>,
     /// The raw layered store (compact base + overlay) of a layered database,
     /// which the direct node/edge APIs use for the default graph; `store` is
     /// only the overlay there. `None` for every other database.
@@ -305,6 +309,8 @@ impl Session {
             graph_store_mut,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
+            #[cfg(all(feature = "wal", feature = "lpg"))]
+            commit_wal_error: parking_lot::Mutex::new(None),
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -427,6 +433,35 @@ impl Session {
         }
     }
 
+    /// Logs a direct write's WAL record at the point its store calls for.
+    ///
+    /// The layered target logs **before** the store write (`before == true`)
+    /// and returns a failure, so a write the WAL refused is neither applied
+    /// nor reported as done. Every other target keeps its original order
+    /// (after the store write, `before == false`) and only warns, as
+    /// [`log_wal_record`](Self::log_wal_record) does.
+    #[cfg(all(feature = "wal", feature = "lpg"))]
+    fn log_direct_wal_record(
+        &self,
+        store: &direct_store::DirectStore,
+        record: &grafeo_storage::wal::WalRecord,
+        before: bool,
+    ) -> Result<()> {
+        match (store.is_layered(), before) {
+            (true, true) => {
+                if let Some(ref wal) = self.wal {
+                    wal.log(record)?;
+                }
+                Ok(())
+            }
+            (false, false) => {
+                self.log_wal_record(record);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Sets the CDC log for this session (shared with the database).
     ///
     /// Wraps the current write store with a `CdcGraphStore` decorator so
@@ -476,6 +511,8 @@ impl Session {
             graph_store_mut: write_store,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
+            #[cfg(all(feature = "wal", feature = "lpg"))]
+            commit_wal_error: parking_lot::Mutex::new(None),
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -755,10 +792,23 @@ impl Session {
             return write();
         }
         self.check_no_active_streams("write")?;
+        #[cfg(feature = "wal")]
+        self.commit_wal_error.lock().take();
         self.begin_transaction_inner(false, None)?;
         match write() {
             Ok(value) => match self.commit_inner() {
-                Ok(()) => Ok(value),
+                Ok(()) => {
+                    // The write is applied in memory, but replay will not
+                    // apply it without its commit marker: report that.
+                    #[cfg(feature = "wal")]
+                    if let Some(e) = self.commit_wal_error.lock().take() {
+                        return Err(grafeo_common::utils::error::Error::Internal(format!(
+                            "write applied in memory but its WAL commit marker failed, \
+                             so it is not durable: {e}"
+                        )));
+                    }
+                    Ok(value)
+                }
                 Err(e) => {
                     // `commit_inner` already rolls back on most failures;
                     // make sure nothing is left open when it did not.
@@ -4133,6 +4183,15 @@ impl Session {
             }
         }
 
+        // Check the buffered vector-index updates before anything is
+        // finalized: they are applied after the commit, where a failure
+        // would report an error for a transaction that already committed.
+        #[cfg(all(feature = "lpg", feature = "vector-index"))]
+        if let Err(e) = self.validate_buffered_vector_intents() {
+            let _ = self.rollback_inner();
+            return Err(e);
+        }
+
         let transaction_id = self.current_transaction.lock().take().ok_or_else(|| {
             grafeo_common::utils::error::Error::Transaction(
                 grafeo_common::utils::error::TransactionError::InvalidState(
@@ -4230,6 +4289,7 @@ impl Session {
                 },
             ]) {
                 grafeo_warn!("Failed to log transaction commit to WAL: {}", e);
+                *self.commit_wal_error.lock() = Some(e.to_string());
             }
         }
 
@@ -4904,6 +4964,49 @@ impl Session {
         self.vector_index_intents.lock().truncate(position);
     }
 
+    /// Checks every buffered vector upsert against its index's dimensions,
+    /// reading the node as the open transaction sees it.
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    fn validate_buffered_vector_intents(&self) -> Result<()> {
+        let (epoch, transaction_id) = self.get_transaction_context();
+        let tid = transaction_id.unwrap_or(TransactionId::SYSTEM);
+        for intent in self.vector_index_intents.lock().iter() {
+            let VectorIndexIntent::Upsert {
+                graph_name,
+                node_id,
+                property,
+            } = intent
+            else {
+                continue;
+            };
+            let store = self.resolve_store(graph_name);
+            let Some(node) = store.get_node_versioned(*node_id, epoch, tid) else {
+                continue;
+            };
+            let Some(Value::Vector(vector)) = node
+                .properties
+                .get(&grafeo_common::types::PropertyKey::new(property))
+            else {
+                continue;
+            };
+            for label in &node.labels {
+                if let Some(index) = store.get_vector_index(label.as_str(), property)
+                    && vector.len() != index.config().dimensions
+                {
+                    return Err(grafeo_common::utils::error::Error::Internal(format!(
+                        "Vector dimension mismatch for :{}({}): expected {}, found {} on node {}",
+                        label,
+                        property,
+                        index.config().dimensions,
+                        vector.len(),
+                        node_id.0
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(all(feature = "lpg", feature = "vector-index"))]
     fn apply_buffered_vector_intents(&self) -> Result<()> {
         let intents: Vec<VectorIndexIntent> = self.vector_index_intents.lock().drain(..).collect();
@@ -5277,7 +5380,11 @@ impl Session {
             let (_, transaction_id) = self.get_transaction_context();
 
             #[cfg(feature = "wal")]
-            let value_for_wal = value.clone();
+            let wal_record = grafeo_storage::wal::WalRecord::SetNodeProperty {
+                id,
+                key: key.to_string(),
+                value: value.clone(),
+            };
             #[cfg(feature = "vector-index")]
             let vector_intent = self.active_graph_storage_key();
 
@@ -5293,14 +5400,11 @@ impl Session {
             if let Some(tid) = transaction_id {
                 self.transaction_manager.record_write(tid, id)?;
             }
-            store.set_node_property(id, key, value, transaction_id);
-
             #[cfg(feature = "wal")]
-            self.log_wal_record(&grafeo_storage::wal::WalRecord::SetNodeProperty {
-                id,
-                key: key.to_string(),
-                value: value_for_wal,
-            });
+            self.log_direct_wal_record(&store, &wal_record, true)?;
+            store.set_node_property(id, key, value, transaction_id);
+            #[cfg(feature = "wal")]
+            self.log_direct_wal_record(&store, &wal_record, false)?;
 
             #[cfg(feature = "vector-index")]
             self.push_vector_intent(VectorIndexIntent::Upsert {
@@ -5331,7 +5435,11 @@ impl Session {
             let (_, transaction_id) = self.get_transaction_context();
 
             #[cfg(feature = "wal")]
-            let value_for_wal = value.clone();
+            let wal_record = grafeo_storage::wal::WalRecord::SetEdgeProperty {
+                id,
+                key: key.to_string(),
+                value: value.clone(),
+            };
 
             if store.is_layered() {
                 let (epoch, _) = self.get_transaction_context();
@@ -5340,14 +5448,11 @@ impl Session {
                     return Err(grafeo_common::utils::error::Error::EdgeNotFound(id));
                 }
             }
-            store.set_edge_property(id, key, value, transaction_id);
-
             #[cfg(feature = "wal")]
-            self.log_wal_record(&grafeo_storage::wal::WalRecord::SetEdgeProperty {
-                id,
-                key: key.to_string(),
-                value: value_for_wal,
-            });
+            self.log_direct_wal_record(&store, &wal_record, true)?;
+            store.set_edge_property(id, key, value, transaction_id);
+            #[cfg(feature = "wal")]
+            self.log_direct_wal_record(&store, &wal_record, false)?;
 
             Ok(())
         })
@@ -5361,8 +5466,18 @@ impl Session {
     /// is returned.
     #[cfg(feature = "lpg")]
     pub fn delete_node(&self, id: NodeId) -> bool {
+        self.delete_node_checked(id).unwrap_or_else(|e| {
+            grafeo_warn!("Session: delete_node({id:?}) failed: {e}");
+            false
+        })
+    }
+
+    /// [`delete_node`](Self::delete_node) that returns its failure (a WAL
+    /// append, the implicit commit, a read-only session) instead of `false`.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn delete_node_checked(&self, id: NodeId) -> Result<bool> {
         let store = self.direct_store();
-        let result = self.with_direct_write(&store, || {
+        self.with_direct_write(&store, || {
             let (epoch, transaction_id) = self.get_transaction_context();
             // On the layered target a base delete only records a tombstone and
             // would report `true` again for an id that is already gone.
@@ -5370,11 +5485,16 @@ impl Session {
                 || store
                     .get_node_versioned(id, epoch, transaction_id.unwrap_or(TransactionId::SYSTEM))
                     .is_some();
+            #[cfg(feature = "wal")]
+            let wal_record = grafeo_storage::wal::WalRecord::DeleteNode { id };
+            #[cfg(feature = "wal")]
+            if visible {
+                self.log_direct_wal_record(&store, &wal_record, true)?;
+            }
             let deleted = visible && store.delete_node(id, epoch, transaction_id);
-
             #[cfg(feature = "wal")]
             if deleted {
-                self.log_wal_record(&grafeo_storage::wal::WalRecord::DeleteNode { id });
+                self.log_direct_wal_record(&store, &wal_record, false)?;
             }
 
             #[cfg(feature = "vector-index")]
@@ -5386,10 +5506,6 @@ impl Session {
             }
 
             Ok(deleted)
-        });
-        result.unwrap_or_else(|e| {
-            grafeo_warn!("Session: delete_node({id:?}) failed: {e}");
-            false
         })
     }
 
@@ -5399,25 +5515,36 @@ impl Session {
     /// [`delete_node`](Self::delete_node) applies.
     #[cfg(feature = "lpg")]
     pub fn delete_edge(&self, id: grafeo_common::types::EdgeId) -> bool {
+        self.delete_edge_checked(id).unwrap_or_else(|e| {
+            grafeo_warn!("Session: delete_edge({id:?}) failed: {e}");
+            false
+        })
+    }
+
+    /// [`delete_edge`](Self::delete_edge) that returns its failure instead of
+    /// `false`.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn delete_edge_checked(&self, id: grafeo_common::types::EdgeId) -> Result<bool> {
         let store = self.direct_store();
-        let result = self.with_direct_write(&store, || {
+        self.with_direct_write(&store, || {
             let (epoch, transaction_id) = self.get_transaction_context();
             let visible = !store.is_layered()
                 || store
                     .get_edge_versioned(id, epoch, transaction_id.unwrap_or(TransactionId::SYSTEM))
                     .is_some();
+            #[cfg(feature = "wal")]
+            let wal_record = grafeo_storage::wal::WalRecord::DeleteEdge { id };
+            #[cfg(feature = "wal")]
+            if visible {
+                self.log_direct_wal_record(&store, &wal_record, true)?;
+            }
             let deleted = visible && store.delete_edge(id, epoch, transaction_id);
-
             #[cfg(feature = "wal")]
             if deleted {
-                self.log_wal_record(&grafeo_storage::wal::WalRecord::DeleteEdge { id });
+                self.log_direct_wal_record(&store, &wal_record, false)?;
             }
 
             Ok(deleted)
-        });
-        result.unwrap_or_else(|e| {
-            grafeo_warn!("Session: delete_edge({id:?}) failed: {e}");
-            false
         })
     }
 

@@ -41,6 +41,8 @@ impl Session {
             graph_store_mut,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
+            #[cfg(all(feature = "wal", feature = "lpg"))]
+            commit_wal_error: parking_lot::Mutex::new(None),
             catalog: cfg.catalog,
             rdf_store,
             transaction_manager: cfg.transaction_manager,

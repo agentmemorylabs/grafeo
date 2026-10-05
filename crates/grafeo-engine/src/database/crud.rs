@@ -285,7 +285,7 @@ impl super::GrafeoDB {
     pub fn delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if self.layered_store.is_some() {
-            return Ok(self.layered_delete_node(id));
+            return self.layered_delete_node(id);
         }
 
         // Capture properties for CDC before deletion
@@ -1349,13 +1349,12 @@ impl super::GrafeoDB {
         Ok(())
     }
 
-    fn layered_delete_node(&self, id: grafeo_common::types::NodeId) -> bool {
+    fn layered_delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {
         let Some(node) = self.get_node(id) else {
-            return false;
+            return Ok(false);
         };
-        let deleted = self.session().delete_node(id);
-        if !deleted {
-            return false;
+        if !self.session().delete_node_checked(id)? {
+            return Ok(false);
         }
 
         #[cfg(feature = "text-index")]
@@ -1383,7 +1382,7 @@ impl super::GrafeoDB {
         }
         #[cfg(not(any(feature = "text-index", feature = "cdc")))]
         let _ = node;
-        true
+        Ok(true)
     }
 
     fn layered_delete_edge(&self, id: grafeo_common::types::EdgeId) -> bool {
