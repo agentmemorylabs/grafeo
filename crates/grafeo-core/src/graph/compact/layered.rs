@@ -2992,8 +2992,11 @@ impl LayeredStore {
             // deletion log so the next checkpoint re-emits it.
             self.note_promoted_node_delete(id);
             self.journal_touch(&mut journal, owner, LayerChange::NodeCopyUp(id));
+            // Hold the journal through the overlay delete, as `promote_lock`
+            // did before (#13): journal -> overlay store is the copy-up order.
+            let deleted = overlay_delete(&self.overlay.load());
             drop(journal);
-            return overlay_delete(&self.overlay.load());
+            return deleted;
         }
         if self.base.load().get_node(id).is_some() {
             // Transaction-scoped tombstone: inserted and journaled under the
@@ -3032,8 +3035,11 @@ impl LayeredStore {
             // #15: see `delete_node_layered`.
             self.note_promoted_edge_delete(id);
             self.journal_touch(&mut journal, owner, LayerChange::EdgeCopyUp(id));
+            // Hold the journal through the overlay delete, as `promote_lock`
+            // did before (#13): journal -> overlay store is the copy-up order.
+            let deleted = overlay_delete(&self.overlay.load());
             drop(journal);
-            return overlay_delete(&self.overlay.load());
+            return deleted;
         }
         if self.base.load().get_edge(id).is_some() {
             let fresh = self.deleted_from_base_edges.write().insert(id);
