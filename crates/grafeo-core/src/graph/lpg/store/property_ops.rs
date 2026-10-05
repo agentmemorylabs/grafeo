@@ -145,6 +145,31 @@ impl LpgStore {
         self.edge_properties.get_all_history(id)
     }
 
+    /// [`Self::node_property_history`] without the entries of open
+    /// transactions (PENDING epochs), for checkpoints and snapshots: an
+    /// uncommitted SET or delete tombstone must not be persisted. Keys left
+    /// with no entry are dropped.
+    #[cfg(feature = "temporal")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn committed_node_property_history(
+        &self,
+        id: NodeId,
+    ) -> Vec<(PropertyKey, Vec<(EpochId, Value)>)> {
+        without_pending(self.node_properties.get_all_history(id))
+    }
+
+    /// Edge variant of [`Self::committed_node_property_history`].
+    #[cfg(feature = "temporal")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn committed_edge_property_history(
+        &self,
+        id: EdgeId,
+    ) -> Vec<(PropertyKey, Vec<(EpochId, Value)>)> {
+        without_pending(self.edge_properties.get_all_history(id))
+    }
+
     /// Removes a property from a node.
     ///
     /// Returns the previous value if it existed, or None if the property didn't exist.
@@ -1100,4 +1125,19 @@ impl LpgStore {
     pub fn node_properties_mark_spilled(&self, key: &PropertyKey) {
         self.node_properties.mark_column_spilled(key);
     }
+}
+
+/// Drops the PENDING (uncommitted) entries of a property history, and the
+/// keys left empty.
+#[cfg(feature = "temporal")]
+fn without_pending(
+    history: Vec<(PropertyKey, Vec<(EpochId, Value)>)>,
+) -> Vec<(PropertyKey, Vec<(EpochId, Value)>)> {
+    history
+        .into_iter()
+        .filter_map(|(key, mut entries)| {
+            entries.retain(|(epoch, _)| *epoch != EpochId::PENDING);
+            (!entries.is_empty()).then_some((key, entries))
+        })
+        .collect()
 }
