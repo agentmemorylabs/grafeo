@@ -1358,7 +1358,9 @@ impl GraphStore for LayeredStore {
 
         // A dirty id is owned by the overlay (as in `nodes_by_label`): it is
         // listed below if its overlay copy is live, and not from the base, so
-        // a base node copied into the overlay and then deleted stays gone.
+        // a base node copied into the overlay and then deleted stays gone. A
+        // tombstoned id is gone in both layers: after a handoff install an
+        // absorbed row deleted through its base keeps its overlay copy.
         let mut ids: Vec<NodeId> = self
             .base
             .load()
@@ -1366,7 +1368,13 @@ impl GraphStore for LayeredStore {
             .into_iter()
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
-        ids.extend(self.overlay.load().node_ids());
+        ids.extend(
+            self.overlay
+                .load()
+                .node_ids()
+                .into_iter()
+                .filter(|id| !deleted.contains(id)),
+        );
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -1412,12 +1420,19 @@ impl GraphStore for LayeredStore {
             .chain(dirty.iter().filter(|id| !deleted.contains(*id)))
             .filter(|id| base.contains_node(**id))
             .count();
-        let overlay_ids = overlay.node_ids();
+        // A tombstoned id is gone even if an overlay row remains: after a
+        // handoff install, deleting an absorbed (not dirty) row tombstones
+        // its base row and leaves the overlay copy in place.
+        let overlay_ids: Vec<_> = overlay
+            .node_ids()
+            .into_iter()
+            .filter(|id| !deleted.contains(id))
+            .collect();
         // Live overlay rows the base also lists: after a handoff install the
         // new base absorbed them while they stay (not dirty) in the overlay.
         let in_both = overlay_ids
             .iter()
-            .filter(|id| !deleted.contains(*id) && !dirty.contains(*id))
+            .filter(|id| !dirty.contains(*id))
             .filter(|id| base.contains_node(**id))
             .count();
         (base.node_count().saturating_sub(hidden) + overlay_ids.len()).saturating_sub(in_both)
@@ -1435,10 +1450,17 @@ impl GraphStore for LayeredStore {
             .chain(dirty.iter().filter(|id| !deleted.contains(*id)))
             .filter(|id| base.contains_edge(**id))
             .count();
-        let overlay_ids = overlay.edge_ids();
+        // A tombstoned id is gone even if an overlay row remains: after a
+        // handoff install, deleting an absorbed (not dirty) row tombstones
+        // its base row and leaves the overlay copy in place.
+        let overlay_ids: Vec<_> = overlay
+            .edge_ids()
+            .into_iter()
+            .filter(|id| !deleted.contains(id))
+            .collect();
         let in_both = overlay_ids
             .iter()
-            .filter(|id| !deleted.contains(*id) && !dirty.contains(*id))
+            .filter(|id| !dirty.contains(*id))
             .filter(|id| base.contains_edge(**id))
             .count();
         (base.edge_count().saturating_sub(hidden) + overlay_ids.len()).saturating_sub(in_both)
