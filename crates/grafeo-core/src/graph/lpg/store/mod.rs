@@ -485,6 +485,10 @@ pub struct LpgStore {
     /// simply discarded.
     /// Lock order: 10 (after named_graphs, independent of other locks)
     property_undo_log: RwLock<FxHashMap<TransactionId, Vec<PropertyUndoEntry>>>,
+
+    /// Node and edge version entries visited by commit, rollback and the
+    /// statistics refresh, for [`Self::transaction_versions_walked`].
+    pub(super) transaction_versions_walked: AtomicU64,
 }
 
 impl LpgStore {
@@ -551,6 +555,7 @@ impl LpgStore {
             needs_stats_recompute: AtomicBool::new(false),
             named_graphs: RwLock::new(FxHashMap::default()),
             property_undo_log: RwLock::new(FxHashMap::default()),
+            transaction_versions_walked: AtomicU64::new(0),
         })
     }
 

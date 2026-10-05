@@ -13,6 +13,25 @@ use grafeo_common::mvcc::VersionChain;
 use grafeo_common::mvcc::{ColdVersionRef, HotVersionRef, VersionIndex};
 
 impl LpgStore {
+    /// How many node and edge version entries commit
+    /// (`finalize_version_epochs`), rollback (`discard_uncommitted_versions`,
+    /// `discard_entities_by_id`) and the statistics refresh after a rollback
+    /// have visited since the store was created.
+    ///
+    /// A test hook: the difference across one commit or rollback shows
+    /// whether it cost O(the transaction's changes) or O(the store) (#410).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn transaction_versions_walked(&self) -> u64 {
+        self.transaction_versions_walked.load(Ordering::Relaxed)
+    }
+
+    /// Adds `n` to [`Self::transaction_versions_walked`].
+    pub(super) fn count_versions_walked(&self, n: usize) {
+        self.transaction_versions_walked
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
     /// Discards all uncommitted versions created by a transaction.
     ///
     /// This is called during transaction rollback to clean up uncommitted changes.
@@ -32,6 +51,7 @@ impl LpgStore {
         // Remove uncommitted node versions
         {
             let mut nodes = self.nodes.write();
+            self.count_versions_walked(nodes.len());
             for chain in nodes.values_mut() {
                 chain.remove_versions_by(transaction_id);
             }
@@ -42,6 +62,7 @@ impl LpgStore {
         // Remove uncommitted edge versions
         {
             let mut edges = self.edges.write();
+            self.count_versions_walked(edges.len());
             for chain in edges.values_mut() {
                 chain.remove_versions_by(transaction_id);
             }
@@ -75,6 +96,7 @@ impl LpgStore {
         node_ids: &[NodeId],
         edge_ids: &[EdgeId],
     ) {
+        self.count_versions_walked(node_ids.len() + edge_ids.len());
         // Capture create-path secondaries before emptying version chains.
         let discarded_nodes: Vec<NodeId> = {
             let nodes = self.nodes.read();
@@ -149,6 +171,7 @@ impl LpgStore {
         // Remove uncommitted node versions
         {
             let mut versions = self.node_versions.write();
+            self.count_versions_walked(versions.len());
             for index in versions.values_mut() {
                 index.remove_versions_by(transaction_id);
             }
@@ -159,6 +182,7 @@ impl LpgStore {
         // Remove uncommitted edge versions
         {
             let mut versions = self.edge_versions.write();
+            self.count_versions_walked(versions.len());
             for index in versions.values_mut() {
                 index.remove_versions_by(transaction_id);
             }
@@ -188,6 +212,7 @@ impl LpgStore {
         node_ids: &[NodeId],
         edge_ids: &[EdgeId],
     ) {
+        self.count_versions_walked(node_ids.len() + edge_ids.len());
         let discarded_nodes: Vec<NodeId> = {
             let versions = self.node_versions.read();
             node_ids
@@ -270,12 +295,14 @@ impl LpgStore {
     pub fn finalize_version_epochs(&self, transaction_id: TransactionId, commit_epoch: EpochId) {
         {
             let mut nodes = self.nodes.write();
+            self.count_versions_walked(nodes.len());
             for chain in nodes.values_mut() {
                 chain.finalize_epochs(transaction_id, commit_epoch);
             }
         }
         {
             let mut edges = self.edges.write();
+            self.count_versions_walked(edges.len());
             for chain in edges.values_mut() {
                 chain.finalize_epochs(transaction_id, commit_epoch);
             }
@@ -302,12 +329,14 @@ impl LpgStore {
     pub fn finalize_version_epochs(&self, transaction_id: TransactionId, commit_epoch: EpochId) {
         {
             let mut versions = self.node_versions.write();
+            self.count_versions_walked(versions.len());
             for index in versions.values_mut() {
                 index.finalize_epochs(transaction_id, commit_epoch);
             }
         }
         {
             let mut versions = self.edge_versions.write();
+            self.count_versions_walked(versions.len());
             for index in versions.values_mut() {
                 index.finalize_epochs(transaction_id, commit_epoch);
             }

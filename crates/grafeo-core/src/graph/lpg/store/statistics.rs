@@ -95,6 +95,7 @@ impl LpgStore {
     #[cfg(not(feature = "tiered-storage"))]
     fn recompute_statistics_full(&self) {
         let epoch = self.current_epoch();
+        self.count_versions_walked(self.nodes.read().len() + self.edges.read().len());
 
         // Full-scan node count
         let total_nodes = self
@@ -143,6 +144,9 @@ impl LpgStore {
     #[cfg(feature = "tiered-storage")]
     fn recompute_statistics_full(&self) {
         let epoch = self.current_epoch();
+        self.count_versions_walked(
+            self.node_versions.read().len() + self.edge_versions.read().len(),
+        );
 
         // Full-scan node count
         let versions = self.node_versions.read();
