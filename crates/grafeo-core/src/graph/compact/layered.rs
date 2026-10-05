@@ -1275,13 +1275,17 @@ impl GraphStore for LayeredStore {
 
     fn node_ids(&self) -> Vec<NodeId> {
         let deleted = self.deleted_from_base_nodes.read();
+        let dirty = self.dirty_node_ids.read();
 
+        // A dirty id is owned by the overlay (as in `nodes_by_label`): it is
+        // listed below if its overlay copy is live, and not from the base, so
+        // a base node copied into the overlay and then deleted stays gone.
         let mut ids: Vec<NodeId> = self
             .base
             .load()
             .node_ids()
             .into_iter()
-            .filter(|id| !deleted.contains(id))
+            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
         ids.extend(self.overlay.load().node_ids());
         ids.sort_unstable();
@@ -2040,6 +2044,8 @@ impl GraphStoreMut for LayeredStore {
 
     fn delete_node(&self, id: NodeId) -> bool {
         let _guard = self.merge_guard.read();
+        // Serialized with copy-ups: see `ensure_in_overlay`.
+        let _promote = self.promote_lock.lock();
         if self.is_node_dirty(id) {
             // Node is in the overlay: delete from overlay. Record the
             // post-freeze deletion so `swap_base_and_repair_overlay` keeps
@@ -2069,6 +2075,7 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> bool {
         let _guard = self.merge_guard.read();
+        let _promote = self.promote_lock.lock();
         if self.is_node_dirty(id) {
             // See `delete_node`: record the N+1 deletion for the repair swap.
             self.record_post_freeze_node(id);
@@ -2092,6 +2099,7 @@ impl GraphStoreMut for LayeredStore {
 
     fn delete_node_edges(&self, node_id: NodeId) {
         let _guard = self.merge_guard.read();
+        let _promote = self.promote_lock.lock();
         // Delete overlay edges.
         if self.is_node_dirty(node_id) {
             let overlay = self.overlay.load();
@@ -2131,6 +2139,8 @@ impl GraphStoreMut for LayeredStore {
 
     fn delete_edge(&self, id: EdgeId) -> bool {
         let _guard = self.merge_guard.read();
+        // Serialized with copy-ups: see `ensure_in_overlay`.
+        let _promote = self.promote_lock.lock();
         if self.is_edge_dirty(id) {
             // See `delete_node`: record the N+1 deletion for the repair swap.
             self.record_post_freeze_edge(id);
@@ -2156,6 +2166,7 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> bool {
         let _guard = self.merge_guard.read();
+        let _promote = self.promote_lock.lock();
         if self.is_edge_dirty(id) {
             // See `delete_node`: record the N+1 deletion for the repair swap.
             self.record_post_freeze_edge(id);
@@ -2325,6 +2336,11 @@ impl LayeredStore {
             self.record_post_freeze_node(id);
             return; // another writer promoted it meanwhile
         }
+        // Base deletes take `promote_lock` too: check again under it, so a
+        // delete that won the race is never followed by a copy-up.
+        if self.is_node_deleted_from_base(id) {
+            return;
+        }
         let Some(base_node) = self.base.load().get_node(id) else {
             return; // not in base either (new node case handled by caller)
         };
@@ -2343,8 +2359,12 @@ impl LayeredStore {
             return;
         }
 
-        // Copy properties.
+        // Copy properties. With `temporal`, also record them at epoch 0 so
+        // historical reads of the epoch-0 row see them; the plain setter keeps
+        // the overlay's property and text indexes up to date.
         for (key, value) in base_node.properties.iter() {
+            #[cfg(feature = "temporal")]
+            overlay.set_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
             overlay.set_node_property(id, key.as_str(), value.clone());
         }
 
@@ -2376,6 +2396,11 @@ impl LayeredStore {
             self.record_post_freeze_edge(id);
             return; // another writer promoted it meanwhile
         }
+        // Second check, after the endpoints are prepared and under the lock
+        // base deletes take: see `ensure_in_overlay`.
+        if self.is_edge_deleted_from_base(id) {
+            return;
+        }
 
         // Create the edge at the same ID, at epoch 0: see `ensure_in_overlay`.
         let overlay = self.overlay.load();
@@ -2392,8 +2417,10 @@ impl LayeredStore {
             return;
         }
 
-        // Copy properties.
+        // Copy properties (see `ensure_in_overlay` for `temporal`).
         for (key, value) in base_edge.properties.iter() {
+            #[cfg(feature = "temporal")]
+            overlay.set_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
             overlay.set_edge_property(id, key.as_str(), value.clone());
         }
 
