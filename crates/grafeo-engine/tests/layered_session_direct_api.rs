@@ -1134,38 +1134,10 @@ fn invalid_vector_write_fails_before_commit() {
 
 // ── Review round 3 (PR #13) ───────────────────────────────────────────
 
-/// Item B: a commit marker that fails once is retried, so the write is
-/// durable and reported as done; a later unrelated rollback cannot drop it.
-#[cfg(feature = "testing-crash-injection")]
-#[test]
-fn failed_commit_marker_is_retried() {
-    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
-    let (_dir, root) = fresh_root();
-    {
-        let db = open_root(&root);
-        let ids = base_ids(&db);
-        // Append 1 is the data record, append 2 the commit pair.
-        enable_io_failure_at(2);
-        let r = db.set_node_property(ids.ada, "source_hash", Value::from("r1"));
-        disable_io_failure();
-        r.expect("a commit marker that fails once is retried");
-
-        let mut other = db.session();
-        other.begin_transaction().expect("begin");
-        other
-            .execute_cypher("CREATE (:Scratch {n: 1})")
-            .expect("scratch");
-        other.rollback().expect("rollback");
-        db.close().expect("close");
-    }
-    let db = open_root(&root);
-    assert_eq!(cypher_ada_hash(&db), Some(Value::from("r1")));
-}
-
-/// Items A and B: when the commit marker cannot be written even on retry,
-/// the error says durability is unconfirmed (it does not claim the write is
-/// lost), the WAL refuses every later write until the database is reopened,
-/// and the root reopens showing only what reached the disk.
+/// Items A and B: when the commit marker cannot be written, the error says
+/// durability is unconfirmed (it does not claim the write is lost), the WAL
+/// refuses every later write until the database is reopened, and the root
+/// reopens showing only what reached the disk.
 #[cfg(feature = "testing-crash-injection")]
 #[test]
 fn unrecoverable_commit_marker_failure_refuses_further_writes() {
@@ -1203,4 +1175,57 @@ fn unrecoverable_commit_marker_failure_refuses_further_writes() {
         None,
         "the refused write is not there either"
     );
+}
+
+// ── Review round 4 (PR #13) ───────────────────────────────────────────
+
+/// Once a commit marker could not be written (the WAL is poisoned), every
+/// later write on the database is refused before it mutates anything: a
+/// Cypher write from another session fails, an open transaction's commit
+/// fails and rolls back, and nothing of it shows after reopen.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn poisoned_wal_refuses_query_writes_and_commits() {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_from};
+    let (_dir, root) = fresh_root();
+    {
+        let db = open_root(&root);
+        let ids = base_ids(&db);
+
+        let mut open_tx = db.session();
+        open_tx.begin_transaction().expect("begin");
+        open_tx
+            .execute_cypher("CREATE (:InTx {n: 1})")
+            .expect("write in the open transaction");
+
+        // Append 1 is the data record, append 2 the commit pair.
+        enable_io_failure_from(2);
+        let r = db.set_node_property(ids.ada, "source_hash", Value::from("p1"));
+        disable_io_failure();
+        assert!(r.is_err(), "commit marker failed");
+
+        let r = db.session().execute_cypher("CREATE (:New {n: 1})");
+        assert!(r.is_err(), "a query write after poisoning is refused");
+        assert_eq!(
+            cypher_count(&db, "MATCH (n:New) RETURN count(n)"),
+            0,
+            "and not applied in memory"
+        );
+
+        assert!(
+            open_tx.commit().is_err(),
+            "an open transaction cannot commit after poisoning"
+        );
+        assert_eq!(
+            cypher_count(&db, "MATCH (n:InTx) RETURN count(n)"),
+            0,
+            "its writes are rolled back"
+        );
+        drop(open_tx);
+        drop(db);
+    }
+    let db = GrafeoDB::open_generation_root(&root, false).expect("reopen");
+    assert_eq!(cypher_count(&db, "MATCH (n:New) RETURN count(n)"), 0);
+    assert_eq!(cypher_count(&db, "MATCH (n:InTx) RETURN count(n)"), 0);
+    assert_eq!(cypher_ada_hash(&db), Some(Value::from("h0")));
 }
