@@ -101,10 +101,10 @@ pub struct LayeredStore {
     /// changed outside the overlay's own MVCC: base tombstones and copy-ups.
     /// See [`TxnLayerJournal`].
     txn_journal: parking_lot::Mutex<TxnLayerJournal>,
-    /// `true` while `txn_journal` holds at least one pending change. Lets the
-    /// write paths that only need to *touch* an existing change skip the
-    /// mutex when no transaction has anything pending. Read paths never
-    /// consult the journal.
+    /// `true` while `txn_journal` holds at least one pending change. Lets
+    /// commit, rollback and savepoint-position calls skip the mutex when no
+    /// transaction has anything pending. Write paths always take the mutex,
+    /// and read paths never consult the journal.
     txn_journal_pending: AtomicBool,
     /// Total journal entries dropped while their transaction was open (see
     /// [`LayeredStore::forgotten_layer_changes`]).
@@ -2888,11 +2888,13 @@ impl LayeredStore {
         }
 
         // Copy properties. With `temporal`, also record them at epoch 0 so
-        // historical reads of the epoch-0 row see them; the plain setter keeps
-        // the overlay's property and text indexes up to date.
+        // historical reads of the epoch-0 row see them, but only where the
+        // property has no history yet: an append behind a later entry would
+        // break the log's epoch order. The plain setter keeps the overlay's
+        // property and text indexes up to date.
         for (key, value) in base_node.properties.iter() {
             #[cfg(feature = "temporal")]
-            overlay.set_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
+            overlay.seed_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
             overlay.set_node_property(id, key.as_str(), value.clone());
         }
 
@@ -2952,7 +2954,7 @@ impl LayeredStore {
         // Copy properties (see `ensure_in_overlay` for `temporal`).
         for (key, value) in base_edge.properties.iter() {
             #[cfg(feature = "temporal")]
-            overlay.set_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
+            overlay.seed_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
             overlay.set_edge_property(id, key.as_str(), value.clone());
         }
 
@@ -5915,6 +5917,59 @@ mod tests {
             .get_edge_at_epoch(edge, EpochId::new(1))
             .expect("copied-up edge visible at an older epoch");
         assert_eq!(old.get_property("since"), Some(&Value::Int64(2020)));
+    }
+
+    /// A copy-up rolled back at a later epoch, then copied up again, must
+    /// not append its epoch-0 property history after the purge's history:
+    /// that trips `VersionLog::append`'s ascending-epoch assertion (debug)
+    /// or leaves the log out of order (release).
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn temporal_copy_up_after_rolled_back_copy_up() {
+        let layered = build_test_layered();
+        let gus = NodeId::new(1);
+        let age = PropertyKey::new("age");
+        let base_age = layered.get_node_property(gus, &age).expect("base age");
+
+        layered.overlay.load().sync_epoch(EpochId::new(5));
+        let tx = TransactionId::new(7);
+        layered.set_node_property_versioned(gus, "age", Value::Int64(99), tx);
+        rollback(&layered, tx);
+        assert!(!layered.is_node_dirty(gus));
+
+        layered.overlay.load().sync_epoch(EpochId::new(6));
+        let tx2 = TransactionId::new(8);
+        layered.set_node_property_versioned(gus, "age", Value::Int64(40), tx2);
+        assert!(layered.is_node_dirty(gus), "second copy-up registered");
+        let old = layered
+            .get_node_at_epoch(gus, EpochId::new(1))
+            .expect("copied-up row visible at an older epoch");
+        assert_eq!(old.get_property("age"), Some(&base_age));
+    }
+
+    /// Edge variant of [`temporal_copy_up_after_rolled_back_copy_up`].
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn temporal_edge_copy_up_after_rolled_back_copy_up() {
+        let layered = build_test_layered();
+        let edge = EdgeId::new(1);
+        let since = PropertyKey::new("since");
+        let base_since = layered.get_edge_property(edge, &since).expect("base since");
+
+        layered.overlay.load().sync_epoch(EpochId::new(5));
+        let tx = TransactionId::new(7);
+        layered.set_edge_property_versioned(edge, "since", Value::Int64(1), tx);
+        rollback(&layered, tx);
+        assert!(!layered.is_edge_dirty(edge));
+
+        layered.overlay.load().sync_epoch(EpochId::new(6));
+        let tx2 = TransactionId::new(8);
+        layered.set_edge_property_versioned(edge, "since", Value::Int64(2), tx2);
+        assert!(layered.is_edge_dirty(edge), "second copy-up registered");
+        let old = layered
+            .get_edge_at_epoch(edge, EpochId::new(1))
+            .expect("copied-up edge visible at an older epoch");
+        assert_eq!(old.get_property("since"), Some(&base_since));
     }
 
     /// A base delete racing a first write to the same base node must never
