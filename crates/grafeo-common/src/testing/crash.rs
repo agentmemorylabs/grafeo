@@ -80,6 +80,7 @@ mod inner {
     thread_local! {
         static IO_FAILURE_COUNTER: Cell<u64> = const { Cell::new(u64::MAX) };
         static IO_FAILURE_ENABLED: Cell<bool> = const { Cell::new(false) };
+        static IO_FAILURE_STICKY: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Like [`maybe_crash`], but returns an I/O error instead of panicking,
@@ -97,6 +98,13 @@ mod inner {
             }
             IO_FAILURE_COUNTER.with(|counter| {
                 let prev = counter.get();
+                let sticky = IO_FAILURE_STICKY.with(Cell::get);
+                if sticky && prev <= 1 {
+                    counter.set(0);
+                    return Err(std::io::Error::other(format!(
+                        "injected I/O failure at: {point}"
+                    )));
+                }
                 counter.set(prev.wrapping_sub(1));
                 if prev == 1 {
                     Err(std::io::Error::other(format!(
@@ -112,12 +120,22 @@ mod inner {
     /// Make the `count`-th call to [`maybe_fail_io`] on this thread fail.
     pub fn enable_io_failure_at(count: u64) {
         IO_FAILURE_COUNTER.with(|c| c.set(count));
+        IO_FAILURE_STICKY.with(|s| s.set(false));
+        IO_FAILURE_ENABLED.with(|e| e.set(true));
+    }
+
+    /// Make the `count`-th call to [`maybe_fail_io`] on this thread, and
+    /// every call after it, fail until [`disable_io_failure`].
+    pub fn enable_io_failure_from(count: u64) {
+        IO_FAILURE_COUNTER.with(|c| c.set(count));
+        IO_FAILURE_STICKY.with(|s| s.set(true));
         IO_FAILURE_ENABLED.with(|e| e.set(true));
     }
 
     /// Disable I/O failure injection on this thread.
     pub fn disable_io_failure() {
         IO_FAILURE_ENABLED.with(|e| e.set(false));
+        IO_FAILURE_STICKY.with(|s| s.set(false));
         IO_FAILURE_COUNTER.with(|c| c.set(u64::MAX));
     }
 }
@@ -146,6 +164,9 @@ mod inner {
 
     /// No-op when crash injection is disabled.
     pub fn enable_io_failure_at(_count: u64) {}
+
+    /// No-op when crash injection is disabled.
+    pub fn enable_io_failure_from(_count: u64) {}
 
     /// No-op when crash injection is disabled.
     pub fn disable_io_failure() {}
