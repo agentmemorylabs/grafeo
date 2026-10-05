@@ -84,6 +84,9 @@ pub mod vector_spill_build;
 #[cfg(all(feature = "wal", feature = "lpg"))]
 pub(crate) mod wal_store;
 
+pub use index::ReplayedNodeWrite;
+#[cfg(feature = "wal")]
+pub(crate) use index::replayed_node_write;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use vector_read::IndexedVectorRead;
 
@@ -584,6 +587,12 @@ impl GrafeoDB {
         let mut wal_torn_tail = false;
         #[cfg(all(feature = "wal", feature = "lpg"))]
         let mut wal_in_named_graph = false;
+        // Node writes made by WAL replay below. Replay writes the store
+        // directly, so the index entries they affect are re-synced once the
+        // database is wired (`reconcile_replayed_node_indexes`).
+        #[cfg(all(feature = "wal", feature = "lpg"))]
+        let mut replayed_writes: Vec<(grafeo_common::types::NodeId, ReplayedNodeWrite)> =
+            Vec::new();
 
         // --- Single-file format (.grafeo) ---
         #[cfg(feature = "grafeo-file")]
@@ -696,6 +705,7 @@ impl GrafeoDB {
                     )?;
                     wal_torn_tail = recovered.torn_tail;
                     wal_in_named_graph = Self::ends_in_named_graph(&recovered.records);
+                    replayed_writes.extend(Self::wal_node_writes(&recovered.records));
                 }
 
                 Some(Arc::new(fm))
@@ -750,6 +760,7 @@ impl GrafeoDB {
                     )?;
                     wal_torn_tail = recovered.torn_tail;
                     wal_in_named_graph = Self::ends_in_named_graph(&recovered.records);
+                    replayed_writes.extend(Self::wal_node_writes(&recovered.records));
                 }
 
                 // Open/create WAL manager with configured durability
@@ -909,6 +920,11 @@ impl GrafeoDB {
         // base embeddings). Topology is reused; no full HNSW rebuild.
         #[cfg(all(feature = "lpg", feature = "vector-index"))]
         db.rehydrate_quantized_vector_indexes()?;
+
+        // WAL replay above bypassed index maintenance: re-sync the replayed
+        // nodes' vector/text entries against the wired (layered) view.
+        #[cfg(all(feature = "wal", feature = "lpg"))]
+        db.reconcile_replayed_node_indexes(&replayed_writes);
 
         // Start periodic checkpoint timer if configured
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
@@ -1268,6 +1284,12 @@ impl GrafeoDB {
             }
             db.wal = Some(wal);
         }
+
+        // WAL replay wrote the overlay directly, bypassing index maintenance:
+        // re-sync the replayed nodes' vector/text entries so the restored base
+        // indexes serve every write since the last publication.
+        #[cfg(feature = "wal")]
+        db.reconcile_replayed_node_indexes(&report.node_writes);
 
         db.generation_root = Some(ownership);
 
@@ -1848,6 +1870,37 @@ impl GrafeoDB {
                 _ => None,
             })
             .unwrap_or(false)
+    }
+
+    /// Default-graph node writes made by node records in `records`
+    /// (deduplicated). Tracks the graph cursor the way
+    /// [`apply_wal_records`](Self::apply_wal_records) routes records: named
+    /// graphs have their own stores and can reuse default-graph node IDs, and
+    /// re-syncing an unchanged default-graph node is a full HNSW re-insert.
+    #[cfg(all(feature = "wal", feature = "lpg"))]
+    fn wal_node_writes(
+        records: &[WalRecord],
+    ) -> Vec<(grafeo_common::types::NodeId, ReplayedNodeWrite)> {
+        let mut current_graph: Option<&str> = None;
+        let mut seen = grafeo_common::utils::hash::FxHashSet::default();
+        let mut writes = Vec::new();
+        for record in records {
+            match record {
+                WalRecord::SwitchGraph { name } => current_graph = name.as_deref(),
+                WalRecord::DropNamedGraph { name } if current_graph == Some(name.as_str()) => {
+                    current_graph = None;
+                }
+                _ if current_graph.is_some() => {}
+                _ => {
+                    if let Some(write) = replayed_node_write(record)
+                        && seen.insert(write.clone())
+                    {
+                        writes.push(write);
+                    }
+                }
+            }
+        }
+        writes
     }
 
     /// Applies WAL records to restore the database state.
@@ -4632,6 +4685,48 @@ impl FromValue for bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Named graphs have their own stores and can reuse default-graph node
+    /// IDs: their writes must not re-sync the default graph's node with the
+    /// same ID. Dropping the active graph returns the cursor to the default.
+    #[cfg(all(feature = "wal", feature = "lpg"))]
+    #[test]
+    fn wal_node_writes_skips_named_graph_records() {
+        use grafeo_common::types::{NodeId, Value};
+
+        let vector = || Value::Vector(vec![1.0_f32, 0.0].into());
+        let set = |id: u64| WalRecord::SetNodeProperty {
+            id: NodeId::new(id),
+            key: "embedding".to_string(),
+            value: vector(),
+        };
+        let records = [
+            WalRecord::SwitchGraph {
+                name: Some("g".to_string()),
+            },
+            WalRecord::CreateNode {
+                id: NodeId::new(1),
+                labels: vec!["Doc".to_string()],
+            },
+            set(1),
+            WalRecord::DeleteNode { id: NodeId::new(2) },
+            WalRecord::SwitchGraph { name: None },
+            set(3),
+            WalRecord::SwitchGraph {
+                name: Some("h".to_string()),
+            },
+            set(1),
+            WalRecord::DropNamedGraph {
+                name: "h".to_string(),
+            },
+            set(4),
+        ];
+        let embedding = || ReplayedNodeWrite::Property("embedding".to_string());
+        assert_eq!(
+            GrafeoDB::wal_node_writes(&records),
+            [(NodeId::new(3), embedding()), (NodeId::new(4), embedding())]
+        );
+    }
 
     #[test]
     fn test_create_in_memory_database() {

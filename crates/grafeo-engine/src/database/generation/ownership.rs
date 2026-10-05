@@ -272,6 +272,9 @@ pub struct GenerationRootOwnership {
     ownership: RootOwnership,
     /// The in-process lease registry holding the selected mmap-backed base.
     registry: std::sync::Arc<super::lease::GenerationLeaseRegistry>,
+    /// Retirement authority for this root: owns the backup-pin registry and
+    /// sees the lease registry, so GC run through it honors live backups.
+    retirement: super::retirement::RetirementAuthority,
 }
 
 #[cfg(feature = "mmap")]
@@ -302,10 +305,23 @@ impl GenerationRootOwnership {
             selected.generation_abs_path.clone(),
         )?;
 
+        let retirement = super::retirement::RetirementAuthority::new(&ownership)
+            .with_lease_registry(std::sync::Arc::clone(&registry));
+
         Ok(Self {
             ownership,
             registry,
+            retirement,
         })
+    }
+
+    /// The retirement authority for this root. Live-root GC
+    /// ([`super::retirement::plan_retirement`] /
+    /// [`super::retirement::collect_retirement`]) must go through this one so
+    /// it sees the pins of in-flight backups taken by the database.
+    #[must_use]
+    pub fn retirement(&self) -> &super::retirement::RetirementAuthority {
+        &self.retirement
     }
 
     /// The process ownership (root lock + validated selected generation).

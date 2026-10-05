@@ -22,8 +22,10 @@
 //! | `EpochRetired` | Frozen overlay prefix drained; WAL truncated at B (post-commit) |
 //! | `Cancelled` / `Failed` | No WAL advance, no overlay retire, freeze slot cleared |
 //!
-//! Checkpoint/close while handoff is active return a typed error rather than
-//! racing freeze/publication. Drop is best-effort cancel only.
+//! Checkpoint and close do not check for an active handoff. On a generation
+//! root `wal_checkpoint` only syncs the WAL (it never truncates), so it
+//! cannot race the handoff's WAL cut or truncation. Drop is best-effort
+//! cancel only.
 //!
 //! # Fault injection
 //!
