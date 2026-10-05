@@ -152,12 +152,22 @@ impl GrafeoDB {
             let _lock = self.handoff_root_lock(&generation_root)?;
             let wal_dir = generation_root.join("wal");
             std::fs::create_dir_all(&wal_dir)?;
-            let wal = WalManager::open(&wal_dir)?;
             // Cut boundary B first so concurrent N+1 writes land after B. The
             // merge-guard barrier above guarantees no mutation lands between
             // the cut and the capture below.
-            let cut = cut_generation_boundary(&wal)
-                .map_err(|e| Error::Internal(format!("WAL freeze cut: {e}")))?;
+            //
+            // The cut must rotate the WAL this handle appends to. A private
+            // `WalManager` on the same directory rotates only itself: the
+            // handle keeps appending to the file before B, so every write
+            // after the handoff is skipped by replay and deleted by the next
+            // handoff's `truncate_before`. A private manager is used only
+            // when this database has no WAL in `wal_dir` (e.g. an in-memory
+            // database freezing into a root).
+            let cut = match self.own_wal_in(&wal_dir) {
+                Some(own) => cut_generation_boundary(own),
+                None => cut_generation_boundary(&WalManager::open(&wal_dir)?),
+            }
+            .map_err(|e| Error::Internal(format!("WAL freeze cut: {e}")))?;
             WalBoundary::from_cursor(&cut.cursor)
             // RootLock drops here before N+1 writers and the later build re-acquire.
         };
@@ -331,6 +341,28 @@ impl GrafeoDB {
             post_freeze_nodes,
             post_freeze_edges,
         })
+    }
+
+    /// This database's own WAL manager when it writes to `wal_dir`.
+    #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
+    fn own_wal_in(&self, wal_dir: &Path) -> Option<&WalManager> {
+        #[cfg(feature = "wal")]
+        {
+            let wal = self.wal.as_ref()?;
+            let same = match (
+                std::fs::canonicalize(wal.dir()),
+                std::fs::canonicalize(wal_dir),
+            ) {
+                (Ok(own), Ok(dir)) => own == dir,
+                _ => false,
+            };
+            if same {
+                return Some(wal.manager());
+            }
+        }
+        #[cfg(not(feature = "wal"))]
+        let _ = wal_dir;
+        None
     }
 
     /// One-shot freeze → build → publish → retire.
