@@ -1166,8 +1166,14 @@ impl GrafeoDB {
         {
             let tail = match report.tail {
                 generation::replay::WalTailClass::Clean => "clean".to_string(),
-                generation::replay::WalTailClass::TornTail { seq, byte_offset } => {
-                    format!("torn-tail(seq={seq}, byte_offset={byte_offset})")
+                generation::replay::WalTailClass::TornTail {
+                    seq,
+                    byte_offset,
+                    discard_records,
+                } => {
+                    format!(
+                        "torn-tail(seq={seq}, byte_offset={byte_offset}, discard_records={discard_records})"
+                    )
                 }
             };
             grafeo_info!(
@@ -1183,7 +1189,9 @@ impl GrafeoDB {
         // freshly installed WAL appends after the last committed frame.
         #[cfg(feature = "wal")]
         if !read_only
-            && let generation::replay::WalTailClass::TornTail { seq, byte_offset } = report.tail
+            && let generation::replay::WalTailClass::TornTail {
+                seq, byte_offset, ..
+            } = report.tail
         {
             grafeo_storage::wal::truncate_active_tail(&wal_dir, seq, byte_offset)?;
         }
@@ -1210,7 +1218,21 @@ impl GrafeoDB {
                 durability: wal_durability,
                 ..WalConfig::default()
             };
-            db.wal = Some(Arc::new(LpgWal::with_config(&wal_dir, wal_config)?));
+            let wal = Arc::new(LpgWal::with_config(&wal_dir, wal_config)?);
+            // The torn tail's unfinished transaction left complete records
+            // before the cut. Close it with an abort so the next commit in the
+            // stream cannot pick them up on a later replay.
+            if let generation::replay::WalTailClass::TornTail {
+                discard_records: true,
+                ..
+            } = report.tail
+            {
+                wal.log(&WalRecord::TransactionAbort {
+                    transaction_id: report.max_transaction_id,
+                })?;
+                wal.sync()?;
+            }
+            db.wal = Some(wal);
         }
 
         db.generation_root = Some(ownership);
@@ -2803,6 +2825,7 @@ impl GrafeoDB {
             #[cfg(not(feature = "wal"))]
             let write_store: Arc<dyn GraphStoreMut> = layered_arc as Arc<dyn GraphStoreMut>;
             session.override_stores(read_store, Some(write_store));
+            session.set_layered_store(Arc::clone(layered));
             // Attach the WAL for TransactionCommit/EpochAdvance logging without
             // re-wrapping the store (the write store above is already wrapped).
             #[cfg(feature = "wal")]
@@ -3455,22 +3478,24 @@ impl GrafeoDB {
                 .last_assigned_transaction_id()
                 .unwrap_or_else(|| self.transaction_manager.begin());
 
-            // Log a TransactionCommit to mark all pending records as committed
-            wal.log(&WalRecord::TransactionCommit {
-                transaction_id: commit_tx,
-            })?;
-
-            // Pair the blanket commit with an EpochAdvance: generation-root
-            // replay (H-ADOPT.3) requires an EpochAdvance after EVERY
-            // TransactionCommit, and a second unpaired close-time commit
-            // otherwise poisons the stream (commit-while-awaiting-epoch =>
-            // NonRecoverable), making the root unopenable after two clean
-            // closes. Legacy directory-format recovery treats EpochAdvance as
-            // metadata pass-through (wal/recovery.rs), so this changes
-            // nothing for existing recovery behavior.
-            wal.log(&WalRecord::EpochAdvance {
-                epoch: self.transaction_manager.current_epoch(),
-            })?;
+            // Log a TransactionCommit to mark all pending records as committed,
+            // paired with an EpochAdvance: generation-root replay (H-ADOPT.3)
+            // requires an EpochAdvance right after EVERY TransactionCommit, and
+            // a second unpaired close-time commit otherwise poisons the stream
+            // (commit-while-awaiting-epoch => NonRecoverable), making the root
+            // unopenable after two clean closes. Written as one atomic append
+            // so no other record can land between them. Legacy directory-format
+            // recovery treats EpochAdvance as metadata pass-through
+            // (wal/recovery.rs), so this changes nothing for existing recovery
+            // behavior.
+            wal.log_atomic(&[
+                WalRecord::TransactionCommit {
+                    transaction_id: commit_tx,
+                },
+                WalRecord::EpochAdvance {
+                    epoch: self.transaction_manager.current_epoch(),
+                },
+            ])?;
 
             wal.sync()?;
         }
@@ -3484,6 +3509,22 @@ impl GrafeoDB {
     #[must_use]
     pub fn wal(&self) -> Option<&Arc<LpgWal>> {
         self.wal.as_ref()
+    }
+
+    /// Returns `true` (after a warning) when the WAL is poisoned, so a write
+    /// API that cannot return an error refuses before mutating anything.
+    pub(super) fn refuse_write_if_wal_poisoned(&self, api: &str) -> bool {
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            grafeo_warn!(
+                "{api} refused: WAL refuses writes until the database is reopened: {reason}"
+            );
+            return true;
+        }
+        let _ = api;
+        false
     }
 
     /// Logs a WAL record if WAL is enabled.

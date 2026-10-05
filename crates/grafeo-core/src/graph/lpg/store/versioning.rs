@@ -529,10 +529,14 @@ impl LpgStore {
 
     // === Recovery Support ===
 
-    /// Creates a node with a specific ID during recovery.
+    /// Creates a node with a specific ID, created at `epoch`, by the system
+    /// transaction.
     ///
-    /// This is used for WAL recovery to restore nodes with their original IDs.
-    /// The caller must ensure IDs don't conflict with existing nodes.
+    /// Used by WAL recovery to restore nodes with their original IDs, and by
+    /// `LayeredStore` to copy a base node into the overlay (at epoch 0, so the
+    /// copy is visible to every snapshot, like the base row it stands for).
+    /// Never lowers the ID allocator. The caller must ensure IDs don't
+    /// conflict with existing nodes.
     ///
     /// # Errors
     ///
@@ -540,8 +544,12 @@ impl LpgStore {
     /// (only possible with the `tiered-storage` feature).
     #[cfg(not(feature = "tiered-storage"))]
     #[doc(hidden)]
-    pub fn create_node_with_id(&self, id: NodeId, labels: &[&str]) -> Result<(), AllocError> {
-        let epoch = self.current_epoch();
+    pub fn create_node_with_id_at(
+        &self,
+        id: NodeId,
+        labels: &[&str],
+        epoch: EpochId,
+    ) -> Result<(), AllocError> {
         let mut record = NodeRecord::new(id, epoch);
         // reason: label count per node is bounded by practical limits, fits u16
         #[allow(clippy::cast_possible_truncation)]
@@ -580,8 +588,12 @@ impl LpgStore {
     /// or allocate space for the node record.
     #[cfg(feature = "tiered-storage")]
     #[doc(hidden)]
-    pub fn create_node_with_id(&self, id: NodeId, labels: &[&str]) -> Result<(), AllocError> {
-        let epoch = self.current_epoch();
+    pub fn create_node_with_id_at(
+        &self,
+        id: NodeId,
+        labels: &[&str],
+        epoch: EpochId,
+    ) -> Result<(), AllocError> {
         let mut record = NodeRecord::new(id, epoch);
         // reason: label count per node is bounded by practical limits, fits u16
         #[allow(clippy::cast_possible_truncation)]
@@ -616,9 +628,9 @@ impl LpgStore {
         Ok(())
     }
 
-    /// Creates an edge with a specific ID during recovery.
-    ///
-    /// This is used for WAL recovery to restore edges with their original IDs.
+    /// Creates an edge with a specific ID, created at `epoch`, by the system
+    /// transaction. Edge counterpart of
+    /// [`create_node_with_id_at`](Self::create_node_with_id_at).
     ///
     /// # Errors
     ///
@@ -626,14 +638,14 @@ impl LpgStore {
     /// (only possible with the `tiered-storage` feature).
     #[cfg(not(feature = "tiered-storage"))]
     #[doc(hidden)]
-    pub fn create_edge_with_id(
+    pub fn create_edge_with_id_at(
         &self,
         id: EdgeId,
         src: NodeId,
         dst: NodeId,
         edge_type: &str,
+        epoch: EpochId,
     ) -> Result<(), AllocError> {
-        let epoch = self.current_epoch();
         let type_id = self.get_or_create_edge_type_id(edge_type);
 
         let record = EdgeRecord::new(id, src, dst, type_id, epoch);
@@ -672,14 +684,14 @@ impl LpgStore {
     /// or allocate space for the edge record.
     #[cfg(feature = "tiered-storage")]
     #[doc(hidden)]
-    pub fn create_edge_with_id(
+    pub fn create_edge_with_id_at(
         &self,
         id: EdgeId,
         src: NodeId,
         dst: NodeId,
         edge_type: &str,
+        epoch: EpochId,
     ) -> Result<(), AllocError> {
-        let epoch = self.current_epoch();
         let type_id = self.get_or_create_edge_type_id(edge_type);
 
         let record = EdgeRecord::new(id, src, dst, type_id, epoch);
@@ -714,6 +726,38 @@ impl LpgStore {
                 }
             });
         Ok(())
+    }
+
+    /// Creates a node with a specific ID at the current epoch (WAL recovery).
+    ///
+    /// See [`create_node_with_id_at`](Self::create_node_with_id_at).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocError`] if the arena allocator cannot allocate space
+    /// (only possible with the `tiered-storage` feature).
+    #[doc(hidden)]
+    pub fn create_node_with_id(&self, id: NodeId, labels: &[&str]) -> Result<(), AllocError> {
+        self.create_node_with_id_at(id, labels, self.current_epoch())
+    }
+
+    /// Creates an edge with a specific ID at the current epoch (WAL recovery).
+    ///
+    /// See [`create_edge_with_id_at`](Self::create_edge_with_id_at).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocError`] if the arena allocator cannot allocate space
+    /// (only possible with the `tiered-storage` feature).
+    #[doc(hidden)]
+    pub fn create_edge_with_id(
+        &self,
+        id: EdgeId,
+        src: NodeId,
+        dst: NodeId,
+        edge_type: &str,
+    ) -> Result<(), AllocError> {
+        self.create_edge_with_id_at(id, src, dst, edge_type, self.current_epoch())
     }
 
     /// Sets the current epoch during recovery.
