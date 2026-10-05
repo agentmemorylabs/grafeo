@@ -229,11 +229,11 @@ fn single_node_no_properties() {
 #[test]
 fn self_loop_survives_compact() {
     let live = GrafeoDB::new_in_memory();
-    let n = live.create_node(&["A"]);
+    let n = live.create_node(&["A"]).expect("create node");
     live.create_edge(n, n, "R1");
 
     let mut compacted = GrafeoDB::new_in_memory();
-    let m = compacted.create_node(&["A"]);
+    let m = compacted.create_node(&["A"]).expect("create node");
     compacted.create_edge(m, m, "R1");
     compacted.compact().expect("compact");
 
