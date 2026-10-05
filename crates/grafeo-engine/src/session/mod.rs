@@ -4305,16 +4305,19 @@ impl Session {
             Err(e) => {
                 // Conflict detected: abort the transaction completely so its
                 // entities are released and its versions discarded (#409).
-                // The conflict error is what the caller gets. A lost abort
-                // marker has poisoned a layered WAL (later writes fail with
-                // its reason), and an incomplete layered undo is logged.
+                // The caller gets the conflict error, unless the layered undo
+                // could not restore every base change: a caller that retries
+                // conflicts would then commit on top of them, so it gets the
+                // "rollback incomplete" error instead. A lost abort marker has
+                // poisoned a layered WAL (later writes fail with its reason).
                 #[cfg_attr(not(feature = "compact-store"), allow(unused_variables))]
                 let outcome = self.abort_transaction(transaction_id, &touched);
                 #[cfg(all(feature = "compact-store", feature = "lpg"))]
-                if outcome.unrestored > 0 {
-                    let _ =
-                        Self::incomplete_rollback_error(transaction_id, outcome.unrestored, false);
-                }
+                let e = if outcome.unrestored > 0 {
+                    Self::incomplete_rollback_error(transaction_id, outcome.unrestored, false)
+                } else {
+                    e
+                };
                 #[cfg(feature = "metrics")]
                 {
                     crate::metrics::record_metric!(self.metrics, tx_active, dec);
