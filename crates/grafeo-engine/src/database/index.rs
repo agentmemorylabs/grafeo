@@ -701,38 +701,51 @@ impl super::GrafeoDB {
     // WAL REPLAY RECONCILE
     // =========================================================================
 
-    /// Re-syncs the vector and text index entries of `nodes` with the graph.
+    /// Re-syncs vector and text index entries with the nodes WAL replay wrote.
     ///
     /// WAL replay on open writes the store directly, without the index
     /// maintenance the write APIs do, so indexes restored from a snapshot or
-    /// a generation miss every replayed write. For each node this re-inserts
-    /// its current value where the node still exists and carries the index's
-    /// label, and drops its entry otherwise: a new vector is found, an updated
-    /// one replaces the restored one, a deleted node is no longer returned.
-    /// The work is per replayed node (the same index updates the original
-    /// writes made), never a rebuild over the base.
+    /// a generation miss every replayed write. For each index this re-syncs
+    /// only the nodes whose writes can change it (see
+    /// [`nodes_to_resync`]): it re-inserts the node's current value where the
+    /// node still exists and carries the index's label, and drops its entry
+    /// otherwise. A new vector is found, an updated one replaces the restored
+    /// one, a deleted node is no longer returned; a node that only had other
+    /// properties written is left alone. The work is per replayed write that
+    /// touches the index, never a rebuild over the base.
     ///
+    /// Default graph only: indexes of named graphs are not re-synced.
     /// Mapped (read-only) vector topology cannot be mutated; such an index is
     /// skipped with a warning and serves only the published base.
-    #[cfg(feature = "lpg")]
-    pub(crate) fn reconcile_replayed_node_indexes(&self, nodes: &[grafeo_common::types::NodeId]) {
-        if nodes.is_empty() {
+    #[cfg(all(feature = "lpg", feature = "wal"))]
+    pub(crate) fn reconcile_replayed_node_indexes(
+        &self,
+        writes: &[(grafeo_common::types::NodeId, ReplayedNodeWrite)],
+    ) {
+        if writes.is_empty() {
             return;
         }
         #[cfg(feature = "vector-index")]
-        self.reconcile_replayed_vectors(nodes);
+        self.reconcile_replayed_vectors(writes);
         #[cfg(feature = "text-index")]
-        self.reconcile_replayed_text(nodes);
+        self.reconcile_replayed_text(writes);
     }
 
-    #[cfg(all(feature = "lpg", feature = "vector-index"))]
-    fn reconcile_replayed_vectors(&self, nodes: &[grafeo_common::types::NodeId]) {
+    #[cfg(all(feature = "lpg", feature = "wal", feature = "vector-index"))]
+    fn reconcile_replayed_vectors(
+        &self,
+        writes: &[(grafeo_common::types::NodeId, ReplayedNodeWrite)],
+    ) {
         use grafeo_common::types::{PropertyKey, Value};
 
         for (key, index) in self.lpg_store().vector_index_entries() {
             let Some((label, property)) = key.split_once(':') else {
                 continue;
             };
+            let nodes = nodes_to_resync(writes, label, property);
+            if nodes.is_empty() {
+                continue;
+            }
             if index.is_mmap_backed() {
                 grafeo_common::grafeo_warn!(
                     "vector index {key}: mapped topology cannot take {} replayed node(s); \
@@ -744,7 +757,7 @@ impl super::GrafeoDB {
             let prop_key = PropertyKey::new(property);
             let dimensions = index.config().dimensions;
             let accessor = self.make_vector_accessor(label, property);
-            for &id in nodes {
+            for id in nodes {
                 let node = self
                     .get_node(id)
                     .filter(|node| node.labels.iter().any(|l| l.as_str() == label));
@@ -772,8 +785,11 @@ impl super::GrafeoDB {
         }
     }
 
-    #[cfg(all(feature = "lpg", feature = "text-index"))]
-    fn reconcile_replayed_text(&self, nodes: &[grafeo_common::types::NodeId]) {
+    #[cfg(all(feature = "lpg", feature = "wal", feature = "text-index"))]
+    fn reconcile_replayed_text(
+        &self,
+        writes: &[(grafeo_common::types::NodeId, ReplayedNodeWrite)],
+    ) {
         use grafeo_common::types::{PropertyKey, Value};
 
         for (key, index) in self.lpg_store().text_index_entries() {
@@ -781,7 +797,7 @@ impl super::GrafeoDB {
                 continue;
             };
             let prop_key = PropertyKey::new(property);
-            for &id in nodes {
+            for id in nodes_to_resync(writes, label, property) {
                 let text = self
                     .get_node(id)
                     .filter(|node| node.labels.iter().any(|l| l.as_str() == label))
@@ -798,5 +814,112 @@ impl super::GrafeoDB {
                 }
             }
         }
+    }
+}
+
+/// What a replayed WAL record wrote on a node, as far as index re-sync cares.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReplayedNodeWrite {
+    /// The node was created.
+    Created,
+    /// The node was deleted.
+    Deleted,
+    /// A property was set or removed.
+    Property(String),
+    /// A label was added or removed.
+    Label(String),
+}
+
+/// The node write `record` makes, if it is a node record.
+#[cfg(feature = "wal")]
+pub(crate) fn replayed_node_write(
+    record: &grafeo_storage::wal::WalRecord,
+) -> Option<(grafeo_common::types::NodeId, ReplayedNodeWrite)> {
+    use grafeo_storage::wal::WalRecord;
+
+    match record {
+        WalRecord::CreateNode { id, .. } => Some((*id, ReplayedNodeWrite::Created)),
+        WalRecord::DeleteNode { id } => Some((*id, ReplayedNodeWrite::Deleted)),
+        WalRecord::SetNodeProperty { id, key, .. } | WalRecord::RemoveNodeProperty { id, key } => {
+            Some((*id, ReplayedNodeWrite::Property(key.clone())))
+        }
+        WalRecord::AddNodeLabel { id, label } | WalRecord::RemoveNodeLabel { id, label } => {
+            Some((*id, ReplayedNodeWrite::Label(label.clone())))
+        }
+        _ => None,
+    }
+}
+
+/// The nodes among `writes` whose entry in the `label`/`property` index can
+/// have changed: created or deleted nodes, writes to `property`, and adds or
+/// removals of `label`. Deduplicated, in first-write order.
+#[cfg(all(
+    feature = "lpg",
+    feature = "wal",
+    any(feature = "vector-index", feature = "text-index")
+))]
+fn nodes_to_resync(
+    writes: &[(grafeo_common::types::NodeId, ReplayedNodeWrite)],
+    label: &str,
+    property: &str,
+) -> Vec<grafeo_common::types::NodeId> {
+    let mut seen = grafeo_common::utils::hash::FxHashSet::default();
+    writes
+        .iter()
+        .filter(|(_, write)| match write {
+            ReplayedNodeWrite::Created | ReplayedNodeWrite::Deleted => true,
+            ReplayedNodeWrite::Property(key) => key == property,
+            ReplayedNodeWrite::Label(name) => name == label,
+        })
+        .map(|(id, _)| *id)
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+#[cfg(all(
+    test,
+    feature = "lpg",
+    feature = "wal",
+    any(feature = "vector-index", feature = "text-index")
+))]
+mod tests {
+    use grafeo_common::types::NodeId;
+
+    use super::{ReplayedNodeWrite, nodes_to_resync};
+
+    fn prop(key: &str) -> ReplayedNodeWrite {
+        ReplayedNodeWrite::Property(key.to_string())
+    }
+
+    fn label(name: &str) -> ReplayedNodeWrite {
+        ReplayedNodeWrite::Label(name.to_string())
+    }
+
+    #[test]
+    fn non_index_writes_do_not_resync() {
+        // A node carrying an embedding that only had other properties or
+        // labels written is not re-inserted into the `Doc:embedding` index.
+        let writes = [
+            (NodeId::new(1), prop("updated_at")),
+            (NodeId::new(1), prop("observations")),
+            (NodeId::new(1), label("Archived")),
+        ];
+        assert!(nodes_to_resync(&writes, "Doc", "embedding").is_empty());
+    }
+
+    #[test]
+    fn index_writes_resync_each_node_once() {
+        let writes = [
+            (NodeId::new(1), prop("embedding")),
+            (NodeId::new(2), ReplayedNodeWrite::Created),
+            (NodeId::new(3), ReplayedNodeWrite::Deleted),
+            (NodeId::new(4), label("Doc")),
+            (NodeId::new(1), prop("embedding")),
+            (NodeId::new(5), prop("updated_at")),
+        ];
+        assert_eq!(
+            nodes_to_resync(&writes, "Doc", "embedding"),
+            [1, 2, 3, 4].map(NodeId::new)
+        );
     }
 }

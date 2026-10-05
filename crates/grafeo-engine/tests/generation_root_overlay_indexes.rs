@@ -133,7 +133,7 @@ fn write_vectors(db: &GrafeoDB, base: &[NodeId]) -> Writes {
 }
 
 fn check_vectors(db: &GrafeoDB, w: &Writes, stage: &str, failures: &mut Vec<String>) {
-    let all = BASE_NODES as usize + 1;
+    let all = usize::try_from(BASE_NODES).expect("small count") + 1;
     let top = nearest(db, NEW_SEED, 1);
     if top != [w.created] {
         failures.push(format!(
@@ -236,6 +236,108 @@ fn overlay_vectors_survive_reopen_then_more_writes() {
     if top != [later] {
         failures.push(format!(
             "[second reopen] later vector: nearest is {top:?}, want [{later:?}]"
+        ));
+    }
+    assert_no_failures(&failures);
+}
+
+const NOTE: &str = "Note";
+
+/// Like `publish_base`, but every node carries both `:Doc` and `:Note`, and
+/// each label has its own vector index on `embedding`.
+fn publish_two_label_base(root: &Path) -> Vec<NodeId> {
+    std::fs::create_dir_all(root).expect("root dir");
+    let source = GrafeoDB::new_in_memory();
+    let ids = (0..BASE_NODES)
+        .map(|i| {
+            source
+                .create_node_with_props(&[LABEL, NOTE], [(VEC, vector(i))])
+                .expect("create base node")
+        })
+        .collect();
+    for label in [LABEL, NOTE] {
+        source
+            .create_vector_index(label, VEC, Some(DIMS), Some("cosine"), None, None, None)
+            .expect("create vector index");
+    }
+    source
+        .build_and_publish_generation(generation_build_request(root, "g1"))
+        .expect("publish base generation");
+    ids
+}
+
+fn nearest_in(db: &GrafeoDB, label: &str, seed: u64, k: usize) -> Vec<NodeId> {
+    db.vector_search(label, VEC, &seeded_vector(seed), k, None, None)
+        .expect("vector search")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// After reopen, each label's index reflects index-membership changes made
+/// since the publication: an updated vector is served by both indexes, a
+/// removed vector property drops the node from both, a removed label drops
+/// it from that label's index only, and a non-vector property update leaves
+/// the node served as before.
+#[test]
+fn index_membership_changes_survive_reopen() {
+    let dir = tempdir().expect("temp dir");
+    let root = dir.path().join("two.grafeo.d");
+    let base = publish_two_label_base(&root);
+    let (updated, unvectored, unlabeled, touched) = (base[2], base[4], base[6], base[8]);
+    let all = usize::try_from(BASE_NODES).expect("small count");
+
+    {
+        let db = open(&root);
+        db.set_node_property(updated, VEC, vector(UPDATED_SEED))
+            .expect("update vector");
+        db.execute_cypher(&format!(
+            "MATCH (n:Doc) WHERE id(n) = {} REMOVE n.embedding",
+            unvectored.as_u64()
+        ))
+        .expect("remove vector property");
+        db.execute_cypher(&format!(
+            "MATCH (n:Doc) WHERE id(n) = {} REMOVE n:Note",
+            unlabeled.as_u64()
+        ))
+        .expect("remove label");
+        db.set_node_property(touched, "updated_at", Value::Int64(1))
+            .expect("non-vector update");
+        db.close().expect("close");
+    }
+
+    let db = open(&root);
+    let mut failures = Vec::new();
+    for label in [LABEL, NOTE] {
+        let top = nearest_in(&db, label, UPDATED_SEED, 1);
+        if top != [updated] {
+            failures.push(format!(
+                ":{label} updated vector: nearest is {top:?}, want [{updated:?}]"
+            ));
+        }
+        let hits = nearest_in(&db, label, 4, all);
+        if hits.contains(&unvectored) {
+            failures.push(format!(
+                ":{label} node {unvectored:?} without a vector returned: {hits:?}"
+            ));
+        }
+        let top = nearest_in(&db, label, 8, 1);
+        if top != [touched] {
+            failures.push(format!(
+                ":{label} node {touched:?} after a non-vector update: nearest is {top:?}"
+            ));
+        }
+    }
+    let hits = nearest_in(&db, NOTE, 6, all);
+    if hits.contains(&unlabeled) {
+        failures.push(format!(
+            ":Note returned {unlabeled:?} after its :Note label was removed: {hits:?}"
+        ));
+    }
+    let top = nearest_in(&db, LABEL, 6, 1);
+    if top != [unlabeled] {
+        failures.push(format!(
+            ":Doc must still serve {unlabeled:?}: nearest is {top:?}"
         ));
     }
     assert_no_failures(&failures);

@@ -70,11 +70,11 @@ pub struct ReplayReport {
     pub final_epoch: EpochId,
     /// Maximum of the boundary transaction ID and replayed commit IDs.
     pub max_transaction_id: TransactionId,
-    /// Default-graph nodes written by applied records (created, deleted, or
-    /// with a property or label change), deduplicated, in first-write order.
-    /// Replay writes the store directly, so the caller re-syncs these nodes'
-    /// vector and text index entries afterwards.
-    pub touched_nodes: Vec<NodeId>,
+    /// Default-graph node writes made by applied records (create, delete,
+    /// property key, label), deduplicated, in first-write order. Replay
+    /// writes the store directly, so the caller re-syncs the index entries
+    /// these writes can affect afterwards.
+    pub node_writes: Vec<(NodeId, crate::database::ReplayedNodeWrite)>,
 }
 
 /// Failure scanning or applying a generation WAL tail.
@@ -111,20 +111,15 @@ struct LpgReplayCursor {
     named_target: Option<Arc<LpgStore>>,
 }
 
-/// The node a default-graph node record writes, if `record` is one.
-fn written_node(record: &WalRecord, cursor: &LpgReplayCursor) -> Option<NodeId> {
+/// The default-graph node write `record` makes, if it is a node record.
+fn written_node(
+    record: &WalRecord,
+    cursor: &LpgReplayCursor,
+) -> Option<(NodeId, crate::database::ReplayedNodeWrite)> {
     if cursor.named_target.is_some() {
         return None;
     }
-    match record {
-        WalRecord::CreateNode { id, .. }
-        | WalRecord::DeleteNode { id }
-        | WalRecord::SetNodeProperty { id, .. }
-        | WalRecord::RemoveNodeProperty { id, .. }
-        | WalRecord::AddNodeLabel { id, .. }
-        | WalRecord::RemoveNodeLabel { id, .. } => Some(*id),
-        _ => None,
-    }
+    crate::database::replayed_node_write(record)
 }
 
 fn apply_error(frame: &ReplayFrame, detail: impl Into<String>) -> ReplayError {
@@ -636,9 +631,8 @@ pub fn replay_generation_wal(
     let mut committed_transactions = 0u64;
     let mut final_epoch = EpochId::new(boundary.overlay_epoch);
     let mut max_transaction_id = TransactionId::new(boundary.transaction_id);
-    let mut touched_nodes: Vec<NodeId> = Vec::new();
-    let mut touched_seen: grafeo_common::utils::hash::FxHashSet<NodeId> =
-        grafeo_common::utils::hash::FxHashSet::default();
+    let mut node_writes: Vec<(NodeId, crate::database::ReplayedNodeWrite)> = Vec::new();
+    let mut node_writes_seen = grafeo_common::utils::hash::FxHashSet::default();
 
     for frame in stream.by_ref() {
         let frame = frame?;
@@ -680,10 +674,10 @@ pub fn replay_generation_wal(
                 for committed_frame in committed.drain(..) {
                     apply_record(&committed_frame, target, &mut cursor)?;
                     applied_records += 1;
-                    if let Some(id) = written_node(&committed_frame.record, &cursor)
-                        && touched_seen.insert(id)
+                    if let Some(write) = written_node(&committed_frame.record, &cursor)
+                        && node_writes_seen.insert(write.clone())
                     {
-                        touched_nodes.push(id);
+                        node_writes.push(write);
                     }
                 }
                 commit_position = None;
@@ -781,7 +775,7 @@ pub fn replay_generation_wal(
         tail,
         final_epoch,
         max_transaction_id,
-        touched_nodes,
+        node_writes,
     })
 }
 

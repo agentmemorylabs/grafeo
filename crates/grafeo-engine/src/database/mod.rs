@@ -84,6 +84,9 @@ pub mod vector_spill_build;
 #[cfg(all(feature = "wal", feature = "lpg"))]
 pub(crate) mod wal_store;
 
+pub use index::ReplayedNodeWrite;
+#[cfg(feature = "wal")]
+pub(crate) use index::replayed_node_write;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use vector_read::IndexedVectorRead;
 
@@ -576,11 +579,12 @@ impl GrafeoDB {
             Vec<grafeo_common::types::EdgeId>,
         )> = None;
 
-        // Nodes written by WAL replay below. Replay writes the store directly,
-        // so their vector/text index entries are re-synced once the database
-        // is wired (`reconcile_replayed_node_indexes`).
+        // Node writes made by WAL replay below. Replay writes the store
+        // directly, so the index entries they affect are re-synced once the
+        // database is wired (`reconcile_replayed_node_indexes`).
         #[cfg(all(feature = "wal", feature = "lpg"))]
-        let mut replayed_nodes: Vec<grafeo_common::types::NodeId> = Vec::new();
+        let mut replayed_writes: Vec<(grafeo_common::types::NodeId, ReplayedNodeWrite)> =
+            Vec::new();
 
         // --- Single-file format (.grafeo) ---
         #[cfg(feature = "grafeo-file")]
@@ -691,7 +695,7 @@ impl GrafeoDB {
                         &rdf_store,
                         &records,
                     )?;
-                    replayed_nodes.extend(Self::wal_written_nodes(&records));
+                    replayed_writes.extend(Self::wal_node_writes(&records));
                 }
 
                 Some(Arc::new(fm))
@@ -744,7 +748,7 @@ impl GrafeoDB {
                         &rdf_store,
                         &records,
                     )?;
-                    replayed_nodes.extend(Self::wal_written_nodes(&records));
+                    replayed_writes.extend(Self::wal_node_writes(&records));
                 }
 
                 // Open/create WAL manager with configured durability
@@ -899,7 +903,7 @@ impl GrafeoDB {
         // WAL replay above bypassed index maintenance: re-sync the replayed
         // nodes' vector/text entries against the wired (layered) view.
         #[cfg(all(feature = "wal", feature = "lpg"))]
-        db.reconcile_replayed_node_indexes(&replayed_nodes);
+        db.reconcile_replayed_node_indexes(&replayed_writes);
 
         // Start periodic checkpoint timer if configured
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
@@ -1252,7 +1256,7 @@ impl GrafeoDB {
         // re-sync the replayed nodes' vector/text entries so the restored base
         // indexes serve every write since the last publication.
         #[cfg(feature = "wal")]
-        db.reconcile_replayed_node_indexes(&report.touched_nodes);
+        db.reconcile_replayed_node_indexes(&report.node_writes);
 
         db.generation_root = Some(ownership);
 
@@ -1819,25 +1823,19 @@ impl GrafeoDB {
         Ok(())
     }
 
-    /// Nodes written by node records in `records` (deduplicated). Graph
+    /// Node writes made by node records in `records` (deduplicated). Graph
     /// switches are not tracked: re-syncing a default-graph node that a
     /// named-graph record happened to share an ID with is harmless, since
     /// the re-sync reads the node's current state.
     #[cfg(all(feature = "wal", feature = "lpg"))]
-    fn wal_written_nodes(records: &[WalRecord]) -> Vec<grafeo_common::types::NodeId> {
+    fn wal_node_writes(
+        records: &[WalRecord],
+    ) -> Vec<(grafeo_common::types::NodeId, ReplayedNodeWrite)> {
         let mut seen = grafeo_common::utils::hash::FxHashSet::default();
         records
             .iter()
-            .filter_map(|record| match record {
-                WalRecord::CreateNode { id, .. }
-                | WalRecord::DeleteNode { id }
-                | WalRecord::SetNodeProperty { id, .. }
-                | WalRecord::RemoveNodeProperty { id, .. }
-                | WalRecord::AddNodeLabel { id, .. }
-                | WalRecord::RemoveNodeLabel { id, .. } => Some(*id),
-                _ => None,
-            })
-            .filter(|id| seen.insert(*id))
+            .filter_map(replayed_node_write)
+            .filter(|write| seen.insert(write.clone()))
             .collect()
     }
 
