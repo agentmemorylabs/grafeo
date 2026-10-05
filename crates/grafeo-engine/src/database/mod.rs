@@ -576,6 +576,12 @@ impl GrafeoDB {
             Vec<grafeo_common::types::EdgeId>,
         )> = None;
 
+        // Nodes written by WAL replay below. Replay writes the store directly,
+        // so their vector/text index entries are re-synced once the database
+        // is wired (`reconcile_replayed_node_indexes`).
+        #[cfg(all(feature = "wal", feature = "lpg"))]
+        let mut replayed_nodes: Vec<grafeo_common::types::NodeId> = Vec::new();
+
         // --- Single-file format (.grafeo) ---
         #[cfg(feature = "grafeo-file")]
         let file_manager: Option<Arc<GrafeoFileManager>> = if is_read_only {
@@ -685,6 +691,7 @@ impl GrafeoDB {
                         &rdf_store,
                         &records,
                     )?;
+                    replayed_nodes.extend(Self::wal_written_nodes(&records));
                 }
 
                 Some(Arc::new(fm))
@@ -737,6 +744,7 @@ impl GrafeoDB {
                         &rdf_store,
                         &records,
                     )?;
+                    replayed_nodes.extend(Self::wal_written_nodes(&records));
                 }
 
                 // Open/create WAL manager with configured durability
@@ -887,6 +895,11 @@ impl GrafeoDB {
         // base embeddings). Topology is reused; no full HNSW rebuild.
         #[cfg(all(feature = "lpg", feature = "vector-index"))]
         db.rehydrate_quantized_vector_indexes()?;
+
+        // WAL replay above bypassed index maintenance: re-sync the replayed
+        // nodes' vector/text entries against the wired (layered) view.
+        #[cfg(all(feature = "wal", feature = "lpg"))]
+        db.reconcile_replayed_node_indexes(&replayed_nodes);
 
         // Start periodic checkpoint timer if configured
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
@@ -1234,6 +1247,12 @@ impl GrafeoDB {
             }
             db.wal = Some(wal);
         }
+
+        // WAL replay wrote the overlay directly, bypassing index maintenance:
+        // re-sync the replayed nodes' vector/text entries so the restored base
+        // indexes serve every write since the last publication.
+        #[cfg(feature = "wal")]
+        db.reconcile_replayed_node_indexes(&report.touched_nodes);
 
         db.generation_root = Some(ownership);
 
@@ -1798,6 +1817,28 @@ impl GrafeoDB {
         self.query_cache = Arc::new(QueryCache::default());
 
         Ok(())
+    }
+
+    /// Nodes written by node records in `records` (deduplicated). Graph
+    /// switches are not tracked: re-syncing a default-graph node that a
+    /// named-graph record happened to share an ID with is harmless, since
+    /// the re-sync reads the node's current state.
+    #[cfg(all(feature = "wal", feature = "lpg"))]
+    fn wal_written_nodes(records: &[WalRecord]) -> Vec<grafeo_common::types::NodeId> {
+        let mut seen = grafeo_common::utils::hash::FxHashSet::default();
+        records
+            .iter()
+            .filter_map(|record| match record {
+                WalRecord::CreateNode { id, .. }
+                | WalRecord::DeleteNode { id }
+                | WalRecord::SetNodeProperty { id, .. }
+                | WalRecord::RemoveNodeProperty { id, .. }
+                | WalRecord::AddNodeLabel { id, .. }
+                | WalRecord::RemoveNodeLabel { id, .. } => Some(*id),
+                _ => None,
+            })
+            .filter(|id| seen.insert(*id))
+            .collect()
     }
 
     /// Applies WAL records to restore the database state.

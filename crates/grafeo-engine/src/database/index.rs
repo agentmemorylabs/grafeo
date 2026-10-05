@@ -696,4 +696,107 @@ impl super::GrafeoDB {
         self.lpg_store().remove_text_index(label, property);
         self.create_text_index(label, property)
     }
+
+    // =========================================================================
+    // WAL REPLAY RECONCILE
+    // =========================================================================
+
+    /// Re-syncs the vector and text index entries of `nodes` with the graph.
+    ///
+    /// WAL replay on open writes the store directly, without the index
+    /// maintenance the write APIs do, so indexes restored from a snapshot or
+    /// a generation miss every replayed write. For each node this re-inserts
+    /// its current value where the node still exists and carries the index's
+    /// label, and drops its entry otherwise: a new vector is found, an updated
+    /// one replaces the restored one, a deleted node is no longer returned.
+    /// The work is per replayed node (the same index updates the original
+    /// writes made), never a rebuild over the base.
+    ///
+    /// Mapped (read-only) vector topology cannot be mutated; such an index is
+    /// skipped with a warning and serves only the published base.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn reconcile_replayed_node_indexes(&self, nodes: &[grafeo_common::types::NodeId]) {
+        if nodes.is_empty() {
+            return;
+        }
+        #[cfg(feature = "vector-index")]
+        self.reconcile_replayed_vectors(nodes);
+        #[cfg(feature = "text-index")]
+        self.reconcile_replayed_text(nodes);
+    }
+
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    fn reconcile_replayed_vectors(&self, nodes: &[grafeo_common::types::NodeId]) {
+        use grafeo_common::types::{PropertyKey, Value};
+
+        for (key, index) in self.lpg_store().vector_index_entries() {
+            let Some((label, property)) = key.split_once(':') else {
+                continue;
+            };
+            if index.is_mmap_backed() {
+                grafeo_common::grafeo_warn!(
+                    "vector index {key}: mapped topology cannot take {} replayed node(s); \
+                     they are not served by vector search until the next publication",
+                    nodes.len()
+                );
+                continue;
+            }
+            let prop_key = PropertyKey::new(property);
+            let dimensions = index.config().dimensions;
+            let accessor = self.make_vector_accessor(label, property);
+            for &id in nodes {
+                let node = self
+                    .get_node(id)
+                    .filter(|node| node.labels.iter().any(|l| l.as_str() == label));
+                match node
+                    .as_ref()
+                    .and_then(|node| node.properties.get(&prop_key))
+                {
+                    // `insert` replaces an existing entry for `id`.
+                    Some(Value::Vector(vector)) if vector.len() == dimensions => {
+                        index.insert(id, vector, &accessor);
+                    }
+                    Some(Value::Vector(vector)) => {
+                        grafeo_common::grafeo_warn!(
+                            "vector index {key}: replayed node {} has {} dimensions, expected {dimensions}; not indexed",
+                            id.as_u64(),
+                            vector.len()
+                        );
+                        index.remove(id);
+                    }
+                    _ => {
+                        index.remove(id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "lpg", feature = "text-index"))]
+    fn reconcile_replayed_text(&self, nodes: &[grafeo_common::types::NodeId]) {
+        use grafeo_common::types::{PropertyKey, Value};
+
+        for (key, index) in self.lpg_store().text_index_entries() {
+            let Some((label, property)) = key.split_once(':') else {
+                continue;
+            };
+            let prop_key = PropertyKey::new(property);
+            for &id in nodes {
+                let text = self
+                    .get_node(id)
+                    .filter(|node| node.labels.iter().any(|l| l.as_str() == label))
+                    .and_then(|node| match node.properties.get(&prop_key) {
+                        Some(Value::String(text)) => Some(text.to_string()),
+                        _ => None,
+                    });
+                let mut index = index.write();
+                match text {
+                    Some(text) => index.insert(id, &text),
+                    None => {
+                        index.remove(id);
+                    }
+                }
+            }
+        }
+    }
 }

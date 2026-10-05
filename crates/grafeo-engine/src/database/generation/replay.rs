@@ -70,6 +70,11 @@ pub struct ReplayReport {
     pub final_epoch: EpochId,
     /// Maximum of the boundary transaction ID and replayed commit IDs.
     pub max_transaction_id: TransactionId,
+    /// Default-graph nodes written by applied records (created, deleted, or
+    /// with a property or label change), deduplicated, in first-write order.
+    /// Replay writes the store directly, so the caller re-syncs these nodes'
+    /// vector and text index entries afterwards.
+    pub touched_nodes: Vec<NodeId>,
 }
 
 /// Failure scanning or applying a generation WAL tail.
@@ -104,6 +109,22 @@ pub enum ReplayError {
 struct LpgReplayCursor {
     current_graph: Option<String>,
     named_target: Option<Arc<LpgStore>>,
+}
+
+/// The node a default-graph node record writes, if `record` is one.
+fn written_node(record: &WalRecord, cursor: &LpgReplayCursor) -> Option<NodeId> {
+    if cursor.named_target.is_some() {
+        return None;
+    }
+    match record {
+        WalRecord::CreateNode { id, .. }
+        | WalRecord::DeleteNode { id }
+        | WalRecord::SetNodeProperty { id, .. }
+        | WalRecord::RemoveNodeProperty { id, .. }
+        | WalRecord::AddNodeLabel { id, .. }
+        | WalRecord::RemoveNodeLabel { id, .. } => Some(*id),
+        _ => None,
+    }
 }
 
 fn apply_error(frame: &ReplayFrame, detail: impl Into<String>) -> ReplayError {
@@ -615,6 +636,9 @@ pub fn replay_generation_wal(
     let mut committed_transactions = 0u64;
     let mut final_epoch = EpochId::new(boundary.overlay_epoch);
     let mut max_transaction_id = TransactionId::new(boundary.transaction_id);
+    let mut touched_nodes: Vec<NodeId> = Vec::new();
+    let mut touched_seen: grafeo_common::utils::hash::FxHashSet<NodeId> =
+        grafeo_common::utils::hash::FxHashSet::default();
 
     for frame in stream.by_ref() {
         let frame = frame?;
@@ -656,6 +680,11 @@ pub fn replay_generation_wal(
                 for committed_frame in committed.drain(..) {
                     apply_record(&committed_frame, target, &mut cursor)?;
                     applied_records += 1;
+                    if let Some(id) = written_node(&committed_frame.record, &cursor)
+                        && touched_seen.insert(id)
+                    {
+                        touched_nodes.push(id);
+                    }
                 }
                 commit_position = None;
                 committed_transactions += 1;
@@ -752,6 +781,7 @@ pub fn replay_generation_wal(
         tail,
         final_epoch,
         max_transaction_id,
+        touched_nodes,
     })
 }
 

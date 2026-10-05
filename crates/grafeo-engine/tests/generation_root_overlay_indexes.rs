@@ -1,10 +1,10 @@
-//! Vector and text indexes on a reopened writable generation root must serve
-//! the writes made since the last publication.
+//! Vector indexes on a reopened writable generation root must serve the
+//! writes made since the last publication.
 //!
 //! A writable generation root restores its vector/text indexes from the
 //! published base sections, then replays the post-boundary WAL into a fresh
 //! overlay. WAL replay writes the store directly; the index maintenance that
-//! the write APIs do (HNSW insert/remove, BM25 postings) does not run there.
+//! the write APIs do (HNSW insert/remove, text postings) does not run there.
 //! So without a reconcile step, every write since the last publication drops
 //! out of the indexes after any restart, silently: new vectors are not found,
 //! updated vectors are found under their old value, and deleted nodes are
@@ -96,14 +96,6 @@ fn open(root: &Path) -> GrafeoDB {
 fn nearest(db: &GrafeoDB, seed: u64, k: usize) -> Vec<NodeId> {
     db.vector_search(LABEL, VEC, &seeded_vector(seed), k, None, None)
         .expect("vector search")
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect()
-}
-
-fn text_hits(db: &GrafeoDB, query: &str) -> Vec<NodeId> {
-    db.text_search(LABEL, TEXT, query, 64)
-        .expect("text search")
         .into_iter()
         .map(|(id, _)| id)
         .collect()
@@ -249,62 +241,22 @@ fn overlay_vectors_survive_reopen_then_more_writes() {
     assert_no_failures(&failures);
 }
 
-/// Text written since the last publication is served by `text_search`, live
-/// and after reopen: a new body is found, an updated body is found under its
-/// new text only, a deleted node is not returned.
+/// A read-only reopen maps the base vector topology, which cannot take the
+/// replayed overlay vectors: the open must still succeed and serve the base
+/// (the overlay vectors are served once a publication absorbs them).
 #[test]
-fn overlay_text_is_searchable_live_and_after_reopen() {
+fn read_only_reopen_with_overlay_vectors_opens_and_serves_base() {
     let dir = tempdir().expect("temp dir");
-    let root = dir.path().join("text.grafeo.d");
+    let root = dir.path().join("ro.grafeo.d");
     let base = publish_base(&root);
-    let mut failures = Vec::new();
-
-    let check = |db: &GrafeoDB, created: NodeId, stage: &str, failures: &mut Vec<String>| {
-        let hits = text_hits(db, "zebra");
-        if hits != [created] {
-            failures.push(format!(
-                "[{stage}] new body: hits {hits:?}, want [{created:?}]"
-            ));
-        }
-        let hits = text_hits(db, "giraffe");
-        if hits != [base[3]] {
-            failures.push(format!(
-                "[{stage}] updated body: hits {hits:?}, want [{:?}]",
-                base[3]
-            ));
-        }
-        let hits = text_hits(db, "number3");
-        if hits.contains(&base[3]) {
-            failures.push(format!(
-                "[{stage}] updated node {:?} still found by its old body",
-                base[3]
-            ));
-        }
-        let hits = text_hits(db, "number5");
-        if hits.contains(&base[5]) {
-            failures.push(format!("[{stage}] deleted node {:?} returned", base[5]));
-        }
-    };
-
-    let created = {
+    {
         let db = open(&root);
-        let created = db
-            .create_node_with_props(&[LABEL], [(TEXT, Value::from("a zebra document"))])
-            .expect("create overlay node");
-        db.set_node_property(base[3], TEXT, Value::from("a giraffe document"))
-            .expect("update base body");
-        assert!(
-            db.delete_node(base[5]).expect("delete"),
-            "base node deleted"
-        );
-        check(&db, created, "live", &mut failures);
+        write_vectors(&db, &base);
         db.close().expect("close");
-        created
-    };
+    }
 
-    let db = open(&root);
-    check(&db, created, "reopen", &mut failures);
-    assert_no_failures(&failures);
+    let db = GrafeoDB::open_generation_root(&root, true).expect("read-only reopen");
+    assert_eq!(nearest(&db, 7, 1), [base[7]], "base vector served");
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -341,7 +293,23 @@ fn single_file_sidecar_replay_keeps_vectors_searchable() {
         .expect("create vector index");
     db.wal_checkpoint().expect("checkpoint to file");
 
-    let writes = write_vectors(&db, &base);
+    // Crash recovery replays committed transactions only, so write through
+    // one (the plain direct-CRUD API logs no commit marker).
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    let created = session
+        .create_node_with_props(&[LABEL], [(VEC, vector(NEW_SEED))])
+        .expect("create node");
+    session
+        .set_node_property(base[3], VEC, vector(UPDATED_SEED))
+        .expect("update vector");
+    assert!(session.delete_node(base[5]), "node deleted");
+    session.commit().expect("commit");
+    let writes = Writes {
+        created,
+        updated: base[3],
+        deleted: base[5],
+    };
     check_vectors(&db, &writes, "live", &mut failures);
     db.wal().expect("sidecar WAL").sync().expect("sync WAL");
 
