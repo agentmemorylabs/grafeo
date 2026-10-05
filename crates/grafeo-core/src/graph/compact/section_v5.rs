@@ -360,39 +360,7 @@ pub fn serialize_v5_with_string_order(
     // ── ID lookups
     let flags: u8 = u8::from(store.preserves_ids());
     if store.preserves_ids() {
-        let mut node_lookup = Vec::new();
-        let mut edge_lookup = Vec::new();
-        let mut node_orig = Vec::new();
-        let mut edge_orig = Vec::new();
-
-        if let Some(ref map) = store.node_id_map {
-            let mut entries: Vec<_> = map.iter().map(|(&id, &v)| (id.as_u64(), v)).collect();
-            entries.sort_by_key(|(id, _)| *id);
-            for (id, (tid, off)) in entries {
-                write_node_id_record(&mut node_lookup, id, tid, off);
-            }
-        }
-        if let Some(ref rev) = store.node_offset_to_id {
-            for table in rev {
-                for id in table {
-                    write_u64(&mut node_orig, id.as_u64());
-                }
-            }
-        }
-        if let Some(ref map) = store.edge_id_map {
-            let mut entries: Vec<_> = map.iter().map(|(&id, &v)| (id.as_u64(), v)).collect();
-            entries.sort_by_key(|(id, _)| *id);
-            for (id, (rid, pos)) in entries {
-                write_edge_id_record(&mut edge_lookup, id, rid, pos);
-            }
-        }
-        if let Some(ref rev) = store.edge_offset_to_id {
-            for table in rev {
-                for id in table {
-                    write_u64(&mut edge_orig, id.as_u64());
-                }
-            }
-        }
+        let [node_lookup, edge_lookup, node_orig, edge_orig] = encode_id_segments(store);
         segments.push((SegmentKind::NodeIdLookup, 1, 0x0001, 8, 24, node_lookup));
         segments.push((SegmentKind::EdgeIdLookup, 1, 0x0001, 8, 24, edge_lookup));
         segments.push((SegmentKind::NodeOriginalIds, 1, 0x0001, 8, 8, node_orig));
@@ -1340,6 +1308,63 @@ pub(crate) fn write_u16(buf: &mut Vec<u8>, v: u16) {
 pub(crate) fn write_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
+/// Encodes the four id-preservation segment bodies, in order: node id lookup,
+/// edge id lookup, node original ids, edge original ids. Shared by the eager
+/// writer above and the streaming writer (`generation::emit::segments`).
+///
+/// A store built on the heap carries the heap maps; a store loaded from a v5
+/// payload carries the mapped segments instead (`set_mapped_id_indexes`
+/// clears the heap maps). Each segment is encoded from whichever form is
+/// installed, so re-serializing a mapped-loaded base keeps its ids. The
+/// mapped bodies are the segments as read, re-emitted byte for byte.
+pub(crate) fn encode_id_segments(store: &CompactStore) -> [Vec<u8>; 4] {
+    let mut node_lookup = Vec::new();
+    if let Some(ref map) = store.node_id_map {
+        let mut entries: Vec<_> = map.iter().map(|(&id, &v)| (id.as_u64(), v)).collect();
+        entries.sort_by_key(|(id, _)| *id);
+        for (id, (tid, off)) in entries {
+            write_node_id_record(&mut node_lookup, id, tid, off);
+        }
+    } else if let Some(ref lookup) = store.mapped_node_id_lookup {
+        node_lookup.extend_from_slice(lookup.as_bytes());
+    }
+
+    let mut node_orig = Vec::new();
+    if let Some(ref rev) = store.node_offset_to_id {
+        for table in rev {
+            for id in table {
+                write_u64(&mut node_orig, id.as_u64());
+            }
+        }
+    } else if let Some(ref bytes) = store.mapped_node_original_ids {
+        node_orig.extend_from_slice(bytes);
+    }
+
+    let mut edge_lookup = Vec::new();
+    if let Some(ref map) = store.edge_id_map {
+        let mut entries: Vec<_> = map.iter().map(|(&id, &v)| (id.as_u64(), v)).collect();
+        entries.sort_by_key(|(id, _)| *id);
+        for (id, (rid, pos)) in entries {
+            write_edge_id_record(&mut edge_lookup, id, rid, pos);
+        }
+    } else if let Some(ref lookup) = store.mapped_edge_id_lookup {
+        edge_lookup.extend_from_slice(lookup.as_bytes());
+    }
+
+    let mut edge_orig = Vec::new();
+    if let Some(ref rev) = store.edge_offset_to_id {
+        for table in rev {
+            for id in table {
+                write_u64(&mut edge_orig, id.as_u64());
+            }
+        }
+    } else if let Some(ref bytes) = store.mapped_edge_original_ids {
+        edge_orig.extend_from_slice(bytes);
+    }
+
+    [node_lookup, edge_lookup, node_orig, edge_orig]
+}
+
 pub(crate) fn write_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
