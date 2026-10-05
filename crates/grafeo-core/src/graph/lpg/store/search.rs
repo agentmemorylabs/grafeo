@@ -103,11 +103,40 @@ impl LpgStore {
         // Find the most selective condition (smallest result set) to start
         // If any condition has an index, use that first
         let mut best_start: Option<(usize, Vec<NodeId>)> = None;
+
+        // A mapped index's heap entry is only its write delta, so those keys
+        // are probed through `find_nodes_by_property` (mapped + delta,
+        // re-checked) rather than read from the heap map directly.
+        let mapped_keys: Vec<PropertyKey> = self
+            .mapped_property_indexes
+            .read()
+            .keys()
+            .cloned()
+            .collect();
+        for (i, (prop, value)) in conditions.iter().enumerate() {
+            if !mapped_keys.iter().any(|k| k.as_str() == *prop) {
+                continue;
+            }
+            let matches = self.find_nodes_by_property(prop, value);
+            if matches.is_empty() {
+                return Vec::new();
+            }
+            if best_start
+                .as_ref()
+                .is_none_or(|(_, best)| matches.len() < best.len())
+            {
+                best_start = Some((i, matches));
+            }
+        }
+
         let indexes = self.property_indexes.read();
 
         for (i, (prop, value)) in conditions.iter().enumerate() {
             let key = PropertyKey::new(*prop);
             let hv = HashableValue::new(value.clone());
+            if mapped_keys.contains(&key) {
+                continue;
+            }
 
             if let Some(index) = indexes.get(&key) {
                 let matches: Vec<NodeId> = index
@@ -165,6 +194,12 @@ impl LpgStore {
     /// If the property is indexed, this is O(1). Otherwise, it scans all nodes
     /// which is O(n). Use [`Self::create_property_index`] for frequently queried properties.
     ///
+    /// With a restored mapped index, hits for nodes this store holds are
+    /// re-checked against their current value, but ids it holds no record of
+    /// (a layered store's base rows) are returned unchecked. On a layered
+    /// overlay, query through the `LayeredStore` instead, which checks every
+    /// hit against the merged base + overlay view.
+    ///
     /// # Example
     ///
     /// ```
@@ -188,9 +223,21 @@ impl LpgStore {
         let hv = HashableValue::new(value.clone());
 
         // RO mapped PropertyIndex section (G-E1.RO): binary search over
-        // file-backed postings — no proportional anonymous DashMap.
-        if let Some(mapped) = self.mapped_property_indexes.read().get(&key) {
-            return mapped.lookup(value);
+        // file-backed postings plus the heap write delta. Mapped postings
+        // can be stale for nodes this store has changed or deleted since, so
+        // those are re-checked; ids this store holds no record of (a layered
+        // store's base rows) pass through for the caller to resolve.
+        if let Some(candidates) = self.mapped_property_index_candidates(property, value) {
+            return candidates
+                .into_iter()
+                .filter(|&node_id| {
+                    !self.has_node_record(node_id)
+                        || self
+                            .node_properties
+                            .get(node_id, &key)
+                            .is_some_and(|v| v == *value)
+                })
+                .collect();
         }
 
         // Try heap indexed lookup first
