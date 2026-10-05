@@ -128,9 +128,10 @@ pub struct Session {
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
     /// Set when the last commit could not write its commit marker to the WAL
-    /// (`commit_inner` only warns); the direct-write path reports it.
+    /// (`commit_inner` only warns): the error, transaction and commit epoch.
+    /// The direct-write path retries the marker and reports the outcome.
     #[cfg(all(feature = "wal", feature = "lpg"))]
-    commit_wal_error: parking_lot::Mutex<Option<String>>,
+    commit_wal_error: parking_lot::Mutex<Option<(String, TransactionId, EpochId)>>,
     /// The raw layered store (compact base + overlay) of a layered database,
     /// which the direct node/edge APIs use for the default graph; `store` is
     /// only the overlay there. `None` for every other database.
@@ -798,14 +799,11 @@ impl Session {
         match write() {
             Ok(value) => match self.commit_inner() {
                 Ok(()) => {
-                    // The write is applied in memory, but replay will not
-                    // apply it without its commit marker: report that.
                     #[cfg(feature = "wal")]
-                    if let Some(e) = self.commit_wal_error.lock().take() {
-                        return Err(grafeo_common::utils::error::Error::Internal(format!(
-                            "write applied in memory but its WAL commit marker failed, \
-                             so it is not durable: {e}"
-                        )));
+                    if let Some((error, transaction_id, epoch)) =
+                        self.commit_wal_error.lock().take()
+                    {
+                        self.retry_commit_marker(&error, transaction_id, epoch)?;
                     }
                     Ok(value)
                 }
@@ -821,6 +819,46 @@ impl Session {
             Err(e) => {
                 let _ = self.rollback_inner();
                 Err(e)
+            }
+        }
+    }
+
+    /// Writes a direct write's commit marker again after `commit_inner`
+    /// failed to (it only warns), so the WAL and memory agree.
+    ///
+    /// The write is already applied in memory. Writing the
+    /// `TransactionCommit` + `EpochAdvance` pair again is safe even if the
+    /// first attempt did reach the file (an fsync or rotation error after the
+    /// frames): replay then sees a second commit with nothing pending. If the
+    /// retry fails too, it is unknown whether the first pair reached the
+    /// disk, and any later commit or abort could settle this transaction's
+    /// records the wrong way on replay, so the WAL is poisoned: every later
+    /// append fails until the database is reopened.
+    #[cfg(all(feature = "wal", feature = "lpg"))]
+    fn retry_commit_marker(
+        &self,
+        error: &str,
+        transaction_id: TransactionId,
+        epoch: EpochId,
+    ) -> Result<()> {
+        use grafeo_storage::wal::WalRecord;
+        let Some(ref wal) = self.wal else {
+            return Ok(());
+        };
+        match wal.log_atomic(&[
+            WalRecord::TransactionCommit { transaction_id },
+            WalRecord::EpochAdvance { epoch },
+        ]) {
+            Ok(()) => Ok(()),
+            Err(retry) => {
+                let message = format!(
+                    "write applied in memory; durability unconfirmed (it may have \
+                     committed): the WAL commit marker failed ({error}) and its retry \
+                     failed ({retry}); further writes are refused until the database \
+                     is reopened"
+                );
+                wal.poison(message.clone());
+                Err(grafeo_common::utils::error::Error::Internal(message))
             }
         }
     }
@@ -4289,7 +4327,7 @@ impl Session {
                 },
             ]) {
                 grafeo_warn!("Failed to log transaction commit to WAL: {}", e);
-                *self.commit_wal_error.lock() = Some(e.to_string());
+                *self.commit_wal_error.lock() = Some((e.to_string(), transaction_id, commit_epoch));
             }
         }
 

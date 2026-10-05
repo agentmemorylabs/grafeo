@@ -916,7 +916,9 @@ fn transaction_sees_its_own_new_typed_edge() {
 #[cfg(feature = "testing-crash-injection")]
 #[test]
 fn handle_writes_report_wal_failures() {
-    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+    use grafeo_common::testing::crash::{
+        disable_io_failure, enable_io_failure_at, enable_io_failure_from,
+    };
     let (_dir, root) = fresh_root();
     let db = open_root(&root);
     let ids = base_ids(&db);
@@ -928,12 +930,6 @@ fn handle_writes_report_wal_failures() {
     assert!(r.is_err(), "failed data-record append must be reported");
     assert_eq!(cypher_ada_hash(&db), Some(Value::from("h0")));
 
-    // The commit marker's append fails: still an error.
-    enable_io_failure_at(2);
-    let r = db.set_node_property(ids.ada, "source_hash", Value::from("e2"));
-    disable_io_failure();
-    assert!(r.is_err(), "failed commit-marker append must be reported");
-
     // delete_node keeps its error channel.
     enable_io_failure_at(1);
     let r = db.delete_node(ids.linus);
@@ -944,6 +940,13 @@ fn handle_writes_report_wal_failures() {
         1,
         "and the delete must not be applied"
     );
+
+    // The commit marker's append keeps failing (the retry too): still an
+    // error. This poisons the WAL, so it goes last.
+    enable_io_failure_from(2);
+    let r = db.set_node_property(ids.ada, "source_hash", Value::from("e2"));
+    disable_io_failure();
+    assert!(r.is_err(), "failed commit-marker append must be reported");
 }
 
 /// The `wal_<seq>.log` files of a root and every complete frame in them.

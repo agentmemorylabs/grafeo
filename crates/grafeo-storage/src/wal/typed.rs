@@ -85,6 +85,12 @@ impl<R: WalEntry> TypedWal<R> {
         self.manager.write_frame(&data, force_sync)
     }
 
+    /// Refuses every later append until this WAL is reopened. See
+    /// [`WalManager::poison`].
+    pub fn poison(&self, reason: impl Into<String>) {
+        self.manager.poison(reason);
+    }
+
     /// Logs several records as adjacent frames: no other writer's record can
     /// land between them. Fsyncs (in sync durability mode) when any of them
     /// [requires it](WalEntry::requires_sync).

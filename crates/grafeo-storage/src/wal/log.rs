@@ -120,6 +120,8 @@ pub struct WalManager {
     current_sequence: AtomicU64,
     /// Latest checkpoint epoch.
     checkpoint_epoch: Mutex<Option<EpochId>>,
+    /// Set by [`poison`](Self::poison): every later append is refused.
+    poisoned: Mutex<Option<String>>,
     /// Encryptor for WAL records (None = unencrypted).
     #[cfg(feature = "encryption")]
     encryptor: Option<grafeo_common::encryption::PageEncryptor>,
@@ -168,6 +170,7 @@ impl WalManager {
             last_sync: Mutex::new(Instant::now()),
             current_sequence: AtomicU64::new(max_sequence),
             checkpoint_epoch: Mutex::new(None),
+            poisoned: Mutex::new(None),
             #[cfg(feature = "encryption")]
             encryptor: None,
         };
@@ -228,6 +231,11 @@ impl WalManager {
     pub(crate) fn write_frames(&self, frames: &[&[u8]], force_sync: bool) -> Result<()> {
         use grafeo_common::testing::crash::maybe_crash;
 
+        if let Some(reason) = self.poisoned.lock().as_ref() {
+            return Err(Error::Internal(format!(
+                "WAL refuses appends until the database is reopened: {reason}"
+            )));
+        }
         self.ensure_active_log()?;
 
         // Phase 1: write frame data and flush buffer while holding the lock.
@@ -385,6 +393,25 @@ impl WalManager {
         }
 
         Ok(())
+    }
+
+    /// Refuses every later append until this WAL is reopened.
+    ///
+    /// For a writer that cannot tell what the log holds any more (a commit
+    /// marker it could not write): appending more records after it could let
+    /// a later commit or abort settle that transaction the wrong way on
+    /// replay. The first reason is kept.
+    pub fn poison(&self, reason: impl Into<String>) {
+        let mut poisoned = self.poisoned.lock();
+        if poisoned.is_none() {
+            *poisoned = Some(reason.into());
+        }
+    }
+
+    /// Why appends are refused, if [`poison`](Self::poison) was called.
+    #[must_use]
+    pub fn poisoned_reason(&self) -> Option<String> {
+        self.poisoned.lock().clone()
     }
 
     /// Writes a checkpoint marker and persists checkpoint metadata.
