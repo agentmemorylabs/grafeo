@@ -11,17 +11,18 @@ impl super::GrafeoDB {
 
     /// Returns the number of nodes in the database.
     ///
-    /// On a layered database (compacted, or a generation root) this counts
-    /// the base plus the overlay, as queries see them.
+    /// Reads the same store queries read: on a layered database (compacted,
+    /// or a generation root) the base plus the overlay, and the tier chain
+    /// while a mid-build drain has tiers installed.
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.count_store().node_count()
+        self.graph_store().node_count()
     }
 
     /// Returns the number of edges in the database.
     #[must_use]
     pub fn edge_count(&self) -> usize {
-        self.count_store().edge_count()
+        self.graph_store().edge_count()
     }
 
     /// Returns the number of distinct labels in the database.
@@ -29,7 +30,7 @@ impl super::GrafeoDB {
     pub fn label_count(&self) -> usize {
         #[cfg(feature = "compact-store")]
         if self.layered_store.is_some() {
-            return self.count_store().all_labels().len();
+            return self.graph_store().all_labels().len();
         }
         self.lpg_store().label_count()
     }
@@ -39,7 +40,7 @@ impl super::GrafeoDB {
     pub fn property_key_count(&self) -> usize {
         #[cfg(feature = "compact-store")]
         if self.layered_store.is_some() {
-            return self.count_store().all_property_keys().len();
+            return self.graph_store().all_property_keys().len();
         }
         self.lpg_store().property_key_count()
     }
@@ -49,7 +50,7 @@ impl super::GrafeoDB {
     pub fn edge_type_count(&self) -> usize {
         #[cfg(feature = "compact-store")]
         if self.layered_store.is_some() {
-            return self.count_store().all_edge_types().len();
+            return self.graph_store().all_edge_types().len();
         }
         self.lpg_store().edge_type_count()
     }

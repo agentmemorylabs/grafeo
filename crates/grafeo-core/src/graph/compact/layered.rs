@@ -1396,31 +1396,43 @@ impl GraphStore for LayeredStore {
     }
 
     fn node_count(&self) -> usize {
-        let base_count = self.base.load().node_count();
-        let deleted = self.deleted_from_base_nodes.read().len();
-        let overlay_count = self.overlay.load().node_count();
-        // Dirty nodes that came from the base are counted once in the overlay.
-        // We subtract them from the base total to avoid double counting.
-        let promoted = self
+        let base = self.base.load();
+        // A base node is hidden when it is deleted from the base or promoted
+        // (its live copy, if any, is counted in the overlay). An id can be
+        // both, so count the union once. Walks only these small sets, never
+        // the base rows.
+        let deleted = self.deleted_from_base_nodes.read();
+        let promoted_only = self
             .dirty_node_ids
             .read()
             .iter()
-            .filter(|id| self.base.load().get_node(**id).is_some())
+            .filter(|id| !deleted.contains(*id) && base.get_node(**id).is_some())
             .count();
-        base_count - deleted - promoted + overlay_count
+        let hidden = deleted
+            .iter()
+            .filter(|id| base.get_node(**id).is_some())
+            .count()
+            + promoted_only;
+        base.node_count().saturating_sub(hidden) + self.overlay.load().node_count()
     }
 
     fn edge_count(&self) -> usize {
-        let base_count = self.base.load().edge_count();
-        let deleted = self.deleted_from_base_edges.read().len();
-        let overlay_count = self.overlay.load().edge_count();
-        let promoted = self
+        let base = self.base.load();
+        // See `node_count`: `delete_node_edges` tombstones base edges that
+        // are also promoted, so the two sets overlap.
+        let deleted = self.deleted_from_base_edges.read();
+        let promoted_only = self
             .dirty_edge_ids
             .read()
             .iter()
-            .filter(|id| self.base.load().get_edge(**id).is_some())
+            .filter(|id| !deleted.contains(*id) && base.get_edge(**id).is_some())
             .count();
-        base_count - deleted - promoted + overlay_count
+        let hidden = deleted
+            .iter()
+            .filter(|id| base.get_edge(**id).is_some())
+            .count()
+            + promoted_only;
+        base.edge_count().saturating_sub(hidden) + self.overlay.load().edge_count()
     }
 
     fn edge_type(&self, id: EdgeId) -> Option<ArcStr> {

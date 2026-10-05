@@ -888,10 +888,14 @@ impl GrafeoDB {
         #[cfg(all(feature = "lpg", feature = "vector-index"))]
         db.rehydrate_quantized_vector_indexes()?;
 
-        // Start periodic checkpoint timer if configured
+        // Start periodic checkpoint timer if configured. Not on a layered
+        // (compacted) database: the timer checkpoints its LpgStore alone, the
+        // overlay here, and a checkpoint replaces the whole container, so it
+        // would drop the CompactStore base from the file.
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
         if let (Some(interval), Some(fm)) = (checkpoint_interval, &db.file_manager)
             && !is_read_only
+            && !db.is_layered()
         {
             *db.checkpoint_timer.lock() = Some(checkpoint_timer::CheckpointTimer::start(
                 interval,
@@ -1689,6 +1693,14 @@ impl GrafeoDB {
         self.read_only = false;
         self.query_cache = Arc::new(QueryCache::default());
         self.projections.write().clear();
+
+        // The periodic checkpoint timer snapshots the pre-compact LpgStore
+        // alone; from here on the file must hold the CompactStore base too,
+        // which only `checkpoint_to_file` writes. See `with_config`.
+        #[cfg(feature = "grafeo-file")]
+        if let Some(mut timer) = self.checkpoint_timer.lock().take() {
+            timer.stop();
+        }
 
         Ok(())
     }
@@ -3249,21 +3261,36 @@ impl GrafeoDB {
         self.layered_store.as_ref()
     }
 
-    /// Returns the store that database-level counts read.
+    /// Returns the store whose counts a checkpoint header records.
     ///
     /// In layered mode (after [`compact()`](Self::compact), or on a reopened
     /// compacted file or generation root) `lpg_store()` is the overlay alone;
-    /// this returns the `LayeredStore`, the same view queries read. Its node
-    /// and edge counts take the base's known row counts and walk only the
-    /// overlay's copied-up ids, never the base rows. Otherwise this is the
-    /// built-in `LpgStore`.
+    /// this returns the `LayeredStore`, whose base and overlay are the
+    /// sections a checkpoint writes. Its node and edge counts take the base's
+    /// known row counts and walk only the deleted and copied-up ids, never
+    /// the base rows. Otherwise this is the built-in `LpgStore`. The public
+    /// count methods read [`graph_store()`](Self::graph_store) instead, which
+    /// also covers the tier chain of a mid-build drain.
     #[cfg(feature = "lpg")]
-    pub(super) fn count_store(&self) -> &dyn grafeo_core::graph::GraphStore {
+    pub(super) fn checkpoint_count_store(&self) -> &dyn grafeo_core::graph::GraphStore {
         #[cfg(feature = "compact-store")]
         if let Some(layered) = self.layered_store.as_ref() {
             return layered.as_ref();
         }
         &**self.lpg_store()
+    }
+
+    /// Returns whether a `LayeredStore` (compact base + overlay) is installed.
+    #[cfg(feature = "lpg")]
+    fn is_layered(&self) -> bool {
+        #[cfg(feature = "compact-store")]
+        {
+            self.layered_store.is_some()
+        }
+        #[cfg(not(feature = "compact-store"))]
+        {
+            false
+        }
     }
 
     /// Returns the disk-backed tier wrapper for the compact base, if
@@ -4193,7 +4220,7 @@ impl GrafeoDB {
         #[cfg(feature = "lpg")]
         let context = flush::build_context(
             self.lpg_store(),
-            self.count_store(),
+            self.checkpoint_count_store(),
             &self.transaction_manager,
         );
         #[cfg(not(feature = "lpg"))]
