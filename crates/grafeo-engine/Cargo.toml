@@ -168,6 +168,11 @@ path = "tests/generation_build_orchestration.rs"
 required-features = ["generation", "compact-store", "lpg"]
 
 [[test]]
+name = "epoch_handoff_wal_boundary"
+path = "tests/epoch_handoff_wal_boundary.rs"
+required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
+
+[[test]]
 name = "compact_store_manifest_publication"
 path = "tests/compact_store_manifest_publication.rs"
 required-features = ["generation", "compact-store", "lpg"]
