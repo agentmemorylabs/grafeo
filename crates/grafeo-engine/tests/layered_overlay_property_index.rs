@@ -16,7 +16,8 @@
 //! Cypher `IN`, Cypher equality, inline-map match, the engine's
 //! `find_nodes_by_property`, and `GraphStore::find_nodes_by_properties`
 //! (single and multi predicate). The state is checked live, after close +
-//! reopen (WAL replay), and after a second reopen.
+//! reopen (WAL replay), after a second reopen, after a read-only reopen,
+//! and around an epoch handoff and its base swap.
 
 #![cfg(all(
     feature = "generation",
@@ -382,11 +383,16 @@ fn reopened_generation_root_index_sees_overlay_writes() {
     drop(db);
 
     // Epoch handoff: publish the overlay into a new base generation from
-    // the live handle, then keep writing.
+    // the live handle, install it as the layered base (the path downstream
+    // runs), then keep writing.
     let db = open(&root);
-    db.run_epoch_handoff(generation_build_request(&root, "g2"))
+    let report = db
+        .run_epoch_handoff(generation_build_request(&root, "g2"))
         .expect("epoch handoff");
     failures.extend(check(&db, "after epoch handoff", &expected));
+    db.publish_and_install_handoff(report)
+        .expect("publish and install handoff");
+    failures.extend(check(&db, "after handoff install (base swap)", &expected));
     db.execute_cypher("CREATE (:L {name: 'n7', k: 'n7', tag: 't'})")
         .expect("create n7");
     db.execute_cypher("MATCH (n:L {name: 'n1'}) SET n.k = 'n1-post-handoff'")
