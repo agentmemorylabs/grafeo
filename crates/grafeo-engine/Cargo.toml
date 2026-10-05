@@ -228,6 +228,11 @@ path = "tests/generation_budget_peaks.rs"
 required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap"]
 
 [[test]]
+name = "live_generation_root_backup"
+path = "tests/live_generation_root_backup.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index", "gql"]
+
+[[test]]
 name = "generation_sections"
 path = "tests/generation_sections.rs"
 required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index", "text-index"]

@@ -649,6 +649,50 @@ impl WalManager {
         Ok(())
     }
 
+    /// Flush and fsync the active log, returning where it ends: `(sequence,
+    /// length in bytes)` of the file that is active **under the append lock**.
+    ///
+    /// This is the cut a live backup needs. The sequence comes from the
+    /// active file itself, not from `current_sequence()`, which
+    /// [`rotate`](Self::rotate) bumps before it swaps the file (so it can
+    /// name a file that is still empty). Because the active log is held while
+    /// the answer is read, every lower sequence is already final (rotated out
+    /// and fsynced), and the length lies on an append-group boundary: appends
+    /// write whole groups under the same lock. The fsync happens after the
+    /// lock is released, as in [`sync`](Self::sync).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no active log, or the flush/fsync fails.
+    pub fn flush_for_cut(&self) -> Result<(u64, u64)> {
+        let (sequence, length, sync_file) = {
+            let mut guard = self.active_log.lock();
+            let Some(log_file) = guard.as_mut() else {
+                return Err(grafeo_common::utils::error::Error::Internal(
+                    "WAL has no active log file to cut".to_string(),
+                ));
+            };
+            // Same order as an append: a poison set before this point is seen
+            // here, so a poisoned log is never cut.
+            if let Some(reason) = self.poisoned_reason() {
+                return Err(Self::poisoned_error(&reason));
+            }
+            log_file.writer.flush()?;
+            let sequence = Self::sequence_from_path(&log_file.path).ok_or_else(|| {
+                grafeo_common::utils::error::Error::Internal(format!(
+                    "active WAL file {} has no sequence in its name",
+                    log_file.path.display()
+                ))
+            })?;
+            let file = log_file.writer.get_ref();
+            (sequence, file.metadata()?.len(), file.try_clone()?)
+        };
+        sync_file.sync_all()?;
+        self.records_since_sync.store(0, Ordering::Relaxed);
+        *self.last_sync.lock() = Instant::now();
+        Ok((sequence, length))
+    }
+
     /// Syncs the WAL to disk (fsync).
     ///
     /// # Errors
@@ -1290,5 +1334,27 @@ mod tests {
         assert!(truncate_active_tail(dir.path(), 0, 0).is_err());
         // Missing directory entirely (fail closed).
         assert!(truncate_active_tail(&dir.path().join("missing"), 0, 0).is_err());
+    }
+
+    #[test]
+    fn flush_for_cut_reports_the_active_file_not_the_bumped_sequence() {
+        let dir = tempdir().unwrap();
+        let wal = WalManager::open(dir.path()).unwrap();
+        let record = WalRecord::CreateNode {
+            id: NodeId::new(1),
+            labels: vec!["Person".to_string()],
+        };
+        wal.log(&record).unwrap();
+        let (seq, len) = wal.flush_for_cut().unwrap();
+        let path = dir.path().join(format!("wal_{seq:08}.log"));
+        assert_eq!(len, fs::metadata(&path).unwrap().len());
+        assert!(len > 0, "the logged record is inside the cut");
+
+        // After a rotation the cut names the new active file, empty.
+        wal.rotate().unwrap();
+        let (seq2, len2) = wal.flush_for_cut().unwrap();
+        assert_eq!(seq2, seq + 1);
+        assert_eq!(len2, 0);
+        assert_eq!(seq2, wal.current_sequence());
     }
 }
