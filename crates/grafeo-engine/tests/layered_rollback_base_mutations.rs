@@ -951,3 +951,105 @@ fn rollback_whose_abort_marker_fails_reports_an_error() {
         .rollback()
         .expect("rollback on an already poisoned WAL");
 }
+
+/// Owner review addendum, item 4: the more common overlapping order. The
+/// loser writes its base mutations while the winner's write to gus is still
+/// open, the winner commits, and only then does the loser write gus and
+/// fail its commit.
+#[test]
+fn failed_commit_with_overlapping_writes_aborts_fully() {
+    let dir = tempdir().expect("tempdir");
+
+    // Reference: the same base with only the winner's change committed.
+    let ref_root = dir.path().join("reference");
+    publish_base(&ref_root);
+    let reference = open_root(&ref_root);
+    reference.create_property_index("name");
+    reference
+        .session()
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 41")
+        .expect("reference SET");
+    let expected = snapshot(&reference);
+    drop(reference);
+
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    db.create_property_index("name");
+
+    let mut winner = db.session();
+    let mut loser = db.session();
+    winner.begin_transaction().expect("begin winner");
+    loser.begin_transaction().expect("begin loser");
+    winner
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 41")
+        .expect("winner SET, still open");
+    // Everything but the conflicting write, while the winner is open.
+    for q in &LOSER_MUTATIONS[..4] {
+        loser.execute(q).expect(q);
+    }
+    winner.commit().expect("winner commits");
+    drop(winner);
+    loser.execute(LOSER_MUTATIONS[4]).expect("loser SET gus");
+
+    let aborts_before = wal_abort_count(&root);
+    let err = loser
+        .commit()
+        .expect_err("the second writer of gus must fail validation");
+    assert!(
+        err.to_string().to_lowercase().contains("conflict"),
+        "unexpected error: {err}"
+    );
+    assert!(!loser.in_transaction());
+    assert_eq!(wal_abort_count(&root), aborts_before + 1);
+    assert_snapshot_eq("live after the failed commit", &snapshot(&db), &expected);
+
+    loser.begin_transaction().expect("begin retry");
+    loser
+        .execute("MATCH (n:Person {name: 'vincent'}) SET n.age = 50")
+        .expect("retry SET vincent");
+    loser
+        .execute("MATCH (n:Person {name: 'alix'}) DETACH DELETE n")
+        .expect("retry DELETE alix");
+    loser.commit().expect("retry commits");
+    // Live state only: the winner's records and its commit marker straddle
+    // the loser's records in the WAL, so the winner's marker settles them
+    // on replay. WAL records carry no transaction id; upstream #411 (the
+    // next port) fixes that interleave.
+}
+
+/// Owner review addendum, item 1: when a commit fails validation and the
+/// layered undo cannot restore every base change (an overlay reset absorbed
+/// them while the transaction was open), the caller gets the "rollback
+/// incomplete" error instead of a retryable conflict.
+#[test]
+fn failed_commit_after_overlay_reset_reports_incomplete_rollback() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    let layered = std::sync::Arc::clone(db.layered_store().expect("layered"));
+
+    let mut loser = db.session();
+    let mut winner = db.session();
+    loser.begin_transaction().expect("begin loser");
+    winner.begin_transaction().expect("begin winner");
+    winner
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 41")
+        .expect("winner SET");
+    winner.commit().expect("winner commits");
+    drop(winner);
+
+    loser.execute(MUTATIONS[0]).expect("delete alix");
+    loser
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 42")
+        .expect("loser SET gus");
+    layered.reset_overlay();
+
+    let err = loser.commit().expect_err("the commit fails validation");
+    assert!(
+        err.to_string().contains("rollback incomplete"),
+        "an unrestored base change must not look like a retryable conflict: {err}"
+    );
+    assert!(!loser.in_transaction(), "the transaction still ended");
+}
