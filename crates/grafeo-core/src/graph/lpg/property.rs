@@ -365,6 +365,28 @@ impl<Id: EntityId> PropertyStorage<Id> {
         }
     }
 
+    /// Erases every property's whole version history for an entity, leaving
+    /// no tombstone: as if the entity never had properties here.
+    #[cfg(feature = "temporal")]
+    pub fn erase_all_history(&self, id: Id) {
+        let mut columns = self.columns.write();
+        for col in columns.values_mut() {
+            col.erase_history(id);
+        }
+    }
+
+    /// Records `value` at `epoch` only if `key` has no history yet for `id`.
+    /// Returns whether it was recorded.
+    #[cfg(feature = "temporal")]
+    pub fn seed(&self, id: Id, key: PropertyKey, value: Value, epoch: EpochId) -> bool {
+        let mut columns = self.columns.write();
+        let mode = self.default_compression;
+        columns
+            .entry(key)
+            .or_insert_with(|| PropertyColumn::with_compression(mode))
+            .seed(id, value, epoch)
+    }
+
     /// Gets all properties for an entity.
     #[must_use]
     pub fn get_all(&self, id: Id) -> FxHashMap<PropertyKey, Value> {
@@ -1759,6 +1781,22 @@ impl<Id: EntityId> PropertyColumn<Id> {
             self.zone_map_dirty = true;
         }
         previous
+    }
+
+    /// Drops the entity's whole version log (no tombstone).
+    pub fn erase_history(&mut self, id: Id) {
+        if self.values.remove(&id).is_some() {
+            self.zone_map_dirty = true;
+        }
+    }
+
+    /// Appends `value` at `epoch` only if the entity has no log yet.
+    pub fn seed(&mut self, id: Id, value: Value, epoch: EpochId) -> bool {
+        if self.values.get(&id).is_some_and(|log| !log.is_empty()) {
+            return false;
+        }
+        self.set(id, value, epoch);
+        true
     }
 
     /// Returns the number of live (non-tombstoned) values in this column.
