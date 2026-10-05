@@ -5446,8 +5446,24 @@ mod tests {
         assert_eq!(layered.forgotten_layer_changes(), 0);
         layered.reset_overlay();
         assert_eq!(layered.forgotten_layer_changes(), 1);
-        // The later rollback finds nothing to undo (the change is gone).
-        layered.rollback_transaction_layers(tx);
+        // The later rollback finds nothing to undo and reports the loss.
+        assert_eq!(layered.rollback_transaction_layers(tx), 1);
+        assert_eq!(layered.rollback_transaction_layers(tx), 0, "reported once");
         assert_eq!(layered.forgotten_layer_changes(), 1);
+    }
+
+    /// Review round 2: a savepoint rollback after a reset dropped the
+    /// transaction's entries must report the loss too (its saved journal
+    /// position is stale), and the full rollback still reports it.
+    #[test]
+    fn savepoint_rollback_after_forget_reports_loss() {
+        let layered = build_test_layered();
+        let tx = TransactionId::new(7);
+        let epoch = layered.current_epoch();
+        let pos = layered.transaction_layer_position(tx);
+        assert!(layered.delete_node_versioned(NodeId::new(0), epoch, tx));
+        layered.reset_overlay();
+        assert_eq!(layered.rollback_transaction_layers_to(tx, pos), 1);
+        assert_eq!(layered.rollback_transaction_layers(tx), 1);
     }
 }

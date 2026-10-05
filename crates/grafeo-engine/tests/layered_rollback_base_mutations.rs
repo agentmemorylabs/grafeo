@@ -194,7 +194,9 @@ fn snapshot(db: &GrafeoDB) -> Snapshot {
     cypher_edges.sort_unstable();
 
     let mut name_lookup = BTreeMap::new();
-    for name in NAMES {
+    // The base names plus every name the test transactions write, so an
+    // index left with a stale posting (old or new value) shows up.
+    for &name in NAMES.iter().chain(&["gus-renamed", "tmp", "isolated", "b"]) {
         let mut ids: Vec<u64> = store
             .find_nodes_by_property("name", &Value::from(name))
             .into_iter()
@@ -247,7 +249,12 @@ fn cypher_rollback_restores_live_state_and_reopen() {
     publish_base(&root);
 
     let db = open_root(&root);
+    // `name` is indexed and MUTATIONS[1] renames gus: the rollback must
+    // leave lookups of both the old and the new value as before.
+    db.create_property_index("name");
     let before = snapshot(&db);
+    assert_eq!(before.name_lookup["gus"].len(), 1, "sanity: gus indexed");
+    assert!(before.name_lookup["gus-renamed"].is_empty(), "sanity");
     assert_eq!(before.node_count, 5, "sanity: base nodes");
     assert_eq!(before.edge_count, 6, "sanity: base edges");
 
@@ -278,6 +285,7 @@ fn cypher_rollback_restores_live_state_and_reopen() {
     db.close().expect("close");
     drop(db);
     let db = open_root(&root);
+    db.create_property_index("name");
     assert_snapshot_eq("after close + reopen", &snapshot(&db), &before);
 }
 
@@ -661,4 +669,48 @@ fn concurrent_sessions_share_a_copy_up() {
     // committed records of `b` that interleave with the aborted `a` (see the
     // PR write-up).
     check(&db, "live");
+}
+
+/// Review round 2: when an overlay reset / merge drops a transaction's
+/// pending base changes, its rollback cannot undo them. That must reach the
+/// caller as an error (not only a log line an embedder may compile out),
+/// for a full rollback and for a savepoint rollback.
+#[test]
+fn rollback_after_overlay_reset_reports_unrestored_changes() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    let layered = std::sync::Arc::clone(db.layered_store().expect("layered"));
+
+    // Full rollback.
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    session.execute(MUTATIONS[0]).expect("delete alix");
+    layered.reset_overlay();
+    let err = session
+        .rollback()
+        .expect_err("rollback must report the change it could not undo");
+    assert!(
+        err.to_string().contains("rollback incomplete"),
+        "unexpected error: {err}"
+    );
+    assert!(!session.in_transaction(), "the transaction still ended");
+    drop(session);
+
+    // Savepoint rollback.
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    session.savepoint("sp").expect("savepoint");
+    session.execute(MUTATIONS[3]).expect("delete LIKES");
+    layered.reset_overlay();
+    let err = session
+        .rollback_to_savepoint("sp")
+        .expect_err("savepoint rollback must report it too");
+    assert!(
+        err.to_string().contains("rollback incomplete"),
+        "unexpected error: {err}"
+    );
+    let _ = session.rollback();
+    assert!(layered.forgotten_layer_changes() >= 2);
 }
