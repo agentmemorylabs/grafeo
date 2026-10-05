@@ -137,6 +137,13 @@ impl GrafeoDB {
             )));
         }
 
+        if slot.backups_in_progress > 0 {
+            return Err(Error::Internal(
+                "a live generation-root backup is in progress; retry the handoff after it finishes"
+                    .into(),
+            ));
+        }
+
         if generation_root.is_file() {
             return Err(Error::Internal(
                 "refusing to freeze into a standalone .grafeo file; use a generation root directory"

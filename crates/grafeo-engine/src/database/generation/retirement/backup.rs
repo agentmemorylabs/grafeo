@@ -126,6 +126,52 @@ pub fn backup_generation_root(
     destination_dir: &Path,
     backup_name: &str,
 ) -> Result<GenerationBackupReceipt, RetirementError> {
+    backup_root_inner(auth, ownership, destination_dir, backup_name, None)
+}
+
+/// Back up a root that a live, writable `GrafeoDB` is serving.
+///
+/// Same pin / validate / stage / publish sequence as
+/// [`backup_generation_root`], except that the WAL is captured as a
+/// **consistent cut** instead of whole files: `sync_wal` is called first
+/// (flush + fsync the live WAL), and only then are the `wal_*.log` files from
+/// the manifest boundary onward listed and their lengths recorded. Each file
+/// is copied up to its recorded length, so bytes appended while the copy runs
+/// are not part of the backup. The caller must already exclude publication
+/// (epoch handoff) for the whole call; see `GrafeoDB::backup_generation_root`.
+#[cfg(all(
+    feature = "wal",
+    feature = "lpg",
+    feature = "generation",
+    feature = "compact-store",
+    feature = "generation-streaming",
+    feature = "mmap"
+))]
+pub(crate) fn backup_live_generation_root(
+    auth: &RetirementAuthority,
+    ownership: &RootOwnership,
+    destination_dir: &Path,
+    backup_name: &str,
+    sync_wal: &dyn Fn() -> Result<(), RetirementError>,
+) -> Result<GenerationBackupReceipt, RetirementError> {
+    backup_root_inner(
+        auth,
+        ownership,
+        destination_dir,
+        backup_name,
+        Some(sync_wal),
+    )
+}
+
+/// Shared body. `live_wal_sync` is `Some` for a live root (consistent-cut WAL
+/// capture) and `None` for an offline root (every WAL file copied whole).
+fn backup_root_inner(
+    auth: &RetirementAuthority,
+    ownership: &RootOwnership,
+    destination_dir: &Path,
+    backup_name: &str,
+    live_wal_sync: Option<&dyn Fn() -> Result<(), RetirementError>>,
+) -> Result<GenerationBackupReceipt, RetirementError> {
     let root = ownership.canonical_root();
     if auth.root() != root {
         return Err(RetirementError::ValidationFailed(
@@ -181,6 +227,18 @@ pub fn backup_generation_root(
         ));
     }
 
+    // The consistency point of a live backup: flush + fsync the WAL, then
+    // record the length of every WAL file at or after the manifest boundary.
+    // Everything acknowledged before this point is inside the recorded
+    // lengths; the files are append-only, so a prefix is a valid log.
+    let wal_cut = match live_wal_sync {
+        Some(sync) => {
+            sync()?;
+            WalSelection::Cut(capture_wal_cut(root, slot.wal_log_sequence)?)
+        }
+        None => WalSelection::All,
+    };
+
     // Stage the backup in a unique temp directory under the destination.
     let temp_name = format!(
         ".tmp-gbackup-{}-{}-{backup_name}",
@@ -192,7 +250,7 @@ pub fn backup_generation_root(
     std::fs::create_dir_all(&temp_wal)?;
 
     let (manifest_record, mut copied_bytes) =
-        match stage_backup(ops, root, &slot, &temp_dir, &temp_wal) {
+        match stage_backup(ops, root, &slot, &wal_cut, &temp_dir, &temp_wal) {
             Ok(staged) => staged,
             Err(e) => {
                 // Fail closed: remove the incomplete staging dir, release the pin.
@@ -234,6 +292,7 @@ fn stage_backup(
     ops: OsGenerationFileOps,
     root: &Path,
     slot: &ManifestSlot,
+    wal_cut: &WalSelection,
     temp_dir: &Path,
     temp_wal: &Path,
 ) -> Result<(GenerationBackupManifest, u64), RetirementError> {
@@ -265,31 +324,49 @@ fn stage_backup(
         ));
     }
 
-    // Copy every referenced WAL file verbatim (names preserved so the
-    // restored root's replay cursor resolves identically).
+    // Copy the WAL (names preserved so the restored root's replay cursor
+    // resolves identically).
     let mut wal_files = Vec::new();
     let wal_dir = root.join("wal");
-    if wal_dir.is_dir() {
-        let mut names: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&wal_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                names.push(entry.file_name().to_string_lossy().into_owned());
+    match wal_cut {
+        WalSelection::All => {
+            if wal_dir.is_dir() {
+                let mut names: Vec<String> = Vec::new();
+                for entry in std::fs::read_dir(&wal_dir)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() {
+                        names.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                }
+                names.sort_unstable();
+                for name in names {
+                    let src = wal_dir.join(&name);
+                    let dst = temp_wal.join(&name);
+                    let len = ops.copy_bounded(&src, &dst, COPY_BUFFER_BYTES)?;
+                    ops.sync_path(&dst)?;
+                    let sha = ops.sha256(&dst)?;
+                    copied += len;
+                    wal_files.push(BackedUpWalFile {
+                        name,
+                        length: len,
+                        sha256: sha,
+                    });
+                }
             }
         }
-        names.sort_unstable();
-        for name in names {
-            let src = wal_dir.join(&name);
-            let dst = temp_wal.join(&name);
-            let len = ops.copy_bounded(&src, &dst, COPY_BUFFER_BYTES)?;
-            ops.sync_path(&dst)?;
-            let sha = ops.sha256(&dst)?;
-            copied += len;
-            wal_files.push(BackedUpWalFile {
-                name,
-                length: len,
-                sha256: sha,
-            });
+        WalSelection::Cut(files) => {
+            for (name, cut_len) in files {
+                let dst = temp_wal.join(name);
+                copy_prefix(&wal_dir.join(name), &dst, *cut_len)?;
+                ops.sync_path(&dst)?;
+                let sha = ops.sha256(&dst)?;
+                copied += cut_len;
+                wal_files.push(BackedUpWalFile {
+                    name: name.clone(),
+                    length: *cut_len,
+                    sha256: sha,
+                });
+            }
         }
     }
 
@@ -316,6 +393,72 @@ fn stage_backup(
         },
         copied,
     ))
+}
+
+/// Which WAL bytes a backup captures.
+enum WalSelection {
+    /// Offline root: every file in `wal/`, whole.
+    All,
+    /// Live root: `(file name, byte length)` recorded at the cut.
+    Cut(Vec<(String, u64)>),
+}
+
+/// List `wal_<seq>.log` files with sequence >= `from_sequence`, sorted by
+/// sequence, with their current lengths.
+///
+/// All names are listed first and lengths read afterwards. If the WAL
+/// rotates in between, a listed file that was active is only longer than
+/// before, and a file created after the listing is simply not part of the
+/// cut. Either way the result is a prefix of the append-only log stream, and
+/// every file but the last is already rotated (final) at the moment of the
+/// listing.
+fn capture_wal_cut(root: &Path, from_sequence: u64) -> Result<Vec<(String, u64)>, RetirementError> {
+    let wal_dir = root.join("wal");
+    let mut listed: Vec<(u64, String)> = Vec::new();
+    for entry in std::fs::read_dir(&wal_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let seq = name
+            .strip_prefix("wal_")
+            .and_then(|rest| rest.strip_suffix(".log"))
+            .and_then(|n| n.parse::<u64>().ok());
+        if let Some(seq) = seq
+            && seq >= from_sequence
+            && entry.file_type()?.is_file()
+        {
+            listed.push((seq, name));
+        }
+    }
+    listed.sort_unstable();
+    if listed.first().map(|(seq, _)| *seq) != Some(from_sequence) {
+        return Err(RetirementError::ValidationFailed(format!(
+            "WAL file for the manifest boundary (sequence {from_sequence}) is missing"
+        )));
+    }
+    listed
+        .into_iter()
+        .map(|(_, name)| {
+            let len = std::fs::metadata(wal_dir.join(&name))?.len();
+            Ok((name, len))
+        })
+        .collect()
+}
+
+/// Copy exactly the first `len` bytes of `src` to a new file `dst`
+/// (streaming, bounded memory). Fails if `src` is shorter than `len`.
+fn copy_prefix(src: &Path, dst: &Path, len: u64) -> Result<(), RetirementError> {
+    use std::io::{Read, Write};
+    let mut input = std::fs::File::open(src)?.take(len);
+    let mut output = std::fs::File::create(dst)?;
+    let copied = std::io::copy(&mut input, &mut output)?;
+    if copied != len {
+        return Err(RetirementError::ValidationFailed(format!(
+            "WAL file {} shrank during backup: copied {copied} of {len} bytes",
+            src.display()
+        )));
+    }
+    output.flush()?;
+    Ok(())
 }
 
 /// Validate one declared backup file: existence, exact length, exact hash.
