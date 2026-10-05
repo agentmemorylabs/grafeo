@@ -409,7 +409,9 @@ impl super::GrafeoDB {
 
     /// Forces a WAL checkpoint.
     ///
-    /// Flushes all pending WAL records to the main storage.
+    /// Flushes all pending WAL records to the main storage. On a generation
+    /// root it only syncs the WAL: it neither publishes a generation nor
+    /// bounds WAL growth (publication deletes WAL below its boundary).
     ///
     /// # Errors
     ///
