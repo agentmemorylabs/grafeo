@@ -102,8 +102,11 @@ impl LpgStore {
         for &id in node_ids {
             #[cfg(not(feature = "temporal"))]
             self.node_properties.remove_all(id);
+            // Erase, don't tombstone: the whole history belongs to the
+            // discarded row, and a tombstone at the current epoch would land
+            // behind the transaction's PENDING entries.
             #[cfg(feature = "temporal")]
-            self.node_properties.remove_all(id, self.current_epoch());
+            self.node_properties.erase_all_history(id);
         }
 
         // reason: discarded batch sizes are bounded by practical graph limits
@@ -130,9 +133,9 @@ impl LpgStore {
             self.decrement_edge_type_count(edge.type_id);
             #[cfg(not(feature = "temporal"))]
             self.edge_properties.remove_all(edge.id);
+            // See `cleanup_node_secondaries`.
             #[cfg(feature = "temporal")]
-            self.edge_properties
-                .remove_all(edge.id, self.current_epoch());
+            self.edge_properties.erase_all_history(edge.id);
         }
 
         // reason: discarded batch sizes are bounded by practical graph limits
@@ -232,9 +235,13 @@ impl LpgStore {
     /// property columns and live counter.
     ///
     /// Used by `LayeredStore` to undo a rolled-back copy-up: the copy was
-    /// written non-versioned (so concurrent readers keep seeing the base
-    /// values), so the MVCC discard cannot remove it. Returns whether the
-    /// node existed.
+    /// created at epoch 0 by the system transaction (so concurrent readers
+    /// keep seeing the base values), so the MVCC discard cannot remove it.
+    /// Returns whether the node existed.
+    ///
+    /// With `temporal`, the copy's property history is erased rather than
+    /// tombstoned: the copy existed only to stand for the base row, and a
+    /// later copy-up seeds that history again at epoch 0.
     ///
     /// Property-index postings are deliberately KEPT: on a layered store the
     /// overlay's property indexes also carry the base nodes' postings
@@ -256,7 +263,8 @@ impl LpgStore {
     }
 
     /// Edge variant of [`Self::purge_copied_node`]: removes the version chain, both
-    /// adjacency entries, the edge-type count and the property columns.
+    /// adjacency entries, the edge-type count and the property columns (with
+    /// `temporal`, their whole history).
     #[doc(hidden)]
     pub fn purge_edge(&self, id: EdgeId) -> bool {
         #[cfg(not(feature = "tiered-storage"))]

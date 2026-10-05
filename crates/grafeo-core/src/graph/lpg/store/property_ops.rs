@@ -83,6 +83,32 @@ impl LpgStore {
         self.edge_properties.set(id, key.into(), value, epoch);
     }
 
+    /// Records a node property at `epoch` only if that property has no
+    /// version history yet. Used to seed a copy-up's epoch-0 history without
+    /// appending behind a later entry.
+    #[cfg(feature = "temporal")]
+    pub fn seed_node_property_at_epoch(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: Value,
+        epoch: EpochId,
+    ) -> bool {
+        self.node_properties.seed(id, key.into(), value, epoch)
+    }
+
+    /// Edge variant of [`Self::seed_node_property_at_epoch`].
+    #[cfg(feature = "temporal")]
+    pub fn seed_edge_property_at_epoch(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: Value,
+        epoch: EpochId,
+    ) -> bool {
+        self.edge_properties.seed(id, key.into(), value, epoch)
+    }
+
     /// Returns the full version history for all properties of a node.
     ///
     /// Each entry is `(key, Vec<(epoch, value)>)`. Used for temporal

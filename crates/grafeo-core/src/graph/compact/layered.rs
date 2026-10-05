@@ -101,10 +101,10 @@ pub struct LayeredStore {
     /// changed outside the overlay's own MVCC: base tombstones and copy-ups.
     /// See [`TxnLayerJournal`].
     txn_journal: parking_lot::Mutex<TxnLayerJournal>,
-    /// `true` while `txn_journal` holds at least one pending change. Lets the
-    /// write paths that only need to *touch* an existing change skip the
-    /// mutex when no transaction has anything pending. Read paths never
-    /// consult the journal.
+    /// `true` while `txn_journal` holds at least one pending change. Lets
+    /// commit, rollback and savepoint-position calls skip the mutex when no
+    /// transaction has anything pending. Write paths always take the mutex,
+    /// and read paths never consult the journal.
     txn_journal_pending: AtomicBool,
     /// Total journal entries dropped while their transaction was open (see
     /// [`LayeredStore::forgotten_layer_changes`]).
@@ -2888,11 +2888,13 @@ impl LayeredStore {
         }
 
         // Copy properties. With `temporal`, also record them at epoch 0 so
-        // historical reads of the epoch-0 row see them; the plain setter keeps
-        // the overlay's property and text indexes up to date.
+        // historical reads of the epoch-0 row see them, but only where the
+        // property has no history yet: an append behind a later entry would
+        // break the log's epoch order. The plain setter keeps the overlay's
+        // property and text indexes up to date.
         for (key, value) in base_node.properties.iter() {
             #[cfg(feature = "temporal")]
-            overlay.set_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
+            overlay.seed_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
             overlay.set_node_property(id, key.as_str(), value.clone());
         }
 
@@ -2952,7 +2954,7 @@ impl LayeredStore {
         // Copy properties (see `ensure_in_overlay` for `temporal`).
         for (key, value) in base_edge.properties.iter() {
             #[cfg(feature = "temporal")]
-            overlay.set_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
+            overlay.seed_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
             overlay.set_edge_property(id, key.as_str(), value.clone());
         }
 
