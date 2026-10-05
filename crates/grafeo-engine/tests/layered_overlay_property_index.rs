@@ -404,12 +404,8 @@ fn reopened_generation_root_index_sees_overlay_writes() {
     db.close().expect("close");
     drop(db);
 
-    // Pre-existing on d63e3708: writes made after an epoch handoff are lost
-    // on reopen (see `writes_after_epoch_handoff_survive_reopen`). The index
-    // must still agree with the label scan.
-    for value in ["n1", "n1-post-handoff", "n7"] {
-        expected.index_matches_oracle_only(value);
-    }
+    // Writes made after the handoff survive the reopen (fixed in #17,
+    // `epoch_handoff_wal_boundary.rs`), so the exact state is expected.
     let db = open(&root);
     failures.extend(check(&db, "reopen after epoch handoff", &expected));
 
@@ -481,11 +477,10 @@ fn rolled_back_set_is_undone_on_live_handle() {
     );
 }
 
-/// Pre-existing data defect pinned for the record (not an index defect):
-/// on d63e3708 writes made on the live handle after `run_epoch_handoff`
-/// are gone after close + reopen.
+/// Writes made on the live handle after `run_epoch_handoff` survive close +
+/// reopen, and the index finds them. On d63e3708 they were lost (the
+/// handoff cut its WAL boundary on a private manager; fixed in #17).
 #[test]
-#[ignore = "pre-existing on d63e3708: writes after an epoch handoff are lost on reopen"]
 fn writes_after_epoch_handoff_survive_reopen() {
     let dir = tempdir().expect("temp dir");
     let root = dir.path().join("handoff.grafeo.d");
