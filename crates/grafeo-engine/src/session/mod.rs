@@ -5190,7 +5190,10 @@ impl Session {
                 continue;
             };
             let store = self.resolve_store(graph_name);
-            let Some(node) = store.get_node_versioned(*node_id, epoch, tid) else {
+            let Some(node) = self
+                .vector_read_view(&store)
+                .get_node_versioned(*node_id, epoch, tid)
+            else {
                 continue;
             };
             let Some(Value::Vector(vector)) = node
@@ -5217,6 +5220,22 @@ impl Session {
         Ok(())
     }
 
+    /// The view vector-index maintenance reads `store`'s nodes through. On a
+    /// layered database the default graph's base nodes are not in the overlay
+    /// `store`, and neither are the base neighbors an HNSW insert compares
+    /// against, so the default graph reads the layered store (base plus
+    /// overlay) instead.
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    fn vector_read_view<'a>(&'a self, store: &'a Arc<LpgStore>) -> &'a dyn GraphStore {
+        #[cfg(feature = "compact-store")]
+        if let Some(ref layered) = self.layered_store
+            && Arc::ptr_eq(store, &self.store)
+        {
+            return &**layered;
+        }
+        &**store
+    }
+
     #[cfg(all(feature = "lpg", feature = "vector-index"))]
     fn apply_buffered_vector_intents(&self) -> Result<()> {
         let intents: Vec<VectorIndexIntent> = self.vector_index_intents.lock().drain(..).collect();
@@ -5235,7 +5254,8 @@ impl Session {
                 property,
             } => {
                 let store = self.resolve_store(graph_name);
-                let Some(node) = store.get_node(*node_id) else {
+                let read = self.vector_read_view(&store);
+                let Some(node) = read.get_node(*node_id) else {
                     return Ok(());
                 };
                 let prop_key = grafeo_common::types::PropertyKey::new(property);
@@ -5263,7 +5283,7 @@ impl Session {
                             )));
                         }
                         let accessor = grafeo_core::index::vector::PropertyVectorAccessor::new(
-                            &*store,
+                            read,
                             property.as_str(),
                         );
                         index.insert(*node_id, vector, &accessor);
