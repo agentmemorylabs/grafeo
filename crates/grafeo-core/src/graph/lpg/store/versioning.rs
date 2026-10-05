@@ -50,12 +50,29 @@ impl LpgStore {
             .push(entry);
     }
 
+    /// Records one change per entry of `entries` (a batch create), under one
+    /// lock.
+    pub(super) fn record_changes(
+        &self,
+        transaction_id: TransactionId,
+        entries: impl IntoIterator<Item = PropertyUndoEntry>,
+    ) {
+        if transaction_id == TransactionId::SYSTEM {
+            return;
+        }
+        self.property_undo_log
+            .write()
+            .entry(transaction_id)
+            .or_default()
+            .extend(entries);
+    }
+
     /// Discards everything a transaction changed in this store (rollback).
     ///
     /// Replays the transaction's changes in reverse, so the cost is
     /// O(changes), and leaves the counters and statistics as they were.
     /// Entities the transaction created are removed with their secondary
-    /// state (labels, label and property index entries, property columns,
+    /// state (labels, label/property/text index entries, property columns,
     /// adjacency, edge-type and live counts).
     #[doc(hidden)]
     pub fn discard_uncommitted_versions(&self, transaction_id: TransactionId) {
@@ -201,7 +218,7 @@ impl LpgStore {
     }
 
     /// Removes a node that `transaction_id` created, when the transaction
-    /// rolls back: its version, labels, label and property index entries,
+    /// rolls back: its version, labels, label/property/text index entries,
     /// properties and count. Nothing of it was ever visible to others.
     pub(super) fn discard_created_node(&self, id: NodeId, transaction_id: TransactionId) {
         self.count_versions_walked(1);
@@ -230,6 +247,8 @@ impl LpgStore {
             versions.remove(&id);
         }
 
+        #[cfg(feature = "text-index")]
+        self.remove_from_all_text_indexes(id);
         self.cleanup_discarded_node_secondaries(&[id]);
     }
 

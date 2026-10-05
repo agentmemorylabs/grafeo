@@ -24,11 +24,12 @@
 //! - preserve returned ID order;
 //! - never call the offline/unindexed bulk loaders.
 //!
-//! Commit/rollback need no batch-specific logic: rows are versioned identically
-//! to the row path, so the transaction-wide `finalize_version_epochs` (commit)
-//! and `discard_uncommitted_versions` (rollback) scans make the whole batch
-//! visible or remove it atomically — including secondary structures published
-//! eagerly by the create path (label/property indexes, adjacency, type counts).
+//! Commit/rollback need no batch-specific logic: rows are versioned and logged
+//! in the transaction's change log identically to the row path, so
+//! `finalize_version_epochs` (commit) and `discard_uncommitted_versions`
+//! (rollback) make the whole batch visible or remove it atomically — including
+//! secondary structures published eagerly by the create path
+//! (label/property indexes, adjacency, type counts).
 
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey, Value};
 use grafeo_common::utils::error::{Error, Result, TransactionError};

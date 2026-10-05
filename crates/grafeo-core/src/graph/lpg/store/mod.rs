@@ -494,8 +494,8 @@ pub struct LpgStore {
     /// Lock order: 10 (after named_graphs, independent of other locks)
     property_undo_log: RwLock<FxHashMap<TransactionId, Vec<PropertyUndoEntry>>>,
 
-    /// Node and edge version entries visited by commit, rollback and the
-    /// statistics refresh, for [`Self::transaction_versions_walked`].
+    /// Node and edge version entries visited by commit and rollback, for
+    /// [`Self::transaction_versions_walked`].
     pub(super) transaction_versions_walked: AtomicU64,
 }
 
