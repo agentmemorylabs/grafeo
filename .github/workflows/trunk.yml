@@ -23,7 +23,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
-  FEATURES: generation,generation-streaming,compact-store,lpg,wal,mmap,cypher,vector-index,text-index
+  # Matches the feature set agent-memory-hosted builds Grafeo with.
+  FEATURES: lpg,cypher,vector-index,text-index,wal,grafeo-file,mmap,parallel,compact-store,generation,generation-streaming,triple-store,tracing
 
 jobs:
   trunk:
@@ -39,28 +40,59 @@ jobs:
       - name: Cache cargo and target
         uses: Swatinem/rust-cache@v2
 
+      # The library itself, with exactly the feature set AMH builds.
       - name: Build
         run: cargo build -p grafeo-engine --features "$FEATURES"
 
+      # Each lib-test step runs even if an earlier one failed, so one run
+      # shows every compile error.
+      - name: Common lib tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p grafeo-common --lib
+
       - name: Core lib tests
-        run: cargo test -p grafeo-core --lib --features "lpg,mmap,compact-store,generation-streaming,vector-index,text-index"
+        if: ${{ !cancelled() }}
+        run: cargo test -p grafeo-core --lib --features "lpg,mmap,compact-store,generation-streaming,vector-index,text-index,triple-store"
+
+      - name: Storage lib tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p grafeo-storage --lib --features "wal,grafeo-file,generation,generation-streaming,tracing"
 
       - name: Engine lib tests
+        if: ${{ !cancelled() }}
         run: cargo test -p grafeo-engine --lib --features "$FEATURES"
 
-      - name: Engine integration tests (generation, layered, compact_store, wal, recovery)
+      # Every engine integration target runs, except the named exceptions below.
+      # A skip-list (not an allow-list) so new tests are picked up automatically,
+      # and every target is compiled, so one that stops compiling fails CI.
+      - name: Engine integration tests (all targets except named exceptions)
+        if: ${{ !cancelled() }}
         run: |
           set -eu
-          targets=""
-          for f in crates/grafeo-engine/tests/*.rs; do
-            n=$(basename "$f" .rs)
-            case "$n" in
-              # Does not compile with generation-streaming: it imports the eager
-              # generate_compact_store, which that feature seals (pub(crate)).
-              compact_store_generation_contract) continue ;;
-              generation_*|layered_*|compact_store_*|*wal*|*recovery*|epoch_handoff_*)
-                targets="$targets --test $n" ;;
-            esac
-          done
-          echo "targets:$targets"
+          # compact_store_generation_contract: cannot compile with generation-streaming
+          #   (imports the eager generate_compact_store, which that feature seals as
+          #   pub(crate)). Runs in the "no-streaming" job below instead.
+          # query_correctness: feature-set mismatch, needs sql-pgq (execute_sql),
+          #   which the AMH feature set does not enable.
+          # section_directory_versions: fails on the base branch (reported in #19);
+          #   re-enable once fixed.
+          skip='^(compact_store_generation_contract|query_correctness|section_directory_versions)$'
+          targets=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="grafeo-engine") | .targets[]
+                     | select(.kind | index("test")) | .name' \
+            | grep -Ev "$skip" | sed 's/^/--test /' | tr '\n' ' ')
+          echo "targets: $targets"
           cargo test -p grafeo-engine --features "$FEATURES" $targets
+
+  no-streaming:
+    name: compact_store_generation_contract (without generation-streaming)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-streaming
+      - name: Run the eager-path contract test
+        run: cargo test -p grafeo-engine --features "generation,compact-store,lpg,wal,mmap" --test compact_store_generation_contract
