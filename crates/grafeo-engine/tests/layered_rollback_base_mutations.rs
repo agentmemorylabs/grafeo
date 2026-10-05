@@ -727,3 +727,220 @@ fn rollback_after_overlay_reset_reports_unrestored_changes() {
     assert!(!session.in_transaction());
     assert!(layered.forgotten_layer_changes() >= 2);
 }
+
+// ── Upstream #409 port: a commit that fails validation aborts fully ──────
+
+/// Counts `TransactionAbort` records in the root WAL after the published
+/// generation's boundary.
+fn wal_abort_count(root: &Path) -> usize {
+    use grafeo_storage::generation::manifest::read_manifest;
+    use grafeo_storage::generation::wal_cursor::{WalReplayCursor, replay_stream_from};
+    use grafeo_storage::wal::WalRecord;
+
+    let (_, slot) = read_manifest(&root.join("manifest.bin")).expect("read manifest");
+    let cursor = WalReplayCursor {
+        log_sequence: slot.wal_log_sequence,
+        byte_offset: slot.wal_byte_offset,
+        epoch: slot.overlay_epoch,
+        transaction_id: slot.transaction_id,
+    };
+    replay_stream_from(&root.join("wal"), &cursor)
+        .expect("stream from boundary")
+        .filter(|frame| {
+            matches!(
+                frame.as_ref().expect("frame decodes").record,
+                WalRecord::TransactionAbort { .. }
+            )
+        })
+        .count()
+}
+
+/// The losing transaction of [`failed_commit_on_generation_root_aborts_fully`]:
+/// every kind of base mutation (node and edge tombstones, a copy-up SET, a
+/// new overlay node with an edge onto a base node), then the write that
+/// conflicts with the already committed winner.
+const LOSER_MUTATIONS: [&str; 5] = [
+    "MATCH (n:Person {name: 'alix'}) DETACH DELETE n",
+    "MATCH (n:Person {name: 'vincent'}) SET n.age = 99",
+    "MATCH (v:Person {name: 'vincent'}) CREATE (:Temp {name: 'tmp'})-[:NEW]->(v)",
+    "MATCH (:Person {name: 'jules'})-[r:LIKES]->() DELETE r",
+    "MATCH (n:Person {name: 'gus'}) SET n.age = 42",
+];
+
+/// Runs the write-write conflict on a generation root: `winner` commits a
+/// SET on gus, then `loser` (begun earlier) applies [`LOSER_MUTATIONS`].
+/// Returns the loser, with its commit not yet attempted, and the live
+/// snapshot taken after the winner committed.
+fn loser_after_winner(db: &GrafeoDB) -> (grafeo_engine::session::Session, Snapshot) {
+    let mut loser = db.session();
+    let mut winner = db.session();
+    loser.begin_transaction().expect("begin loser");
+    winner.begin_transaction().expect("begin winner");
+    winner
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 41")
+        .expect("winner SET");
+    winner.commit().expect("winner commits");
+    drop(winner);
+    let after_winner = snapshot(db);
+
+    for q in LOSER_MUTATIONS {
+        loser.execute(q).expect(q);
+    }
+    (loser, after_winner)
+}
+
+/// A commit that fails validation on a generation root is a full abort:
+/// overlay versions are discarded, base tombstones and copy-ups are undone,
+/// a `TransactionAbort` is logged, the session has no transaction left, the
+/// entities are released so a retry succeeds, and a later commit marker does
+/// not settle any of the failed transaction's records on replay.
+#[test]
+fn failed_commit_on_generation_root_aborts_fully() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    db.create_property_index("name");
+
+    let (mut loser, after_winner) = loser_after_winner(&db);
+    let aborts_before = wal_abort_count(&root);
+    let err = loser
+        .commit()
+        .expect_err("the second writer of gus must fail validation");
+    assert!(
+        err.to_string().to_lowercase().contains("conflict"),
+        "unexpected error: {err}"
+    );
+
+    assert!(
+        !loser.in_transaction(),
+        "the failed commit ended the transaction"
+    );
+    assert!(
+        loser.rollback().is_err(),
+        "there is no transaction left to roll back"
+    );
+    assert_eq!(
+        wal_abort_count(&root),
+        aborts_before + 1,
+        "the failed commit logs exactly one TransactionAbort"
+    );
+    assert_snapshot_eq(
+        "live state after the failed commit",
+        &snapshot(&db),
+        &after_winner,
+    );
+
+    // The entities the loser wrote are released: the same session retries
+    // writes to all of them and commits.
+    loser.begin_transaction().expect("begin retry");
+    loser
+        .execute("MATCH (n:Person {name: 'vincent'}) SET n.age = 50")
+        .expect("retry SET vincent");
+    loser
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 43")
+        .expect("retry SET gus");
+    loser
+        .execute("MATCH (n:Person {name: 'alix'}) DETACH DELETE n")
+        .expect("retry DELETE alix");
+    loser.commit().expect("retry commits");
+    drop(loser);
+
+    let after_retry = snapshot(&db);
+    assert!(after_retry.by_label["Temp"].is_empty(), "no Temp node");
+    assert!(
+        after_retry
+            .cypher_edges
+            .iter()
+            .any(|(_, t, _)| t.contains("LIKES")),
+        "the LIKES tombstone was undone"
+    );
+
+    // The retry's commit marker follows the failed transaction's records in
+    // the WAL; replay must not settle them as committed.
+    db.close().expect("close");
+    drop(db);
+    let db = open_root(&root);
+    db.create_property_index("name");
+    assert_snapshot_eq("after close + reopen", &snapshot(&db), &after_retry);
+}
+
+/// A failed commit whose abort marker cannot be appended does not pass
+/// silently: the WAL is poisoned (a later commit marker could otherwise
+/// settle the failed transaction's records on replay), later writes are
+/// refused, and the failed transaction is not there after reopen.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn failed_commit_whose_abort_marker_fails_poisons_the_wal() {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_from};
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let after_winner;
+    {
+        let db = open_root(&root);
+        let (mut loser, snap) = loser_after_winner(&db);
+        after_winner = snap;
+        // Validation fails before anything is appended, so the abort
+        // marker is the next append.
+        enable_io_failure_from(1);
+        let r = loser.commit();
+        disable_io_failure();
+        let err = r.expect_err("the commit still fails");
+        assert!(
+            err.to_string().to_lowercase().contains("conflict"),
+            "the caller still gets the conflict: {err}"
+        );
+        assert!(!loser.in_transaction());
+        assert_snapshot_eq("live, abort marker failed", &snapshot(&db), &after_winner);
+        assert!(
+            db.session()
+                .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 43")
+                .is_err(),
+            "the WAL refuses writes after the abort marker failed"
+        );
+        drop(loser);
+        drop(db);
+    }
+    let db = open_root(&root);
+    assert_snapshot_eq("after reopen", &snapshot(&db), &after_winner);
+}
+
+/// An explicit rollback whose abort marker cannot be appended reports an
+/// error instead of `Ok`, still ends the transaction, and poisons the WAL.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn rollback_whose_abort_marker_fails_reports_an_error() {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_from};
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+    let before = snapshot(&db);
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    for q in MUTATIONS {
+        session.execute(q).expect(q);
+    }
+    enable_io_failure_from(1);
+    let r = session.rollback();
+    disable_io_failure();
+    let err = r.expect_err("a lost abort marker must not be reported as success");
+    assert!(
+        err.to_string().contains("abort marker"),
+        "unexpected error: {err}"
+    );
+    assert!(!session.in_transaction(), "the transaction still ended");
+    assert_snapshot_eq("live after rollback", &snapshot(&db), &before);
+    assert!(
+        session.execute("INSERT (:After)").is_err(),
+        "the WAL is poisoned"
+    );
+    // Rolling back once the WAL is already poisoned is not an error: the
+    // poison already refuses every later append.
+    session.begin_transaction().expect("begin after poison");
+    session
+        .rollback()
+        .expect("rollback on an already poisoned WAL");
+}
