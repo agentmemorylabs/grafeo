@@ -631,15 +631,17 @@ impl LayeredStore {
     /// (G-EM0.5c MAJOR-1).
     ///
     /// Every [`GraphStoreMut`] overlay mutation holds the merge guard as
-    /// `.read()` for the duration of the whole operation (see
-    /// [`Self::merge_guard`]). Holding `.write()` here — across the WAL
-    /// boundary cut, the epoch sync, the freeze payload capture, and the
-    /// `begin_epoch_handoff` install — makes the freeze a writer
-    /// linearization point: no mutation can land between the cut and the
-    /// capture, so G(N) can neither duplicate a frozen entity (record > B)
-    /// nor include an N+1-epoch entity. The caller MUST drop the returned
-    /// guard before the freeze returns so N+1 writers proceed only after the
-    /// handoff is fully installed.
+    /// `.read()` while it mutates the store (see [`Self::merge_guard`]).
+    /// Holding `.write()` here — across the WAL boundary cut, the epoch sync,
+    /// the freeze payload capture, and the `begin_epoch_handoff` install —
+    /// keeps store mutations out of the capture: G(N) cannot include an
+    /// N+1-epoch entity. It does not order WAL records against the cut: a
+    /// WAL-backed store appends its record after the store mutation has
+    /// released the guard, and transaction commit markers are written
+    /// separately. Callers must drain writers before the freeze (see
+    /// `GrafeoDB::freeze_epoch_for_handoff`). The caller MUST drop the
+    /// returned guard before the freeze returns so N+1 writers proceed only
+    /// after the handoff is fully installed.
     pub fn freeze_write_barrier(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
         self.merge_guard.write()
     }
@@ -1679,10 +1681,16 @@ impl GraphStore for LayeredStore {
         // Base neighbors, read even when `node` is dirty: `ensure_in_overlay`
         // copies labels and properties but not adjacency. Derived from base
         // edges so per-edge deletions apply; dirty (promoted) edges are
-        // skipped because the overlay copy is authoritative for them.
-        if !deleted_nodes.contains(&node) {
+        // skipped because the overlay copy is authoritative for them. As in
+        // `edges_from` (fork #13), a base node copied into the overlay and
+        // then deleted there is gone.
+        let base_node_gone = |id: &NodeId| {
+            deleted_nodes.contains(id)
+                || (self.is_node_dirty(*id) && self.overlay.load().get_node(*id).is_none())
+        };
+        if !base_node_gone(&node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !deleted_nodes.contains(&target)
+                if !base_node_gone(&target)
                     && !deleted_edges.contains(&eid)
                     && !self.is_edge_dirty(eid)
                 {
@@ -1716,10 +1724,16 @@ impl GraphStore for LayeredStore {
         // Base edges, read even when `node` is dirty: `ensure_in_overlay`
         // copies labels and properties but not adjacency. Dirty (promoted)
         // edges are skipped: the overlay copy is authoritative, and deleting
-        // a promoted edge only removes that copy.
-        if !deleted_nodes.contains(&node) {
+        // a promoted edge only removes that copy. Additionally (fork #13), a
+        // base node copied into the overlay and then deleted there is gone:
+        // its base adjacency must not come back (`base_node_gone`).
+        let base_node_gone = |id: &NodeId| {
+            deleted_nodes.contains(id)
+                || (self.is_node_dirty(*id) && self.overlay.load().get_node(*id).is_none())
+        };
+        if !base_node_gone(&node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !deleted_nodes.contains(&target)
+                if !base_node_gone(&target)
                     && !deleted_edges.contains(&eid)
                     && !self.is_edge_dirty(eid)
                 {
@@ -1849,6 +1863,28 @@ impl GraphStore for LayeredStore {
             .load()
             .edge_type(id)
             .or_else(|| self.overlay.load().edge_type(id))
+    }
+
+    fn edge_type_versioned(
+        &self,
+        id: EdgeId,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Option<ArcStr> {
+        if self.is_edge_deleted_from_base(id) {
+            return None;
+        }
+        if self.is_edge_dirty(id) {
+            return self
+                .overlay
+                .load()
+                .edge_type_versioned(id, epoch, transaction_id);
+        }
+        self.base.load().edge_type(id).or_else(|| {
+            self.overlay
+                .load()
+                .edge_type_versioned(id, epoch, transaction_id)
+        })
     }
 
     fn has_property_index(&self, property: &str) -> bool {
@@ -2809,12 +2845,15 @@ impl LayeredStore {
     /// copies its labels and properties into the overlay and marks it dirty.
     ///
     /// `owner` is the writing transaction (`None` for non-transactional
-    /// writes). The copy is written non-versioned so concurrent readers keep
-    /// seeing the base values, and journaled so a rollback of `owner` removes
-    /// it again.
+    /// writes). The copy is created at epoch 0 by the system transaction so
+    /// every snapshot keeps seeing the base values, and journaled so a
+    /// rollback of `owner` removes it again.
+    ///
+    /// The whole step runs under the journal lock, which base deletes also
+    /// take (`delete_*_layered`, `delete_node_edges`): it serializes copy-ups
+    /// of the same entity and orders them against deletes, so a delete that
+    /// won the race is never followed by a copy-up.
     fn ensure_in_overlay(&self, id: NodeId, owner: Option<TransactionId>) {
-        // Not dirty ⇒ the journal is locked for the whole copy-up, which
-        // also serializes concurrent copy-ups of the same node.
         let (dirty, mut journal) = self.node_dirty_guarded(id);
         if dirty {
             // Already overlay-tracked. During an active handoff this mutation
@@ -2826,27 +2865,35 @@ impl LayeredStore {
             self.journal_touch(&mut journal, owner, LayerChange::NodeCopyUp(id));
             return;
         }
+        // Checked under the journal lock (see above).
+        if self.is_node_deleted_from_base(id) {
+            return; // deleted: never copy it back
+        }
         let Some(base_node) = self.base.load().get_node(id) else {
             return; // not in base either (new node case handled by caller)
         };
 
-        // Copy the node into the overlay at the same ID.
-        // We temporarily lower the ID counter, create the node, then restore it.
-        let saved_next = self.overlay.load().next_node_id();
-        self.overlay.load().set_next_node_id(id.as_u64());
+        // Copy the node into the overlay at the same ID, created at epoch 0
+        // by the system transaction: it stands for committed base data, so
+        // every snapshot (including transactions that began before this
+        // write) must keep seeing it. An explicit ID never touches the
+        // overlay's ID allocator, so concurrent creates cannot take it.
         let labels: Vec<&str> = base_node.labels.iter().map(|l| l.as_str()).collect();
-        let promoted_id = self.overlay.load().create_node(&labels);
-        debug_assert_eq!(
-            promoted_id, id,
-            "promoted node should reuse the original ID"
-        );
-        self.overlay.load().set_next_node_id(saved_next);
+        let overlay = self.overlay.load();
+        if overlay
+            .create_node_with_id_at(id, &labels, EpochId::new(0))
+            .is_err()
+        {
+            return;
+        }
 
-        // Copy properties.
+        // Copy properties. With `temporal`, also record them at epoch 0 so
+        // historical reads of the epoch-0 row see them; the plain setter keeps
+        // the overlay's property and text indexes up to date.
         for (key, value) in base_node.properties.iter() {
-            self.overlay
-                .load()
-                .set_node_property(id, key.as_str(), value.clone());
+            #[cfg(feature = "temporal")]
+            overlay.set_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
+            overlay.set_node_property(id, key.as_str(), value.clone());
         }
 
         // Register the owner before the dirty mark publishes the copy.
@@ -2859,6 +2906,10 @@ impl LayeredStore {
     fn ensure_edge_in_overlay(&self, id: EdgeId, owner: Option<TransactionId>) {
         if self.touch_if_edge_dirty(id, owner) {
             return;
+        }
+        // Fast path; checked again under the journal lock below.
+        if self.is_edge_deleted_from_base(id) {
+            return; // deleted: never copy it back
         }
         let Some(base_edge) = self.base.load().get_edge(id) else {
             return;
@@ -2877,26 +2928,32 @@ impl LayeredStore {
             self.journal_touch(&mut journal, owner, LayerChange::EdgeCopyUp(id));
             return;
         }
+        // Second check, after the endpoints are prepared and under the
+        // journal lock base deletes take: see `ensure_in_overlay`.
+        if self.is_edge_deleted_from_base(id) {
+            return;
+        }
 
-        // Create the edge at the same ID.
-        let saved_next = self.overlay.load().next_edge_id();
-        self.overlay.load().set_next_edge_id(id.as_u64());
-        let promoted_id = self.overlay.load().create_edge(
-            base_edge.src,
-            base_edge.dst,
-            base_edge.edge_type.as_str(),
-        );
-        debug_assert_eq!(
-            promoted_id, id,
-            "promoted edge should reuse the original ID"
-        );
-        self.overlay.load().set_next_edge_id(saved_next);
+        // Create the edge at the same ID, at epoch 0: see `ensure_in_overlay`.
+        let overlay = self.overlay.load();
+        if overlay
+            .create_edge_with_id_at(
+                id,
+                base_edge.src,
+                base_edge.dst,
+                base_edge.edge_type.as_str(),
+                EpochId::new(0),
+            )
+            .is_err()
+        {
+            return;
+        }
 
-        // Copy properties.
+        // Copy properties (see `ensure_in_overlay` for `temporal`).
         for (key, value) in base_edge.properties.iter() {
-            self.overlay
-                .load()
-                .set_edge_property(id, key.as_str(), value.clone());
+            #[cfg(feature = "temporal")]
+            overlay.set_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
+            overlay.set_edge_property(id, key.as_str(), value.clone());
         }
 
         self.journal_new(&mut journal, owner, LayerChange::EdgeCopyUp(id));
@@ -5813,5 +5870,77 @@ mod tests {
         layered.reset_overlay();
         assert_eq!(layered.rollback_transaction_layers_to(tx, pos), 1);
         assert_eq!(layered.rollback_transaction_layers(tx), 1);
+    }
+
+    // ── Copy-up review round 2 (fork PR #13) ─────────────────────────
+
+    /// With `temporal`, a copy-up's properties must be readable at the same
+    /// older epochs as its epoch-0 row.
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn test_copy_up_properties_visible_at_older_epochs() {
+        let layered = build_test_layered();
+        let alix = layered
+            .nodes_by_label("Person")
+            .into_iter()
+            .find(|id| {
+                layered.get_node_property(*id, &PropertyKey::new("name"))
+                    == Some(Value::from("Alix"))
+            })
+            .unwrap();
+        layered.overlay.load().sync_epoch(EpochId::new(5));
+        layered.set_node_property(alix, "city", Value::from("Berlin"));
+        let old = layered
+            .get_node_at_epoch(alix, EpochId::new(1))
+            .expect("copied-up row visible at an older epoch");
+        assert_eq!(
+            old.get_property("name"),
+            Some(&Value::from("Alix")),
+            "base properties of a copy-up visible at an older epoch"
+        );
+
+        let edge = layered
+            .edges_from(alix, Direction::Outgoing)
+            .first()
+            .map(|(_, eid)| *eid)
+            .unwrap();
+        layered.set_edge_property(edge, "note", Value::from("x"));
+        let old = layered
+            .get_edge_at_epoch(edge, EpochId::new(1))
+            .expect("copied-up edge visible at an older epoch");
+        assert_eq!(old.get_property("since"), Some(&Value::Int64(2020)));
+    }
+
+    /// A base delete racing a first write to the same base node must never
+    /// leave a copied-up row behind a tombstone (hidden from `get_node` but
+    /// still listed by `node_ids`).
+    #[test]
+    fn test_concurrent_delete_and_copy_up_never_resurrect() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..2_000 {
+            let layered = Arc::new(build_test_layered());
+            let city = layered.nodes_by_label("City")[0];
+            let barrier = Arc::new(Barrier::new(2));
+            let (l1, b1) = (Arc::clone(&layered), Arc::clone(&barrier));
+            let deleter = std::thread::spawn(move || {
+                b1.wait();
+                l1.delete_node(city)
+            });
+            let (l2, b2) = (Arc::clone(&layered), Arc::clone(&barrier));
+            let writer = std::thread::spawn(move || {
+                b2.wait();
+                l2.set_node_property(city, "x", Value::Int64(1));
+            });
+            assert!(deleter.join().unwrap());
+            writer.join().unwrap();
+            assert!(
+                layered.get_node(city).is_none(),
+                "deleted node stays hidden"
+            );
+            assert!(
+                !layered.node_ids().contains(&city),
+                "deleted node must not be listed by node_ids"
+            );
+        }
     }
 }

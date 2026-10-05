@@ -109,6 +109,9 @@ impl Session {
         if !self.identity.can_admin() && optimized_plan.root.has_mutations() {
             self.require_permission(crate::auth::StatementKind::Write)?;
         }
+        if optimized_plan.root.has_mutations() {
+            self.check_wal_writable()?;
+        }
 
         let planner = RdfPlanner::new(Arc::clone(&self.rdf_store))
             .with_transaction_id(*self.current_transaction.lock());
@@ -168,6 +171,9 @@ impl Session {
         if !self.identity.can_admin() && optimized_plan.root.has_mutations() {
             self.require_permission(crate::auth::StatementKind::Write)?;
         }
+        if optimized_plan.root.has_mutations() {
+            self.check_wal_writable()?;
+        }
 
         // EXPLAIN: return the logical plan tree without executing
         if optimized_plan.explain {
@@ -219,6 +225,9 @@ impl Session {
         // Check role-based permission for mutations (skip tree walk for admin)
         if !self.identity.can_admin() && optimized_plan.root.has_mutations() {
             self.require_permission(crate::auth::StatementKind::Write)?;
+        }
+        if optimized_plan.root.has_mutations() {
+            self.check_wal_writable()?;
         }
 
         // EXPLAIN: return the logical plan tree without executing
@@ -280,6 +289,9 @@ impl Session {
         // Check role-based permission for mutations (skip tree walk for admin)
         if !self.identity.can_admin() && optimized_plan.root.has_mutations() {
             self.require_permission(crate::auth::StatementKind::Write)?;
+        }
+        if optimized_plan.root.has_mutations() {
+            self.check_wal_writable()?;
         }
 
         // EXPLAIN: return the logical plan tree without executing

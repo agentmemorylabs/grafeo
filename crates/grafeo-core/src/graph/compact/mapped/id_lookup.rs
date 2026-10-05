@@ -74,6 +74,13 @@ impl MappedNodeIdLookup {
         self.bytes.len()
     }
 
+    /// The raw segment body (sorted 24-byte records), for re-emitting the
+    /// segment unchanged when the store is serialized again.
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Binary-searches for `id`. Complexity O(log N).
     #[must_use]
     pub fn lookup(&self, id: NodeId) -> Option<(u16, u64)> {
@@ -185,6 +192,13 @@ impl MappedEdgeIdLookup {
     #[must_use]
     pub fn byte_len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// The raw segment body (sorted 24-byte records), for re-emitting the
+    /// segment unchanged when the store is serialized again.
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// Binary-searches for `id`. Complexity O(log E).

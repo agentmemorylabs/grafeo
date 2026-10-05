@@ -283,6 +283,11 @@ impl super::GrafeoDB {
     /// Returns an error if the WAL log (when enabled) fails to record the
     /// deletion.
     pub fn delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if self.layered_store.is_some() {
+            return self.layered_delete_node(id);
+        }
+
         // Capture properties for CDC before deletion
         #[cfg(feature = "cdc")]
         let cdc_props = if self.cdc_active() {
@@ -393,6 +398,11 @@ impl super::GrafeoDB {
         key: &str,
         value: grafeo_common::types::Value,
     ) -> Result<()> {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if self.layered_store.is_some() {
+            return self.layered_set_node_property(id, key, value);
+        }
+
         // Extract vector data before the value is moved into the store
         #[cfg(feature = "vector-index")]
         let vector_data = match &value {
@@ -457,26 +467,37 @@ impl super::GrafeoDB {
         // Auto-update matching text indexes
         #[cfg(feature = "text-index")]
         if let Some(node) = self.lpg_store().get_node(id) {
-            let text_val = node
-                .properties
-                .get(&grafeo_common::types::PropertyKey::new(key))
-                .and_then(|v| match v {
-                    grafeo_common::types::Value::String(s) => Some(s.to_string()),
-                    _ => None,
-                });
-            for label in &node.labels {
-                if let Some(index) = self.lpg_store().get_text_index(label.as_str(), key) {
-                    let mut idx = index.write();
-                    if let Some(ref text) = text_val {
-                        idx.insert(id, text);
-                    } else {
-                        idx.remove(id);
-                    }
-                }
-            }
+            self.reindex_text_property(id, key, &node);
         }
 
         Ok(())
+    }
+
+    /// Re-indexes `node`'s `key` property in the text indexes of its labels.
+    #[cfg(feature = "text-index")]
+    fn reindex_text_property(
+        &self,
+        id: grafeo_common::types::NodeId,
+        key: &str,
+        node: &grafeo_core::graph::lpg::Node,
+    ) {
+        let text_val = node
+            .properties
+            .get(&grafeo_common::types::PropertyKey::new(key))
+            .and_then(|v| match v {
+                grafeo_common::types::Value::String(s) => Some(s.to_string()),
+                _ => None,
+            });
+        for label in &node.labels {
+            if let Some(index) = self.lpg_store().get_text_index(label.as_str(), key) {
+                let mut idx = index.write();
+                if let Some(ref text) = text_val {
+                    idx.insert(id, text);
+                } else {
+                    idx.remove(id);
+                }
+            }
+        }
     }
 
     /// Adds a label to an existing node.
@@ -848,6 +869,11 @@ impl super::GrafeoDB {
         &self,
         id: grafeo_common::types::EdgeId,
     ) -> Option<grafeo_core::graph::lpg::Edge> {
+        // Same as `get_node`: a layered database serves base edges too.
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.get_edge(id);
+        }
         self.lpg_store().get_edge(id)
     }
 
@@ -855,6 +881,11 @@ impl super::GrafeoDB {
     ///
     /// If WAL is enabled, the operation is logged for durability.
     pub fn delete_edge(&self, id: grafeo_common::types::EdgeId) -> bool {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if self.layered_store.is_some() {
+            return self.layered_delete_edge(id);
+        }
+
         // Capture properties for CDC before deletion
         #[cfg(feature = "cdc")]
         let cdc_props = if self.cdc_active() {
@@ -896,6 +927,12 @@ impl super::GrafeoDB {
         key: &str,
         value: grafeo_common::types::Value,
     ) {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if self.layered_store.is_some() {
+            self.layered_set_edge_property(id, key, value);
+            return;
+        }
+
         // Log to WAL first
         #[cfg(feature = "wal")]
         if let Err(e) = self.log_wal(&WalRecord::SetEdgeProperty {
@@ -1006,6 +1043,7 @@ impl super::GrafeoDB {
     /// # Returns
     ///
     /// Vector of created `NodeId`s in the same order as the input vectors.
+    /// Empty, with nothing created, once the WAL is poisoned.
     pub fn batch_create_nodes(
         &self,
         label: &str,
@@ -1013,6 +1051,10 @@ impl super::GrafeoDB {
         vectors: Vec<Vec<f32>>,
     ) -> Vec<grafeo_common::types::NodeId> {
         use grafeo_common::types::{PropertyKey, Value};
+
+        if self.refuse_write_if_wal_poisoned("batch_create_nodes") {
+            return Vec::new();
+        }
 
         let prop_key = PropertyKey::new(property);
         let labels: &[&str] = &[label];
@@ -1094,6 +1136,7 @@ impl super::GrafeoDB {
     /// # Returns
     ///
     /// Vector of created `NodeId`s in the same order as the input.
+    /// Empty, with nothing created, once the WAL is poisoned.
     pub fn batch_create_nodes_with_props(
         &self,
         label: &str,
@@ -1106,6 +1149,10 @@ impl super::GrafeoDB {
     ) -> Vec<grafeo_common::types::NodeId> {
         #[cfg(any(feature = "vector-index", feature = "text-index"))]
         use grafeo_common::types::Value;
+
+        if self.refuse_write_if_wal_poisoned("batch_create_nodes_with_props") {
+            return Vec::new();
+        }
 
         let labels: &[&str] = &[label];
 
@@ -1264,5 +1311,145 @@ impl super::GrafeoDB {
         self.lpg_store()
             .bulk_create_nodes_with_props_unindexed(label, rows)
             .map_err(|message| grafeo_common::utils::error::Error::Internal(message.to_owned()))
+    }
+}
+
+/// Direct CRUD on a layered database (a generation root, or after
+/// `compact()`).
+///
+/// `lpg_store()` is only the overlay there: base elements are invisible to it
+/// and writes to them are dropped. These route the store write through a
+/// session instead, which writes the layered store, logs the WAL records and
+/// commits in an implicit transaction (so generation-root replay keeps the
+/// write), and applies vector-index updates. The CDC and text-index side
+/// effects of the plain path are kept here, read through the layered view.
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+impl super::GrafeoDB {
+    fn layered_set_node_property(
+        &self,
+        id: grafeo_common::types::NodeId,
+        key: &str,
+        value: grafeo_common::types::Value,
+    ) -> Result<()> {
+        #[cfg(feature = "cdc")]
+        let cdc_change = self.cdc_active().then(|| {
+            let old = self
+                .get_node(id)
+                .and_then(|node| node.get_property(key).cloned());
+            (old, value.clone())
+        });
+
+        self.session().set_node_property(id, key, value)?;
+
+        #[cfg(feature = "cdc")]
+        if let Some((old, new)) = cdc_change {
+            self.cdc_log.record_update(
+                crate::cdc::EntityId::Node(id),
+                self.lpg_store().current_epoch(),
+                key,
+                old,
+                new,
+            );
+        }
+
+        #[cfg(feature = "text-index")]
+        if let Some(node) = self.get_node(id) {
+            self.reindex_text_property(id, key, &node);
+        }
+        Ok(())
+    }
+
+    fn layered_delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {
+        let Some(node) = self.get_node(id) else {
+            return Ok(false);
+        };
+        if !self.session().delete_node_checked(id)? {
+            return Ok(false);
+        }
+
+        #[cfg(feature = "text-index")]
+        for label in &node.labels {
+            let prefix = format!("{}:", label.as_str());
+            for (key, index) in self.lpg_store().text_index_entries() {
+                if key.starts_with(&prefix) {
+                    index.write().remove(id);
+                }
+            }
+        }
+
+        #[cfg(feature = "cdc")]
+        if self.cdc_active() {
+            self.cdc_log.record_delete(
+                crate::cdc::EntityId::Node(id),
+                self.lpg_store().current_epoch(),
+                Some(
+                    node.properties
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        #[cfg(not(any(feature = "text-index", feature = "cdc")))]
+        let _ = node;
+        Ok(true)
+    }
+
+    fn layered_delete_edge(&self, id: grafeo_common::types::EdgeId) -> bool {
+        #[cfg(feature = "cdc")]
+        let cdc_props = if self.cdc_active() {
+            self.get_edge(id).map(|edge| {
+                edge.properties
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect::<std::collections::HashMap<String, grafeo_common::types::Value>>()
+            })
+        } else {
+            None
+        };
+
+        let deleted = self.session().delete_edge(id);
+
+        #[cfg(feature = "cdc")]
+        if deleted && self.cdc_active() {
+            self.cdc_log.record_delete(
+                crate::cdc::EntityId::Edge(id),
+                self.lpg_store().current_epoch(),
+                cdc_props,
+            );
+        }
+        deleted
+    }
+
+    fn layered_set_edge_property(
+        &self,
+        id: grafeo_common::types::EdgeId,
+        key: &str,
+        value: grafeo_common::types::Value,
+    ) {
+        #[cfg(feature = "cdc")]
+        let cdc_change = self.cdc_active().then(|| {
+            let old = self
+                .get_edge(id)
+                .and_then(|edge| edge.get_property(key).cloned());
+            (old, value.clone())
+        });
+
+        // This method has no error channel (unlike `set_node_property`).
+        if let Err(e) = self.session().set_edge_property(id, key, value) {
+            grafeo_common::grafeo_warn!("set_edge_property({id:?}, {key}) failed: {e}");
+            return;
+        }
+
+        #[cfg(feature = "cdc")]
+        if let Some((old, new)) = cdc_change {
+            self.cdc_log.record_update(
+                crate::cdc::EntityId::Edge(id),
+                self.lpg_store().current_epoch(),
+                key,
+                old,
+                new,
+            );
+        }
     }
 }

@@ -41,12 +41,19 @@ pub struct ReplayTarget<'a> {
 pub enum WalTailClass {
     /// The stream ended at a committed boundary.
     Clean,
-    /// Complete uncommitted records at the active-file tail were discarded.
+    /// The tail holds an unfinished transaction: complete uncommitted
+    /// records, or a `TransactionCommit` whose `EpochAdvance` never made it
+    /// (a crash between the two frames). Its records were not applied.
     TornTail {
         /// Active WAL sequence.
         seq: u64,
-        /// First partial or absent frame position after the discarded tail.
+        /// Where a writable open truncates the active file: the first partial
+        /// or absent frame, or the unpaired `TransactionCommit` frame.
         byte_offset: u64,
+        /// Complete records of the unfinished transaction remain before
+        /// `byte_offset`; a writable open must log a `TransactionAbort` after
+        /// truncating, or a later commit would apply them.
+        discard_records: bool,
     },
 }
 
@@ -598,6 +605,10 @@ pub fn replay_generation_wal(
     // Serial-transaction invariant: data records carry no transaction ID, so
     // exactly one pending transaction can exist in the stream.
     let mut pending: Vec<ReplayFrame> = Vec::new();
+    // A commit's records are applied only once its `EpochAdvance` is read: a
+    // commit frame without one (a crash between the two) is a torn tail.
+    let mut committed: Vec<ReplayFrame> = Vec::new();
+    let mut commit_position: Option<(u64, u64)> = None;
     let mut awaiting_epoch: Option<TransactionId> = None;
     let mut cursor = LpgReplayCursor::default();
     let mut applied_records = 0u64;
@@ -617,12 +628,8 @@ pub fn replay_generation_wal(
                         ),
                     ));
                 }
-                for pending_frame in pending.drain(..) {
-                    apply_record(&pending_frame, target, &mut cursor)?;
-                    applied_records += 1;
-                }
-                committed_transactions += 1;
-                max_transaction_id = max_transaction_id.max(*transaction_id);
+                committed = std::mem::take(&mut pending);
+                commit_position = Some((frame.log_sequence, frame.byte_offset));
                 awaiting_epoch = Some(*transaction_id);
             }
             WalRecord::TransactionAbort { transaction_id } => {
@@ -646,6 +653,13 @@ pub fn replay_generation_wal(
                         format!("epoch advance {epoch} has no preceding commit"),
                     ));
                 };
+                for committed_frame in committed.drain(..) {
+                    apply_record(&committed_frame, target, &mut cursor)?;
+                    applied_records += 1;
+                }
+                commit_position = None;
+                committed_transactions += 1;
+                max_transaction_id = max_transaction_id.max(transaction_id);
                 final_epoch = final_epoch.max(*epoch);
                 target
                     .transaction_manager
@@ -706,12 +720,25 @@ pub fn replay_generation_wal(
             detail: "WAL stream exhausted without a terminal position".to_string(),
         });
     };
-    let tail = if pending.is_empty() {
+    let tail = if let Some((commit_seq, commit_offset)) = commit_position {
+        // Unpaired commit: cut it off; the records before it were never
+        // applied and must be aborted.
+        WalTailClass::TornTail {
+            seq: commit_seq,
+            byte_offset: commit_offset,
+            discard_records: !committed.is_empty(),
+        }
+    } else if pending.is_empty() {
         WalTailClass::Clean
     } else {
-        pending.clear();
-        WalTailClass::TornTail { seq, byte_offset }
+        WalTailClass::TornTail {
+            seq,
+            byte_offset,
+            discard_records: true,
+        }
     };
+    pending.clear();
+    committed.clear();
 
     target.transaction_manager.sync_epoch(final_epoch);
     target
@@ -1199,7 +1226,7 @@ mod tests {
         assert_eq!(report.applied_records, 1);
         assert_eq!(report.committed_transactions, 1);
         assert!(
-            matches!(report.tail, WalTailClass::TornTail { seq: 0, byte_offset } if byte_offset > 0)
+            matches!(report.tail, WalTailClass::TornTail { seq: 0, byte_offset, .. } if byte_offset > 0)
         );
         assert!(target.layered.get_node(NodeId::new(70)).is_some());
         assert!(target.layered.get_node(NodeId::new(71)).is_none());

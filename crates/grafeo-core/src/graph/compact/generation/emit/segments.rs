@@ -15,13 +15,13 @@ use crate::graph::compact::CompactStore;
 use crate::graph::compact::generation::error::GenerationError;
 use crate::graph::compact::mapped::{
     SegmentKind, ZONE_MAP_RECORD_LEN, build_dictionary_code_index, build_string_segments,
-    build_zone_map_segments, write_edge_id_record, write_node_id_record,
+    build_zone_map_segments,
 };
 use crate::graph::compact::node_table::NodeTable;
 use crate::graph::compact::rel_table::RelTable;
 use crate::graph::compact::section_v5::{
-    append_u32_array, codec_disc, value_type_code, write_column_body, write_u16, write_u32,
-    write_u64,
+    append_u32_array, codec_disc, encode_id_segments, value_type_code, write_column_body,
+    write_u16, write_u32, write_u64,
 };
 use grafeo_common::utils::hash::FxHashMap;
 
@@ -431,39 +431,7 @@ pub fn emit_canonical_descriptors(
 
     // ── ID lookups ──────────────────────────────────────────────────────
     if store.preserves_ids() {
-        let mut node_lookup = Vec::new();
-        let mut edge_lookup = Vec::new();
-        let mut node_orig = Vec::new();
-        let mut edge_orig = Vec::new();
-
-        if let Some(ref map) = store.node_id_map {
-            let mut entries: Vec<_> = map.iter().map(|(&id, &v)| (id.as_u64(), v)).collect();
-            entries.sort_by_key(|(id, _)| *id);
-            for (id, (tid, off)) in entries {
-                write_node_id_record(&mut node_lookup, id, tid, off);
-            }
-        }
-        if let Some(ref rev) = store.node_offset_to_id {
-            for table in rev {
-                for id in table {
-                    write_u64(&mut node_orig, id.as_u64());
-                }
-            }
-        }
-        if let Some(ref map) = store.edge_id_map {
-            let mut entries: Vec<_> = map.iter().map(|(&id, &v)| (id.as_u64(), v)).collect();
-            entries.sort_by_key(|(id, _)| *id);
-            for (id, (rid, pos)) in entries {
-                write_edge_id_record(&mut edge_lookup, id, rid, pos);
-            }
-        }
-        if let Some(ref rev) = store.edge_offset_to_id {
-            for table in rev {
-                for id in table {
-                    write_u64(&mut edge_orig, id.as_u64());
-                }
-            }
-        }
+        let [node_lookup, edge_lookup, node_orig, edge_orig] = encode_id_segments(store);
         descriptors.push(emit(
             SegmentKind::NodeIdLookup,
             1,
