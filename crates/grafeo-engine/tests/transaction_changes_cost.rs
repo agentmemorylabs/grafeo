@@ -141,7 +141,11 @@ fn plain_store_rollback_and_commit_walk_only_the_changes() {
 
         walked.push((size, rollback, commit));
     }
-    let [(_, small_rollback, small_commit), (_, large_rollback, large_commit)] = walked[..] else {
+    let [
+        (_, small_rollback, small_commit),
+        (_, large_rollback, large_commit),
+    ] = walked[..]
+    else {
         unreachable!()
     };
     assert_eq!(
@@ -193,7 +197,12 @@ mod generation_root {
                     .unwrap()
             })
             .collect();
-        for (s, d, t) in [(0, 1, "KNOWS"), (1, 2, "KNOWS"), (2, 3, "KNOWS"), (3, 4, "LIKES")] {
+        for (s, d, t) in [
+            (0, 1, "KNOWS"),
+            (1, 2, "KNOWS"),
+            (2, 3, "KNOWS"),
+            (3, 4, "LIKES"),
+        ] {
             source.create_edge(ids[s], ids[d], t);
         }
         source
@@ -239,9 +248,7 @@ mod generation_root {
             .execute("MATCH (p:Person) RETURN p.name, p.age ORDER BY p.name")
             .unwrap();
         state.insert("people".into(), format!("{:?}", rows.rows()));
-        let rows = db
-            .execute("MATCH (b:Bulk {i: 1}) RETURN b.flag")
-            .unwrap();
+        let rows = db.execute("MATCH (b:Bulk {i: 1}) RETURN b.flag").unwrap();
         state.insert("bulk 1".into(), format!("{:?}", rows.rows()));
         state
     }
@@ -271,7 +278,11 @@ mod generation_root {
             db.execute("MATCH (p:Person) RETURN count(p)").unwrap();
             let rollback = overlay.transaction_versions_walked() - start;
 
-            assert_eq!(state(&db), before, "rollback with {overlay_rows} overlay rows");
+            assert_eq!(
+                state(&db),
+                before,
+                "rollback with {overlay_rows} overlay rows"
+            );
             walked.push(rollback);
 
             // The same changes still commit.

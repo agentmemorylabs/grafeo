@@ -1712,6 +1712,12 @@ fn test_committed_property_history_skips_pending_entries() {
             })
             .collect()
     };
-    assert_eq!(committed(a), vec![("k".to_string(), vec![Value::from("a")])]);
-    assert_eq!(committed(b), vec![("k".to_string(), vec![Value::from("b")])]);
+    assert_eq!(
+        committed(a),
+        vec![("k".to_string(), vec![Value::from("a")])]
+    );
+    assert_eq!(
+        committed(b),
+        vec![("k".to_string(), vec![Value::from("b")])]
+    );
 }
