@@ -83,7 +83,11 @@ impl GrafeoDB {
                     "no file manager configured for snapshot write".to_string(),
                 ));
             };
-            db.checkpoint_to_file(fm, super::flush::FlushReason::Checkpoint)
+            // Full image (`Explicit`): `write_versioned_sections` replaces the
+            // whole file with exactly the sections it is given, so a
+            // dirty-only flush would drop every clean section (e.g. the
+            // compacted base) from the file.
+            db.checkpoint_to_file(fm, super::flush::FlushReason::Explicit)
                 .map(|_| ())
         })
         .await

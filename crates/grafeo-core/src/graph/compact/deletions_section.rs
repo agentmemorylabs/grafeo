@@ -70,6 +70,10 @@ impl OverlayDeletionsSection {
     pub fn from_layered(layered: Arc<LayeredStore>) -> Self {
         let mut nodes = layered.snapshot_deleted_node_ids();
         let mut edges = layered.snapshot_deleted_edge_ids();
+        // Base entities copied into the overlay and then deleted there have
+        // no other durable record; see `snapshot_deleted_promoted_node_ids`.
+        nodes.extend(layered.snapshot_deleted_promoted_node_ids());
+        edges.extend(layered.snapshot_deleted_promoted_edge_ids());
         nodes.sort_unstable();
         nodes.dedup();
         edges.sort_unstable();
