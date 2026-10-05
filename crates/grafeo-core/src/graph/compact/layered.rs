@@ -1703,9 +1703,11 @@ impl GraphStore for LayeredStore {
         // `compact()` whose src is a base node records the base id in
         // the overlay's adjacency even though the overlay has no
         // corresponding node object; gating on `overlay.get_node(node)`
-        // would miss that case.
-        for nid in self.overlay.load().neighbors(node, direction) {
-            if !deleted_nodes.contains(&nid) {
+        // would miss that case. Read through the edges, as `edges_from`
+        // does, so a tombstoned edge is skipped: after a handoff install an
+        // absorbed edge deleted through its base keeps its overlay copy.
+        for (nid, eid) in self.overlay.load().edges_from(node, direction) {
+            if !deleted_nodes.contains(&nid) && !deleted_edges.contains(&eid) {
                 results.push(nid);
             }
         }
