@@ -112,8 +112,9 @@ impl Kind {
     }
 }
 
+/// The kinds compiled in (one or both, by feature).
+#[allow(unused_mut, clippy::vec_init_then_push)]
 fn kinds() -> Vec<Kind> {
-    #[allow(unused_mut)]
     let mut kinds = Vec::new();
     #[cfg(feature = "grafeo-file")]
     kinds.push(Kind::SingleFile);

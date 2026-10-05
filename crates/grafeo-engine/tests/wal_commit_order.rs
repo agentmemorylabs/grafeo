@@ -19,7 +19,6 @@
 #![cfg(all(debug_assertions, feature = "wal", feature = "lpg", feature = "gql"))]
 #![allow(missing_docs)]
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -98,7 +97,7 @@ fn check_reopen(open: impl Fn() -> GrafeoDB) {
 }
 
 #[cfg(all(feature = "generation", feature = "compact-store", feature = "mmap"))]
-fn publish_root(dir: &Path) -> PathBuf {
+fn publish_root(dir: &std::path::Path) -> std::path::PathBuf {
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
     let source = GrafeoDB::new_in_memory();
