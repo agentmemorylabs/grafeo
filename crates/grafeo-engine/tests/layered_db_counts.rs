@@ -683,6 +683,58 @@ mod generation_root {
         db.close().expect("close");
     }
 
+    /// After a handoff install the absorbed rows stay in the overlay, not
+    /// dirty. Deleting one tombstones its base row while the overlay copy
+    /// stays, and the counts added that copy back.
+    #[test]
+    fn counts_after_deleting_absorbed_rows_after_a_handoff_install() {
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path().join("handoff-delete.grafeo.d");
+        publish_base(&root);
+        let db = open_root(&root);
+        run_writes(
+            &db,
+            &[
+                "INSERT (:R {name: 'd'})",
+                "MATCH (a:P {name: 'a'}), (d:R {name: 'd'}) INSERT (a)-[:L]->(d)",
+            ],
+        );
+        assert_counts(&db, 4, 3, "before handoff");
+        let report = db
+            .run_epoch_handoff(generation_build_request(&root, "counts-g2"))
+            .expect("run epoch handoff");
+        db.publish_and_install_handoff(report)
+            .expect("publish and install handoff");
+        assert_counts(&db, 4, 3, "after handoff install");
+
+        // The absorbed edge, through a query.
+        run_writes(&db, &["MATCH ()-[r:L]->() DELETE r"]);
+        assert_counts(&db, 4, 2, "after deleting the absorbed edge");
+
+        // The absorbed node, through the direct API.
+        let d = match &db
+            .execute("MATCH (n:R {name: 'd'}) RETURN id(n)")
+            .expect("id of d")
+            .rows()[0][0]
+        {
+            Value::Int64(id) => grafeo_common::types::NodeId::new(u64::try_from(*id).expect("id")),
+            other => panic!("expected an integer id, got {other:?}"),
+        };
+        assert!(db.delete_node(d).expect("delete d"), "d was deleted");
+        assert!(db.get_node(d).is_none(), "d is gone");
+        assert_counts(&db, 3, 2, "after deleting the absorbed node");
+        let layered = db.layered_store().expect("layered");
+        assert_eq!(layered.node_ids().len(), 3, "node_ids after the deletes");
+        db.close().expect("close");
+        drop(db);
+
+        for reopen in 1..=2 {
+            let db = open_root(&root);
+            assert_counts(&db, 3, 2, &format!("reopen #{reopen} after the deletes"));
+            db.close().expect("close");
+        }
+    }
+
     /// A base whose nodes carry more than one label stores the extra labels
     /// in the label-membership segment. `label_count` must see them.
     #[test]
