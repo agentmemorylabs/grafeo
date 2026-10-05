@@ -396,14 +396,26 @@ impl Session {
     /// error rather than only a log line so embedders that compile out
     /// `tracing` still see it.
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    ///
+    /// The message does not promise a repair: after a merge the new base
+    /// already contains the changes, a layered session may have no WAL, and
+    /// a generation freeze can capture pending tombstones, so reopening is
+    /// not guaranteed to restore the committed state.
     fn incomplete_rollback_error(
         transaction_id: TransactionId,
         unrestored: usize,
+        transaction_still_open: bool,
     ) -> grafeo_common::utils::error::Error {
+        let open_note = if transaction_still_open {
+            " The transaction is still open."
+        } else {
+            ""
+        };
         let msg = format!(
             "rollback incomplete: {unrestored} layered base change(s) of {transaction_id:?} \
-             could not be undone because an overlay reset or merge absorbed them while the \
-             transaction was open; reopen the database to restore the committed state"
+             could not be fully restored because an overlay reset or merge absorbed them \
+             while the transaction was open; recovery requires checking the persisted \
+             generation and WAL.{open_note}"
         );
         grafeo_warn!("{}", msg);
         grafeo_common::utils::error::Error::Transaction(
@@ -4121,7 +4133,7 @@ impl Session {
                 {
                     let unrestored = self.rollback_layered_bookkeeping(transaction_id);
                     if unrestored > 0 {
-                        let _ = Self::incomplete_rollback_error(transaction_id, unrestored);
+                        let _ = Self::incomplete_rollback_error(transaction_id, unrestored, false);
                     }
                 }
                 #[cfg(feature = "triple-store")]
@@ -4376,7 +4388,11 @@ impl Session {
         // surface base changes the layered undo could not restore.
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if result.is_ok() && unrestored > 0 {
-            return Err(Self::incomplete_rollback_error(transaction_id, unrestored));
+            return Err(Self::incomplete_rollback_error(
+                transaction_id,
+                unrestored,
+                false,
+            ));
         }
 
         result
@@ -4540,7 +4556,11 @@ impl Session {
         // state could not be fully restored.
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if unrestored > 0 {
-            return Err(Self::incomplete_rollback_error(transaction_id, unrestored));
+            return Err(Self::incomplete_rollback_error(
+                transaction_id,
+                unrestored,
+                true,
+            ));
         }
 
         Ok(())

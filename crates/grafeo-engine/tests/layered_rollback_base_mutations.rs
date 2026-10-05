@@ -708,9 +708,22 @@ fn rollback_after_overlay_reset_reports_unrestored_changes() {
         .rollback_to_savepoint("sp")
         .expect_err("savepoint rollback must report it too");
     assert!(
-        err.to_string().contains("rollback incomplete"),
+        err.to_string().contains("rollback incomplete") && err.to_string().contains("still open"),
         "unexpected error: {err}"
     );
-    let _ = session.rollback();
+    assert!(
+        session.in_transaction(),
+        "a savepoint rollback leaves the transaction open"
+    );
+    // The loss stays recorded, so the full rollback reports it as well and
+    // still ends the transaction.
+    let err = session
+        .rollback()
+        .expect_err("the full rollback reports the same loss");
+    assert!(
+        err.to_string().contains("rollback incomplete") && !err.to_string().contains("still open"),
+        "unexpected error: {err}"
+    );
+    assert!(!session.in_transaction());
     assert!(layered.forgotten_layer_changes() >= 2);
 }
