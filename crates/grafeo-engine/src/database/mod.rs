@@ -1166,8 +1166,14 @@ impl GrafeoDB {
         {
             let tail = match report.tail {
                 generation::replay::WalTailClass::Clean => "clean".to_string(),
-                generation::replay::WalTailClass::TornTail { seq, byte_offset } => {
-                    format!("torn-tail(seq={seq}, byte_offset={byte_offset})")
+                generation::replay::WalTailClass::TornTail {
+                    seq,
+                    byte_offset,
+                    discard_records,
+                } => {
+                    format!(
+                        "torn-tail(seq={seq}, byte_offset={byte_offset}, discard_records={discard_records})"
+                    )
                 }
             };
             grafeo_info!(
@@ -1183,7 +1189,9 @@ impl GrafeoDB {
         // freshly installed WAL appends after the last committed frame.
         #[cfg(feature = "wal")]
         if !read_only
-            && let generation::replay::WalTailClass::TornTail { seq, byte_offset } = report.tail
+            && let generation::replay::WalTailClass::TornTail {
+                seq, byte_offset, ..
+            } = report.tail
         {
             grafeo_storage::wal::truncate_active_tail(&wal_dir, seq, byte_offset)?;
         }
@@ -1210,7 +1218,21 @@ impl GrafeoDB {
                 durability: wal_durability,
                 ..WalConfig::default()
             };
-            db.wal = Some(Arc::new(LpgWal::with_config(&wal_dir, wal_config)?));
+            let wal = Arc::new(LpgWal::with_config(&wal_dir, wal_config)?);
+            // The torn tail's unfinished transaction left complete records
+            // before the cut. Close it with an abort so the next commit in the
+            // stream cannot pick them up on a later replay.
+            if let generation::replay::WalTailClass::TornTail {
+                discard_records: true,
+                ..
+            } = report.tail
+            {
+                wal.log(&WalRecord::TransactionAbort {
+                    transaction_id: report.max_transaction_id,
+                })?;
+                wal.sync()?;
+            }
+            db.wal = Some(wal);
         }
 
         db.generation_root = Some(ownership);
