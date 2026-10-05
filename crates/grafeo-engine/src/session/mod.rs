@@ -4548,8 +4548,9 @@ impl Session {
     /// Aborts a transaction that has already been taken out of
     /// `current_transaction`: discards its versions in every touched graph,
     /// undoes its layered base changes, its RDF changes and buffered CDC and
-    /// vector-index updates, clears the session's transaction state, marks it
-    /// aborted in the transaction manager and logs the abort to the WAL.
+    /// vector-index updates, clears the session's transaction state, logs the
+    /// abort to the WAL and then marks it aborted in the transaction manager
+    /// (which releases its entities).
     ///
     /// Shared by rollback and by a commit that fails validation, so a failed
     /// commit leaves no active transaction holding its entities (#409).
