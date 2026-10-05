@@ -39,6 +39,15 @@ struct Scenario {
     writes: &'static [&'static str],
     nodes: usize,
     edges: usize,
+    /// Distinct label names in the schema (base and overlay). A label stays
+    /// in the base schema after its last node is deleted.
+    labels: usize,
+    /// Distinct edge type names in the schema.
+    edge_types: usize,
+    /// Distinct property key names of nodes and edges together. `None` when
+    /// the only element carrying a key was deleted: whether the name stays
+    /// in the overlay's schema then differs before and after a reopen.
+    property_keys: Option<usize>,
 }
 
 const SCENARIOS: &[Scenario] = &[
@@ -47,6 +56,9 @@ const SCENARIOS: &[Scenario] = &[
         writes: &[],
         nodes: 3,
         edges: 2,
+        labels: 2,
+        edge_types: 1,
+        property_keys: Some(2),
     },
     Scenario {
         name: "overlay creates",
@@ -56,18 +68,27 @@ const SCENARIOS: &[Scenario] = &[
         ],
         nodes: 4,
         edges: 3,
+        labels: 3,
+        edge_types: 2,
+        property_keys: Some(2),
     },
     Scenario {
         name: "delete a base node",
         writes: &["MATCH (n:Q {name: 'c'}) DETACH DELETE n"],
         nodes: 2,
         edges: 1,
+        labels: 2,
+        edge_types: 1,
+        property_keys: Some(2),
     },
     Scenario {
         name: "copy-up",
         writes: &["MATCH (n:Q {name: 'c'}) SET n.n = 100"],
         nodes: 3,
         edges: 2,
+        labels: 2,
+        edge_types: 1,
+        property_keys: Some(2),
     },
     Scenario {
         name: "copy-up then delete",
@@ -77,6 +98,9 @@ const SCENARIOS: &[Scenario] = &[
         ],
         nodes: 2,
         edges: 1,
+        labels: 2,
+        edge_types: 1,
+        property_keys: Some(2),
     },
     // A SET on a base edge copies the edge and both endpoints up; the DETACH
     // DELETE of its source then tombstones the base edge while its id is
@@ -89,6 +113,32 @@ const SCENARIOS: &[Scenario] = &[
         ],
         nodes: 2,
         edges: 1,
+        labels: 2,
+        edge_types: 1,
+        property_keys: None,
+    },
+    // A SET on a base edge copies it up; deleting it then removes the
+    // overlay copy and must hide the base row.
+    Scenario {
+        name: "edge copy-up then delete",
+        writes: &[
+            "MATCH (:P {name: 'a'})-[r:K]->(:P {name: 'b'}) SET r.w = 1",
+            "MATCH ()-[r:K]->() WHERE r.w = 1 DELETE r",
+        ],
+        nodes: 3,
+        edges: 1,
+        labels: 2,
+        edge_types: 1,
+        property_keys: None,
+    },
+    Scenario {
+        name: "delete a base edge",
+        writes: &["MATCH (:P {name: 'a'})-[r:K]->(:P {name: 'b'}) DELETE r"],
+        nodes: 3,
+        edges: 1,
+        labels: 2,
+        edge_types: 1,
+        property_keys: Some(2),
     },
 ];
 
@@ -143,28 +193,47 @@ fn assert_counts(db: &GrafeoDB, nodes: usize, edges: usize, ctx: &str) {
         stats.edge_count, edges,
         "{ctx}: detailed_stats().edge_count"
     );
-    // Base labels P and Q and base edge type K are always registered, even
-    // when the overlay holds nothing.
-    assert!(
-        stats.label_count >= 2,
-        "{ctx}: detailed_stats().label_count = {}",
-        stats.label_count
-    );
-    assert!(
-        stats.edge_type_count >= 1,
-        "{ctx}: detailed_stats().edge_type_count = {}",
-        stats.edge_type_count
-    );
+}
+
+/// Both the element counts and the schema counts a scenario expects.
+fn assert_scenario(db: &GrafeoDB, scenario: &Scenario, ctx: &str) {
+    assert_counts(db, scenario.nodes, scenario.edges, ctx);
+    assert_schema_counts(db, scenario, ctx);
+}
+
+/// The schema-level counts: distinct label, edge type and property key names
+/// across the base and the overlay.
+fn assert_schema_counts(db: &GrafeoDB, scenario: &Scenario, ctx: &str) {
+    let stats = db.detailed_stats();
+    for (what, from_db, from_stats, expected) in [
+        (
+            "label_count",
+            db.label_count(),
+            stats.label_count,
+            scenario.labels,
+        ),
+        (
+            "edge_type_count",
+            db.edge_type_count(),
+            stats.edge_type_count,
+            scenario.edge_types,
+        ),
+    ] {
+        assert_eq!(from_db, expected, "{ctx}: {what}");
+        assert_eq!(from_stats, expected, "{ctx}: detailed_stats().{what}");
+    }
     assert_eq!(
-        db.label_count(),
-        stats.label_count,
-        "{ctx}: label_count agrees with detailed_stats"
+        db.property_key_count(),
+        stats.property_key_count,
+        "{ctx}: property_key_count agrees with detailed_stats"
     );
-    assert_eq!(
-        db.edge_type_count(),
-        stats.edge_type_count,
-        "{ctx}: edge_type_count agrees with detailed_stats"
-    );
+    if let Some(expected) = scenario.property_keys {
+        assert_eq!(
+            db.property_key_count(),
+            expected,
+            "{ctx}: property_key_count"
+        );
+    }
 }
 
 // ── Compacted single file ─────────────────────────────────────────────
@@ -208,10 +277,9 @@ fn single_file(scenario: &Scenario) {
         db.compact().expect("compact");
         assert_counts(&db, 3, 2, &format!("{ctx}: after compact"));
         run_writes(&db, scenario.writes);
-        assert_counts(
+        assert_scenario(
             &db,
-            scenario.nodes,
-            scenario.edges,
+            scenario,
             &format!("{ctx}: after writes, before reopen"),
         );
         db.close().expect("close");
@@ -223,12 +291,7 @@ fn single_file(scenario: &Scenario) {
     );
     for reopen in 1..=2 {
         let db = open_file(&path);
-        assert_counts(
-            &db,
-            scenario.nodes,
-            scenario.edges,
-            &format!("{ctx}: reopen #{reopen}"),
-        );
+        assert_scenario(&db, scenario, &format!("{ctx}: reopen #{reopen}"));
         db.close().expect("close");
     }
 }
@@ -263,18 +326,20 @@ fn single_file_counts_after_edge_copy_up_then_source_delete() {
     single_file(&SCENARIOS[5]);
 }
 
+#[test]
+fn single_file_counts_after_edge_copy_up_then_delete() {
+    single_file(&SCENARIOS[6]);
+}
+
+#[test]
+fn single_file_counts_after_base_edge_delete() {
+    single_file(&SCENARIOS[7]);
+}
+
 /// Writes made in a reopened session (on the mapped base) are counted too.
-///
-/// Leaves out "overlay creates": on a reopened compacted file whose overlay
-/// is empty, the overlay's id allocator is not seeded past the base, so a
-/// new node takes a base node's id and hides it. That is a separate bug from
-/// the counts and is not fixed here.
 #[test]
 fn single_file_counts_after_writes_in_a_reopened_session() {
-    for scenario in SCENARIOS
-        .iter()
-        .filter(|scenario| scenario.name != "overlay creates")
-    {
+    for scenario in SCENARIOS {
         let ctx = scenario.name;
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("counts-reopened.grafeo");
@@ -288,12 +353,7 @@ fn single_file_counts_after_writes_in_a_reopened_session() {
             let db = open_file(&path);
             assert_counts(&db, 3, 2, &format!("{ctx}: first reopen"));
             run_writes(&db, scenario.writes);
-            assert_counts(
-                &db,
-                scenario.nodes,
-                scenario.edges,
-                &format!("{ctx}: writes after reopen"),
-            );
+            assert_scenario(&db, scenario, &format!("{ctx}: writes after reopen"));
             db.close().expect("close");
         }
         assert_eq!(
@@ -302,12 +362,7 @@ fn single_file_counts_after_writes_in_a_reopened_session() {
             "{ctx}: checkpoint header counts after reopened writes"
         );
         let db = open_file(&path);
-        assert_counts(
-            &db,
-            scenario.nodes,
-            scenario.edges,
-            &format!("{ctx}: second reopen"),
-        );
+        assert_scenario(&db, scenario, &format!("{ctx}: second reopen"));
         db.close().expect("close");
     }
 }
@@ -345,6 +400,68 @@ fn single_file_counts_after_delete_node_edges_of_a_copied_up_edge() {
         let db = open_file(&path);
         assert_counts(&db, 3, 1, &format!("reopen #{reopen}"));
         db.close().expect("close");
+    }
+}
+
+/// On reopen of a compacted single file the overlay's id allocator must sit
+/// above the base's ids. It was restored from the overlay's own rows only, so
+/// a new node took a base node's id and, on the next reopen, hid that base
+/// node as if it were a copy-up.
+#[test]
+fn single_file_new_nodes_after_reopen_do_not_reuse_base_ids() {
+    for (ctx, before_reopen) in [
+        ("empty overlay", &[][..]),
+        (
+            "overlay holds a copy-up of the lowest base node",
+            &["MATCH (n:P {name: 'a'}) SET n.touched = true"][..],
+        ),
+    ] {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("ids.grafeo");
+        {
+            let mut db = open_file(&path);
+            build_base(&db);
+            db.compact().expect("compact");
+            run_writes(&db, before_reopen);
+            db.close().expect("close");
+        }
+        {
+            let db = open_file(&path);
+            let node = db.create_node(&["R"]).expect("create node");
+            let edge = db.create_edge(node, node, "SELF");
+            let base_ids = db
+                .execute("MATCH (n) WHERE NOT n:R RETURN id(n)")
+                .expect("base ids");
+            for row in base_ids.rows() {
+                assert_ne!(
+                    row[0],
+                    Value::Int64(i64::try_from(node.as_u64()).expect("id")),
+                    "{ctx}: new node took a base node's id"
+                );
+            }
+            let base_edge_ids = db
+                .execute("MATCH ()-[r:K]->() RETURN id(r)")
+                .expect("base edge ids");
+            for row in base_edge_ids.rows() {
+                assert_ne!(
+                    row[0],
+                    Value::Int64(i64::try_from(edge.as_u64()).expect("id")),
+                    "{ctx}: new edge took a base edge's id"
+                );
+            }
+            assert_counts(&db, 4, 3, &format!("{ctx}: after create"));
+            db.close().expect("close");
+        }
+        for reopen in 1..=2 {
+            let db = open_file(&path);
+            assert_counts(&db, 4, 3, &format!("{ctx}: reopen #{reopen}"));
+            assert_eq!(
+                count(&db, "MATCH (n:P) RETURN count(n)"),
+                2,
+                "{ctx}: reopen #{reopen}: base P nodes"
+            );
+            db.close().expect("close");
+        }
     }
 }
 
@@ -470,22 +587,16 @@ mod generation_root {
             let db = open_root(&root);
             assert_counts(&db, 3, 2, &format!("{ctx}: first open"));
             run_writes(&db, scenario.writes);
-            assert_counts(
+            assert_scenario(
                 &db,
-                scenario.nodes,
-                scenario.edges,
+                scenario,
                 &format!("{ctx}: after writes, before reopen"),
             );
             db.close().expect("close");
         }
         for reopen in 1..=2 {
             let db = open_root(&root);
-            assert_counts(
-                &db,
-                scenario.nodes,
-                scenario.edges,
-                &format!("{ctx}: reopen #{reopen}"),
-            );
+            assert_scenario(&db, scenario, &format!("{ctx}: reopen #{reopen}"));
             db.close().expect("close");
         }
     }
@@ -518,6 +629,56 @@ mod generation_root {
     #[test]
     fn generation_root_counts_after_edge_copy_up_then_source_delete() {
         generation_root(&SCENARIOS[5]);
+    }
+
+    #[test]
+    fn generation_root_counts_after_edge_copy_up_then_delete() {
+        generation_root(&SCENARIOS[6]);
+    }
+
+    #[test]
+    fn generation_root_counts_after_base_edge_delete() {
+        generation_root(&SCENARIOS[7]);
+    }
+
+    /// An in-process epoch handoff swaps in a base that absorbed the overlay
+    /// rows while those rows stay in the overlay, and keeps tombstones whose
+    /// rows the new base no longer has. Neither may change the counts.
+    #[test]
+    fn counts_after_an_epoch_handoff_install() {
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path().join("handoff.grafeo.d");
+        publish_base(&root);
+        let db = open_root(&root);
+        run_writes(
+            &db,
+            &[
+                "INSERT (:R {name: 'd'})",
+                "MATCH (a:P {name: 'a'}), (d:R {name: 'd'}) INSERT (a)-[:L]->(d)",
+                "MATCH (n:Q {name: 'c'}) DETACH DELETE n",
+            ],
+        );
+        assert_counts(&db, 3, 2, "before handoff");
+        let report = db
+            .run_epoch_handoff(generation_build_request(&root, "counts-g2"))
+            .expect("run epoch handoff");
+        db.publish_and_install_handoff(report)
+            .expect("publish and install handoff");
+        assert_eq!(
+            db.layered_store()
+                .expect("layered")
+                .base_store_arc()
+                .total_nodes(),
+            3,
+            "the new base absorbed the overlay"
+        );
+        assert_counts(&db, 3, 2, "after handoff install");
+        db.close().expect("close");
+        drop(db);
+
+        let db = open_root(&root);
+        assert_counts(&db, 3, 2, "reopen after handoff");
+        db.close().expect("close");
     }
 
     /// A base whose nodes carry more than one label stores the extra labels
