@@ -35,8 +35,8 @@ use grafeo_common::storage::SectionType;
 use grafeo_common::types::{PropertyKey, Value};
 use grafeo_core::graph::compact::section::CompactStoreSection;
 use grafeo_engine::{
-    GrafeoDB, OrphanClassification, PublicationCrashPoint, generation_build_request,
-    read_manifest_state, recover_generation_root,
+    BuildPublication, GrafeoDB, OrphanClassification, PublicationCrashPoint, RecoveryViewError,
+    RootRecovery, generation_build_request, read_manifest_state, recover_generation_root,
 };
 use grafeo_storage::file::GrafeoFileManager;
 use grafeo_storage::generation::manifest;
@@ -45,6 +45,46 @@ use grafeo_storage::wal::{WalManager, WalRecord};
 use tempfile::TempDir;
 
 const HELPER_ENV: &str = "GRAFEORECOV_HELPER";
+
+/// Serializes child spawns against root-lock cycles (acquire after release)
+/// across the parallel test threads of this binary.
+///
+/// The root ownership lock is a `flock`, which belongs to the *open file
+/// description*, not to the process or the fd number. Spawning a child forks,
+/// and between fork and exec the child holds a copy of every fd this process
+/// has open, including another test thread's locked root file (O_CLOEXEC only
+/// closes them at exec). If that thread drops its lock holder (unlock by
+/// close) and immediately re-acquires in that window, the child's copy still
+/// holds the lock and the re-acquire fails with "root already locked by
+/// another process". So child starts and parent-side lock cycles take turns:
+/// `std`'s `spawn` returns only once the child has exec'd, so a cycle that
+/// takes this mutex starts after every earlier fork has dropped its inherited
+/// copies. Keep the critical sections short and never hold this across a wait
+/// on a child. Same fix as `compact_store_generation_retirement`.
+static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take one turn of the lock-cycle mutex (poison-tolerant: a panicking test
+/// must not cascade into every other test in the binary).
+fn lock_cycle() -> std::sync::MutexGuard<'static, ()> {
+    LOCK_CYCLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `build_and_publish_generation` taken as one turn of the lock-cycle mutex.
+fn publish(
+    db: &GrafeoDB,
+    gen_root: &std::path::Path,
+    id: &str,
+) -> Result<BuildPublication, grafeo_common::utils::error::Error> {
+    let _cycle = lock_cycle();
+    db.build_and_publish_generation(generation_build_request(gen_root, id))
+}
+
+/// `recover_generation_root` taken as one turn of the lock-cycle mutex (the
+/// returned recovery keeps holding the root lock after the turn ends).
+fn recover(root: &std::path::Path) -> Result<RootRecovery, RecoveryViewError> {
+    let _cycle = lock_cycle();
+    recover_generation_root(root)
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -123,19 +163,17 @@ fn recover_selects_newest_with_parity_and_retained_previous() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "first");
-    let first = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-first"))
+    let first = publish(&db, &gen_root, "g-first")
         .expect("first publish")
         .publication;
 
     populate(&db, "second");
-    let second = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-second"))
+    let second = publish(&db, &gen_root, "g-second")
         .expect("second publish")
         .publication;
     drop(db);
 
-    let recovery = recover_generation_root(&gen_root).expect("recover generation root");
+    let recovery = recover(&gen_root).expect("recover generation root");
     assert_eq!(recovery.selected.slot.generation_id, "g-second");
     assert_eq!(recovery.selected.slot.publication_sequence, 2);
     assert_eq!(recovery.wal_boundary, second.wal_boundary);
@@ -194,7 +232,7 @@ fn recover_genesis_root_fails_closed() {
     )
     .unwrap();
 
-    let err = recover_generation_root(&gen_root).expect_err("genesis must fail closed");
+    let err = recover(&gen_root).expect_err("genesis must fail closed");
     // Typed identity: the W0 NoValidGeneration variant is preserved through
     // the engine error surface (never flattened to an opaque I/O error).
     let is_no_valid = matches!(
@@ -219,7 +257,7 @@ fn recover_while_locked_fails_typed_lock_error() {
         // if rejected with the typed Lock error.
         let root = std::env::var("GRAFEORECOV_ROOT").expect("child root env");
         match recover_generation_root(std::path::Path::new(&root)) {
-            Err(grafeo_engine::RecoveryViewError::Lock(_)) => std::process::exit(0),
+            Err(RecoveryViewError::Lock(_)) => std::process::exit(0),
             other => {
                 eprintln!("child expected typed Lock rejection, got: {other:?}");
                 std::process::exit(1);
@@ -236,22 +274,26 @@ fn recover_while_locked_fails_typed_lock_error() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "held");
-    db.build_and_publish_generation(generation_build_request(&gen_root, "g-held"))
-        .expect("publish");
+    publish(&db, &gen_root, "g-held").expect("publish");
     drop(db);
 
     // Parent recovery holds the lock for its lifetime.
-    let held = recover_generation_root(&gen_root).expect("parent recovery");
+    let held = recover(&gen_root).expect("parent recovery");
 
     // A second process attempting recovery is rejected with the typed Lock
     // error (exit 0 from the child = rejected as expected).
-    let status = Command::new(std::env::current_exe().expect("current exe"))
+    let mut child = Command::new(std::env::current_exe().expect("current exe"));
+    child
         .arg("recover_while_locked_fails_typed_lock_error")
         .arg("--exact")
         .env(HELPER_ENV, "1")
-        .env("GRAFEORECOV_ROOT", &gen_root)
-        .status()
-        .expect("spawn lock-contention child");
+        .env("GRAFEORECOV_ROOT", &gen_root);
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut child = {
+        let _cycle = lock_cycle();
+        child.spawn().expect("spawn lock-contention child")
+    };
+    let status = child.wait().expect("wait for lock-contention child");
     assert!(
         status.success(),
         "child must be rejected with typed Lock error, got {status}"
@@ -259,7 +301,7 @@ fn recover_while_locked_fails_typed_lock_error() {
     drop(held);
 
     // After the parent's lock drops, recovery succeeds again.
-    let after = recover_generation_root(&gen_root).expect("recovery after lock release");
+    let after = recover(&gen_root).expect("recovery after lock release");
     assert_eq!(after.selected.slot.generation_id, "g-held");
 }
 
@@ -278,13 +320,11 @@ fn torn_newest_generation_falls_back_to_previous() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "one");
-    let first = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-one"))
+    let first = publish(&db, &gen_root, "g-one")
         .expect("first publish")
         .publication;
     populate(&db, "two");
-    let second = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-two"))
+    let second = publish(&db, &gen_root, "g-two")
         .expect("second publish")
         .publication;
     drop(db);
@@ -293,7 +333,7 @@ fn torn_newest_generation_falls_back_to_previous() {
     // corruption the manifest cannot know about).
     fs::write(gen_root.join(&second.generation_path), b"torn").unwrap();
 
-    let recovery = recover_generation_root(&gen_root).expect("fallback recovery");
+    let recovery = recover(&gen_root).expect("fallback recovery");
     assert_eq!(recovery.selected.slot.generation_id, "g-one");
     assert_eq!(recovery.selected.slot.publication_sequence, 1);
     assert_eq!(recovery.wal_boundary, first.wal_boundary);
@@ -330,13 +370,11 @@ fn corrupt_both_generations_fail_closed_with_both_causes() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "one");
-    let first = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-one"))
+    let first = publish(&db, &gen_root, "g-one")
         .expect("first publish")
         .publication;
     populate(&db, "two");
-    let second = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-two"))
+    let second = publish(&db, &gen_root, "g-two")
         .expect("second publish")
         .publication;
     drop(db);
@@ -344,7 +382,7 @@ fn corrupt_both_generations_fail_closed_with_both_causes() {
     fs::write(gen_root.join(&first.generation_path), b"torn-a").unwrap();
     fs::write(gen_root.join(&second.generation_path), b"torn-b").unwrap();
 
-    let err = recover_generation_root(&gen_root).expect_err("both corrupt must fail");
+    let err = recover(&gen_root).expect_err("both corrupt must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("no valid generation"),
@@ -370,13 +408,11 @@ fn orphan_future_mtime_generation_never_promoted() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "one");
-    let first = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-one"))
+    let first = publish(&db, &gen_root, "g-one")
         .expect("first publish")
         .publication;
     populate(&db, "two");
-    let second = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-two"))
+    let second = publish(&db, &gen_root, "g-two")
         .expect("second publish")
         .publication;
     drop(db);
@@ -392,7 +428,7 @@ fn orphan_future_mtime_generation_never_promoted() {
     let past = filetime::FileTime::from_unix_time(946_684_800, 0); // 2000-01-01
     filetime::set_file_mtime(gen_root.join(&second.generation_path), past).unwrap();
 
-    let recovery = recover_generation_root(&gen_root).expect("recovery ignores mtime");
+    let recovery = recover(&gen_root).expect("recovery ignores mtime");
     assert_eq!(
         recovery.selected.slot.generation_id, "g-two",
         "manifest authority, not mtime, selects the generation"
@@ -439,8 +475,7 @@ fn unpublished_build_artifact_classified_never_promoted() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "one");
-    let first = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-one"))
+    let first = publish(&db, &gen_root, "g-one")
         .expect("first publish")
         .publication;
     drop(db);
@@ -456,7 +491,7 @@ fn unpublished_build_artifact_classified_never_promoted() {
     )
     .unwrap();
 
-    let recovery = recover_generation_root(&gen_root).expect("recovery with leftover");
+    let recovery = recover(&gen_root).expect("recovery with leftover");
     assert_eq!(recovery.selected.slot.generation_id, "g-one");
     assert_eq!(recovery.selected.slot.publication_sequence, 1);
 
@@ -502,8 +537,7 @@ fn wal_advance_preserves_post_boundary_writes() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "one");
-    let first = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-one"))
+    let first = publish(&db, &gen_root, "g-one")
         .expect("first publish")
         .publication;
     drop(db);
@@ -522,13 +556,12 @@ fn wal_advance_preserves_post_boundary_writes() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "two");
-    let second = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-two"))
+    let second = publish(&db, &gen_root, "g-two")
         .expect("second publish")
         .publication;
     drop(db);
 
-    let recovery = recover_generation_root(&gen_root).expect("recovery after wal advance");
+    let recovery = recover(&gen_root).expect("recovery after wal advance");
     assert_eq!(recovery.selected.slot.generation_id, "g-two");
 
     // The selected boundary advanced past the first publication's boundary
@@ -610,18 +643,22 @@ fn engine_crash_case(boundary: &str, test_name: &str, expect_new: bool) {
     {
         let db = GrafeoDB::new_in_memory();
         populate(&db, "prev");
-        db.build_and_publish_generation(generation_build_request(&gen_root, "g-prev"))
-            .expect("prior publish");
+        publish(&db, &gen_root, "g-prev").expect("prior publish");
     }
 
-    let status = Command::new(std::env::current_exe().expect("current exe"))
+    let mut child = Command::new(std::env::current_exe().expect("current exe"));
+    child
         .arg(test_name)
         .arg("--exact")
         .env(HELPER_ENV, "1")
         .env("GRAFEORECOV_ROOT", &gen_root)
-        .env("GRAFEO_3C_ABORT", boundary)
-        .status()
-        .expect("spawn child");
+        .env("GRAFEO_3C_ABORT", boundary);
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut child = {
+        let _cycle = lock_cycle();
+        child.spawn().expect("spawn child")
+    };
+    let status = child.wait().expect("wait for child");
     // Pin the abort origin: the child must die by SIGABRT (the seam's
     // `std::process::abort`), not merely fail (a panic or unrelated error
     // exit would also be non-success but proves nothing about the boundary).
@@ -641,7 +678,7 @@ fn engine_crash_case(boundary: &str, test_name: &str, expect_new: bool) {
 
     // The lock is released by the child's death; recovery selects from the
     // surviving bytes exactly as the locked expectation demands.
-    let recovery = recover_generation_root(&gen_root).expect("recovery on surviving bytes");
+    let recovery = recover(&gen_root).expect("recovery on surviving bytes");
     let observed = recovery.selected.slot.publication_sequence;
     // The child builds its generation from ITS OWN fresh live graph (only
     // "crashed" nodes); the prior generation holds "prev" nodes. Parity is
