@@ -258,6 +258,25 @@ pub struct Config {
     /// `without_max_property_size()` to disable.
     pub max_property_size: Option<usize>,
 
+    /// Byte cap on one transaction's buffered WAL records.
+    ///
+    /// A transaction's WAL records are held in memory, encoded, until it
+    /// commits (#411). A write that would take them past this cap fails
+    /// with a retryable error ([`Error::AdmissionRetryable`]) and nothing of
+    /// the transaction is written to the WAL; roll it back and retry the
+    /// work in smaller transactions. A write outside a transaction that hits
+    /// the cap also poisons the WAL, because it cannot be rolled back.
+    ///
+    /// This is a stopgap limit until transaction buffers are charged to a
+    /// process-wide memory ledger: it keeps one huge transaction from taking
+    /// the process down. `None` means no cap.
+    ///
+    /// Default: 512 MiB. Use `with_wal_transaction_buffer_cap()` to change
+    /// or `without_wal_transaction_buffer_cap()` to disable.
+    ///
+    /// [`Error::AdmissionRetryable`]: grafeo_common::utils::error::Error::AdmissionRetryable
+    pub wal_transaction_buffer_cap: Option<usize>,
+
     /// Run MVCC version garbage collection every N commits.
     ///
     /// Old versions that are no longer visible to any active transaction are
@@ -406,6 +425,7 @@ impl Default for Config {
             schema_constraints: false,
             query_timeout: Some(Duration::from_secs(30)),
             max_property_size: Some(16 * 1024 * 1024), // 16 MiB
+            wal_transaction_buffer_cap: Some(512 * 1024 * 1024), // 512 MiB
             gc_interval: 100,
             access_mode: AccessMode::default(),
             cdc_enabled: false,
@@ -565,6 +585,21 @@ impl Config {
     #[must_use]
     pub fn without_max_property_size(mut self) -> Self {
         self.max_property_size = None;
+        self
+    }
+
+    /// Sets the byte cap on one transaction's buffered WAL records (see
+    /// [`wal_transaction_buffer_cap`](Self::wal_transaction_buffer_cap)).
+    #[must_use]
+    pub fn with_wal_transaction_buffer_cap(mut self, bytes: usize) -> Self {
+        self.wal_transaction_buffer_cap = Some(bytes);
+        self
+    }
+
+    /// Removes the byte cap on one transaction's buffered WAL records.
+    #[must_use]
+    pub fn without_wal_transaction_buffer_cap(mut self) -> Self {
+        self.wal_transaction_buffer_cap = None;
         self
     }
 

@@ -220,6 +220,27 @@ impl WalManager {
         self.write_frame(&data, force_sync)
     }
 
+    /// Logs records as one contiguous group: no other writer's records can
+    /// land between them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a record cannot be serialized or written.
+    pub fn log_batch(&self, records: &[WalRecord]) -> Result<()> {
+        let frames = records
+            .iter()
+            .map(|record| {
+                bincode::serde::encode_to_vec(record, bincode::config::standard())
+                    .map_err(|e| Error::Serialization(e.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let frame_refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+        let force_sync = records
+            .iter()
+            .any(|record| matches!(record, WalRecord::TransactionCommit { .. }));
+        self.write_frames(&frame_refs, force_sync)
+    }
+
     /// Writes a pre-serialized frame to the active WAL log.
     ///
     /// Frame format: `[length: u32 LE][data: bytes][crc32: u32 LE]`.

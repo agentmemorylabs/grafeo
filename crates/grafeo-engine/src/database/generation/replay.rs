@@ -53,8 +53,9 @@ pub enum WalTailClass {
     /// The stream ended at a committed boundary.
     Clean,
     /// The tail holds an unfinished transaction: complete uncommitted
-    /// records, or a `TransactionCommit` whose `EpochAdvance` never made it
-    /// (a crash between the two frames). Its records were not applied.
+    /// records, a `TransactionCommit` whose `EpochAdvance` never made it
+    /// (a crash between the two frames), or only the bytes of a frame cut
+    /// off by a crash. Its records were not applied.
     TornTail {
         /// Active WAL sequence.
         seq: u64,
@@ -81,6 +82,11 @@ pub struct ReplayReport {
     pub final_epoch: EpochId,
     /// Maximum of the boundary transaction ID and replayed commit IDs.
     pub max_transaction_id: TransactionId,
+    /// Whether the replayed records leave the graph cursor on a named graph.
+    /// A log written before the #411 port can end there (its graph context
+    /// was shared across writers); every new group assumes it starts in the
+    /// default graph, so a writable open must switch back first.
+    pub ends_in_named_graph: bool,
     /// Default-graph node writes made by applied records (create, delete,
     /// property key, label), deduplicated, in first-write order. Replay
     /// writes the store directly, so the caller re-syncs the index entries
@@ -763,7 +769,24 @@ pub fn replay_generation_wal(
             discard_records: !committed.is_empty(),
         }
     } else if pending.is_empty() {
-        WalTailClass::Clean
+        // The stream stops cleanly at the first partial or absent frame.
+        // Bytes after that point are a frame cut off by a crash (possibly
+        // the first frame of a group, with nothing pending before it). Cut
+        // them too, or the next append lands behind bytes that are not a
+        // record and replay cannot read past them.
+        let active = wal_dir.join(format!("wal_{seq:08}.log"));
+        let file_len = std::fs::metadata(&active)
+            .map_err(|e| ReplayError::Scan(WalCursorError::Io(e)))?
+            .len();
+        if file_len > byte_offset {
+            WalTailClass::TornTail {
+                seq,
+                byte_offset,
+                discard_records: false,
+            }
+        } else {
+            WalTailClass::Clean
+        }
     } else {
         WalTailClass::TornTail {
             seq,
@@ -786,6 +809,7 @@ pub fn replay_generation_wal(
         tail,
         final_epoch,
         max_transaction_id,
+        ends_in_named_graph: cursor.current_graph.is_some(),
         node_writes,
     })
 }

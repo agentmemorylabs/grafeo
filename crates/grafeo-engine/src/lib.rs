@@ -138,5 +138,10 @@ pub use metrics::{MetricsRegistry, MetricsSnapshot};
 #[cfg(all(feature = "gql", feature = "lpg"))]
 pub use query::executor::stream::{OwnedResultStream, OwnedRowIterator, ResultStream, RowIterator};
 pub use session::Session;
+#[cfg(all(debug_assertions, feature = "wal"))]
+#[doc(hidden)]
+pub use transaction::wal_buffer::{
+    COMMIT_STALL_BEFORE_GROUP, COMMIT_STALL_BEFORE_VALIDATION, COMMIT_STALL_PARKED,
+};
 #[cfg(feature = "lpg")]
 pub use transaction::{CommitInfo, PreparedCommit};
