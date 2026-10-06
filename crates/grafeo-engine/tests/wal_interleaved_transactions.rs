@@ -211,6 +211,52 @@ fn run_scenario(scenario: &str, db: &GrafeoDB) -> Vec<String> {
             insert(&loser, "django");
             strings(&["django", "mia", "vincent"])
         }
+        // Writes through the `GrafeoDB`-level APIs, outside any session
+        // (AMH's bulk ingest uses `batch_create_nodes_with_props`). Each call
+        // must be durable on its own, without a later commit marker.
+        "db_level_writes" => {
+            let props = |name: &str| {
+                std::collections::HashMap::from([(
+                    grafeo_common::types::PropertyKey::new("name"),
+                    Value::from(name),
+                )])
+            };
+            let ids = db.batch_create_nodes_with_props("Person", vec![props("alix"), props("gus")]);
+            assert_eq!(ids.len(), 2);
+            db.create_node_with_props(&["Person"], [("name", Value::from("vincent"))])
+                .unwrap();
+            let jules = db
+                .create_node_with_props(&["Other"], [("name", Value::from("jules"))])
+                .unwrap();
+            assert!(db.add_node_label(jules, "Person"));
+            strings(&["alix", "gus", "jules", "vincent"])
+        }
+        // A commit whose WAL group cannot be written: the commit reports
+        // durability unconfirmed, the WAL is poisoned, and the transaction
+        // never reached the disk.
+        #[cfg(feature = "testing-crash-injection")]
+        "failed_group" => {
+            use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+            insert(&db.session(), "alix");
+            let mut s = db.session();
+            s.begin_transaction().unwrap();
+            insert(&s, "gus");
+            // The transaction's group is the next WAL append.
+            enable_io_failure_at(1);
+            let r = s.commit();
+            disable_io_failure();
+            let err = r.expect_err("a lost WAL group must not report success");
+            assert!(
+                err.to_string().contains("durability unconfirmed"),
+                "unexpected error: {err}"
+            );
+            let err = db
+                .session()
+                .execute("INSERT (:Person {name: 'refused'})")
+                .expect_err("the WAL is poisoned");
+            assert!(err.to_string().contains("WAL refuses"), "{err}");
+            strings(&["alix"])
+        }
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -330,6 +376,36 @@ fn rollback_between_crash_reopen() {
 fn commit_between_crash_reopen() {
     let _serial = serial();
     check_crash_reopen("commit_between");
+}
+
+#[test]
+fn db_level_writes_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("db_level_writes");
+}
+
+/// The crash (no close) keeps the in-memory transaction from reaching the
+/// file through a close-time checkpoint, so the reopen shows what the WAL
+/// holds.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn failed_group_crash_reopen() {
+    let _serial = serial();
+    for kind in kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = kind.create(dir.path());
+        crash_after("failed_group", &path, kind);
+        let db = kind.open(&path);
+        assert_eq!(names(&db), strings(&["alix"]), "{kind:?}");
+        insert(&db.session(), "after");
+        db.close().unwrap();
+        drop(db);
+        assert_eq!(
+            names(&kind.open(&path)),
+            strings(&["after", "alix"]),
+            "{kind:?}: after one more commit"
+        );
+    }
 }
 
 #[test]
@@ -455,6 +531,52 @@ mod old_format {
         let session = db.session();
         session.use_graph("g");
         assert_eq!(names_in(&session), strings(&["mia"]), "graph g");
+    }
+
+    /// The newest WAL file of a generation root.
+    fn active_wal_file(root: &Path) -> PathBuf {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(root.join("wal"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        files.sort();
+        files.pop().unwrap()
+    }
+
+    /// A crash inside the first frame of a group leaves bytes that are not a
+    /// complete record and no pending record before them. The open must cut
+    /// them off, or the next group lands behind them and cannot be read.
+    #[test]
+    fn generation_root_torn_first_frame_is_cut_at_open() {
+        let _serial = serial();
+        for garbage in [&[7u8, 0][..], &[40, 0, 0, 0, 1, 2, 3][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = Kind::GenerationRoot.create(dir.path());
+            {
+                let db = Kind::GenerationRoot.open(&root);
+                insert(&db.session(), "alix");
+                db.close().unwrap();
+            }
+            {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(active_wal_file(&root))
+                    .unwrap()
+                    .write_all(garbage)
+                    .unwrap();
+            }
+            {
+                let db = Kind::GenerationRoot.open(&root);
+                assert_eq!(names(&db), strings(&["alix"]), "{garbage:?}");
+                insert(&db.session(), "gus");
+                db.close().unwrap();
+            }
+            let db = GrafeoDB::open_generation_root(&root, false)
+                .unwrap_or_else(|e| panic!("{garbage:?}: reopen after the cut: {e}"));
+            assert_eq!(names(&db), strings(&["alix", "gus"]), "{garbage:?}");
+        }
     }
 
     /// A pre-port generation-root WAL cut off by a crash in the middle of a
