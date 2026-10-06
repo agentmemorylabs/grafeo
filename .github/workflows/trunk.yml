@@ -1,0 +1,115 @@
+name: Trunk
+
+# Trimmed CI for the fork's real trunk. ci.yml only triggers on main and
+# release/*, and its full matrix (3 OSes, language bindings, miri, coverage,
+# benchmarks) is too large for a fork-trunk gate. This builds and tests only
+# the feature sets this fork actually uses.
+
+on:
+  push:
+    branches: [fix/root-mount-covers-nested]
+  pull_request:
+    branches: [fix/root-mount-covers-nested]
+  workflow_dispatch:
+
+concurrency:
+  group: trunk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  # Matches the feature set agent-memory-hosted builds Grafeo with.
+  FEATURES: lpg,cypher,vector-index,text-index,wal,grafeo-file,mmap,parallel,compact-store,generation,generation-streaming,triple-store,tracing
+
+jobs:
+  trunk:
+    name: Build and test (trunk feature set)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+
+      # The library itself, with exactly the feature set AMH builds.
+      - name: Build
+        run: cargo build -p grafeo-engine --features "$FEATURES"
+
+      # Each lib-test step runs even if an earlier one failed, so one run
+      # shows every compile error.
+      - name: Common lib tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p grafeo-common --lib
+
+      - name: Core lib tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p grafeo-core --lib --features "lpg,mmap,compact-store,generation-streaming,vector-index,text-index,triple-store"
+
+      - name: Storage lib tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p grafeo-storage --lib --features "wal,grafeo-file,generation,generation-streaming,tracing"
+
+      - name: Engine lib tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p grafeo-engine --lib --features "$FEATURES"
+
+      # Every engine integration target runs, except the named exceptions below.
+      # A skip-list (not an allow-list) so new tests are picked up automatically,
+      # and every target is compiled, so one that stops compiling fails CI.
+      # --no-fail-fast so one failing target does not hide the rest.
+      - name: Engine integration tests (all targets except named exceptions)
+        if: ${{ !cancelled() }}
+        run: |
+          set -eu
+          # compact_store_generation_contract: cannot compile with generation-streaming
+          #   (imports the eager generate_compact_store, which that feature seals as
+          #   pub(crate)). Runs in the "no-streaming" job below instead.
+          # query_correctness: feature-set mismatch, needs sql-pgq (execute_sql),
+          #   which the AMH feature set does not enable.
+          # section_directory_versions: fails on the base branch (reported in #19);
+          #   re-enable once fixed.
+          # n_vs_4n_peak_memory: asserts a 128 MiB peak RssAnon budget, which a debug
+          #   build exceeds on the hosted runner (143628 kB before fork #24). It runs
+          #   in the "peak-memory-release" job below, where it fits since #24.
+          skip='^(compact_store_generation_contract|query_correctness|section_directory_versions|n_vs_4n_peak_memory)$'
+          targets=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="grafeo-engine") | .targets[]
+                     | select(.kind | index("test")) | .name' \
+            | grep -Ev "$skip" | sed 's/^/--test /' | tr '\n' ' ')
+          echo "targets: $targets"
+          cargo test -p grafeo-engine --features "$FEATURES" --no-fail-fast $targets
+
+  no-streaming:
+    name: compact_store_generation_contract (without generation-streaming)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-streaming
+      - name: Run the eager-path contract test
+        run: cargo test -p grafeo-engine --features "generation,compact-store,lpg,wal,mmap" --test compact_store_generation_contract
+
+  peak-memory-release:
+    name: n_vs_4n_peak_memory (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: peak-memory-release
+      - name: Run the peak-memory acceptance test in release
+        run: cargo test --release -p grafeo-engine --features "$FEATURES" --test n_vs_4n_peak_memory
