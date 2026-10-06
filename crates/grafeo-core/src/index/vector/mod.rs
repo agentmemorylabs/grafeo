@@ -180,11 +180,22 @@ impl VectorIndexKind {
         }
     }
 
-    /// Removes a vector from the index.
+    /// Removes a vector from the index without reconnecting its former
+    /// neighbours, which can disconnect the graph (AMH #174). Prefer
+    /// [`Self::remove_with_accessor`].
     pub fn remove(&self, id: NodeId) -> bool {
         match self {
             Self::Hnsw(idx) => idx.remove(id),
             Self::Quantized(idx) => idx.remove(id),
+        }
+    }
+
+    /// Removes a vector and reconnects its former neighbours, using
+    /// `accessor` for the pruning distances.
+    pub fn remove_with_accessor(&self, id: NodeId, accessor: &impl VectorAccessor) -> bool {
+        match self {
+            Self::Hnsw(idx) => idx.remove_with_accessor(id, accessor),
+            Self::Quantized(idx) => idx.remove_with_accessor(id, accessor),
         }
     }
 

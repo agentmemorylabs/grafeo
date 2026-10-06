@@ -608,7 +608,31 @@ impl QuantizedHnswIndex {
         self.hnsw.contains(id)
     }
 
-    /// Removes a vector from the index.
+    /// Removes a vector from the index and reconnects its former HNSW
+    /// neighbours (see [`HnswIndex::remove_with_accessor`]).
+    pub fn remove_with_accessor(&self, id: NodeId, accessor: &impl VectorAccessor) -> bool {
+        self.remove_codes(id);
+        self.hnsw.remove_with_accessor(id, accessor)
+    }
+
+    fn remove_codes(&self, id: NodeId) {
+        self.vectors.write().remove(&id);
+        match self.quantization_type {
+            QuantizationType::None => {}
+            QuantizationType::Scalar => {
+                self.scalar_vectors.write().remove(&id);
+            }
+            QuantizationType::Binary => {
+                self.binary_vectors.write().remove(&id);
+            }
+            QuantizationType::Product { .. } => {
+                self.product_codes.write().remove(&id);
+            }
+        }
+    }
+
+    /// Removes a vector from the index without reconnecting its former
+    /// neighbours; prefer [`Self::remove_with_accessor`].
     pub fn remove(&self, id: NodeId) -> bool {
         self.vectors.write().remove(&id);
         match self.quantization_type {

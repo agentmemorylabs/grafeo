@@ -5305,13 +5305,22 @@ impl Session {
                         Value::Vector(vector) => Some(vector),
                         _ => None,
                     });
+                let accessor = grafeo_core::index::vector::PropertyVectorAccessor::new(
+                    read,
+                    property.as_str(),
+                );
                 for label in &node.labels {
                     if let Some(index) = store.get_vector_index(label.as_str(), property) {
-                        index.remove(*node_id);
+                        // AMH #174: `insert` replaces an existing entry and
+                        // reconnects its former neighbours. A plain `remove`
+                        // first would drop the node without reconnecting, and
+                        // on a chain-like topology split the graph.
                         let Some(vector) = vector else {
+                            index.remove_with_accessor(*node_id, &accessor);
                             continue;
                         };
                         if vector.len() != index.config().dimensions {
+                            index.remove_with_accessor(*node_id, &accessor);
                             return Err(grafeo_common::utils::error::Error::Internal(format!(
                                 "Vector dimension mismatch for :{}({}): expected {}, found {} on node {}",
                                 label,
@@ -5321,10 +5330,6 @@ impl Session {
                                 node_id.0
                             )));
                         }
-                        let accessor = grafeo_core::index::vector::PropertyVectorAccessor::new(
-                            read,
-                            property.as_str(),
-                        );
                         index.insert(*node_id, vector, &accessor);
                     }
                 }
@@ -5334,8 +5339,12 @@ impl Session {
                 node_id,
             } => {
                 let store = self.resolve_store(graph_name);
-                for (_key, index) in store.vector_index_entries() {
-                    index.remove(*node_id);
+                let read = self.vector_read_view(&store);
+                for (key, index) in store.vector_index_entries() {
+                    let property = key.split_once(':').map_or(key.as_str(), |(_, p)| p);
+                    let accessor =
+                        grafeo_core::index::vector::PropertyVectorAccessor::new(read, property);
+                    index.remove_with_accessor(*node_id, &accessor);
                 }
             }
         }
