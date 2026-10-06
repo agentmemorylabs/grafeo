@@ -595,24 +595,28 @@ fn direct_delete_of_an_overlay_node_leaves_the_vector_index() {
         !hits.iter().any(|(id, _)| *id == c),
         "c still in the index after delete"
     );
-    // Reopen: whether the index definition persisted or is rebuilt from the
-    // layered view, the deleted node must not be in it.
+    // At trunk a vector index created on an open generation root does not
+    // survive reopen: `create_vector_index` writes no WAL record, replay
+    // ignores `CreateIndex` ("rebuilt from replayed data"), and the base
+    // generation carries no VectorStore section for it until a handoff
+    // publishes one. Pinned so a change shows up here. Rebuilt from the
+    // layered view, the index must not contain the deleted node.
     let db = open(&root);
-    if db
-        .vector_search("MemoryEntity", "embedding", &query, 5, None, None)
-        .is_err()
-    {
-        db.create_vector_index(
-            "MemoryEntity",
-            "embedding",
-            Some(4),
-            Some("cosine"),
-            None,
-            None,
-            None,
-        )
-        .expect("rebuild vector index after reopen");
-    }
+    assert!(
+        db.vector_search("MemoryEntity", "embedding", &query, 5, None, None)
+            .is_err(),
+        "the vector index now survives reopen; update this test's comment"
+    );
+    db.create_vector_index(
+        "MemoryEntity",
+        "embedding",
+        Some(4),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("rebuild vector index after reopen");
     let hits = db
         .vector_search("MemoryEntity", "embedding", &query, 5, None, None)
         .expect("search after reopen");
