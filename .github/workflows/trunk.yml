@@ -77,11 +77,9 @@ jobs:
           #   which the AMH feature set does not enable.
           # section_directory_versions: fails on the base branch (reported in #19);
           #   re-enable once fixed.
-          # n_vs_4n_peak_memory: asserts a 128 MiB peak RssAnon budget. The 4N run
-          #   is over it in debug (143628 kB) and also in release (137448 kB) on the
-          #   hosted runner. It runs in the "peak-memory-release" job below, which is
-          #   red until the headroom fix in fork #24 lands; re-run it after merging
-          #   the trunk.
+          # n_vs_4n_peak_memory: asserts a 128 MiB peak RssAnon budget, which a debug
+          #   build exceeds on the hosted runner (143628 kB before fork #24). It runs
+          #   in the "peak-memory-release" job below, where it fits since #24.
           skip='^(compact_store_generation_contract|query_correctness|section_directory_versions|n_vs_4n_peak_memory)$'
           targets=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="grafeo-engine") | .targets[]
