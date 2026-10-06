@@ -32,7 +32,9 @@ pub const MANIFEST_SIZE: usize = 2 * SLOT_SIZE;
 pub const SLOT_MAGIC: &[u8; 4] = b"GMNF";
 /// Schema version written by this module.
 pub const SCHEMA_VERSION: u16 = 1;
-/// CompactStore format version recorded in slots.
+/// CompactStore format version recorded in slots when the published
+/// sections carry no CompactStore section to report its own (v5). A
+/// generation whose payload is v6 records 6.
 pub const COMPACT_STORE_FORMAT_VERSION: u16 = 5;
 
 const GEN_ID_CAP: usize = 128;

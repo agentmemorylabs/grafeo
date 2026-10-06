@@ -385,7 +385,10 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
     pos += 4;
     let version = data[pos];
     pos += 1;
-    if version == FORMAT_VERSION {
+    // v5 and v6 share the mapped segment-directory layout; v6 widens the
+    // column-body geometry past 4 GiB (G4). Heap sections still write v5;
+    // the bounded generation builder writes v6 when a payload needs it.
+    if version == FORMAT_VERSION || version == super::mapped::FORMAT_VERSION_V6 {
         return super::section_v5::deserialize_v5(data_bytes);
     }
     if version != FORMAT_VERSION_V4
@@ -394,7 +397,8 @@ fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, 
         && version != FORMAT_VERSION_V1
     {
         return Err(format!(
-            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION_V4}, {FORMAT_VERSION})"
+            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION_V3}, {FORMAT_VERSION_V4}, {FORMAT_VERSION}, {})",
+            super::mapped::FORMAT_VERSION_V6
         ));
     }
     let flags = data[pos];

@@ -40,3 +40,7 @@ mod orchestrator_tests;
 mod pipeline_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod v6_auto_tests;
+#[cfg(test)]
+mod v6_tests;

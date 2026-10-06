@@ -129,17 +129,19 @@ impl BoundedDictionary {
 
     /// Builds `DictionaryCodeIndex` segment body bytes (sorted by string
     /// content). Byte-identical to `build_dictionary_code_index`.
-    #[must_use]
-    pub fn code_index_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::WireWidthOverflow`] when a code or a string length
+    /// does not fit `u32`.
+    pub fn code_index_bytes(&self) -> Result<Vec<u8>, GenerationError> {
         let mut records: Vec<(u64, u32, u32, &str)> = Vec::with_capacity(self.strings.len());
         let mut offset = 0u64;
         for (i, s) in self.strings.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            let code = i as u32;
-            #[allow(clippy::cast_possible_truncation)]
-            let len = s.len() as u32;
+            let (code, len) =
+                crate::graph::compact::mapped::code_index::code_index_fields(i, s.len())?;
             records.push((offset, len, code, s.as_str()));
-            offset += u64::from(len);
+            offset += s.len() as u64;
         }
         records.sort_by(|a, b| a.3.cmp(b.3));
         let mut out = Vec::with_capacity(records.len() * CODE_INDEX_RECORD_LEN);
@@ -148,7 +150,7 @@ impl BoundedDictionary {
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(&code.to_le_bytes());
         }
-        out
+        Ok(out)
     }
 }
 

@@ -277,6 +277,15 @@ pub fn compute_column_geometries(
                         kind: "Vector(dims overflow)",
                         context: g.key.clone(),
                     })?;
+                // A zero-dimension vector has no rows to read back: the v5
+                // reader returns nothing for it (silent loss) and the v6 wide
+                // reader refuses it. Fail the build with the column named.
+                if dims == 0 {
+                    return Err(GenerationError::UnsupportedValue {
+                        kind: "Vector(zero dims)",
+                        context: g.key.clone(),
+                    });
+                }
                 match g.vector_dims {
                     Some(d) if d != dims => {
                         return Err(GenerationError::MixedColumnTypes {

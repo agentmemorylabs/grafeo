@@ -245,7 +245,7 @@ fn dictionary_code_index_sorted_lookup() {
     let strings = ["zeta", "alpha", "mu"];
     let (off, bytes) = build_string_segments(&strings);
     let dict = MappedStringDictionary::new(Bytes::from(off), Bytes::from(bytes)).unwrap();
-    let index_bytes = build_dictionary_code_index(&strings);
+    let index_bytes = build_dictionary_code_index(&strings).unwrap();
     let index = DictionaryCodeIndex::new(Bytes::from(index_bytes), &dict).unwrap();
     assert_eq!(index.lookup(&dict, "alpha"), Some(1));
     assert_eq!(index.lookup(&dict, "mu"), Some(2));

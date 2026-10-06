@@ -1,10 +1,13 @@
-//! CompactStore v5 header and checked segment directory.
+//! CompactStore v5/v6 header and checked segment directory.
+//!
+//! v6 differs from v5 only in field widths; see [`super::payload_version`].
 //!
 //! The `u64 as usize` casts below convert wire offsets/lengths into in-memory
 //! indices for a payload already fully resident in `Bytes`; they are bounded
 //! by the section's own length on the 64-bit targets this engine supports.
 #![allow(clippy::cast_possible_truncation)]
 
+use super::payload_version::{PayloadVersion, read_directory_entry};
 use super::views::{read_u16_le, read_u32_le, read_u64_le};
 use bytes::Bytes;
 
@@ -229,8 +232,8 @@ pub struct SegmentEntry {
     pub length: u64,
     /// Fixed element width, or 0 for variable.
     pub element_width: u32,
-    /// Element count for fixed-width segments.
-    pub element_count: u32,
+    /// Element count for fixed-width segments (`u32` on the v5 wire).
+    pub element_count: u64,
     /// IEEE CRC-32 over the segment bytes.
     pub crc32: u32,
 }
@@ -249,9 +252,11 @@ impl SegmentEntry {
     }
 }
 
-/// Parsed v5 header fields (excluding the directory bytes themselves).
+/// Parsed v5/v6 header fields (excluding the directory bytes themselves).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V5Header {
+    /// Payload layout version (header byte 4).
+    pub version: PayloadVersion,
     /// Header flags (bit 0 = preserves original IDs).
     pub flags: u8,
     /// Number of directory entries.
@@ -309,12 +314,12 @@ impl SegmentDirectory {
     }
 }
 
-/// Parses and validates the 64-byte v5 header.
+/// Parses and validates the 64-byte v5/v6 header.
 ///
 /// # Errors
 ///
-/// Returns an error on truncation, bad magic, wrong version, non-zero
-/// reserved fields, or inconsistent directory geometry.
+/// Returns an error on truncation, bad magic, a version other than 5 or 6,
+/// non-zero reserved fields, or inconsistent directory geometry.
 pub fn parse_v5_header(data: &[u8]) -> Result<V5Header, String> {
     if data.len() < HEADER_LEN {
         return Err("truncated CompactStore v5 header".into());
@@ -322,12 +327,7 @@ pub fn parse_v5_header(data: &[u8]) -> Result<V5Header, String> {
     if data[0..4] != *b"GCST" {
         return Err("bad CompactStore magic".into());
     }
-    if data[4] != FORMAT_VERSION_V5 {
-        return Err(format!(
-            "unsupported CompactStore section version {} (expected {FORMAT_VERSION_V5})",
-            data[4]
-        ));
-    }
+    let version = PayloadVersion::from_byte(data[4])?;
     let flags = data[5];
     let mut pos = 6;
     let header_length = read_u16_le(data, &mut pos).map_err(str::to_string)?;
@@ -379,6 +379,7 @@ pub fn parse_v5_header(data: &[u8]) -> Result<V5Header, String> {
     }
 
     Ok(V5Header {
+        version,
         flags,
         segment_count,
         directory_offset,
@@ -431,7 +432,8 @@ pub fn validate_segment_range(
         ));
     }
     if entry.element_width > 0 {
-        let need = u64::from(entry.element_count)
+        let need = entry
+            .element_count
             .checked_mul(u64::from(entry.element_width))
             .ok_or_else(|| {
                 format!(
@@ -483,7 +485,8 @@ pub fn parse_segment_directory(
     let mut prev_end: u64 = header.data_offset;
 
     for _ in 0..header.segment_count {
-        let kind_raw = read_u16_le(dir, &mut pos).map_err(str::to_string)?;
+        let fields = read_directory_entry(dir, &mut pos, header.version)?;
+        let kind_raw = fields.kind;
         let kind = SegmentKind::from_u16(kind_raw)?;
         if let Some(prev) = prev_kind
             && kind_raw < prev
@@ -499,33 +502,16 @@ pub fn parse_segment_directory(
         }
         prev_kind = Some(kind_raw);
 
-        let encoding_version = read_u16_le(dir, &mut pos).map_err(str::to_string)?;
-        let flags = read_u16_le(dir, &mut pos).map_err(str::to_string)?;
-        let alignment = read_u16_le(dir, &mut pos).map_err(str::to_string)?;
-        let offset = read_u64_le(dir, &mut pos).map_err(str::to_string)?;
-        let length = read_u64_le(dir, &mut pos).map_err(str::to_string)?;
-        let element_width = read_u32_le(dir, &mut pos).map_err(str::to_string)?;
-        let element_count = read_u32_le(dir, &mut pos).map_err(str::to_string)?;
-        let crc32 = read_u32_le(dir, &mut pos).map_err(str::to_string)?;
-        let reserved_a = read_u32_le(dir, &mut pos).map_err(str::to_string)?;
-        let reserved_b = read_u64_le(dir, &mut pos).map_err(str::to_string)?;
-        if reserved_a != 0 || reserved_b != 0 {
-            return Err(format!(
-                "v5 segment {:?} reserved fields must be zero",
-                kind
-            ));
-        }
-
         let entry = SegmentEntry {
             kind,
-            encoding_version,
-            flags,
-            alignment,
-            offset,
-            length,
-            element_width,
-            element_count,
-            crc32,
+            encoding_version: fields.encoding_version,
+            flags: fields.flags,
+            alignment: fields.alignment,
+            offset: fields.offset,
+            length: fields.length,
+            element_width: fields.element_width,
+            element_count: fields.element_count,
+            crc32: fields.crc32,
         };
         validate_segment_range(&entry, payload_len_without_crc as u64, header.data_offset)?;
         if entry.offset < prev_end {
