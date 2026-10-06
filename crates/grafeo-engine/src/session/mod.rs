@@ -5345,11 +5345,20 @@ impl Session {
                     });
                 for label in &node.labels {
                     if let Some(index) = store.get_vector_index(label.as_str(), property) {
-                        index.remove(*node_id);
+                        // Neighbour vectors through the merged view with the
+                        // spill fallback (AMH #175).
+                        let accessor =
+                            self.intent_vector_accessor(&store, read, label.as_str(), property);
+                        // AMH #174: `insert` replaces an existing entry and
+                        // reconnects its former neighbours. A plain `remove`
+                        // first would drop the node without reconnecting, and
+                        // on a chain-like topology split the graph.
                         let Some(vector) = vector else {
+                            index.remove_with_accessor(*node_id, &accessor);
                             continue;
                         };
                         if vector.len() != index.config().dimensions {
+                            index.remove_with_accessor(*node_id, &accessor);
                             return Err(grafeo_common::utils::error::Error::Internal(format!(
                                 "Vector dimension mismatch for :{}({}): expected {}, found {} on node {}",
                                 label,
@@ -5359,24 +5368,6 @@ impl Session {
                                 node_id.0
                             )));
                         }
-                        // Spill-aware (AMH #175): under ForceDisk the
-                        // neighbours' vectors may live only in the spill.
-                        #[cfg(all(feature = "mmap", not(feature = "temporal")))]
-                        let accessor = crate::database::vector_access::spill_aware_accessor(
-                            read,
-                            if Arc::ptr_eq(&store, &self.store) {
-                                self.vector_spill_storages.as_ref()
-                            } else {
-                                None
-                            },
-                            label.as_str(),
-                            property.as_str(),
-                        );
-                        #[cfg(not(all(feature = "mmap", not(feature = "temporal"))))]
-                        let accessor = grafeo_core::index::vector::PropertyVectorAccessor::new(
-                            read,
-                            property.as_str(),
-                        );
                         index.insert(*node_id, vector, &accessor);
                     }
                 }
@@ -5386,12 +5377,47 @@ impl Session {
                 node_id,
             } => {
                 let store = self.resolve_store(graph_name);
-                for (_key, index) in store.vector_index_entries() {
-                    index.remove(*node_id);
+                let read = self.vector_read_view(&store);
+                for (key, index) in store.vector_index_entries() {
+                    let Some((label, property)) = key.split_once(':') else {
+                        continue;
+                    };
+                    let accessor = self.intent_vector_accessor(&store, read, label, property);
+                    index.remove_with_accessor(*node_id, &accessor);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Accessor for vector-intent maintenance: `read` (the merged view)
+    /// with the default graph's ForceDisk spill as fallback (AMH #175).
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    fn intent_vector_accessor<'a>(
+        &'a self,
+        store: &Arc<LpgStore>,
+        read: &'a dyn GraphStore,
+        label: &str,
+        property: &str,
+    ) -> grafeo_core::index::vector::VectorAccessorKind<'a> {
+        #[cfg(all(feature = "mmap", not(feature = "temporal")))]
+        return crate::database::vector_access::spill_aware_accessor(
+            read,
+            if Arc::ptr_eq(store, &self.store) {
+                self.vector_spill_storages.as_ref()
+            } else {
+                None
+            },
+            label,
+            property,
+        );
+        #[cfg(not(all(feature = "mmap", not(feature = "temporal"))))]
+        {
+            let _ = (store, label);
+            grafeo_core::index::vector::VectorAccessorKind::Property(
+                grafeo_core::index::vector::PropertyVectorAccessor::new(read, property),
+            )
+        }
     }
 
     /// Creates a planner with transaction context and constraint validator.
