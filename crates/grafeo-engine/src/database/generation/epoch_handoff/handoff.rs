@@ -530,7 +530,8 @@ impl GrafeoDB {
             edge_ids.sort_unstable();
             for raw in edge_ids {
                 if let Some(e) = overlay.get_edge(EdgeId::new(raw)) {
-                    edges.push(edge_to_generation(&e));
+                    // See the node loop above.
+                    edges.push(edge_to_generation(&layered.materialize_overlay_edge(e)));
                 }
             }
             return Ok((freeze, nodes, edges));
