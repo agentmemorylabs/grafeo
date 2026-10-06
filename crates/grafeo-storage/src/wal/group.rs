@@ -566,10 +566,13 @@ impl GroupBuffer {
                     .expect("4-byte length prefix"),
             ) as usize;
             let payload = &self.ram[offset + 4..offset + 4 + len];
-            spill.push_frame(payload)?;
+            let sealed = spill.push_frame(payload)?;
+            // The RAM frames, the grown write buffer, this frame's sealed
+            // copy (just dropped) and the triggering record's encoding were
+            // all in RAM at once.
             self.peak_ram = self
                 .peak_ram
-                .max(self.ram.capacity() + spill.pending.capacity());
+                .max(self.ram.capacity() + spill.pending.capacity() + sealed + self.scratch_in_use);
             offset += 4 + len;
             position.frames += 1;
             position.bytes += RAM_FRAME_HEADER + len as u64;
@@ -1075,6 +1078,34 @@ mod tests {
         // its decrypted copy, fewer).
         assert!(peak >= 3 << 20, "peak {peak} misses the record's copies");
         assert!(peak <= 1024 + 4 * IO_CHUNK + 5 * (1 << 20), "peak {peak}");
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn peak_counts_a_large_ram_frame_moved_by_the_first_spill() {
+        // The inverse case: a large record still fits in RAM, and a small one
+        // then triggers the spill, which moves (and seals) the large frame.
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = group(dir.path(), (1 << 20) + 4096, true);
+        let big = WalRecord::CreateNode {
+            id: NodeId::new(1),
+            labels: vec!["y".repeat(1 << 20)],
+        };
+        g.push(&big).unwrap();
+        assert!(!g.is_spilled());
+        let mut next = 2;
+        while !g.is_spilled() {
+            g.push(&node(next)).unwrap();
+            next += 1;
+        }
+        let peak = g.peak_ram_bytes();
+        // RAM still holding the frame, its sealed copy and the write buffer
+        // holding that copy.
+        assert!(
+            peak >= 3 << 20,
+            "peak {peak} misses the moved frame's copies"
+        );
+        assert_eq!(decode_all(&mut g).len() as u64, next - 1);
     }
 
     #[cfg(feature = "testing-crash-injection")]

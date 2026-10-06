@@ -204,6 +204,12 @@ fn insert_rows(session: &Session, label: &str, from: usize, rows: usize) {
     }
 }
 
+/// A write applied in memory whose WAL records were refused or lost: never
+/// retryable (a blind retry could apply it twice).
+fn is_unconfirmed(error: &Error) -> bool {
+    !error.error_code().is_retryable() && error.to_string().contains("durability unconfirmed")
+}
+
 fn is_buffer_full(error: &Error) -> bool {
     matches!(error, Error::AdmissionRetryable(_)) && error.error_code().is_retryable()
 }
@@ -225,7 +231,7 @@ fn crash_child() {
     insert_rows(&session, "Kept", 0, 3);
     if let Some(case) = scenario.strip_prefix("session_") {
         let err = failing_session_write(&session, case);
-        assert!(is_buffer_full(&err), "{kind:?} {case}: {err}");
+        assert!(is_unconfirmed(&err), "{kind:?} {case}: {err}");
         // Crash: no close(), no destructors.
         std::process::exit(0);
     }
@@ -698,13 +704,18 @@ fn implicit_session_write_copy_failure_is_reported() {
 }
 
 /// A session write outside a transaction whose records cannot be buffered
-/// (spill create, spill write, over the cap): the call fails with a
-/// retryable error that says a reopen is needed, the next write is refused,
-/// close does not checkpoint memory, and after close + reopen or crash +
-/// reopen the write is gone, so a retry after reopen does not duplicate it.
+/// (spill create, spill write, over the cap), after the store applied it:
+/// the call fails with a non-retryable "durability unconfirmed" error, the
+/// write is in memory, the next write is refused, and close fails without a
+/// checkpoint.
+///
+/// The write is then gone after close + reopen and after crash + reopen, but
+/// only because nothing else snapshotted memory in between (no checkpoint
+/// timer, save, export or generation build ran): that is not a promise the
+/// error makes, so the error says the write may or may not survive.
 #[cfg(feature = "testing-crash-injection")]
 #[test]
-fn session_write_outside_a_transaction_refused_records_are_gone_after_reopen() {
+fn session_write_outside_a_transaction_refused_records_are_durability_unconfirmed() {
     let _serial = serial();
     for kind in kinds() {
         for case in ["spill_create", "spill_write", "cap"] {
@@ -715,9 +726,9 @@ fn session_write_outside_a_transaction_refused_records_are_gone_after_reopen() {
             let db = open_for_session_case(kind, &path, &scenario);
             insert_rows(&db.session(), "Kept", 0, 3);
             let err = failing_session_write(&db.session(), case);
-            assert!(is_buffer_full(&err), "{kind:?} {case}: {err}");
+            assert!(is_unconfirmed(&err), "{kind:?} {case}: {err}");
             assert!(
-                err.to_string().contains("does not have the write"),
+                err.to_string().contains("never reached the WAL"),
                 "{kind:?} {case}: {err}"
             );
             assert_eq!(
@@ -725,9 +736,11 @@ fn session_write_outside_a_transaction_refused_records_are_gone_after_reopen() {
                 1,
                 "{kind:?} {case}: applied in memory"
             );
+            // Next write refused, close fails; gone after reopen (controlled:
+            // no snapshot path ran).
             check_reopen_after_poison(kind, &path, db, 1);
 
-            // Crash + reopen.
+            // Crash + reopen (controlled as above).
             let dir = tempfile::tempdir().unwrap();
             let path = kind.create(dir.path());
             crash_after(&scenario, &path, kind);
@@ -736,6 +749,52 @@ fn session_write_outside_a_transaction_refused_records_are_gone_after_reopen() {
             assert_eq!(seqs(&session, "Kept"), vec![0, 1, 2], "{kind:?} {case}");
             assert_eq!(count(&session, "Lost"), 0, "{kind:?} {case}: after a crash");
         }
+    }
+}
+
+/// Poisons `db`'s WAL with a write outside a transaction over the cap (the
+/// database must be open with [`SESSION_CAP`]).
+fn poison_with_a_refused_write(kind: Kind, db: &GrafeoDB) {
+    let err = failing_session_write(&db.session(), "cap");
+    assert!(is_unconfirmed(&err), "{kind:?}: {err}");
+}
+
+/// A poisoned database refuses to snapshot its live state: `save` to both
+/// destination formats and `export_snapshot` fail and create nothing.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn poisoned_database_refuses_save_and_export() {
+    let _serial = serial();
+    for kind in kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = kind.create(dir.path());
+        let db = open_for_session_case(kind, &path, "session_cap");
+        insert_rows(&db.session(), "Kept", 0, 3);
+        poison_with_a_refused_write(kind, &db);
+
+        for target in ["copy.grafeo", "copy-dir"] {
+            let target = dir.path().join(target);
+            let err = db.save(&target).expect_err("save from a poisoned database");
+            assert!(
+                err.to_string().contains("WAL is poisoned"),
+                "{kind:?}: {err}"
+            );
+            assert!(
+                !target.exists(),
+                "{kind:?}: save created {}",
+                target.display()
+            );
+        }
+        let err = db
+            .export_snapshot()
+            .expect_err("export from a poisoned database");
+        assert!(
+            err.to_string().contains("WAL is poisoned"),
+            "{kind:?}: {err}"
+        );
+        assert!(db.close().is_err());
+        drop(db);
+        assert_eq!(count(&kind.open(&path).session(), "Lost"), 0, "{kind:?}");
     }
 }
 
@@ -892,6 +951,69 @@ mod generation_root {
         drop(db);
         let db = kind.open(&root);
         assert_eq!(count(&db.session(), "Pending"), LARGE / 2);
+    }
+
+    /// A poisoned root refuses to start an epoch handoff: nothing is
+    /// published, and the refused write is not in the reopened root.
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn poisoned_root_refuses_epoch_handoff() {
+        let _serial = serial();
+        let kind = Kind::GenerationRoot;
+        let dir = tempfile::tempdir().unwrap();
+        let root = kind.create(dir.path());
+        {
+            let db = open_for_session_case(kind, &root, "session_cap");
+            insert_rows(&db.session(), "Kept", 0, 3);
+            poison_with_a_refused_write(kind, &db);
+            let err = db
+                .run_epoch_handoff(grafeo_engine::generation_build_request(&root, "g-poisoned"))
+                .expect_err("handoff from a poisoned root");
+            assert!(err.to_string().contains("WAL is poisoned"), "{err}");
+            assert!(!db.epoch_handoff_active());
+            assert!(db.close().is_err());
+        }
+        let db = kind.open(&root);
+        let session = db.session();
+        assert_eq!(seqs(&session, "Kept"), vec![0, 1, 2]);
+        assert_eq!(count(&session, "Lost"), 0, "the handoff published nothing");
+        // The selected generation is still the base: the next handoff works.
+        drop(session);
+        let report = db
+            .run_epoch_handoff(grafeo_engine::generation_build_request(&root, "g-after"))
+            .expect("handoff after reopen");
+        db.publish_and_install_handoff(report).expect("install");
+    }
+
+    /// A poisoned database refuses a direct generation build into a new
+    /// root: nothing is published there.
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn poisoned_database_refuses_generation_build() {
+        let _serial = serial();
+        for kind in kinds() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = kind.create(dir.path());
+            let db = open_for_session_case(kind, &path, "session_cap");
+            insert_rows(&db.session(), "Kept", 0, 3);
+            poison_with_a_refused_write(kind, &db);
+            let target = dir.path().join("built-root");
+            std::fs::create_dir_all(&target).unwrap();
+            let err = db
+                .build_and_publish_generation(grafeo_engine::generation_build_request(
+                    &target, "g-built",
+                ))
+                .expect_err("build from a poisoned database");
+            assert!(
+                err.to_string().contains("WAL is poisoned"),
+                "{kind:?}: {err}"
+            );
+            assert!(
+                GrafeoDB::open_generation_root(&target, true).is_err(),
+                "{kind:?}: nothing was published"
+            );
+            let _ = db.close();
+        }
     }
 
     #[test]

@@ -277,8 +277,10 @@ pub struct Config {
     /// past this cap fails with a retryable error
     /// ([`Error::AdmissionRetryable`]) and nothing of the transaction is
     /// written to the WAL; roll it back and retry the work in smaller
-    /// transactions. A write outside a transaction that hits the cap also
-    /// poisons the WAL, because it cannot be rolled back.
+    /// transactions. A write outside a transaction that hits the cap (or
+    /// whose records cannot be spilled) is already applied in memory and
+    /// cannot be rolled back: it poisons the WAL and fails with a
+    /// non-retryable "durability unconfirmed" error.
     ///
     /// Since buffers spill, this bounds the disk one transaction's buffered
     /// records may take (the spill file's checksum or encryption overhead is

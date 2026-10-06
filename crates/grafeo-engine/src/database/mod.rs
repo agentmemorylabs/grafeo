@@ -3600,8 +3600,14 @@ impl GrafeoDB {
     ///
     /// Returns an error if the WAL can't be flushed (check disk space/permissions).
     /// Also when the WAL was poisoned (a write could not be logged): the
-    /// database then closes without checkpointing memory, so a write that
-    /// never reached the WAL is not kept, and the next open replays the WAL.
+    /// database then closes without checkpointing memory or writing a
+    /// close-time commit marker, and the next writable open replays the WAL.
+    /// A write reported as "durability unconfirmed" may or may not be there
+    /// afterwards (another snapshot path may have persisted it).
+    ///
+    /// After such a close, **drop** this `GrafeoDB` before reopening the same
+    /// database: a generation root keeps its root lock until drop, and
+    /// retrying `close()` returns `Ok` without confirming anything.
     pub fn close(&self) -> Result<()> {
         let mut is_open = self.is_open.write();
         if !*is_open {
@@ -3628,25 +3634,35 @@ impl GrafeoDB {
         }
 
         // A poisoned WAL: some write applied in memory may never have reached
-        // it, and was reported as failed. Neither snapshot memory into the
-        // container nor write a close-time commit marker (either would make
-        // that write durable, or settle a partial group). Keep the WAL as it
-        // is: the next open replays it, so the database comes back as the WAL
-        // left it. The close itself fails, after releasing the files.
+        // it, and was reported as durability unconfirmed. Neither snapshot
+        // memory into the container nor write a close-time commit marker
+        // (either could make that write durable, or settle a partial group).
+        // The WAL handle is closed without appending anything (bytes already
+        // encoded in its write buffer may still be flushed by the drop); the
+        // next writable open replays the WAL. The close itself fails, after
+        // releasing the files it can (a generation root's lock is released
+        // when the database is dropped).
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.poisoned_reason()
         {
             wal.close_active_log();
+            // The file manager releases its lock even if its sync fails;
+            // report that failure too, without skipping the rest.
+            #[allow(unused_mut)]
+            let mut file_error = String::new();
             #[cfg(feature = "grafeo-file")]
-            if let Some(ref fm) = self.file_manager {
-                fm.close()?;
+            if let Some(ref fm) = self.file_manager
+                && let Err(e) = fm.close()
+            {
+                file_error = format!(" (closing the database file also failed: {e})");
             }
             *is_open = false;
             return Err(Error::Internal(format!(
-                "database closed without a checkpoint: the WAL was poisoned ({reason}); \
-                 changes after the failure that never reached the WAL are not kept, and \
-                 the next open replays the WAL"
+                "database closed without a checkpoint: the WAL was poisoned ({reason}); the \
+                 next writable open replays the WAL, and a write reported as durability \
+                 unconfirmed may or may not be there. Drop this database before reopening \
+                 it{file_error}"
             )));
         }
 
@@ -3794,6 +3810,29 @@ impl GrafeoDB {
         {
             return Err(Error::Internal(format!(
                 "WAL refuses writes until the database is reopened: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuses to snapshot or publish this database's live state (`what`)
+    /// while its WAL is poisoned: memory may then hold a write whose records
+    /// never reached the WAL (reported as durability unconfirmed), and a
+    /// snapshot would make it durable. A cheap entry check, not a barrier: a
+    /// write refused while the snapshot runs is not excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming `what` and the poison reason.
+    #[cfg(feature = "wal")]
+    pub(super) fn check_snapshot_source(&self, what: &str) -> Result<()> {
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            return Err(Error::Internal(format!(
+                "refusing to {what}: the WAL is poisoned ({reason}), so memory may hold a \
+                 write that never reached it; drop this database and reopen it (the open \
+                 replays the WAL), then retry"
             )));
         }
         Ok(())

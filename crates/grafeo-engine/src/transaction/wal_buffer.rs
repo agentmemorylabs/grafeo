@@ -351,8 +351,9 @@ impl WalBuffer {
     /// empty.
     ///
     /// Outside a transaction a refused push cannot be rolled back: its write
-    /// is already applied in memory and will never reach the WAL. That
-    /// poisons the WAL, so every later write is refused until a reopen.
+    /// is already applied in memory and its records never reach the WAL.
+    /// That poisons the WAL, so every later write is refused until a reopen,
+    /// and the caller reports the write as durability unconfirmed.
     ///
     /// # Errors
     ///
@@ -363,18 +364,9 @@ impl WalBuffer {
             self.wal.poison(format!(
                 "a write outside a transaction could not be logged: {error}"
             ));
-            // Keep the error's kind (#27 keeps the cap retryable), but say
-            // that nothing succeeds before a reopen.
-            const REOPEN: &str = " The write is applied in memory but not logged: the WAL \
-                                  refuses writes until the database is reopened, and the \
-                                  reopened database does not have the write.";
-            return Err(match error {
-                Error::AdmissionRetryable(message) => {
-                    Error::AdmissionRetryable(format!("{message}.{REOPEN}"))
-                }
-                Error::Internal(message) => Error::Internal(format!("{message}.{REOPEN}")),
-                other => other,
-            });
+            // The caller reports it as "durability unconfirmed" (see
+            // `unconfirmed_write_error`): the write is applied already.
+            return Err(error);
         }
         if self.is_empty() {
             return Ok(());
@@ -383,13 +375,20 @@ impl WalBuffer {
     }
 }
 
-/// The error for a write outside a transaction whose implicit group failed:
-/// a refused record (over the cap) keeps its retryable error; a failed
-/// append becomes "durability unconfirmed", because the write is applied in
-/// memory, cannot be undone, and the WAL is poisoned.
+/// The error for a write outside a transaction whose implicit group failed.
+/// Always "durability unconfirmed" and never retryable: the write is applied
+/// in memory, cannot be undone, and the WAL is poisoned. A refused record
+/// (over the cap, spill create or write failed) never reached the WAL, but a
+/// snapshot of memory may still persist it; a failed append may have reached
+/// the WAL. Either way a blind retry could apply the write twice.
 pub(crate) fn unconfirmed_write_error(error: Error) -> Error {
     match error {
-        Error::AdmissionRetryable(_) => error,
+        Error::AdmissionRetryable(refusal) => Error::Internal(format!(
+            "write applied in memory; durability unconfirmed: its WAL records were refused \
+             and never reached the WAL ({refusal}), but a snapshot may still persist it, so \
+             do not retry it blindly; the WAL refuses further writes until the database is \
+             reopened"
+        )),
         other => Error::Internal(format!(
             "write applied in memory; durability unconfirmed (it may have been written): \
              its WAL group failed ({other}); the WAL refuses further writes until the \
