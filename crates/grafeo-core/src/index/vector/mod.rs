@@ -716,8 +716,9 @@ mod tests {
         use super::super::*;
         use std::collections::HashSet;
 
-        /// Minimal accessor that always returns None (quantized indexes
-        /// store vectors internally so the accessor is unused).
+        /// Accessor that returns no vectors. Only valid where the test does not
+        /// depend on distances: since search scores through the accessor, every
+        /// distance through this accessor is `f32::MAX` and results are arbitrary.
         struct NoopAccessor;
         impl VectorAccessor for NoopAccessor {
             fn get_vector(&self, _id: NodeId) -> Option<std::sync::Arc<[f32]>> {
@@ -725,16 +726,58 @@ mod tests {
             }
         }
 
+        fn test_vectors(n: usize) -> Vec<Vec<f32>> {
+            (0..n)
+                .map(|i| {
+                    (0..4)
+                        .map(|j| ((i * 4 + j) as f32) / (n * 4) as f32)
+                        .collect()
+                })
+                .collect()
+        }
+
+        /// Seeded so the HNSW level assignment (graph topology) is reproducible.
         fn build_quantized_kind(n: usize) -> VectorIndexKind {
             let config = HnswConfig::new(4, DistanceMetric::Euclidean);
-            let q = QuantizedHnswIndex::new(config, QuantizationType::Scalar);
-            for i in 0..n {
-                let vec: Vec<f32> = (0..4)
-                    .map(|j| ((i * 4 + j) as f32) / (n * 4) as f32)
-                    .collect();
-                q.test_insert(NodeId::new(i as u64 + 1), &vec);
+            let q = QuantizedHnswIndex::with_seed(config, QuantizationType::Scalar, 42);
+            for (i, vec) in test_vectors(n).iter().enumerate() {
+                q.test_insert(NodeId::new(i as u64 + 1), vec);
             }
             VectorIndexKind::Quantized(q)
+        }
+
+        /// Accessor backed by the index's test vectors. Search scores nodes
+        /// through the accessor (the quantized index keeps no f32 copy in
+        /// production), so filtered-search assertions need real vectors.
+        fn accessor(kind: &VectorIndexKind) -> impl VectorAccessor + '_ {
+            kind.as_quantized().expect("quantized kind").accessor()
+        }
+
+        /// Exact filtered top-k over `test_vectors(n)`.
+        fn exact_filtered(
+            n: usize,
+            query: &[f32],
+            k: usize,
+            allowlist: &HashSet<NodeId>,
+        ) -> Vec<NodeId> {
+            let vectors = test_vectors(n);
+            brute_force_knn_filtered(
+                vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (NodeId::new(i as u64 + 1), v.as_slice())),
+                query,
+                k,
+                DistanceMetric::Euclidean,
+                |id| allowlist.contains(&id),
+            )
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+        }
+
+        fn ids(results: &[(NodeId, f32)]) -> Vec<NodeId> {
+            results.iter().map(|(id, _)| *id).collect()
         }
 
         #[test]
@@ -750,7 +793,7 @@ mod tests {
         fn quantized_kind_insert_and_search() {
             let kind = build_quantized_kind(30);
             let query = vec![0.5, 0.5, 0.0, 0.0];
-            let results = kind.search(&query, 3, &NoopAccessor);
+            let results = kind.search(&query, 3, &accessor(&kind));
             assert_eq!(results.len(), 3);
         }
 
@@ -758,7 +801,7 @@ mod tests {
         fn quantized_kind_search_with_ef() {
             let kind = build_quantized_kind(30);
             let query = vec![0.5, 0.5, 0.0, 0.0];
-            let results = kind.search_with_ef(&query, 3, 50, &NoopAccessor);
+            let results = kind.search_with_ef(&query, 3, 50, &accessor(&kind));
             assert_eq!(results.len(), 3);
         }
 
@@ -767,11 +810,8 @@ mod tests {
             let kind = build_quantized_kind(30);
             let allowlist: HashSet<NodeId> = (1..=10).map(NodeId::new).collect();
             let query = vec![0.1, 0.1, 0.0, 0.0];
-            let results = kind.search_with_filter(&query, 5, &allowlist, &NoopAccessor);
-            assert!(!results.is_empty());
-            for (id, _) in &results {
-                assert!(allowlist.contains(id));
-            }
+            let results = kind.search_with_filter(&query, 5, &allowlist, &accessor(&kind));
+            assert_eq!(ids(&results), exact_filtered(30, &query, 5, &allowlist));
         }
 
         #[test]
@@ -779,26 +819,27 @@ mod tests {
             let kind = build_quantized_kind(30);
             let allowlist: HashSet<NodeId> = (5..=15).map(NodeId::new).collect();
             let query = vec![0.3, 0.3, 0.0, 0.0];
-            let results = kind.search_with_ef_and_filter(&query, 3, 50, &allowlist, &NoopAccessor);
-            for (id, _) in &results {
-                assert!(allowlist.contains(id));
-            }
+            let results =
+                kind.search_with_ef_and_filter(&query, 3, 50, &allowlist, &accessor(&kind));
+            assert_eq!(ids(&results), exact_filtered(30, &query, 3, &allowlist));
         }
 
         #[test]
         fn quantized_kind_batch_search() {
             let kind = build_quantized_kind(30);
             let queries = vec![vec![0.1, 0.0, 0.0, 0.0], vec![0.9, 0.9, 0.0, 0.0]];
-            let results = kind.batch_search(&queries, 2, &NoopAccessor);
+            let results = kind.batch_search(&queries, 2, &accessor(&kind));
             assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|r| r.len() == 2));
         }
 
         #[test]
         fn quantized_kind_batch_search_with_ef() {
             let kind = build_quantized_kind(30);
             let queries = vec![vec![0.1, 0.0, 0.0, 0.0]];
-            let results = kind.batch_search_with_ef(&queries, 2, 50, &NoopAccessor);
+            let results = kind.batch_search_with_ef(&queries, 2, 50, &accessor(&kind));
             assert_eq!(results.len(), 1);
+            assert_eq!(results[0].len(), 2);
         }
 
         #[test]
@@ -806,11 +847,12 @@ mod tests {
             let kind = build_quantized_kind(30);
             let allowlist: HashSet<NodeId> = (1..=10).map(NodeId::new).collect();
             let queries = vec![vec![0.1, 0.0, 0.0, 0.0]];
-            let results = kind.batch_search_with_filter(&queries, 5, &allowlist, &NoopAccessor);
+            let results = kind.batch_search_with_filter(&queries, 5, &allowlist, &accessor(&kind));
             assert_eq!(results.len(), 1);
-            for (id, _) in &results[0] {
-                assert!(allowlist.contains(id));
-            }
+            assert_eq!(
+                ids(&results[0]),
+                exact_filtered(30, &queries[0], 5, &allowlist)
+            );
         }
 
         #[test]
@@ -819,11 +861,12 @@ mod tests {
             let allowlist: HashSet<NodeId> = (1..=15).map(NodeId::new).collect();
             let queries = vec![vec![0.2, 0.0, 0.0, 0.0]];
             let results =
-                kind.batch_search_with_ef_and_filter(&queries, 3, 50, &allowlist, &NoopAccessor);
+                kind.batch_search_with_ef_and_filter(&queries, 3, 50, &allowlist, &accessor(&kind));
             assert_eq!(results.len(), 1);
-            for (id, _) in &results[0] {
-                assert!(allowlist.contains(id));
-            }
+            assert_eq!(
+                ids(&results[0]),
+                exact_filtered(30, &queries[0], 3, &allowlist)
+            );
         }
 
         #[test]
