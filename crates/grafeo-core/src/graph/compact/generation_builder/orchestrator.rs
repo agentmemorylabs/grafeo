@@ -51,8 +51,8 @@ use crate::graph::compact::generation_builder::emit_ids::{
 };
 use crate::graph::compact::generation_builder::live_graph::LogicalLabelLookup;
 use crate::graph::compact::generation_builder::node_pass::{self, NodeSchema};
-use crate::graph::compact::mapped::SegmentKind;
 use crate::graph::compact::mapped::id_index::MappedNodeIdIndex;
+use crate::graph::compact::mapped::{PayloadVersionPolicy, SegmentKind};
 use grafeo_common::utils::hash::FxHashMap;
 use std::path::PathBuf;
 
@@ -116,6 +116,8 @@ pub struct BoundedGenerationBuilder {
     /// ledger (via `RunStore::job_anon_ledger`), so the whole-job peak
     /// reflects concurrently live arenas across all passes.
     job_anon: std::sync::Arc<JobAnonLedger>,
+    /// Payload version policy (G4): v5 when every field fits, else v6.
+    payload_policy: PayloadVersionPolicy,
 }
 
 impl BoundedGenerationBuilder {
@@ -128,7 +130,17 @@ impl BoundedGenerationBuilder {
             metrics: GenerationMetrics::default(),
             cancel: None,
             job_anon,
+            payload_policy: PayloadVersionPolicy::Auto,
         }
+    }
+
+    /// Sets the payload version policy (default [`PayloadVersionPolicy::Auto`]:
+    /// v5 unless a column body offset, length or vector component count, or a
+    /// segment element count, passes `u32`).
+    #[must_use]
+    pub fn with_payload_version_policy(mut self, policy: PayloadVersionPolicy) -> Self {
+        self.payload_policy = policy;
+        self
     }
 
     /// Attaches a cancel token.
@@ -545,6 +557,7 @@ impl BoundedGenerationBuilder {
             &mut self.metrics,
             self.cancel.as_ref(),
             &self.job_anon,
+            self.payload_policy,
         )?;
 
         // R3 (MAJOR-2): block_zone_maps are now charged INSIDE
@@ -872,15 +885,8 @@ impl BoundedGenerationBuilder {
                 )
             })
             .collect();
-        write_directory_segments(
-            &col_result.columns,
-            &node_tables,
-            &rel_tables,
-            &mut node_dir,
-            &mut rel_dir,
-            &mut col_dir,
-            &mut col_block_index,
-        )?;
+        // The directory segments are written at the end, once every other
+        // segment is finished and the payload version is known (G4).
 
         // Build ID lookups — streamed into spool sinks (no graph-proportional
         // resident vectors). Node lookup is index-order (already sorted by
@@ -1014,18 +1020,9 @@ impl BoundedGenerationBuilder {
         };
         descriptors.push(meta_desc);
 
-        let node_dir_desc = make_resident_desc(SegmentKind::NodeTableDirectory, 8, 24, &node_dir);
-        let rel_dir_desc = make_resident_desc(SegmentKind::RelTableDirectory, 8, 24, &rel_dir);
-        let col_dir_desc = make_resident_desc(SegmentKind::ColumnDirectory, 8, 24, &col_dir);
-        let col_block_desc =
-            make_resident_desc(SegmentKind::ColumnBlockIndex, 4, 12, &col_block_index);
         let table_zm_desc = make_resident_desc(SegmentKind::TableZoneMaps, 8, 40, &table_zm);
         let block_zm_desc = make_resident_desc(SegmentKind::BlockZoneMaps, 8, 40, &block_zm);
 
-        descriptors.push(node_dir_desc);
-        descriptors.push(rel_dir_desc);
-        descriptors.push(col_dir_desc);
-        descriptors.push(col_block_desc);
         // ID-lookup segments stream from spool sinks (disk-backed bodies).
         descriptors.push(node_lookup_sink.finish()?);
         descriptors.push(node_orig_sink.finish()?);
@@ -1071,6 +1068,49 @@ impl BoundedGenerationBuilder {
             descriptors.push(membership_sink.finish()?);
         }
 
+        // G4: resolve the payload version now that every body length and
+        // element count is known, then encode the directories for it. Under
+        // `Auto` a payload whose fields all fit u32 stays byte-identical v5.
+        let needs_v6 = col_result.requires_v6()
+            || descriptors
+                .iter()
+                .any(|d| d.element_count > u64::from(u32::MAX));
+        let payload_version = self.payload_policy.resolve(needs_v6);
+        write_directory_segments(
+            payload_version,
+            &col_result.columns,
+            &node_tables,
+            &rel_tables,
+            &mut node_dir,
+            &mut rel_dir,
+            &mut col_dir,
+            &mut col_block_index,
+        )?;
+        descriptors.push(make_resident_desc(
+            SegmentKind::NodeTableDirectory,
+            8,
+            24,
+            &node_dir,
+        ));
+        descriptors.push(make_resident_desc(
+            SegmentKind::RelTableDirectory,
+            8,
+            24,
+            &rel_dir,
+        ));
+        descriptors.push(make_resident_desc(
+            SegmentKind::ColumnDirectory,
+            8,
+            24,
+            &col_dir,
+        ));
+        descriptors.push(make_resident_desc(
+            SegmentKind::ColumnBlockIndex,
+            payload_version.block_index_alignment(),
+            payload_version.block_index_record_len() as u32,
+            &col_block_index,
+        ));
+
         // Sort by kind ascending.
         descriptors.sort_by_key(|d| d.kind.as_u16());
 
@@ -1082,6 +1122,7 @@ impl BoundedGenerationBuilder {
             self.metrics.clone(),
             Some(self.config.temp_dir.clone()),
         )
+        .with_payload_version(payload_version)
         .with_frozen_epoch(self.config.frozen_epoch))
     }
 }

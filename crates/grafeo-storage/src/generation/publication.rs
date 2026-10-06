@@ -180,6 +180,16 @@ pub fn publish_generation(
 
     let partial_path = unpublished_dir.join("generation.grafeo.partial");
 
+    // The slot records the CompactStore payload version actually written
+    // (5, or 6 when the payload needs 64-bit column geometry, G4).
+    let compact_store_format_version = input
+        .sections
+        .iter()
+        .find(|s| s.section_type() == SectionType::CompactStore)
+        .map_or(manifest::COMPACT_STORE_FORMAT_VERSION, |s| {
+            u16::from(s.directory_version())
+        });
+
     // Step 4: stream the complete container to the partial file.
     create_versioned_sections_streaming(&partial_path, &input.header, input.sections, file_ops)
         .map_err(|e| PublicationError::ManifestWrite(format!("streaming: {e}")))?;
@@ -231,7 +241,7 @@ pub fn publish_generation(
         node_count: input.header.node_count,
         edge_count: input.header.edge_count,
         outer_container_format_version: crate::file::format::FORMAT_VERSION,
-        compact_store_format_version: manifest::COMPACT_STORE_FORMAT_VERSION,
+        compact_store_format_version,
         generation_sha256,
         generation_id: input.generation_id.clone(),
         parent_generation_id: input

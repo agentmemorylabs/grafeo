@@ -151,9 +151,7 @@ impl SegmentSink for SpoolSegmentSink {
         let crc = std::mem::replace(&mut self.crc, crc32fast::Hasher::new()).finalize();
         let length = self.length;
         let element_count = if self.element_width > 0 {
-            #[allow(clippy::cast_possible_truncation)]
-            let count = (length / u64::from(self.element_width)) as u32;
-            count
+            length / u64::from(self.element_width)
         } else {
             0
         };
@@ -233,9 +231,7 @@ impl SegmentSink for MemorySegmentSink {
         let length = self.bytes.len() as u64;
         let crc = self.crc.finalize();
         let element_count = if self.element_width > 0 {
-            #[allow(clippy::cast_possible_truncation)]
-            let count = (length / u64::from(self.element_width)) as u32;
-            count
+            length / u64::from(self.element_width)
         } else {
             0
         };

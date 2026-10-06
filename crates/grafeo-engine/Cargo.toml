@@ -163,6 +163,16 @@ path = "tests/generation_root_forcedisk_handoff_vectors.rs"
 required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index"]
 
 [[test]]
+name = "compact_store_v6_payload_large"
+path = "tests/compact_store_v6_payload_large.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "cypher"]
+
+[[test]]
+name = "compact_store_v6_payload"
+path = "tests/compact_store_v6_payload.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "cypher"]
+
+[[test]]
 name = "compact_store_disk_parity"
 path = "tests/compact_store_disk_parity.rs"
 required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
@@ -181,6 +191,11 @@ required-features = ["generation", "generation-streaming", "lpg", "compact-store
 name = "generation_root_overlay_indexes"
 path = "tests/generation_root_overlay_indexes.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher", "vector-index", "text-index"]
+
+[[test]]
+name = "generation_root_overlay_delete"
+path = "tests/generation_root_overlay_delete.rs"
+required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
 
 [[test]]
 name = "epoch_handoff_wal_boundary"

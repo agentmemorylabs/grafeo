@@ -20,6 +20,7 @@ use crate::graph::compact::generation::emit::dict_column_lookup::DictCodeLookup;
 use crate::graph::compact::generation::emit::sink::SegmentSink;
 use crate::graph::compact::generation::error::GenerationError;
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
+use crate::graph::compact::mapped::{PayloadVersionPolicy, vector_body_header};
 use crate::graph::compact::zone_map::{ZoneMap, fold_value_into_block_zone_map};
 use grafeo_common::types::Value;
 
@@ -118,6 +119,8 @@ enum BodyFamily {
     Float64,
     Float32Vector {
         dims: u16,
+        /// v6 wide header (`[7][dims u16][components u64]`).
+        wide: bool,
     },
     RawI64,
     Empty,
@@ -150,14 +153,41 @@ impl StreamingBodyWriter {
         dict_lookup: Option<Box<dyn DictCodeLookup>>,
         context: impl Into<String>,
     ) -> Result<Self, GenerationError> {
+        Self::new_with_policy(sink, geo, dict_lookup, context, PayloadVersionPolicy::Auto)
+    }
+
+    /// Like [`Self::new`], choosing vector header widths by `policy`: a
+    /// vector column whose component count passes `u32`, or any vector
+    /// column under [`PayloadVersionPolicy::V6`], gets the v6 wide header,
+    /// and the payload must then be written as v6
+    /// ([`Self::requires_v6`]).
+    ///
+    /// # Errors
+    ///
+    /// Codec or I/O failure.
+    pub fn new_with_policy(
+        sink: &mut dyn SegmentSink,
+        geo: &ColumnGeometry,
+        dict_lookup: Option<Box<dyn DictCodeLookup>>,
+        context: impl Into<String>,
+        policy: PayloadVersionPolicy,
+    ) -> Result<Self, GenerationError> {
         let context = context.into();
         let row_count = geo.row_count;
 
         let family = if geo.has_string {
             BodyFamily::Dict { empty: false }
-        } else if geo.vector_dims.is_some() {
+        } else if let Some(dims) = geo.vector_dims {
+            let components = row_count.checked_mul(u64::from(dims)).ok_or(
+                GenerationError::WireWidthOverflow {
+                    what: "vector_component_count",
+                    count: row_count,
+                    max: u64::MAX,
+                },
+            )?;
             BodyFamily::Float32Vector {
-                dims: geo.vector_dims.expect("checked"),
+                dims,
+                wide: policy.wide_vector_header(components),
             }
         } else if geo.saw_signed_int || geo.min_int.is_some() {
             if geo.saw_signed_int {
@@ -210,6 +240,13 @@ impl StreamingBodyWriter {
         })
     }
 
+    /// True when this column's body uses a v6-only encoding, so the payload
+    /// that carries it must be v6.
+    #[must_use]
+    pub fn requires_v6(&self) -> bool {
+        matches!(self.family, BodyFamily::Float32Vector { wide: true, .. })
+    }
+
     /// Feeds one present, non-null row value.
     ///
     /// # Errors
@@ -247,7 +284,7 @@ impl StreamingBodyWriter {
                     BodyFamily::BitPacked { .. } => Value::Int64(0),
                     BodyFamily::Bitmap { .. } => Value::Bool(false),
                     BodyFamily::Float64 => Value::Float64(0.0),
-                    BodyFamily::Float32Vector { dims } => {
+                    BodyFamily::Float32Vector { dims, .. } => {
                         Value::Vector(std::sync::Arc::from(vec![0.0f32; usize::from(*dims)]))
                     }
                     BodyFamily::RawI64 => Value::Int64(0),
@@ -335,7 +372,7 @@ impl StreamingBodyWriter {
                 write_bytes(sink, &mut self.body_len, &f.to_le_bytes())?;
             }
             Value::Vector(vec) if matches!(self.family, BodyFamily::Float32Vector { .. }) => {
-                let BodyFamily::Float32Vector { dims } = self.family else {
+                let BodyFamily::Float32Vector { dims, .. } = self.family else {
                     unreachable!()
                 };
                 if vec.len() != usize::from(dims) {
@@ -462,7 +499,7 @@ fn write_body_header(
             write(sink, &[4])?;
             write(sink, &(row_count as u32).to_le_bytes())?;
         }
-        BodyFamily::Float32Vector { dims } => {
+        BodyFamily::Float32Vector { dims, wide } => {
             let component_count = row_count.checked_mul(u64::from(*dims)).ok_or_else(|| {
                 GenerationError::WireWidthOverflow {
                     what: "vector_component_count",
@@ -470,9 +507,11 @@ fn write_body_header(
                     max: u64::MAX,
                 }
             })?;
-            write(sink, &[5])?;
-            write(sink, &dims.to_le_bytes())?;
-            write(sink, &(component_count as u32).to_le_bytes())?;
+            // Narrow (v5) form fails loudly past u32 instead of truncating.
+            write(
+                sink,
+                &vector_body_header(false, *dims, component_count, *wide)?,
+            )?;
         }
         BodyFamily::RawI64 => {
             write(sink, &[6])?;

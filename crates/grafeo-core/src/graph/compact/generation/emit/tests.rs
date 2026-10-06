@@ -230,12 +230,12 @@ fn dictionary_string_segments_match_eager_helper() {
 #[test]
 fn dictionary_code_index_matches_eager_helper() {
     let strings = vec!["Mango", "apple", "zebra"];
-    let eager_index = build_dictionary_code_index(&strings);
+    let eager_index = build_dictionary_code_index(&strings).unwrap();
 
     let dict = BoundedDictionary {
         strings: strings.iter().map(|s| s.to_string()).collect(),
     };
-    let bounded_index = dict.code_index_bytes();
+    let bounded_index = dict.code_index_bytes().unwrap();
 
     assert_eq!(
         bounded_index, eager_index,

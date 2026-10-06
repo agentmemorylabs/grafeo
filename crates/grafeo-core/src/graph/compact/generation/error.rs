@@ -144,3 +144,13 @@ impl fmt::Display for GenerationError {
 }
 
 impl std::error::Error for GenerationError {}
+
+impl From<crate::graph::compact::mapped::WireOverflow> for GenerationError {
+    fn from(e: crate::graph::compact::mapped::WireOverflow) -> Self {
+        Self::WireWidthOverflow {
+            what: e.what,
+            count: e.count,
+            max: e.max,
+        }
+    }
+}

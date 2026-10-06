@@ -5,6 +5,7 @@
 // the resident section length; they cannot truncate on the 64-bit targets
 // this engine supports.
 #![allow(clippy::cast_possible_truncation)]
+use super::payload_version::WireOverflow;
 use super::string_dict::MappedStringDictionary;
 use bytes::Bytes;
 
@@ -44,15 +45,18 @@ pub const CODE_INDEX_RECORD_LEN: usize = 16;
 ///
 /// `strings[i]` is dictionary code `i`. Records are sorted lexicographically
 /// by UTF-8 content.
-#[must_use]
-pub fn build_dictionary_code_index(strings: &[&str]) -> Vec<u8> {
+///
+/// # Errors
+///
+/// [`WireOverflow`] when a code or a single string's length does not fit
+/// the record's `u32` field.
+pub fn build_dictionary_code_index(strings: &[&str]) -> Result<Vec<u8>, WireOverflow> {
     let mut records: Vec<(u64, u32, u32, &str)> = Vec::with_capacity(strings.len());
     let mut offset = 0u64;
     for (i, s) in strings.iter().enumerate() {
-        let code = i as u32;
-        let len = s.len() as u32;
+        let (code, len) = code_index_fields(i, s.len())?;
         records.push((offset, len, code, *s));
-        offset += u64::from(len);
+        offset += s.len() as u64;
     }
     records.sort_by(|a, b| a.3.cmp(b.3));
     let mut out = Vec::with_capacity(records.len() * CODE_INDEX_RECORD_LEN);
@@ -61,7 +65,23 @@ pub fn build_dictionary_code_index(strings: &[&str]) -> Vec<u8> {
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&code.to_le_bytes());
     }
-    out
+    Ok(out)
+}
+
+/// Checked `(code, string_len)` for one code-index record.
+///
+/// # Errors
+///
+/// [`WireOverflow`] when either does not fit `u32`.
+pub(crate) fn code_index_fields(code: usize, len: usize) -> Result<(u32, u32), WireOverflow> {
+    let narrow = |what, v: usize| {
+        u32::try_from(v).map_err(|_| WireOverflow {
+            what,
+            count: v as u64,
+            max: u64::from(u32::MAX),
+        })
+    };
+    Ok((narrow("dict_code", code)?, narrow("dict_string_len", len)?))
 }
 
 /// Binary-searchable mapped code index.
