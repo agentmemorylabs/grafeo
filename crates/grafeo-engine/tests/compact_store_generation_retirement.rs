@@ -55,6 +55,32 @@ const EXPECT_ENV: &str = "GRAFEORET_EXPECT";
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// Serializes child spawns against root-lock cycles (acquire after release)
+/// across the parallel test threads of this binary.
+///
+/// The root ownership lock is a `flock`, which belongs to the *open file
+/// description*, not to the process or the fd number. `spawn_child` forks, and
+/// between fork and exec the child holds a copy of every fd this process has
+/// open, including another test thread's locked ownership file (O_CLOEXEC only
+/// closes them at exec). If that thread drops its `RootOwnership` (unlock by
+/// close) and immediately re-acquires the lock in that window, the child's copy
+/// still holds it and the re-acquire fails with `AlreadyLocked`. So child
+/// starts and lock cycles take turns: `std`'s `spawn` returns only once the
+/// child has exec'd, so a cycle that takes this mutex starts after every
+/// earlier fork has dropped its inherited copies. Keep the critical sections
+/// short and never hold this across a wait on a child.
+static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_cycle() -> std::sync::MutexGuard<'static, ()> {
+    LOCK_CYCLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `RootOwnership::open` taken as one turn of the lock-cycle mutex.
+fn open_root(root: &std::path::Path) -> Result<RootOwnership, OwnershipError> {
+    let _cycle = lock_cycle();
+    RootOwnership::open(root)
+}
+
 /// Populate a throwaway in-memory DB with two labeled nodes (unique `tag`)
 /// and a single edge, so each published generation has distinct content.
 fn populate(db: &GrafeoDB, tag: &str) {
@@ -70,6 +96,12 @@ fn populate(db: &GrafeoDB, tag: &str) {
 /// Publish one generation of the current in-memory DB into `gen_root` and
 /// return its `(publication sequence, root-relative path)`.
 fn publish(db: &GrafeoDB, gen_root: &std::path::Path, id: &str) -> (u64, String) {
+    let _cycle = lock_cycle();
+    publish_in_cycle(db, gen_root, id)
+}
+
+/// `publish` for a caller that already holds [`lock_cycle`].
+fn publish_in_cycle(db: &GrafeoDB, gen_root: &std::path::Path, id: &str) -> (u64, String) {
     let publication = db
         .build_and_publish_generation(generation_build_request(gen_root, id))
         .expect("publish generation")
@@ -213,7 +245,12 @@ fn spawn_child(
     if let Some((key, value)) = extra_env {
         cmd.env(key, value);
     }
-    cmd.status().expect("spawn lifecycle child")
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut child = {
+        let _cycle = lock_cycle();
+        cmd.spawn().expect("spawn lifecycle child")
+    };
+    child.wait().expect("wait for lifecycle child")
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +286,7 @@ fn fresh_process_restart_recovers_selection_and_retention() {
 
     // In-process: ownership exposes the validated selection and the root
     // lock owner state (packet requirement 5, lock part).
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
     assert_eq!(ownership.mode(), OpenMode::Writable);
     assert_eq!(ownership.selected().slot.generation_id, *id2);
     let owner = ownership.owner_state();
@@ -299,7 +336,7 @@ fn second_process_writer_and_readonly_rejected() {
     let dir = TempDir::new().unwrap();
     let (gen_root, _) = publish_many(&dir, &["held"]);
 
-    let ownership = RootOwnership::open(&gen_root).expect("parent ownership");
+    let ownership = open_root(&gen_root).expect("parent ownership");
 
     for mode in ["second-writer", "second-readonly"] {
         let status = spawn_child(
@@ -316,7 +353,7 @@ fn second_process_writer_and_readonly_rejected() {
 
     drop(ownership);
     // Kernel lock released with the handle: a fresh process opens cleanly.
-    let reopened = RootOwnership::open(&gen_root).expect("open after owner drop");
+    let reopened = open_root(&gen_root).expect("open after owner drop");
     assert_eq!(reopened.selected().slot.generation_id, "g-held");
 }
 
@@ -349,7 +386,7 @@ fn crash_releases_lock_and_recovery_revalidates() {
 
     // Fresh process: the kernel released the lock on process exit; recovery
     // validates the manifest/WAL state and selects the only generation.
-    let ownership = RootOwnership::open(&gen_root).expect("fresh open after crash");
+    let ownership = open_root(&gen_root).expect("fresh open after crash");
     assert_eq!(ownership.selected().slot.generation_id, "g-crash");
     assert_eq!(ownership.selected().slot.publication_sequence, 1);
     assert!(ownership.wal_boundary().log_sequence >= 1);
@@ -390,7 +427,7 @@ fn unsupported_filesystem_fails_explicitly() {
         return;
     }
 
-    let err = RootOwnership::open(&canonical).expect_err("tmpfs root must fail explicitly");
+    let err = open_root(&canonical).expect_err("tmpfs root must fail explicitly");
     assert!(
         matches!(
             err,
@@ -418,7 +455,7 @@ fn external_snapshot_outlives_live_root_gc() {
     let (gen_root, published) = publish_many(&dir, &["one", "two"]);
     let (_, _, rel2) = &published[1];
 
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
 
     // Publish an external snapshot of the selected generation through the
     // W0 contract (streaming copy + validate + atomic rename + parent fsync).
@@ -506,7 +543,7 @@ fn backup_pins_selected_and_copies_exact_bytes() {
     let (gen_root, published) = publish_many(&dir, &["one", "two"]);
     let (_, seq2, rel2) = &published[1];
 
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
     let auth = RetirementAuthority::new(&ownership);
 
     // Rejection surfaces: unsafe name; destination inside the live root.
@@ -587,7 +624,7 @@ fn backup_pin_survives_publication_gc_protects_then_collects() {
     let (_, seq3, _) = published[2];
 
     // Open + authority; pin generation 1 (currently the oldest) for backup.
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
     let auth = RetirementAuthority::new(&ownership);
     let pin = auth.pin_for_backup(rel1.clone(), 1);
     assert_eq!(pin.pinned_path(), rel1);
@@ -601,7 +638,7 @@ fn backup_pin_survives_publication_gc_protects_then_collects() {
     assert!(seq4 > seq3);
     drop(db);
 
-    let ownership = RootOwnership::open(&gen_root).expect("re-open owned root");
+    let ownership = open_root(&gen_root).expect("re-open owned root");
     let plan = plan_retirement(&auth).expect("plan");
     let pinned = plan
         .protected
@@ -661,7 +698,7 @@ fn restore_recovers_backed_up_generation_with_parity() {
     let (gen_root, published) = publish_many(&dir, &["one", "two"]);
     let (_, seq2, _) = &published[1];
 
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
     let auth = RetirementAuthority::new(&ownership);
     let receipt = backup_generation_root(&auth, &ownership, &dir.path().join("backups"), "b1")
         .expect("backup");
@@ -669,7 +706,11 @@ fn restore_recovers_backed_up_generation_with_parity() {
 
     // Restore into a NEW root: recovery must select the backed-up sequence.
     let new_root = dir.path().join("restored.grafeo.d");
-    let restored = restore_generation_root(&receipt.backup_dir, &new_root).expect("restore");
+    let restored = {
+        let _cycle = lock_cycle();
+        restore_generation_root(&receipt.backup_dir, &new_root)
+    }
+    .expect("restore");
     assert_eq!(restored.selected().slot.publication_sequence, *seq2);
     assert_eq!(restored.selected().slot.generation_id, "g-two");
     assert_eq!(restored.mode(), OpenMode::Writable);
@@ -682,7 +723,7 @@ fn restore_recovers_backed_up_generation_with_parity() {
     );
 
     // The restored root is exclusively locked: a second process is rejected.
-    let err = RootOwnership::open(&new_root).expect_err("restored root is owned");
+    let err = open_root(&new_root).expect_err("restored root is owned");
     assert!(matches!(err, OwnershipError::Lock(_)), "got: {err}");
     drop(restored);
 
@@ -727,7 +768,7 @@ fn gc_never_deletes_selected_previous_pinned_or_leased() {
     let (_, _, rel1) = published[0].clone();
     let (_, _, rel3) = published[2].clone();
 
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
 
     // In-process lease on generation 1 (out of both manifest slots now).
     let registry = grafeo_engine::GenerationLeaseRegistry::from_selected(
@@ -796,7 +837,7 @@ fn stale_plan_fails_closed_when_pin_lands_between_plan_and_collect() {
     let (gen_root, published) = publish_many(&dir, &["one", "two", "three"]);
     let (_, _, rel1) = published[0].clone();
 
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
     let auth = RetirementAuthority::new(&ownership);
 
     // Plan: generation 1 (out of both slots) is eligible.
@@ -866,7 +907,7 @@ fn gc_interleaved_with_publication_and_pin_churn_never_deletes_protected() {
     // take the exclusive root lock, so they serialize exactly as they do in
     // the owner process: each GC pass opens a fresh ownership (acquiring the
     // lock), and each publication runs with the lock free.
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
     let auth = Arc::new(RetirementAuthority::new(&ownership));
     drop(ownership);
 
@@ -892,11 +933,14 @@ fn gc_interleaved_with_publication_and_pin_churn_never_deletes_protected() {
     let db = GrafeoDB::new_in_memory();
     for tag in ["four", "five", "six", "seven"] {
         populate(&db, tag);
-        publish(&db, &gen_root, &format!("g-{tag}"));
+        // One lock cycle: publish (acquire + release), then the GC open.
+        let cycle = lock_cycle();
+        publish_in_cycle(&db, &gen_root, &format!("g-{tag}"));
         // A GC pass under the lock: it must never delete the selected or
         // previous generation, and must respect any pin the churner
         // currently holds on generation 1.
         let ownership = RootOwnership::open(&gen_root).expect("open for GC");
+        drop(cycle);
         let plan = plan_retirement(&auth).expect("plan under lock");
         match collect_retirement(&auth, &plan) {
             Ok(_) | Err(RetirementError::SelectionChanged(_)) => {}
@@ -918,7 +962,7 @@ fn gc_interleaved_with_publication_and_pin_churn_never_deletes_protected() {
             .generation_id,
         "g-seven"
     );
-    let ownership = RootOwnership::open(&gen_root).expect("final recovery");
+    let ownership = open_root(&gen_root).expect("final recovery");
     let report = auth.lifecycle_report(&ownership).expect("final report");
     let selected = report.selected.as_ref().expect("selected reported");
     assert!(selected.generation_id.as_deref() == Some("g-seven"));
@@ -948,7 +992,7 @@ fn lifecycle_report_exposes_all_classes_without_strong_refs() {
     let (_, _, rel1) = published[0].clone();
     let (_, _, rel3) = published[2].clone();
 
-    let ownership = RootOwnership::open(&gen_root).expect("open owned root");
+    let ownership = open_root(&gen_root).expect("open owned root");
 
     // Lease on generation 1 (out of both slots) + an unreferenced orphan.
     let registry = grafeo_engine::GenerationLeaseRegistry::from_selected(
