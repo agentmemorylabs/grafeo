@@ -244,8 +244,7 @@ pub fn filesystem_for_path(
             path_str.starts_with('/')
         } else {
             mp == path_str
-                || (path_str.starts_with(mp)
-                    && path_str.as_bytes().get(mp.len()) == Some(&b'/'))
+                || (path_str.starts_with(mp) && path_str.as_bytes().get(mp.len()) == Some(&b'/'))
         };
         if covers {
             let len = mp.len();

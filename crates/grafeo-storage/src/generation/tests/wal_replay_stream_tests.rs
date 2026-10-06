@@ -638,59 +638,273 @@ fn replay_stream_tx_state_layout_commit_abort_torn() {
 }
 
 // ---------------------------------------------------------------------------
-// Rotated-file anomalies (fail-closed per packet §3)
+// Transactions that straddle a rotation
+//
+// A rotated file is final (rotate() flushes and fsyncs it under the
+// active-log lock), so a rotated file that ends with a transaction open is
+// not damage: the transaction continues in the next file. Only the end of
+// the active (newest) file decides that a trailing transaction is
+// uncommitted. Frame-level damage in a rotated file still fails closed.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn replay_stream_rotated_file_ending_tx_open_is_incomplete_transaction() {
-    let (_dir, wal) = fixture_wal();
-    // File 0 ends with an uncommitted data record, then rotate.
+/// A WAL that rotates by size after almost every append group.
+fn fixture_tiny_wal() -> (TempDir, WalManager) {
+    let dir = TempDir::new().unwrap();
+    let wal = WalManager::with_config(
+        dir.path(),
+        crate::wal::WalConfig {
+            max_log_size: 64,
+            ..crate::wal::WalConfig::default()
+        },
+    )
+    .unwrap();
+    (dir, wal)
+}
+
+fn log_data(wal: &WalManager, id: u64) {
     wal.log(&WalRecord::CreateNode {
-        id: NodeId::new(1),
-        labels: vec![],
+        id: NodeId::new(id),
+        labels: vec!["Person".to_string()],
     })
     .unwrap();
-    crate::generation::wal_cursor::cut_generation_boundary(&wal).unwrap();
-    log_committed_tx(&wal, 2);
-    wal.flush().unwrap();
+}
 
-    let dir = wal.dir().to_path_buf();
-    let seq0 = wal.current_sequence() - 1;
-    let mut stream = replay_stream_from(&dir, &cursor_at(seq0, 0)).expect("stream opens");
-    // The rotated file's uncommitted data frame is yielded first; the error
-    // arrives at the rotated file's EOF with a transaction still open.
-    match stream.next() {
-        Some(Ok(frame)) => {
-            assert_eq!(frame.log_sequence, seq0);
-            assert_eq!(frame.byte_offset, 0);
+/// One transaction of `records` data records whose size rotations land
+/// between its own data records, then its commit pair. Returns the sequence
+/// of the first file.
+fn log_straddling_tx(wal: &WalManager, tx: u64, records: u64) -> u64 {
+    let first_seq = wal.current_sequence();
+    for i in 0..records {
+        log_data(wal, tx * 1000 + i);
+    }
+    assert!(
+        wal.current_sequence() >= first_seq + 2,
+        "fixture must rotate inside the transaction"
+    );
+    wal.log(&WalRecord::TransactionCommit {
+        transaction_id: TransactionId::new(tx),
+    })
+    .unwrap();
+    wal.log(&WalRecord::EpochAdvance {
+        epoch: EpochId::new(tx),
+    })
+    .unwrap();
+    wal.flush().unwrap();
+    first_seq
+}
+
+/// Sequences of the files whose last frame leaves a transaction open, among
+/// the non-newest files.
+fn rotated_files_ending_tx_open(frames: &[ReplayFrame], max_seq: u64) -> Vec<u64> {
+    let mut open = Vec::new();
+    for pair in frames.windows(2) {
+        let (last, next) = (&pair[0], &pair[1]);
+        if last.log_sequence != next.log_sequence
+            && last.log_sequence != max_seq
+            && matches!(last.record, WalRecord::CreateNode { .. })
+        {
+            open.push(last.log_sequence);
         }
-        other => panic!("expected the rotated file's data frame first, got {other:?}"),
     }
-    match stream.next() {
-        Some(Err(WalCursorError::IncompleteTransaction(seq))) => assert_eq!(seq, seq0),
-        other => panic!("expected IncompleteTransaction, got {other:?}"),
-    }
-    // Fused after error; no clean termination.
-    assert!(stream.next().is_none());
-    assert_eq!(stream.stopped_at(), None);
+    open
 }
 
 #[test]
-fn validate_replayable_rotated_file_ending_tx_open_is_incomplete_transaction() {
-    let (_dir, wal) = fixture_wal();
-    wal.log(&WalRecord::CreateNode {
-        id: NodeId::new(1),
-        labels: vec![],
-    })
-    .unwrap();
-    crate::generation::wal_cursor::cut_generation_boundary(&wal).unwrap();
-    log_committed_tx(&wal, 2);
-    wal.flush().unwrap();
-
+fn replay_stream_yields_transaction_straddling_size_rotation() {
+    let (_dir, wal) = fixture_tiny_wal();
+    let seq0 = log_straddling_tx(&wal, 1, 10);
     let dir = wal.dir().to_path_buf();
-    let seq0 = wal.current_sequence() - 1;
+    let max_seq = wal.current_sequence();
+
+    let mut stream = replay_stream_from(&dir, &cursor_at(seq0, 0)).expect("stream opens");
+    let frames = collect_stream(&mut stream).expect("a straddling transaction is replayable");
+    assert!(
+        !rotated_files_ending_tx_open(&frames, max_seq).is_empty(),
+        "fixture must leave a rotated file ending with the transaction open"
+    );
+    let ids: Vec<u64> = frames
+        .iter()
+        .filter_map(|f| match &f.record {
+            WalRecord::CreateNode { id, .. } => Some(id.as_u64()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        (1000..1010).collect::<Vec<_>>(),
+        "every record, in order"
+    );
+    let tail: Vec<&str> = frames[frames.len() - 2..]
+        .iter()
+        .map(|f| discriminant_name(&f.record))
+        .collect();
+    assert_eq!(tail, vec!["TransactionCommit", "EpochAdvance"]);
+    assert_eq!(
+        stream.stopped_at(),
+        Some((max_seq, file_len(&dir, max_seq))),
+        "clean end at the active file's EOF"
+    );
+
+    validate_replayable(&dir, &cursor_at(seq0, 0))
+        .expect("validate_replayable accepts a straddling transaction");
+    check_agreement(&dir, &cursor_at(seq0, 0), "straddling transaction");
+}
+
+#[test]
+fn replay_stream_yields_straddle_between_committed_transactions() {
+    // tx1 committed in place, tx2 straddles several files, tx3 committed.
+    let (_dir, wal) = fixture_tiny_wal();
+    let seq0 = wal.current_sequence();
+    log_committed_tx(&wal, 1);
+    log_straddling_tx(&wal, 2, 8);
+    log_committed_tx(&wal, 3);
+    wal.flush().unwrap();
+    let dir = wal.dir().to_path_buf();
+
+    validate_replayable(&dir, &cursor_at(seq0, 0)).expect("validate accepts");
+    let mut stream = replay_stream_from(&dir, &cursor_at(seq0, 0)).expect("stream opens");
+    let frames = collect_stream(&mut stream).expect("stream accepts");
+    let commits = frames
+        .iter()
+        .filter(|f| matches!(f.record, WalRecord::TransactionCommit { .. }))
+        .count();
+    assert_eq!(commits, 3);
+    assert_eq!(frames.len(), 3 + 10 + 3);
+}
+
+#[test]
+fn straddling_transaction_open_at_active_end_stays_uncommitted() {
+    // The transaction crosses rotations and is still open when the newest
+    // file ends: a clean end whose trailing records have no commit (the
+    // replayer discards them, as for an open tail inside a single file).
+    let (_dir, wal) = fixture_tiny_wal();
+    let seq0 = wal.current_sequence();
+    log_committed_tx(&wal, 1);
+    for i in 0..10 {
+        log_data(&wal, 2000 + i);
+    }
+    wal.flush().unwrap();
+    let dir = wal.dir().to_path_buf();
+    let max_seq = wal.current_sequence();
+    assert!(
+        max_seq >= seq0 + 2,
+        "fixture must rotate inside the open tail"
+    );
+
+    validate_replayable(&dir, &cursor_at(seq0, 0)).expect("an open active tail is tolerated");
+    let mut stream = replay_stream_from(&dir, &cursor_at(seq0, 0)).expect("stream opens");
+    let frames = collect_stream(&mut stream).expect("clean end");
+    let after_last_commit: Vec<&ReplayFrame> = frames
+        .iter()
+        .skip_while(|f| !matches!(f.record, WalRecord::EpochAdvance { .. }))
+        .skip(1)
+        .collect();
+    assert_eq!(after_last_commit.len(), 10);
+    assert!(
+        after_last_commit
+            .iter()
+            .all(|f| matches!(f.record, WalRecord::CreateNode { .. })),
+        "the open tail has no commit or abort"
+    );
+    assert_eq!(
+        stream.stopped_at(),
+        Some((max_seq, file_len(&dir, max_seq)))
+    );
+}
+
+#[test]
+fn torn_frame_in_rotated_file_inside_straddle_fails_closed() {
+    let (_dir, wal) = fixture_tiny_wal();
+    let seq0 = log_straddling_tx(&wal, 1, 10);
+    let dir = wal.dir().to_path_buf();
+    drop(wal);
+
+    // Cut the last frame of the first (rotated) file short.
+    let len = file_len(&dir, seq0);
+    let f = OpenOptions::new()
+        .write(true)
+        .open(wal_path(&dir, seq0))
+        .unwrap();
+    f.set_len(len - 3).unwrap();
+    drop(f);
+
     match validate_replayable(&dir, &cursor_at(seq0, 0)) {
         Err(WalCursorError::IncompleteTransaction(seq)) => assert_eq!(seq, seq0),
         other => panic!("expected IncompleteTransaction, got {other:?}"),
     }
+    let mut stream = replay_stream_from(&dir, &cursor_at(seq0, 0)).expect("stream opens");
+    match collect_stream(&mut stream) {
+        Err(WalCursorError::IncompleteTransaction(seq)) => assert_eq!(seq, seq0),
+        other => panic!("expected IncompleteTransaction from stream, got {other:?}"),
+    }
+    assert_eq!(stream.stopped_at(), None);
+    check_agreement(&dir, &cursor_at(seq0, 0), "torn frame in rotated file");
+}
+
+#[test]
+fn partial_length_prefix_in_rotated_file_inside_straddle_fails_closed() {
+    let (_dir, wal) = fixture_tiny_wal();
+    let seq0 = log_straddling_tx(&wal, 1, 10);
+    let dir = wal.dir().to_path_buf();
+    drop(wal);
+
+    // Two stray bytes after the rotated file's last frame: a short read of
+    // the next length prefix.
+    {
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(wal_path(&dir, seq0))
+            .unwrap();
+        f.write_all(&[0x01, 0x00]).unwrap();
+    }
+
+    match validate_replayable(&dir, &cursor_at(seq0, 0)) {
+        Err(WalCursorError::IncompleteTransaction(seq)) => assert_eq!(seq, seq0),
+        other => panic!("expected IncompleteTransaction, got {other:?}"),
+    }
+    check_agreement(&dir, &cursor_at(seq0, 0), "short prefix in rotated file");
+}
+
+#[test]
+fn sequence_gap_inside_straddle_fails_closed() {
+    let (_dir, wal) = fixture_tiny_wal();
+    let seq0 = log_straddling_tx(&wal, 1, 10);
+    let dir = wal.dir().to_path_buf();
+    drop(wal);
+
+    // Lose a middle file of the straddling transaction.
+    std::fs::remove_file(wal_path(&dir, seq0 + 1)).unwrap();
+
+    match validate_replayable(&dir, &cursor_at(seq0, 0)) {
+        Err(WalCursorError::SequenceGap { expected, .. }) => assert_eq!(expected, seq0 + 1),
+        other => panic!("expected SequenceGap, got {other:?}"),
+    }
+    match replay_stream_from(&dir, &cursor_at(seq0, 0)) {
+        Err(WalCursorError::SequenceGap { expected, .. }) => assert_eq!(expected, seq0 + 1),
+        other => panic!("expected SequenceGap from stream, got {other:?}"),
+    }
+}
+
+#[test]
+fn corrupted_crc_in_rotated_file_inside_straddle_fails_closed() {
+    let (_dir, wal) = fixture_tiny_wal();
+    let seq0 = log_straddling_tx(&wal, 1, 10);
+    let dir = wal.dir().to_path_buf();
+    drop(wal);
+
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(wal_path(&dir, seq0 + 1))
+            .unwrap();
+        f.seek(SeekFrom::Start(4)).unwrap();
+        f.write_all(&[0xFF]).unwrap();
+    }
+    match validate_replayable(&dir, &cursor_at(seq0, 0)) {
+        Err(WalCursorError::FrameChecksum { seq, offset }) => {
+            assert_eq!((seq, offset), (seq0 + 1, 0));
+        }
+        other => panic!("expected FrameChecksum, got {other:?}"),
+    }
+    check_agreement(&dir, &cursor_at(seq0, 0), "crc in straddle");
 }

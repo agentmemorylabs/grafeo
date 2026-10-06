@@ -15,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::generation::records::MAX_RECORD_BODY_BYTES;
-use crate::wal::{WalEntry, WalManager, WalRecord};
+use crate::wal::{WalManager, WalRecord};
 
 /// Durable WAL replay boundary recorded in a manifest slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,9 +76,15 @@ pub enum WalCursorError {
         /// Declared body length from the 4-byte prefix.
         declared: u32,
     },
-    /// A non-active WAL file ends mid-transaction or with a torn frame
-    /// (a rotated file must end at a committed boundary).
-    #[error("incomplete committed transaction at sequence={0}")]
+    /// A non-active (rotated) WAL file ends with a torn frame: a partial
+    /// length prefix, body, or checksum. A rotated file is final, so a short
+    /// read there is damage, never a crash tail.
+    ///
+    /// A rotated file that ends with a transaction still open is **not** this
+    /// error: a size rotation can land between two records of one
+    /// transaction, which then continues in the next file. Only the end of
+    /// the active file decides that a trailing transaction is uncommitted.
+    #[error("torn frame at the end of rotated WAL file sequence={0}")]
     IncompleteTransaction(u64),
     /// Underlying I/O error.
     #[error("I/O: {0}")]
@@ -125,6 +131,12 @@ fn wal_files(wal_dir: &Path) -> std::io::Result<Vec<(u64, PathBuf)>> {
 /// return a cursor at offset 0 of the new sequence. New writes resume in
 /// that sequence.
 ///
+/// Replay starts at the cursor and never reads records before it, so the
+/// cut is a transaction boundary only when no transaction is open across
+/// it: callers drain writers first (see the engine's
+/// `freeze_epoch_for_handoff`). A size rotation inside a transaction never
+/// produces a cursor; only this cut does.
+///
 /// # Errors
 ///
 /// Returns [`WalCursorError::Io`] when sync/rotate fails.
@@ -166,7 +178,12 @@ pub fn cut_generation_boundary(wal: &WalManager) -> Result<GenerationCut, WalCur
 /// Validate that a recorded cursor is replayable: the cursor file exists,
 /// sequences are contiguous through the newest file, `byte_offset` is
 /// frame-aligned, every complete frame checksum-validates, and rotated
-/// (non-active) files end at committed boundaries.
+/// (non-active) files end at a whole frame.
+///
+/// A transaction may straddle a rotation (a size rotation can fall between
+/// two of its records): its records stay open across the file boundary and
+/// are settled by a later commit or abort, or, at the end of the active
+/// file, left uncommitted for the replayer to discard.
 ///
 /// # Errors
 ///
@@ -202,9 +219,9 @@ pub fn validate_replayable(wal_dir: &Path, cursor: &WalReplayCursor) -> Result<(
 
     // Parse frames from the cursor file through every later file. The
     // newest file may have a torn tail (crash during write); any earlier
-    // file must end exactly at a committed boundary.
+    // file must end exactly at a frame boundary (parse_one_frame rejects a
+    // short read there). An open transaction carries into the next file.
     let mut offset = cursor.byte_offset;
-    let mut tx_open = false;
     // One reusable frame-body buffer: O(one frame <= cap) memory (H-ADOPT.3).
     let mut body_buf = Vec::new();
     for (seq, path) in files.iter().filter(|(seq, _)| *seq >= cursor.log_sequence) {
@@ -213,21 +230,7 @@ pub fn validate_replayable(wal_dir: &Path, cursor: &WalReplayCursor) -> Result<(
             offset = 0;
         }
         let is_active = *seq == max_seq;
-        while parse_one_frame(
-            &mut file,
-            *seq,
-            &mut offset,
-            &mut tx_open,
-            is_active,
-            &mut body_buf,
-        )?
-        .is_some()
-        {}
-        // Reached EOF (or a tolerated torn tail): a rotated file must end at
-        // a committed boundary.
-        if !is_active && tx_open {
-            return Err(WalCursorError::IncompleteTransaction(*seq));
-        }
+        while parse_one_frame(&mut file, *seq, &mut offset, is_active, &mut body_buf)?.is_some() {}
     }
 
     Ok(())
@@ -255,7 +258,9 @@ pub struct ReplayFrame {
 /// records.
 ///
 /// Ends cleanly at EOF of the active (max-sequence) file, tolerating a torn
-/// tail there; every other anomaly yields the same [`WalCursorError`] variant
+/// tail there. A transaction open at the end of a rotated file continues in
+/// the next file (records are yielded as read; the consumer settles them on
+/// the commit or abort). Every other anomaly yields the same [`WalCursorError`] variant
 /// [`validate_replayable`] reports (checksum/decode failures are never
 /// downgraded to torn tail). The stream is fused: after clean termination or
 /// after yielding an error, [`Iterator::next`] returns `None`.
@@ -273,8 +278,6 @@ pub struct WalReplayStream {
     max_seq: u64,
     /// Offset of the next byte to read in the current file.
     offset: u64,
-    /// Single-open-transaction state (serial-transaction invariant).
-    tx_open: bool,
     /// Reusable frame-body buffer: O(one frame) anonymous memory.
     body_buf: Vec<u8>,
     /// `(seq, byte_offset)` where the stream stopped after clean termination.
@@ -309,7 +312,6 @@ impl Iterator for WalReplayStream {
                 &mut self.file,
                 self.seq,
                 &mut self.offset,
-                &mut self.tx_open,
                 is_active,
                 &mut self.body_buf,
             ) {
@@ -328,13 +330,10 @@ impl Iterator for WalReplayStream {
                         self.stopped = Some((self.seq, self.offset));
                         return None;
                     }
-                    // Rotated file: it must end at a committed boundary.
-                    if self.tx_open {
-                        self.errored = true;
-                        return Some(Err(WalCursorError::IncompleteTransaction(self.seq)));
-                    }
-                    // Continue into the next sequence file (existence and
-                    // contiguity were checked in replay_stream_from).
+                    // Rotated file, ended at a whole frame: continue into the
+                    // next sequence file (existence and contiguity were
+                    // checked in replay_stream_from). A transaction open here
+                    // straddles the rotation and continues in that file.
                     self.file_index += 1;
                     let (next_seq, next_path) = &self.files[self.file_index];
                     match File::open(next_path) {
@@ -407,7 +406,6 @@ pub fn replay_stream_from(
         seq: cursor.log_sequence,
         max_seq,
         offset: cursor.byte_offset,
-        tx_open: false,
         body_buf: Vec::new(),
         stopped: None,
         errored: false,
@@ -458,7 +456,6 @@ fn parse_one_frame(
     file: &mut File,
     seq: u64,
     offset: &mut u64,
-    tx_open: &mut bool,
     is_active: bool,
     body_buf: &mut Vec<u8>,
 ) -> Result<Option<WalRecord>, WalCursorError> {
@@ -516,9 +513,6 @@ fn parse_one_frame(
             offset: frame_start,
         });
     };
-    let completes_tx =
-        record.is_commit() || record.is_abort() || record.is_checkpoint() || record.is_metadata();
-    *tx_open = !completes_tx;
     // reason: frame size is bounded by the u32 prefix; u64 cannot wrap here
     *offset = frame_start + 4 + u64::from(declared) + 4;
     Ok(Some(record))
@@ -548,6 +542,11 @@ pub fn earliest_retained_cursor(
 
 /// Delete whole WAL log files with sequence strictly older than the
 /// retention floor's log sequence. Never deletes the floor's own file.
+///
+/// The floor is a [`cut_generation_boundary`] cursor, which no transaction
+/// straddles, so a transaction that straddles a size rotation lies wholly
+/// after the floor (kept) or wholly before it (already applied to a
+/// published generation).
 ///
 /// # Errors
 ///
