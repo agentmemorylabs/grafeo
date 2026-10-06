@@ -29,7 +29,7 @@
 ))]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use grafeo_common::types::Value;
 use grafeo_engine::{Config, GrafeoDB};
@@ -37,6 +37,29 @@ use grafeo_engine::{Config, GrafeoDB};
 const ENV_SCENARIO: &str = "GRAFEO_CRASH_CHILD_SCENARIO";
 const ENV_POINT: &str = "GRAFEO_CRASH_CHILD_POINT";
 const ENV_PATH: &str = "GRAFEO_CRASH_CHILD_PATH";
+
+/// Serializes child spawns against database-lock cycles (acquire after
+/// release) across the parallel test threads of this binary.
+///
+/// The database file lock is a `flock`, which belongs to the *open file
+/// description*, not to the process or the fd number. Spawning a child forks,
+/// and between fork and exec the child holds a copy of every fd this process
+/// has open, including another test thread's locked database file (O_CLOEXEC
+/// only closes them at exec). If that thread drops its database (unlock by
+/// close) and the next open of the same file races that window, the child's
+/// copy still holds the lock and the open fails as already locked. So child
+/// starts and parent-side opens take turns: `std`'s `spawn` returns only once
+/// the child has exec'd, so an open that takes this mutex starts after every
+/// earlier fork has dropped its inherited copies. Keep the critical sections
+/// short and never hold this across a wait on a child. Same fix as
+/// `compact_store_generation_retirement`.
+static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take one turn of the lock-cycle mutex (poison-tolerant: a panicking test
+/// must not cascade into every other test in the binary).
+fn lock_cycle() -> std::sync::MutexGuard<'static, ()> {
+    LOCK_CYCLE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Upper bound on crash points per scenario, so a regression that stops the
 /// child from ever completing cannot loop forever.
@@ -111,6 +134,7 @@ fn insert_people(db: &GrafeoDB, people: &[&str]) {
 /// destroy. Some padding makes the image span several pages so a partial
 /// overwrite is visible.
 fn establish_round1(scenario: &str, path: &Path) {
+    let _cycle = lock_cycle();
     let db = GrafeoDB::with_config(config_for(scenario, path)).unwrap();
     insert_people(&db, ROUND1);
     let session = db.session();
@@ -175,18 +199,26 @@ fn crash_child_entry() {
 /// Returns the name of the crash point the child died at, or `None` if it ran
 /// the checkpoint to completion.
 fn spawn_child(scenario: &str, point: u64, path: &Path) -> Option<String> {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "crash_child_entry",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(ENV_SCENARIO, scenario)
-        .env(ENV_POINT, point.to_string())
-        .env(ENV_PATH, path)
-        .output()
-        .unwrap();
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "crash_child_entry",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(ENV_SCENARIO, scenario)
+    .env(ENV_POINT, point.to_string())
+    .env(ENV_PATH, path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    // `Command::output()` forks and then waits for the child; split it so only
+    // the spawn (fork through exec) is under the lock-cycle mutex.
+    let child = {
+        let _cycle = lock_cycle();
+        cmd.spawn().unwrap()
+    };
+    let output = child.wait_with_output().unwrap();
     if output.status.success() {
         return None;
     }
@@ -233,7 +265,11 @@ fn run_scenario(
         };
         eprintln!("{scenario}: {crash_site}");
 
-        match GrafeoDB::with_config(config_for(scenario, &path)) {
+        let reopened = {
+            let _cycle = lock_cycle();
+            GrafeoDB::with_config(config_for(scenario, &path))
+        };
+        match reopened {
             Ok(db) => {
                 let got = names(&db);
                 if !accept(&got) {

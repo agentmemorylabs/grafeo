@@ -55,6 +55,36 @@ use grafeo_storage::file::generation_writer::GenerationFileOps;
 use grafeo_storage::generation::wal_cursor::validate_replayable;
 use tempfile::TempDir;
 
+/// Serializes child spawns against root-lock cycles (acquire after release)
+/// across the parallel test threads of this binary.
+///
+/// The root ownership lock is a `flock`, which belongs to the *open file
+/// description*, not to the process or the fd number. Spawning a child forks,
+/// and between fork and exec the child holds a copy of every fd this process
+/// has open, including another test thread's locked root file (O_CLOEXEC only
+/// closes them at exec). If that thread drops its lock holder (unlock by
+/// close) and immediately re-acquires in that window, the child's copy still
+/// holds the lock and the re-acquire fails with "root already locked by
+/// another process". So child starts and parent-side lock cycles take turns:
+/// `std`'s `spawn` returns only once the child has exec'd, so a cycle that
+/// takes this mutex starts after every earlier fork has dropped its inherited
+/// copies. Keep the critical sections short and never hold this across a wait
+/// on a child. Same fix as `compact_store_generation_retirement`.
+static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take one turn of the lock-cycle mutex (poison-tolerant: a panicking test
+/// must not cascade into every other test in the binary).
+fn lock_cycle() -> std::sync::MutexGuard<'static, ()> {
+    LOCK_CYCLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `f` (a parent-side root-lock acquisition or publish/handoff cycle) as
+/// one turn of the lock-cycle mutex.
+fn in_cycle<T>(f: impl FnOnce() -> T) -> T {
+    let _cycle = lock_cycle();
+    f()
+}
+
 /// Convert a freeze-identity node set (`u64` originals) to `NodeId`s.
 fn frozen_to_node_ids(ids: &FxHashSet<u64>) -> FxHashSet<NodeId> {
     ids.iter().map(|raw| NodeId::new(*raw)).collect()
@@ -158,9 +188,10 @@ fn smoke_whole_graph_swap_bounds_overlay() {
             .set_node_property(n, "name", Value::from(format!("p-c{i}")));
         expected.insert(format!("p-c{i}"));
 
-        let pubn = db
-            .build_and_publish_generation(generation_build_request(&gen_root, format!("wg-{i}")))
-            .expect("whole-graph publish");
+        let pubn = in_cycle(|| {
+            db.build_and_publish_generation(generation_build_request(&gen_root, format!("wg-{i}")))
+        })
+        .expect("whole-graph publish");
         let new_base = open_generation_base(&pubn.generation_abs_path);
         let _old = db
             .layered_store()
@@ -198,14 +229,15 @@ fn restart_recovers_latest_generation_and_replayable_boundary() {
     db.create_node_with_props(&["Person"], [("name", Value::from("p-seed"))])
         .expect("seed");
     db.compact().expect("compact");
-    let pubn = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-final"))
-        .expect("publish");
+    let pubn = in_cycle(|| {
+        db.build_and_publish_generation(generation_build_request(&gen_root, "g-final"))
+    })
+    .expect("publish");
     db.close().expect("checkpoint close");
 
     // R5 (Linux): fresh reopen selects the just-published generation and its
     // boundary is replayable. The Windows leg is a residual (see module docs).
-    let recovery = recover_generation_root(&gen_root).expect("recover");
+    let recovery = in_cycle(|| recover_generation_root(&gen_root)).expect("recover");
     assert_eq!(recovery.selected.slot.generation_id, "g-final");
     assert_eq!(recovery.wal_boundary, pubn.publication.wal_boundary);
     validate_replayable(&gen_root.join("wal"), &recovery.wal_boundary.to_cursor())
@@ -245,7 +277,7 @@ fn handoff_build_repaired_swap_preserves_exact_once() {
         .unwrap()
         .set_node_property(n_a, "name", Value::from("frozen-n-a"));
 
-    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
     assert_eq!(db.epoch_handoff_phase(), EpochHandoffPhase::FreezeCaptured);
 
     // Post-freeze N+1 (created, never frozen).
@@ -254,9 +286,10 @@ fn handoff_build_repaired_swap_preserves_exact_once() {
         .unwrap()
         .set_node_property(n1, "name", Value::from("p-n1"));
 
-    let report = db
-        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "hand-1"))
-        .expect("complete handoff");
+    let report = in_cycle(|| {
+        db.complete_epoch_handoff(handle, generation_build_request(&gen_root, "hand-1"))
+    })
+    .expect("complete handoff");
     assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
 
     // 5d: install the handoff generation as the base, repairing the overlay.
@@ -316,7 +349,7 @@ fn repair_swap_keeps_post_freeze_modification_of_base_node_visible() {
     // Freeze epoch N. The base node is present in the base and NOT modified at
     // freeze → it is NOT in the freeze shadow set → the handoff build keeps
     // old-base v0 in the new generation.
-    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
     assert!(
         !handle.freeze.overlay_node_ids.contains(&base_id.as_u64()),
         "unmodified-at-freeze base node must NOT be in the freeze shadow set"
@@ -327,9 +360,10 @@ fn repair_swap_keeps_post_freeze_modification_of_base_node_visible() {
         .unwrap()
         .set_node_property(base_id, "name", Value::from("base-v1"));
 
-    let report = db
-        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "hand-modify"))
-        .expect("complete handoff");
+    let report = in_cycle(|| {
+        db.complete_epoch_handoff(handle, generation_build_request(&gen_root, "hand-modify"))
+    })
+    .expect("complete handoff");
     assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
 
     // The handoff generation still serves frozen v0 (the build only carries
@@ -407,7 +441,7 @@ fn repair_swap_keeps_post_freeze_modification_of_frozen_node_visible() {
         .unwrap()
         .set_node_property(fx, "name", Value::from("frozen-v0"));
 
-    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
     assert!(
         handle.freeze.overlay_node_ids.contains(&fx.as_u64()),
         "the overlay node must be part of the freeze identity"
@@ -418,12 +452,13 @@ fn repair_swap_keeps_post_freeze_modification_of_frozen_node_visible() {
         .unwrap()
         .set_node_property(fx, "name", Value::from("frozen-v1"));
 
-    let report = db
-        .complete_epoch_handoff(
+    let report = in_cycle(|| {
+        db.complete_epoch_handoff(
             handle,
             generation_build_request(&gen_root, "hand-frozen-mod"),
         )
-        .expect("complete handoff");
+    })
+    .expect("complete handoff");
     assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
     // The propagated identity MUST record the frozen entity's N+1 re-mutation
     // — this is the exact set the repair predicate retains dirty for.
@@ -492,7 +527,7 @@ fn repair_swap_hides_post_freeze_deletion_of_frozen_node() {
         .unwrap()
         .set_node_property(fx, "name", Value::from("frozen-doomed"));
 
-    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
     assert!(handle.freeze.overlay_node_ids.contains(&fx.as_u64()));
 
     // Post-freeze N+1 deletion of the frozen entity.
@@ -501,12 +536,13 @@ fn repair_swap_hides_post_freeze_deletion_of_frozen_node() {
         "post-freeze delete of the frozen node"
     );
 
-    let report = db
-        .complete_epoch_handoff(
+    let report = in_cycle(|| {
+        db.complete_epoch_handoff(
             handle,
             generation_build_request(&gen_root, "hand-frozen-del"),
         )
-        .expect("complete handoff");
+    })
+    .expect("complete handoff");
     // The propagated identity MUST record the frozen entity's N+1 deletion —
     // the repair predicate relies on it to keep the entity hidden.
     assert!(
@@ -682,13 +718,13 @@ fn repeated_cycles_with_concurrent_readers() {
             // the model, and the same exact-multiset parity assert run here ──
             let bad_root = dir.path().join("not-a-dir.grafeo");
             std::fs::write(&bad_root, b"occupied").unwrap();
-            let handle = db
-                .freeze_epoch_for_handoff(&gen_root)
+            let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root))
                 .expect("freeze before failing build");
-            let build_err = db
-                .complete_epoch_handoff(handle, generation_build_request(&bad_root, "bad"))
-                .map(|_| ())
-                .expect_err("build into a file path must fail with a phase-tagged error");
+            let build_err = in_cycle(|| {
+                db.complete_epoch_handoff(handle, generation_build_request(&bad_root, "bad"))
+            })
+            .map(|_| ())
+            .expect_err("build into a file path must fail with a phase-tagged error");
             assert!(
                 !db.epoch_handoff_active(),
                 "failure must cancel the handoff"
@@ -699,8 +735,7 @@ fn repeated_cycles_with_concurrent_readers() {
             // the freeze identity, drive the post-freeze N+1 create, complete,
             // and run the repaired 5d swap — identically to the normal
             // handoff cycles.
-            let retry = db
-                .freeze_epoch_for_handoff(&gen_root)
+            let retry = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root))
                 .expect("re-freeze after failure");
             let n1_name = format!("c{cycle}-n1");
             let n1 = db.layered_store().unwrap().create_node(&["Person"]);
@@ -709,9 +744,13 @@ fn repeated_cycles_with_concurrent_readers() {
                 .set_node_property(n1, "name", Value::from(n1_name.clone()));
             model.insert(n1_name.clone());
 
-            let report = db
-                .complete_epoch_handoff(retry, generation_build_request(&gen_root, "cycle-1-retry"))
-                .expect("retried handoff completes");
+            let report = in_cycle(|| {
+                db.complete_epoch_handoff(
+                    retry,
+                    generation_build_request(&gen_root, "cycle-1-retry"),
+                )
+            })
+            .expect("retried handoff completes");
             assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
 
             let gen_abs = report
@@ -748,12 +787,13 @@ fn repeated_cycles_with_concurrent_readers() {
                 .set_node_property(n1, "name", Value::from(n1_name.clone()));
             model.insert(n1_name.clone());
 
-            let pubn = db
-                .build_and_publish_generation(generation_build_request(
+            let pubn = in_cycle(|| {
+                db.build_and_publish_generation(generation_build_request(
                     &gen_root,
                     format!("cycle-{cycle}"),
                 ))
-                .expect("whole-graph publish");
+            })
+            .expect("whole-graph publish");
             let new_base = open_generation_base(&pubn.generation_abs_path);
             db.layered_store()
                 .unwrap()
@@ -772,7 +812,7 @@ fn repeated_cycles_with_concurrent_readers() {
             // ── normal handoff cycle: freeze → concurrent N+1 → complete →
             // repaired 5d swap. The N+1 write is retained via the overlay
             // base-miss path until the NEXT cycle absorbs it into the base.
-            let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+            let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
             assert!(db.epoch_handoff_active());
             // Post-freeze N+1 create (accepted working set that must survive
             // the swap through the retained-N+1 base-miss path).
@@ -783,12 +823,13 @@ fn repeated_cycles_with_concurrent_readers() {
                 .set_node_property(n1, "name", Value::from(n1_name.clone()));
             model.insert(n1_name.clone());
 
-            let report = db
-                .complete_epoch_handoff(
+            let report = in_cycle(|| {
+                db.complete_epoch_handoff(
                     handle,
                     generation_build_request(&gen_root, format!("cycle-{cycle}")),
                 )
-                .expect("complete handoff");
+            })
+            .expect("complete handoff");
             assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
 
             // 5d: install the handoff generation as base (repaired swap).
@@ -849,7 +890,7 @@ fn repeated_cycles_with_concurrent_readers() {
     // selects the MOST RECENT published generation and its boundary is
     // replayable.
     db.close().expect("final checkpoint close");
-    let recovery = recover_generation_root(&gen_root).expect("recover");
+    let recovery = in_cycle(|| recover_generation_root(&gen_root)).expect("recover");
     assert_eq!(
         recovery.selected.slot.generation_id, "cycle-4",
         "latest cycle generation selected: {}",
@@ -890,14 +931,15 @@ fn backup_pin_held_across_a_cycle_restores_pinned_bytes() {
     db.create_node_with_props(&["Person"], [("name", Value::from("pinned-seed"))])
         .expect("seed");
     db.compact().expect("compact");
-    let first = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-pinned"))
-        .expect("publish first");
+    let first = in_cycle(|| {
+        db.build_and_publish_generation(generation_build_request(&gen_root, "g-pinned"))
+    })
+    .expect("publish first");
     db.close().expect("checkpoint");
 
     // Pin via a REAL backup (copies exact bytes + WAL; records the pinned seq).
     let backup_root = dir.path().join("backups");
-    let ownership = RootOwnership::open(&gen_root).expect("owned root");
+    let ownership = in_cycle(|| RootOwnership::open(&gen_root)).expect("owned root");
     let auth = RetirementAuthority::new(&ownership);
     let receipt = backup_generation_root(&auth, &ownership, &backup_root, "pin-pre-cycle")
         .expect("backup pins the selected generation");
@@ -915,10 +957,11 @@ fn backup_pin_held_across_a_cycle_restores_pinned_bytes() {
     let ctl =
         Arc::new(OverlayAdmissionController::new(OverlayBudgetConfig::for_tests()).expect("ctl"));
     db.install_overlay_admission(Arc::clone(&ctl));
-    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
-    let report = db
-        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-after-cycle"))
-        .expect("cycle completes");
+    let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
+    let report = in_cycle(|| {
+        db.complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-after-cycle"))
+    })
+    .expect("cycle completes");
     assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
     assert!(
         report
@@ -1125,16 +1168,22 @@ fn mem_build_child_direction(base_nodes: usize) {
 // instrumentation. Gates kept as-is.
 fn spawn_mem_build_child(base_nodes: usize) -> BuildPeakReport {
     let exe = std::env::current_exe().expect("current exe");
-    let output = std::process::Command::new(exe)
-        .arg("--exact")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--exact")
         .arg("n_vs_4n_transient_build_boundedness")
         .arg("--nocapture")
         .env(MEM_CHILD_ENV, "1")
         .env("GRAFEO5D_BUILD_N", base_nodes.to_string())
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .expect("spawn child");
+        .stderr(std::process::Stdio::inherit());
+    // `Command::output()` forks and then waits for the child; split it so only
+    // the spawn (fork through exec) is under the lock-cycle mutex.
+    let child = {
+        let _cycle = lock_cycle();
+        cmd.spawn().expect("spawn child")
+    };
+    let output = child.wait_with_output().expect("wait for child");
     assert!(
         output.status.success(),
         "child failed: {}",

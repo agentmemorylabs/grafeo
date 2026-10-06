@@ -25,6 +25,29 @@ mod tests {
     const PATH_VAR: &str = "GRAFEO_WAL_GROUP_PATH";
     const FORMAT_VAR: &str = "GRAFEO_WAL_GROUP_FORMAT";
 
+    /// Serializes child spawns against database-lock cycles (acquire after
+    /// release) across the parallel test threads of this binary.
+    ///
+    /// The database lock is a `flock`, which belongs to the *open file
+    /// description*, not to the process or the fd number. Spawning a child forks,
+    /// and between fork and exec the child holds a copy of every fd this process
+    /// has open, including another test thread's locked database file (O_CLOEXEC
+    /// only closes them at exec). If that thread drops its database (unlock by
+    /// close) and the next open of the same path races that window, the child's
+    /// copy still holds the lock and the open fails as already locked. So child
+    /// starts and parent-side opens take turns: `std`'s `spawn` returns only once
+    /// the child has exec'd, so an open that takes this mutex starts after every
+    /// earlier fork has dropped its inherited copies. Keep the critical sections
+    /// short and never hold this across a wait on a child. Same fix as
+    /// `compact_store_generation_retirement`.
+    static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take one turn of the lock-cycle mutex (poison-tolerant: a panicking test
+    /// must not cascade into every other test in the binary).
+    fn lock_cycle() -> std::sync::MutexGuard<'static, ()> {
+        LOCK_CYCLE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn formats(dir: &Path) -> Vec<(&'static str, PathBuf)> {
         let mut formats = vec![("wal-directory", dir.join("dir-db"))];
         #[cfg(feature = "grafeo-file")]
@@ -45,6 +68,7 @@ mod tests {
     }
 
     fn open(path: &Path, format: &str) -> GrafeoDB {
+        let _cycle = lock_cycle();
         GrafeoDB::with_config(config(path, format)).unwrap()
     }
 
@@ -63,13 +87,17 @@ mod tests {
     /// Runs `scenario` in a child process that exits without closing the
     /// database, like a crash.
     fn crash_after(scenario: &str, path: &Path, format: &str) {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::crash_child", "--nocapture"])
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "tests::crash_child", "--nocapture"])
             .env(SCENARIO_VAR, scenario)
             .env(PATH_VAR, path)
-            .env(FORMAT_VAR, format)
-            .status()
-            .unwrap();
+            .env(FORMAT_VAR, format);
+        // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+        let mut child = {
+            let _cycle = lock_cycle();
+            cmd.spawn().unwrap()
+        };
+        let status = child.wait().unwrap();
         assert!(status.success(), "{format}: scenario {scenario} failed");
     }
 
@@ -438,6 +466,7 @@ mod tests {
         use grafeo_engine::GraphModel;
 
         fn open_rdf(path: &Path, format: &str) -> GrafeoDB {
+            let _cycle = lock_cycle();
             GrafeoDB::with_config(config(path, format).with_graph_model(GraphModel::Rdf)).unwrap()
         }
 
