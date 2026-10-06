@@ -240,6 +240,17 @@ pub struct Config {
     /// WAL durability mode. Only used when `wal_enabled` is true.
     pub wal_durability: DurabilityMode,
 
+    /// Encoded WAL bytes one transaction may hold in RAM before they move to
+    /// a spill file next to the WAL (`<wal dir>/txn-spill/`). Default 8 MiB.
+    ///
+    /// A transaction's WAL records are written to the WAL as one group at
+    /// commit; until then they are buffered. Past this threshold the buffer
+    /// lives on disk, so a large transaction (a bulk import) needs about this
+    /// much RAM for its WAL records, whatever its size; the
+    /// [`wal_transaction_buffer_cap`](Self::wal_transaction_buffer_cap) still
+    /// bounds the total. `usize::MAX` never spills.
+    pub wal_spill_threshold: usize,
+
     /// Storage format for persistent databases.
     ///
     /// `Auto` (default) detects the format from the path: `.grafeo` extension
@@ -275,16 +286,30 @@ pub struct Config {
 
     /// Byte cap on one transaction's buffered WAL records.
     ///
-    /// A transaction's WAL records are held in memory, encoded, until it
-    /// commits (#411). A write that would take them past this cap fails
-    /// with a retryable error ([`Error::AdmissionRetryable`]) and nothing of
-    /// the transaction is written to the WAL; roll it back and retry the
-    /// work in smaller transactions. A write outside a transaction that hits
-    /// the cap also poisons the WAL, because it cannot be rolled back.
+    /// A transaction's WAL records are buffered, encoded, until it commits
+    /// (#411): in memory up to [`wal_spill_threshold`](Self::wal_spill_threshold),
+    /// then in a spill file next to the WAL. A write that would take them
+    /// past this cap fails with a retryable error
+    /// ([`Error::AdmissionRetryable`]) and nothing of the transaction is
+    /// written to the WAL; roll it back and retry the work in smaller
+    /// transactions. A write outside a transaction that hits the cap (or
+    /// whose records cannot be spilled) is already applied in memory and
+    /// cannot be rolled back: it poisons the WAL and fails with a
+    /// non-retryable "durability unconfirmed" error.
     ///
-    /// This is a stopgap limit until transaction buffers are charged to a
-    /// process-wide memory ledger: it keeps one huge transaction from taking
-    /// the process down. `None` means no cap.
+    /// Since buffers spill, this bounds the disk one transaction's buffered
+    /// records may take (the spill file's checksum or encryption overhead is
+    /// charged too), not its RAM while it runs. At commit the spill file and
+    /// its copy in the WAL briefly coexist, so a commit needs up to twice the
+    /// cap in free disk, for each concurrent large transaction.
+    ///
+    /// It still bounds RAM at **reopen**: WAL replay holds a whole committed
+    /// transaction's records in memory until its commit marker. Do not raise
+    /// this cap until replay streams large transactions.
+    ///
+    /// It is a stopgap limit until transaction buffers are charged to a
+    /// process-wide ledger: it keeps one huge transaction from filling the
+    /// disk, or the memory of the next reopen. `None` means no cap.
     ///
     /// Default: 512 MiB. Use `with_wal_transaction_buffer_cap()` to change
     /// or `without_wal_transaction_buffer_cap()` to disable.
@@ -442,6 +467,7 @@ impl Default for Config {
             adaptive: AdaptiveConfig::default(),
             factorized_execution: true,
             wal_durability: DurabilityMode::default(),
+            wal_spill_threshold: 8 << 20, // 8 MiB
             storage_format: StorageFormat::default(),
             schema_constraints: false,
             query_timeout: Some(Duration::from_secs(30)),
@@ -565,6 +591,14 @@ impl Config {
     #[must_use]
     pub fn with_wal_durability(mut self, mode: DurabilityMode) -> Self {
         self.wal_durability = mode;
+        self
+    }
+
+    /// Sets how many encoded WAL bytes one transaction may hold in RAM
+    /// before spilling them to disk (see [`Config::wal_spill_threshold`]).
+    #[must_use]
+    pub fn with_wal_spill_threshold(mut self, bytes: usize) -> Self {
+        self.wal_spill_threshold = bytes;
         self
     }
 

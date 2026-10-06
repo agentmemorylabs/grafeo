@@ -158,14 +158,21 @@ fn run_scenario(scenario: &str, db: &GrafeoDB) -> Vec<String> {
             s.commit().expect("a small transaction commits afterwards");
             ex(&["alix", "mia"])
         }
-        // A database-level SPARQL update over the cap is refused with the
-        // cap's error; nothing of it reaches the WAL.
+        // A database-level SPARQL update over the cap: applied in memory,
+        // its records refused (nothing of it reaches the WAL). There is no
+        // transaction to roll back, so it is reported as durability
+        // unconfirmed and never as retryable (#28 round 3).
         "cap_db" => {
             db.execute_sparql(&insert_data("alix", "1")).unwrap();
             let err = db
                 .execute_sparql(&insert_data("big", &"x".repeat(2 * SMALL_CAP)))
                 .expect_err("over the cap");
-            assert_cap_error(&err);
+            assert_unconfirmed(&err);
+            assert!(!err.error_code().is_retryable(), "{err}");
+            assert!(
+                err.to_string().contains("transaction WAL buffer cap"),
+                "names the cap: {err}"
+            );
             ex(&["alix"])
         }
         other => panic!("unknown scenario {other}"),

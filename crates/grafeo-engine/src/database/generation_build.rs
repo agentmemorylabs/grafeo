@@ -263,6 +263,8 @@ impl GrafeoDB {
     /// assembles the extended [`PublishedGeneration`] from the result.
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
     fn build_generation_inner(&self, request: GenerationBuildRequest) -> Result<BuildPublication> {
+        #[cfg(feature = "wal")]
+        self.check_snapshot_source("build a generation")?;
         let root = request.generation_root.as_path();
         if root.is_file() {
             return Err(Error::Internal(
