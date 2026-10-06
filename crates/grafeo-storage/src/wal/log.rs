@@ -325,8 +325,9 @@ impl WalManager {
     }
 
     fn poisoned_error(reason: &str) -> Error {
+        use grafeo_common::utils::write_outcome::UNTIL_REOPENED;
         Error::Internal(format!(
-            "WAL refuses appends until the database is reopened: {reason}"
+            "WAL refuses appends {UNTIL_REOPENED}: {reason}"
         ))
     }
 

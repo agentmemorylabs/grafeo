@@ -432,13 +432,14 @@ impl Session {
         unrestored: usize,
         transaction_still_open: bool,
     ) -> grafeo_common::utils::error::Error {
+        use grafeo_common::utils::write_outcome::ROLLBACK_INCOMPLETE;
         let open_note = if transaction_still_open {
             " The transaction is still open."
         } else {
             ""
         };
         let msg = format!(
-            "rollback incomplete: {unrestored} layered base change(s) of {transaction_id:?} \
+            "{ROLLBACK_INCOMPLETE} {unrestored} layered base change(s) of {transaction_id:?} \
              could not be fully restored because an overlay reset or merge absorbed them \
              while the transaction was open; recovery requires checking the persisted \
              generation and WAL.{open_note}"
@@ -924,8 +925,9 @@ impl Session {
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.wal().poisoned_reason()
         {
+            use grafeo_common::utils::write_outcome::UNTIL_REOPENED;
             return Err(grafeo_common::utils::error::Error::Internal(format!(
-                "WAL refuses writes until the database is reopened: {reason}"
+                "WAL refuses writes {UNTIL_REOPENED}: {reason}"
             )));
         }
         Ok(())
@@ -4562,10 +4564,11 @@ impl Session {
 
         #[cfg(feature = "wal")]
         if let Some(error) = durability_error {
+            use grafeo_common::utils::write_outcome::{DURABILITY_UNCONFIRMED, UNTIL_REOPENED};
             return Err(grafeo_common::utils::error::Error::Internal(format!(
-                "transaction applied in memory; durability unconfirmed (it may have \
+                "transaction applied in memory; {DURABILITY_UNCONFIRMED} (it may have \
                  committed): its WAL group failed ({error}); the WAL refuses \
-                 further writes until the database is reopened"
+                 further writes {UNTIL_REOPENED}"
             )));
         }
 

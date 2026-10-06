@@ -4,9 +4,17 @@
 //! (`Internal`, `Transaction(InvalidState)`, `AdmissionRetryable`) with fixed
 //! wording. Callers used to classify them by matching that wording, which
 //! drifts when a message changes. [`Error::write_outcome`] classifies them
-//! here instead, from the same marker constants the engine builds its
-//! messages with, so the wording and the classification change together.
-//! The messages themselves are unchanged.
+//! here instead. Every engine message for one of these outcomes interpolates
+//! the marker constants below, so the wording and the classification change
+//! together; `write_outcome_kinds` pins each public path.
+//!
+//! The messages are byte-identical to before, except `close()` over a
+//! poisoned WAL: it said "a write reported as durability unconfirmed …",
+//! which put the durability marker in a close error. It now says "a write
+//! whose durability was reported unconfirmed …" and classifies as
+//! [`WriteOutcome::WalPoisoned`]. A caller that matched the old substring
+//! (AMH's `classify_engine_error`) no longer classifies that close error;
+//! classify it with [`Error::write_outcome`] instead.
 
 use super::error::{Error, TransactionError};
 
@@ -15,13 +23,18 @@ use super::error::{Error, TransactionError};
 /// whose group failed or whose records were refused.
 pub const DURABILITY_UNCONFIRMED: &str = "durability unconfirmed";
 
-/// Present in every "the WAL is poisoned, reopen the database" refusal of a
-/// write, an append or a snapshot.
-pub const WAL_POISONED_MARKERS: [&str; 3] = [
-    "until the database is reopened",
-    "the WAL is poisoned",
-    "the WAL was poisoned",
-];
+/// A refused write or append: "… refuses writes until the database is
+/// reopened". Also in the durability-unconfirmed messages, which win.
+pub const UNTIL_REOPENED: &str = "until the database is reopened";
+
+/// A refused snapshot or checkpoint of a poisoned database.
+pub const WAL_IS_POISONED: &str = "the WAL is poisoned";
+
+/// A close over a poisoned WAL (closed without a checkpoint).
+pub const WAL_WAS_POISONED: &str = "the WAL was poisoned";
+
+/// Every "the WAL is poisoned, reopen the database" marker.
+pub const WAL_POISONED_MARKERS: [&str; 3] = [UNTIL_REOPENED, WAL_IS_POISONED, WAL_WAS_POISONED];
 
 /// Prefix of a rollback that could not restore every change.
 pub const ROLLBACK_INCOMPLETE: &str = "rollback incomplete:";

@@ -1,7 +1,10 @@
 //! `Error::write_outcome` on the engine's real errors: each outcome a caller
 //! must not treat as an ordinary failure is classified from the error the
 //! engine actually returns, so a reworded message that drops its marker fails
-//! here. (`RollbackIncomplete` is asserted in `layered_rollback_base_mutations`.)
+//! here. Each engine message also interpolates the marker constants from
+//! `grafeo_common::utils::write_outcome`. (`RollbackIncomplete` is asserted in
+//! `layered_rollback_base_mutations`; its three call sites share one
+//! constructor.)
 
 #![cfg(all(
     feature = "wal",
@@ -95,4 +98,63 @@ fn poisoned_database_reports_each_kind() {
         "{err}"
     );
     assert!(WriteOutcome::WalPoisoned.requires_reopen());
+}
+
+/// A poisoned single file refuses `wal_checkpoint` (the flush path the
+/// checkpoint timer also takes): `WalPoisoned`.
+#[test]
+fn poisoned_wal_checkpoint_is_wal_poisoned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_capped(dir.path());
+    db.wal().expect("wal").poison("test: injected");
+    let err = db.wal_checkpoint().expect_err("refused");
+    assert_eq!(
+        err.write_outcome(),
+        Some(WriteOutcome::WalPoisoned),
+        "{err}"
+    );
+}
+
+/// A poisoned source refuses to build a generation: `WalPoisoned`.
+#[cfg(all(feature = "generation", feature = "compact-store"))]
+#[test]
+fn poisoned_generation_build_is_wal_poisoned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_capped(dir.path());
+    db.session().execute("INSERT (:Kept)").unwrap();
+    db.wal().expect("wal").poison("test: injected");
+    let root = dir.path().join("target.grafeo.d");
+    std::fs::create_dir_all(&root).unwrap();
+    let err = db
+        .build_and_publish_generation(
+            grafeo_engine::database::generation_build::generation_build_request(&root, "g1"),
+        )
+        .expect_err("refused");
+    assert_eq!(
+        err.write_outcome(),
+        Some(WriteOutcome::WalPoisoned),
+        "{err}"
+    );
+}
+
+/// An explicit commit whose WAL group append fails (and its retry) is
+/// applied in memory: `DurabilityUnconfirmed`.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn explicit_commit_whose_group_fails_is_durability_unconfirmed() {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_from};
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_capped(dir.path());
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    session.execute("INSERT (:Committed)").unwrap();
+    enable_io_failure_from(1);
+    let result = session.commit();
+    disable_io_failure();
+    let err = result.expect_err("the group append fails");
+    assert_eq!(
+        err.write_outcome(),
+        Some(WriteOutcome::DurabilityUnconfirmed),
+        "{err}"
+    );
 }

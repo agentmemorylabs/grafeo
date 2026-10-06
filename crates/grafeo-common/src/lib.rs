@@ -33,6 +33,7 @@ pub use types::{
     EdgeId, EpochId, LogicalType, NodeId, PropertyKey, Timestamp, TransactionId, Value,
 };
 pub use utils::error::{Error, Result};
+pub use utils::write_outcome::WriteOutcome;
 
 // Tiered storage types (feature-gated)
 #[cfg(feature = "tiered-storage")]
