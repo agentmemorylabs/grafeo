@@ -488,6 +488,26 @@ impl CompactStore {
         }
     }
 
+    /// Returns whether `id` names a node row of this store, without building
+    /// the node (no labels or properties are read).
+    pub(crate) fn contains_node(&self, id: NodeId) -> bool {
+        self.resolve_node(id).is_some_and(|(table_id, offset)| {
+            self.resolve_node_table(table_id)
+                .is_some_and(|nt| usize::try_from(offset).is_ok_and(|row| row < nt.len()))
+        })
+    }
+
+    /// Returns whether `id` names an edge of this store, without building
+    /// the edge.
+    pub(crate) fn contains_edge(&self, id: EdgeId) -> bool {
+        self.resolve_edge(id)
+            .is_some_and(|(rel_table_id, position)| {
+                self.resolve_rel_table(rel_table_id).is_some_and(|rt| {
+                    usize::try_from(position).is_ok_and(|pos| pos < rt.num_edges())
+                })
+            })
+    }
+
     /// Translates a compact-encoded `NodeId` (from internal CSR/table lookups)
     /// back to the original preserved ID. No-op when not ID-preserving.
     #[inline]

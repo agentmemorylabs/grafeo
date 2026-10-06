@@ -125,6 +125,10 @@ pub fn write_membership_segment(
 pub struct LabelMembershipView {
     bytes: Bytes,
     count: usize,
+    /// Distinct label codes across all records, ascending. Collected during
+    /// the validation pass in `parse`, so it is schema-sized and asking for
+    /// the label inventory never walks the per-node records again.
+    distinct_label_codes: Vec<u32>,
 }
 
 impl LabelMembershipView {
@@ -150,8 +154,10 @@ impl LabelMembershipView {
                 SegmentKind::NodeLabelMembership,
             ));
         }
-        // Validate ascending order without copying.
+        // Validate ascending order without copying, collecting the distinct
+        // label codes on the way.
         let mut prev: Option<LabelMembership> = None;
+        let mut label_codes = std::collections::BTreeSet::new();
         for i in 0..count {
             let start = MEMBERSHIP_HEADER_LEN + i * MEMBERSHIP_RECORD_LEN;
             let rec = LabelMembership::from_bytes(&bytes[start..start + MEMBERSHIP_RECORD_LEN])
@@ -169,11 +175,13 @@ impl LabelMembershipView {
                     ));
                 }
             }
+            label_codes.insert(rec.label_code);
             prev = Some(rec);
         }
         Ok(Self {
             bytes: bytes.clone(),
             count,
+            distinct_label_codes: label_codes.into_iter().collect(),
         })
     }
 
@@ -251,6 +259,12 @@ impl LabelMembershipView {
         self.count
     }
 
+    /// Distinct logical label codes across all records, ascending.
+    #[must_use]
+    pub fn distinct_label_codes(&self) -> &[u32] {
+        &self.distinct_label_codes
+    }
+
     /// Reads the record at index `i` from the retained bytes.
     #[must_use]
     pub fn record_at(&self, i: usize) -> LabelMembership {
@@ -300,6 +314,7 @@ mod tests {
         assert_eq!(view.labels_of(0, 1), vec![1]);
         assert_eq!(view.nodes_with(1), vec![(0, 0), (0, 1)]);
         assert_eq!(view.nodes_with(3), vec![(1, 0)]);
+        assert_eq!(view.distinct_label_codes(), &[1, 2, 3]);
     }
 
     #[test]

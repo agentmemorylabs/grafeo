@@ -1703,9 +1703,11 @@ impl GraphStore for LayeredStore {
         // `compact()` whose src is a base node records the base id in
         // the overlay's adjacency even though the overlay has no
         // corresponding node object; gating on `overlay.get_node(node)`
-        // would miss that case.
-        for nid in self.overlay.load().neighbors(node, direction) {
-            if !deleted_nodes.contains(&nid) {
+        // would miss that case. Read through the edges, as `edges_from`
+        // does, so a tombstoned edge is skipped: after a handoff install an
+        // absorbed edge deleted through its base keeps its overlay copy.
+        for (nid, eid) in self.overlay.load().edges_from(node, direction) {
+            if !deleted_nodes.contains(&nid) && !deleted_edges.contains(&eid) {
                 results.push(nid);
             }
         }
@@ -1780,7 +1782,9 @@ impl GraphStore for LayeredStore {
 
         // A dirty id is owned by the overlay (as in `nodes_by_label`): it is
         // listed below if its overlay copy is live, and not from the base, so
-        // a base node copied into the overlay and then deleted stays gone.
+        // a base node copied into the overlay and then deleted stays gone. A
+        // tombstoned id is gone in both layers: after a handoff install an
+        // absorbed row deleted through its base keeps its overlay copy.
         let mut ids: Vec<NodeId> = self
             .base
             .load()
@@ -1788,7 +1792,13 @@ impl GraphStore for LayeredStore {
             .into_iter()
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
-        ids.extend(self.overlay.load().node_ids());
+        ids.extend(
+            self.overlay
+                .load()
+                .node_ids()
+                .into_iter()
+                .filter(|id| !deleted.contains(id)),
+        );
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -1818,31 +1828,66 @@ impl GraphStore for LayeredStore {
     }
 
     fn node_count(&self) -> usize {
-        let base_count = self.base.load().node_count();
-        let deleted = self.deleted_from_base_nodes.read().len();
-        let overlay_count = self.overlay.load().node_count();
-        // Dirty nodes that came from the base are counted once in the overlay.
-        // We subtract them from the base total to avoid double counting.
-        let promoted = self
-            .dirty_node_ids
-            .read()
+        // Counts exactly what `node_ids` lists: base nodes that are neither
+        // deleted from the base nor dirty (owned by the overlay), plus live
+        // overlay nodes, an id once. Walks the deleted, dirty and overlay id
+        // sets with id-only base lookups, never the base rows.
+        let base = self.base.load();
+        let overlay = self.overlay.load();
+        let deleted = self.deleted_from_base_nodes.read();
+        let dirty = self.dirty_node_ids.read();
+        // Base rows hidden by a tombstone or a copy-up. After a handoff
+        // install a tombstone can name a row the new base no longer has, and
+        // an id can be both deleted and dirty: count each base row once.
+        let hidden = deleted
             .iter()
-            .filter(|id| self.base.load().get_node(**id).is_some())
+            .chain(dirty.iter().filter(|id| !deleted.contains(*id)))
+            .filter(|id| base.contains_node(**id))
             .count();
-        base_count - deleted - promoted + overlay_count
+        // A tombstoned id is gone even if an overlay row remains: after a
+        // handoff install, deleting an absorbed (not dirty) row tombstones
+        // its base row and leaves the overlay copy in place.
+        let overlay_ids: Vec<_> = overlay
+            .node_ids()
+            .into_iter()
+            .filter(|id| !deleted.contains(id))
+            .collect();
+        // Live overlay rows the base also lists: after a handoff install the
+        // new base absorbed them while they stay (not dirty) in the overlay.
+        let in_both = overlay_ids
+            .iter()
+            .filter(|id| !dirty.contains(*id))
+            .filter(|id| base.contains_node(**id))
+            .count();
+        (base.node_count().saturating_sub(hidden) + overlay_ids.len()).saturating_sub(in_both)
     }
 
     fn edge_count(&self) -> usize {
-        let base_count = self.base.load().edge_count();
-        let deleted = self.deleted_from_base_edges.read().len();
-        let overlay_count = self.overlay.load().edge_count();
-        let promoted = self
-            .dirty_edge_ids
-            .read()
+        // See `node_count`; `delete_node_edges` tombstones base edges that
+        // are also dirty, so the deleted and dirty sets overlap.
+        let base = self.base.load();
+        let overlay = self.overlay.load();
+        let deleted = self.deleted_from_base_edges.read();
+        let dirty = self.dirty_edge_ids.read();
+        let hidden = deleted
             .iter()
-            .filter(|id| self.base.load().get_edge(**id).is_some())
+            .chain(dirty.iter().filter(|id| !deleted.contains(*id)))
+            .filter(|id| base.contains_edge(**id))
             .count();
-        base_count - deleted - promoted + overlay_count
+        // A tombstoned id is gone even if an overlay row remains: after a
+        // handoff install, deleting an absorbed (not dirty) row tombstones
+        // its base row and leaves the overlay copy in place.
+        let overlay_ids: Vec<_> = overlay
+            .edge_ids()
+            .into_iter()
+            .filter(|id| !deleted.contains(id))
+            .collect();
+        let in_both = overlay_ids
+            .iter()
+            .filter(|id| !dirty.contains(*id))
+            .filter(|id| base.contains_edge(**id))
+            .count();
+        (base.edge_count().saturating_sub(hidden) + overlay_ids.len()).saturating_sub(in_both)
     }
 
     fn edge_type(&self, id: EdgeId) -> Option<ArcStr> {
@@ -5296,6 +5341,35 @@ mod tests {
         assert!(layered.edges_from(alix, Direction::Outgoing).is_empty());
         assert!(layered.neighbors(alix, Direction::Outgoing).is_empty());
         assert_eq!(layered.neighbors(amsterdam, Direction::Incoming), vec![gus]);
+    }
+
+    /// `delete_node_edges` tombstones base edges that are also dirty (copied
+    /// up). Each excluded base edge must be subtracted once; the old formula
+    /// subtracted it as deleted and again as promoted.
+    #[test]
+    fn test_edge_count_excludes_a_deleted_promoted_base_edge_once() {
+        let layered = build_test_layered();
+        let (alix, _gus, _amsterdam, e1) = fixture_ids(&layered);
+
+        layered.set_edge_property(e1, "since", Value::Int64(2024));
+        layered.delete_node_edges(alix);
+        assert_eq!(layered.edge_count(), 1, "only gus -> amsterdam is left");
+        assert_eq!(layered.node_count(), 3);
+    }
+
+    /// With both base edges copied up and then cut, the old formula computed
+    /// `2 - 2 - 2 + 0` and underflowed (a panic in debug builds).
+    #[test]
+    fn test_edge_count_does_not_underflow_when_all_cut_edges_were_promoted() {
+        let layered = build_test_layered();
+        let (_alix, _gus, amsterdam, _e1) = fixture_ids(&layered);
+
+        for (_, eid) in layered.edges_from(amsterdam, Direction::Incoming) {
+            layered.set_edge_property(eid, "since", Value::Int64(2025));
+        }
+        layered.delete_node_edges(amsterdam);
+        assert_eq!(layered.edge_count(), 0, "no edges are left");
+        assert_eq!(layered.node_count(), 3);
     }
 
     /// A dirty base id whose overlay copy was deleted is reported for the

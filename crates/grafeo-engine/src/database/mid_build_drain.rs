@@ -332,7 +332,10 @@ impl GrafeoDB {
         {
             self.store = Some(layered.overlay_store());
         }
-        self.mid_build_tiers.write().push(Arc::clone(&reopened));
+        let range = grafeo_core::graph::compact::tier_chain::TierChainView::node_range(&reopened);
+        self.mid_build_tiers
+            .write()
+            .push((Arc::clone(&reopened), range));
         self.mid_build_drain_seq = seq;
 
         let anon_after = layered.overlay_memory_bytes() as u64;
