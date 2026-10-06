@@ -2360,14 +2360,17 @@ impl GraphStore for LayeredStore {
     }
 
     fn get_node_history(&self, id: NodeId) -> Vec<(EpochId, Option<EpochId>, Node)> {
-        if self.is_node_dirty(id) {
+        // The base keeps no versions; an untracked overlay-only row (AMH
+        // #161) has its history in the overlay like a dirty one.
+        if self.is_node_dirty(id) || !self.base.load().contains_node(id) {
             return self.overlay.load().get_node_history(id);
         }
         Vec::new()
     }
 
     fn get_edge_history(&self, id: EdgeId) -> Vec<(EpochId, Option<EpochId>, Edge)> {
-        if self.is_edge_dirty(id) {
+        // See `get_node_history`.
+        if self.is_edge_dirty(id) || !self.base.load().contains_edge(id) {
             return self.overlay.load().get_edge_history(id);
         }
         Vec::new()
@@ -4578,6 +4581,18 @@ mod tests {
         layered.rollback_transaction_layers(tx);
         assert!(layered.get_edge(e).is_some(), "edge restored by rollback");
         assert!(layered.get_node(b).is_some(), "node restored by rollback");
+    }
+
+    #[test]
+    fn test_history_of_untracked_overlay_rows() {
+        let layered = build_test_layered();
+        let overlay = layered.overlay_store();
+        let a = overlay.create_node(&["Person"]);
+        let b = overlay.create_node(&["Person"]);
+        let e = overlay.create_edge(a, b, "KNOWS");
+        assert!(!layered.is_node_dirty(a) && !layered.is_edge_dirty(e));
+        assert_eq!(layered.get_node_history(a).len(), 1, "node history");
+        assert_eq!(layered.get_edge_history(e).len(), 1, "edge history");
     }
 
     #[test]
