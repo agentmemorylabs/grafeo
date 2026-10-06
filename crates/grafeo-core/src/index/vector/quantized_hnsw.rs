@@ -733,9 +733,18 @@ impl QuantizedHnswIndex {
         let has_own_copy = !self.vectors.read().is_empty();
         let walk = |n: usize| {
             let found = if has_own_copy {
+                // Lock order: `vectors` before `nodes` (taken inside the
+                // traversal), the same order as `filtered_exact_scan`, so the
+                // two cannot deadlock behind queued writers. The guard is
+                // dropped before the pipeline rescores (which re-reads
+                // `vectors`), since a recursive read can block on a queued
+                // writer.
+                let internal = self.vectors.read();
                 let lookup = |id: NodeId| -> Option<Arc<[f32]>> {
-                    let own = self.vectors.read().get(&id).cloned();
-                    own.or_else(|| accessor.get_vector(id))
+                    internal
+                        .get(&id)
+                        .cloned()
+                        .or_else(|| accessor.get_vector(id))
                 };
                 self.hnsw
                     .filtered_traversal(query, n, ef.max(n), allowlist, plan.budget, &lookup)

@@ -87,35 +87,23 @@ use std::sync::Arc;
 /// * Correctness. The scan is exact, so small allowlists, which a graph walk
 ///   reaches least reliably, always get the true filtered top-k.
 ///
-/// Larger allowlists use the in-traversal filter, under a work budget (see
-/// [`FILTERED_WALK_BUDGET_FACTOR`]). If the walk exceeds the budget, or
-/// returns fewer than `min(k, |A|)` results, the search falls back to the same
-/// exact scan.
+/// Larger allowlists use the in-traversal filter, under a work budget of
+/// `|A|` scored nodes. A filtered walk keeps expanding until it holds `ef`
+/// allowlisted nodes and no closer candidate remains, so when the allowlisted
+/// nodes are few or far from the query it could otherwise expand the whole
+/// graph. Once a walk has scored `|A|` nodes it already costs about as much
+/// as the scan that replaces it, so a filtered search costs at most about
+/// twice the cheaper path (assuming, as above, similar per-read cost). Healthy
+/// walks over large allowlists score far fewer nodes than `|A|` (on a
+/// 10k x 64 index: ~1.4k scored for a 90% allowlist of 9k ids) and keep using
+/// the index. If the walk exceeds the budget, or returns fewer than
+/// `min(k, |A|)` results, the search falls back to the same exact scan.
 ///
 /// Prior art: Qdrant plans a full scan when the filter cardinality is below
 /// `full_scan_threshold`, Weaviate switches to flat search below
 /// `flatSearchCutoff` (default 40,000), and pgvector 0.8 iterative index scans
 /// keep widening until enough rows pass the filter.
 pub const FILTERED_EXACT_SCAN_THRESHOLD: usize = 2048;
-
-/// Work budget of a filtered walk.
-///
-/// A filtered walk keeps expanding until it holds `ef` allowlisted nodes and
-/// no closer candidate remains. When the allowlisted nodes are few or far
-/// from the query, that can mean expanding the whole graph. The walk
-/// therefore gives up after scoring
-/// `max(FILTERED_WALK_BUDGET_FACTOR * visits, |A|)` nodes, where `visits` is
-/// the expansion estimate above, and the search falls back to the exact scan
-/// of the `|A|` allowlisted ids.
-///
-/// For allowlists that pass the gate (`|A|^2 > ef * n`) the second term
-/// dominates, so a walk stops once it has scored as many nodes as the scan
-/// would. A filtered search then costs at most about twice the cheaper of the
-/// two paths. Healthy walks over large allowlists score far fewer nodes than
-/// `|A|` (on a 10k x 64 index: ~1.4k scored for a 90% allowlist of 9k ids)
-/// and keep using the index; the budget only fires where a walk would cost
-/// more than scanning.
-pub const FILTERED_WALK_BUDGET_FACTOR: usize = 4;
 
 /// Whether a filtered search over `indexed` allowlisted ids, whose walk would
 /// expand about `visit_estimate` nodes, should take the exact scan. See
@@ -1106,9 +1094,9 @@ impl HnswIndex {
     }
 
     /// Counts the allowlisted ids in this index and derives the walk's
-    /// expected expansions and budget from that count (not from the raw
-    /// allowlist, which may hold nodes the index never saw). See
-    /// [`FILTERED_EXACT_SCAN_THRESHOLD`] and [`FILTERED_WALK_BUDGET_FACTOR`].
+    /// expected expansions and budget (`|A|` scored nodes) from that count,
+    /// not from the raw allowlist, which may hold nodes the index never saw.
+    /// See [`FILTERED_EXACT_SCAN_THRESHOLD`].
     pub(crate) fn filtered_plan(
         &self,
         ef: usize,
@@ -1121,9 +1109,7 @@ impl HnswIndex {
             (indexed, nodes.len())
         };
         let visit_estimate = Self::visit_estimate(ef.max(k), indexed, total);
-        let budget = FILTERED_WALK_BUDGET_FACTOR
-            .saturating_mul(visit_estimate)
-            .max(indexed);
+        let budget = indexed;
         #[cfg(test)]
         let budget = filtered_scan_stats::budget_override().unwrap_or(budget);
         FilteredPlan {
@@ -1776,7 +1762,7 @@ impl HnswIndex {
 
     /// Searches for k nearest neighbors for multiple queries with an allowlist filter.
     ///
-    /// The beam width is automatically scaled based on allowlist selectivity.
+    /// Each query runs [`search_with_filter`](Self::search_with_filter).
     #[must_use]
     pub fn batch_search_with_filter(
         &self,
