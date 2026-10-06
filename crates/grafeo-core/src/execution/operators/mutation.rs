@@ -1903,58 +1903,45 @@ mod tests {
     }
 
     // AMH #161: a matched row the store refuses to delete is an error, not
-    // a silent `Ok`. Another transaction's pending delete makes a plain
-    // `LpgStore` refuse while the row stays visible to this one (with no
-    // write tracker to report the conflict first).
+    // a silent `Ok`. No production store refuses a visible row once the
+    // layered fix is in (`LpgStore`'s transactional delete always succeeds
+    // on a visible row), so the post-delete checks are tested directly.
 
-    /// Returns a store with one edge, deleted (uncommitted) by tx 2.
-    fn edge_held_deleted_by_other_tx() -> (Arc<LpgStore>, EdgeId, EpochId) {
+    #[test]
+    fn test_left_behind_check_fails_only_for_a_still_visible_row() {
         let store = Arc::new(LpgStore::new().unwrap());
         let n1 = store.create_node(&["N"]);
         let n2 = store.create_node(&["N"]);
         let eid = store.create_edge(n1, n2, "R");
         let epoch = store.current_epoch();
-        assert!(store.delete_edge_versioned(eid, epoch, TransactionId::new(2)));
-        (store, eid, epoch)
-    }
+        let tx = TransactionId::new(1);
+        let dyn_store: &dyn GraphStoreMut = store.as_ref();
 
-    #[test]
-    fn test_delete_edge_refused_while_visible_is_an_error() {
-        let (store, eid, epoch) = edge_held_deleted_by_other_tx();
-        let mut op = DeleteEdgeOperator::new(
-            store,
-            MockInput::boxed(edge_id_chunk(&[eid])),
-            0,
-            vec![LogicalType::Int64],
-        )
-        .with_transaction_context(epoch, Some(TransactionId::new(1)));
-        let err = op.next().expect_err("a refused delete of a visible edge");
-        assert!(
-            err.to_string().contains("did not delete"),
-            "unexpected error: {err}"
-        );
-    }
+        // Still visible: the delete was refused, which is the error.
+        let err = check_edge_not_left_behind(dyn_store, eid, epoch, tx).unwrap_err();
+        assert!(err.to_string().contains("did not delete"), "{err}");
+        let err = check_node_not_left_behind(dyn_store, n1, epoch, tx).unwrap_err();
+        assert!(err.to_string().contains("did not delete"), "{err}");
 
-    #[test]
-    fn test_delete_edge_committed_by_other_tx_is_not_an_error() {
-        // Gone at the store's current epoch: commit validation owns this
-        // conflict, the operator does not fail.
-        let (store, eid, epoch) = edge_held_deleted_by_other_tx();
-        store.finalize_version_epochs(TransactionId::new(2), EpochId::new(epoch.as_u64() + 1));
-        let mut op = DeleteEdgeOperator::new(
-            store,
-            MockInput::boxed(edge_id_chunk(&[eid])),
-            0,
-            vec![LogicalType::Int64],
-        )
-        .with_transaction_context(epoch, Some(TransactionId::new(1)));
-        assert_eq!(op.next().unwrap().unwrap().row_count(), 1);
+        // Deleted by this transaction (a repeat delete in one statement).
+        assert!(store.delete_edge_versioned(eid, epoch, tx));
+        assert!(store.delete_node_versioned(n2, epoch, tx));
+        check_edge_not_left_behind(dyn_store, eid, epoch, tx).unwrap();
+        check_node_not_left_behind(dyn_store, n2, epoch, tx).unwrap();
+
+        // Deleted and committed by another transaction after our snapshot:
+        // commit validation owns that conflict.
+        let other = TransactionId::new(2);
+        assert!(store.delete_node_versioned(n1, epoch, other));
+        store.finalize_version_epochs(other, EpochId::new(epoch.as_u64() + 1));
+        check_node_not_left_behind(dyn_store, n1, epoch, tx).unwrap();
     }
 
     #[test]
     fn test_delete_same_edge_twice_in_one_statement_is_not_an_error() {
         // An undirected match yields each edge twice; the second delete finds
-        // it already deleted by this transaction.
+        // it already deleted by this transaction, returns `false`, and the
+        // post-delete check lets it pass.
         let store = Arc::new(LpgStore::new().unwrap());
         let n1 = store.create_node(&["N"]);
         let n2 = store.create_node(&["N"]);
@@ -1967,27 +1954,6 @@ mod tests {
         )
         .with_transaction_context(store.current_epoch(), Some(TransactionId::new(1)));
         assert_eq!(op.next().unwrap().unwrap().row_count(), 2);
-    }
-
-    #[test]
-    fn test_delete_node_refused_while_visible_is_an_error() {
-        let store = Arc::new(LpgStore::new().unwrap());
-        let nid = store.create_node(&["N"]);
-        let epoch = store.current_epoch();
-        assert!(store.delete_node_versioned(nid, epoch, TransactionId::new(2)));
-        let mut op = DeleteNodeOperator::new(
-            store,
-            MockInput::boxed(node_id_chunk(&[nid])),
-            0,
-            vec![LogicalType::Int64],
-            false,
-        )
-        .with_transaction_context(epoch, Some(TransactionId::new(1)));
-        let err = op.next().expect_err("a refused delete of a visible node");
-        assert!(
-            err.to_string().contains("did not delete"),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]
