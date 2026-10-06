@@ -227,6 +227,32 @@ struct LoadedCompactBase {
 /// let result = session.execute("MATCH (p:Person) RETURN p")?;
 /// # Ok::<(), grafeo_common::utils::error::Error>(())
 /// ```
+///
+/// # Durability of direct writes
+///
+/// The write methods on `GrafeoDB` itself (`create_node*`, `create_edge*`,
+/// the label and property setters and removers, the deletes and the batch
+/// creates) run outside any session transaction. With a WAL, each call
+/// writes its records as one implicit group (a batch is one group), after
+/// the change is applied in memory:
+///
+/// - **The return value describes the in-memory change, not confirmed
+///   durability.** If the group cannot be written, the change stays applied
+///   in memory but may not survive a crash, and the WAL is poisoned. The
+///   methods that return `Result` report that as an error ("durability
+///   unconfirmed"); the ones that return `bool`, an ID, a `Vec` of IDs or
+///   nothing only log it. Use the `Result` methods, or
+///   [`try_batch_create_nodes_with_props`](Self::try_batch_create_nodes_with_props),
+///   where the caller needs to know.
+/// - **Once the WAL is poisoned, every write method refuses before changing
+///   anything:** the `Result` methods return the WAL's error, the others
+///   return `false`, [`EdgeId::INVALID`](grafeo_common::types::EdgeId::INVALID)
+///   or an empty `Vec` and log a warning. Reopen the database to write again.
+/// - **They do not take the sessions' commit order.** A session transaction
+///   that overwrites an entity a direct write is still logging can reach the
+///   WAL first, and replay then applies the older value last. Callers that
+///   mix direct writes and session transactions on the same entities must
+///   serialize them.
 pub struct GrafeoDB {
     /// Database configuration.
     pub(super) config: Config,
@@ -245,11 +271,11 @@ pub struct GrafeoDB {
     /// Write-ahead log manager (if durability is enabled).
     #[cfg(feature = "wal")]
     pub(super) wal: Option<Arc<LpgWal>>,
-    /// Shared WAL graph context tracker. Tracks which named graph was last
-    /// written to the WAL, so concurrent sessions can emit `SwitchGraph`
-    /// records only when the context actually changes.
+    /// Orders WAL groups like their commits: held by a session from its
+    /// commit validation until its group is in the WAL, so a transaction
+    /// that saw another's committed writes always lands after it (#411).
     #[cfg(feature = "wal")]
-    pub(super) wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
+    pub(super) wal_commit_order: Arc<parking_lot::Mutex<()>>,
     /// Query cache for parsed and optimized plans.
     pub(super) query_cache: Arc<QueryCache>,
     /// Shared commit counter for auto-GC across sessions.
@@ -584,6 +610,14 @@ impl GrafeoDB {
             Vec<grafeo_common::types::EdgeId>,
         )> = None;
 
+        // What WAL recovery found at the end of the log, applied once the WAL
+        // is open (#411): a torn tail must be sealed before anything new is
+        // logged, and a log that ends inside a named graph must switch back
+        // to the default graph, where every new group starts.
+        #[cfg(all(feature = "wal", feature = "lpg"))]
+        let mut wal_torn_tail = false;
+        #[cfg(all(feature = "wal", feature = "lpg"))]
+        let mut wal_in_named_graph = false;
         // Node writes made by WAL replay below. Replay writes the store
         // directly, so the index entries they affect are re-synced once the
         // database is wired (`reconcile_replayed_node_indexes`).
@@ -692,15 +726,17 @@ impl GrafeoDB {
                 #[cfg(all(feature = "wal", feature = "lpg"))]
                 if config.wal_enabled && fm.has_sidecar_wal() {
                     let recovery = WalRecovery::new(fm.sidecar_wal_path());
-                    let records = recovery.recover()?;
+                    let recovered = recovery.recover_with_tail()?;
                     Self::apply_wal_records(
                         &store,
                         &catalog,
                         #[cfg(feature = "triple-store")]
                         &rdf_store,
-                        &records,
+                        &recovered.records,
                     )?;
-                    replayed_writes.extend(Self::wal_node_writes(&records));
+                    wal_torn_tail = recovered.torn_tail;
+                    wal_in_named_graph = Self::ends_in_named_graph(&recovered.records);
+                    replayed_writes.extend(Self::wal_node_writes(&recovered.records));
                 }
 
                 Some(Arc::new(fm))
@@ -745,15 +781,17 @@ impl GrafeoDB {
                 #[cfg(feature = "lpg")]
                 if !is_single_file && wal_path.exists() {
                     let recovery = WalRecovery::new(&wal_path);
-                    let records = recovery.recover()?;
+                    let recovered = recovery.recover_with_tail()?;
                     Self::apply_wal_records(
                         &store,
                         &catalog,
                         #[cfg(feature = "triple-store")]
                         &rdf_store,
-                        &records,
+                        &recovered.records,
                     )?;
-                    replayed_writes.extend(Self::wal_node_writes(&records));
+                    wal_torn_tail = recovered.torn_tail;
+                    wal_in_named_graph = Self::ends_in_named_graph(&recovered.records);
+                    replayed_writes.extend(Self::wal_node_writes(&recovered.records));
                 }
 
                 // Open/create WAL manager with configured durability
@@ -776,6 +814,15 @@ impl GrafeoDB {
                     ..WalConfig::default()
                 };
                 let wal_manager = LpgWal::with_config(&wal_path, wal_config)?;
+                #[cfg(feature = "lpg")]
+                {
+                    if wal_torn_tail {
+                        wal_manager.seal_torn_tail()?;
+                    }
+                    if wal_in_named_graph {
+                        wal_manager.log(&WalRecord::SwitchGraph { name: None })?;
+                    }
+                }
                 Some(Arc::new(wal_manager))
             } else {
                 None
@@ -824,7 +871,7 @@ impl GrafeoDB {
             #[cfg(feature = "wal")]
             wal,
             #[cfg(feature = "wal")]
-            wal_graph_context: Arc::new(parking_lot::Mutex::new(None)),
+            wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1085,7 +1132,7 @@ impl GrafeoDB {
             #[cfg(feature = "wal")]
             wal: None,
             #[cfg(feature = "wal")]
-            wal_graph_context: Arc::new(parking_lot::Mutex::new(None)),
+            wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1240,10 +1287,19 @@ impl GrafeoDB {
                 }
                 crate::config::DurabilityMode::NoSync => WalDurabilityMode::NoSync,
             };
-            let wal_config = WalConfig {
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            let mut wal_config = WalConfig {
                 durability: wal_durability,
                 ..WalConfig::default()
             };
+            #[cfg(debug_assertions)]
+            {
+                let max = generation::replay::GENERATION_ROOT_WAL_MAX_LOG_SIZE
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if max > 0 {
+                    wal_config.max_log_size = max;
+                }
+            }
             let wal = Arc::new(LpgWal::with_config(&wal_dir, wal_config)?);
             // The torn tail's unfinished transaction left complete records
             // before the cut. Close it with an abort so the next commit in the
@@ -1256,6 +1312,18 @@ impl GrafeoDB {
                 wal.log(&WalRecord::TransactionAbort {
                     transaction_id: report.max_transaction_id,
                 })?;
+                wal.sync()?;
+            }
+            // A log written before the #411 port can end inside a named
+            // graph. New groups start in the default graph, so switch back
+            // first, as a committed group of its own (replay requires the
+            // epoch advance after the commit).
+            if report.ends_in_named_graph {
+                let mut group = vec![WalRecord::SwitchGraph { name: None }];
+                group.extend(crate::transaction::wal_buffer::implicit_markers(
+                    report.final_epoch,
+                ));
+                wal.log_atomic_or_poison(&group)?;
                 wal.sync()?;
             }
             db.wal = Some(wal);
@@ -1439,7 +1507,7 @@ impl GrafeoDB {
             #[cfg(feature = "wal")]
             wal: None,
             #[cfg(feature = "wal")]
-            wal_graph_context: Arc::new(parking_lot::Mutex::new(None)),
+            wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1560,7 +1628,7 @@ impl GrafeoDB {
             #[cfg(feature = "wal")]
             wal: None,
             #[cfg(feature = "wal")]
-            wal_graph_context: Arc::new(parking_lot::Mutex::new(None)),
+            wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1838,6 +1906,22 @@ impl GrafeoDB {
         self.query_cache = Arc::new(QueryCache::default());
 
         Ok(())
+    }
+
+    /// Whether replaying `records` leaves the graph cursor on a named graph.
+    ///
+    /// Logs written before 0.5.44 could end inside a named graph; new groups
+    /// assume they start in the default graph.
+    #[cfg(all(feature = "wal", feature = "lpg"))]
+    fn ends_in_named_graph(records: &[WalRecord]) -> bool {
+        records
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                WalRecord::SwitchGraph { name } => Some(name.is_some()),
+                _ => None,
+            })
+            .unwrap_or(false)
     }
 
     /// Default-graph node writes made by node records in `records`
@@ -2897,13 +2981,15 @@ impl GrafeoDB {
             let read_store = Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>;
             // Write store: the LayeredStore, wrapped in a WalGraphStore when the
             // database carries a WAL so query mutations reach the root's WAL
-            // (H-ADOPT.3 Phase C, D1).
+            // (H-ADOPT.3 Phase C, D1). The wrapper records into the session's
+            // WAL buffer, which the session writes as one group at commit.
             #[cfg(feature = "wal")]
-            let write_store: Arc<dyn GraphStoreMut> = if let Some(ref wal) = self.wal {
+            let wal_buffer = self.new_wal_buffer();
+            #[cfg(feature = "wal")]
+            let write_store: Arc<dyn GraphStoreMut> = if let Some(ref buffer) = wal_buffer {
                 let wal_store = Arc::new(crate::database::wal_store::WalGraphStore::new(
                     layered_arc as Arc<dyn GraphStoreMut>,
-                    Arc::clone(wal),
-                    Arc::clone(&self.wal_graph_context),
+                    Arc::clone(buffer),
                 ));
                 wal_store as Arc<dyn GraphStoreMut>
             } else {
@@ -2913,11 +2999,11 @@ impl GrafeoDB {
             let write_store: Arc<dyn GraphStoreMut> = layered_arc as Arc<dyn GraphStoreMut>;
             session.override_stores(read_store, Some(write_store));
             session.set_layered_store(Arc::clone(layered));
-            // Attach the WAL for TransactionCommit/EpochAdvance logging without
-            // re-wrapping the store (the write store above is already wrapped).
+            // Attach the same buffer without re-wrapping the store (the write
+            // store above is already wrapped around it).
             #[cfg(feature = "wal")]
-            if let Some(ref wal) = self.wal {
-                session.attach_wal(Arc::clone(wal), Arc::clone(&self.wal_graph_context));
+            if let Some(buffer) = wal_buffer {
+                session.attach_wal(buffer);
             }
             return session;
         }
@@ -2945,8 +3031,8 @@ impl GrafeoDB {
                 .expect("session creation for non-lpg build");
 
         #[cfg(all(feature = "wal", feature = "lpg"))]
-        if let Some(ref wal) = self.wal {
-            session.set_wal(Arc::clone(wal), Arc::clone(&self.wal_graph_context));
+        if let Some(buffer) = self.new_wal_buffer() {
+            session.set_wal(buffer);
         }
 
         #[cfg(feature = "cdc")]
@@ -3664,9 +3750,77 @@ impl GrafeoDB {
         false
     }
 
-    /// Logs a WAL record if WAL is enabled.
+    /// Refuses a write once the WAL is poisoned, before anything is mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the poison's "WAL refuses writes" error.
+    #[cfg(feature = "wal")]
+    pub(super) fn check_wal_writable(&self) -> Result<()> {
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            return Err(Error::Internal(format!(
+                "WAL refuses writes until the database is reopened: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A WAL buffer for one session or one database-level statement, or
+    /// `None` without a WAL. Buffers of one database share its commit order
+    /// and the configured `wal_transaction_buffer_cap`; a group that fails to
+    /// append poisons the WAL.
+    #[cfg(feature = "wal")]
+    pub(crate) fn new_wal_buffer(&self) -> Option<Arc<crate::transaction::wal_buffer::WalBuffer>> {
+        let wal = self.wal.as_ref()?;
+        Some(Arc::new(
+            crate::transaction::wal_buffer::WalBuffer::for_database(
+                Arc::clone(wal),
+                Arc::clone(&self.wal_commit_order),
+                self.config.wal_transaction_buffer_cap,
+            ),
+        ))
+    }
+
+    /// Writes one record as an implicit WAL group (with its own system
+    /// commit and epoch advance), if WAL is enabled. For the `GrafeoDB`-level
+    /// writes, which run outside any session transaction.
     #[cfg(feature = "wal")]
     pub(super) fn log_wal(&self, record: &WalRecord) -> Result<()> {
+        self.log_wal_group(vec![record.clone()])
+    }
+
+    /// Writes `records` as one implicit WAL group, if WAL is enabled: one
+    /// contiguous append closed by `[TransactionCommit(SYSTEM),
+    /// EpochAdvance]`, so a crash cannot keep part of it and a later commit
+    /// marker cannot settle it (#411). A failed append poisons the WAL.
+    ///
+    /// The `GrafeoDB`-level writes apply their change before this group is
+    /// written and do not take the sessions' commit-order lock, on every
+    /// kind of database (generation roots included). A session that sees
+    /// such a write and overwrites it can commit before the group lands, and
+    /// replay then applies the older value last. Callers mixing these writes
+    /// with session transactions on the same entities must serialize them.
+    #[cfg(feature = "wal")]
+    pub(super) fn log_wal_group(&self, records: Vec<WalRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        match self.new_wal_buffer() {
+            Some(buffer) => buffer
+                .write_implicit_group(&records, self.transaction_manager.current_epoch())
+                .map_err(crate::transaction::wal_buffer::unconfirmed_write_error),
+            None => Ok(()),
+        }
+    }
+
+    /// Logs a bare WAL record, outside any group, if WAL is enabled. Only for
+    /// [`save`](Self::save), which fills a target database that its
+    /// `close()` then commits as a whole; the target must be new and unused
+    /// while the save runs (see `save`).
+    #[cfg(feature = "wal")]
+    pub(super) fn log_wal_bare(&self, record: &WalRecord) -> Result<()> {
         if let Some(ref wal) = self.wal {
             wal.log(record)?;
         }

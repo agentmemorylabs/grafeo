@@ -23,6 +23,17 @@ use crate::catalog::{
 use crate::database::generation::manifest::WalBoundary;
 use crate::transaction::TransactionManager;
 
+/// Debug-only test seam: when non-zero, a writable generation-root open
+/// installs its root WAL with this `max_log_size` (bytes) instead of the
+/// 64 MiB default, so tests can make size rotations land inside a
+/// transaction. Zero (the default) leaves the WAL config untouched.
+///
+/// Compiled out of release builds (mirrors `FREEZE_STALL_BEFORE_CAPTURE`).
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static GENERATION_ROOT_WAL_MAX_LOG_SIZE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Fresh runtime targets restored from the selected generation's WAL tail.
 pub struct ReplayTarget<'a> {
     /// Layered compact base plus fresh writable overlay.
@@ -42,8 +53,9 @@ pub enum WalTailClass {
     /// The stream ended at a committed boundary.
     Clean,
     /// The tail holds an unfinished transaction: complete uncommitted
-    /// records, or a `TransactionCommit` whose `EpochAdvance` never made it
-    /// (a crash between the two frames). Its records were not applied.
+    /// records, a `TransactionCommit` whose `EpochAdvance` never made it
+    /// (a crash between the two frames), or only the bytes of a frame cut
+    /// off by a crash. Its records were not applied.
     TornTail {
         /// Active WAL sequence.
         seq: u64,
@@ -70,6 +82,11 @@ pub struct ReplayReport {
     pub final_epoch: EpochId,
     /// Maximum of the boundary transaction ID and replayed commit IDs.
     pub max_transaction_id: TransactionId,
+    /// Whether the replayed records leave the graph cursor on a named graph.
+    /// A log written before the #411 port can end there (its graph context
+    /// was shared across writers); every new group assumes it starts in the
+    /// default graph, so a writable open must switch back first.
+    pub ends_in_named_graph: bool,
     /// Default-graph node writes made by applied records (create, delete,
     /// property key, label), deduplicated, in first-write order. Replay
     /// writes the store directly, so the caller re-syncs the index entries
@@ -752,7 +769,24 @@ pub fn replay_generation_wal(
             discard_records: !committed.is_empty(),
         }
     } else if pending.is_empty() {
-        WalTailClass::Clean
+        // The stream stops cleanly at the first partial or absent frame.
+        // Bytes after that point are a frame cut off by a crash (possibly
+        // the first frame of a group, with nothing pending before it). Cut
+        // them too, or the next append lands behind bytes that are not a
+        // record and replay cannot read past them.
+        let active = wal_dir.join(format!("wal_{seq:08}.log"));
+        let file_len = std::fs::metadata(&active)
+            .map_err(|e| ReplayError::Scan(WalCursorError::Io(e)))?
+            .len();
+        if file_len > byte_offset {
+            WalTailClass::TornTail {
+                seq,
+                byte_offset,
+                discard_records: false,
+            }
+        } else {
+            WalTailClass::Clean
+        }
     } else {
         WalTailClass::TornTail {
             seq,
@@ -775,6 +809,7 @@ pub fn replay_generation_wal(
         tail,
         final_epoch,
         max_transaction_id,
+        ends_in_named_graph: cursor.current_graph.is_some(),
         node_writes,
     })
 }
@@ -805,6 +840,21 @@ mod tests {
         fn new() -> Self {
             let dir = TempDir::new().unwrap();
             let wal = WalManager::open(dir.path()).unwrap();
+            Self { dir, wal }
+        }
+
+        /// A WAL that rotates by size after almost every append, so a
+        /// multi-record transaction straddles several files.
+        fn tiny() -> Self {
+            let dir = TempDir::new().unwrap();
+            let wal = WalManager::with_config(
+                dir.path(),
+                grafeo_storage::wal::WalConfig {
+                    max_log_size: 64,
+                    ..grafeo_storage::wal::WalConfig::default()
+                },
+            )
+            .unwrap();
             Self { dir, wal }
         }
 
@@ -1254,5 +1304,63 @@ mod tests {
         );
         assert!(target.layered.get_node(NodeId::new(70)).is_some());
         assert!(target.layered.get_node(NodeId::new(71)).is_none());
+    }
+
+    #[test]
+    fn replay_applies_transaction_straddling_size_rotation() {
+        let fixture = WalFixture::tiny();
+        fixture.committed(primary_records(), 40, 9);
+        assert!(
+            fixture.wal.current_sequence() >= 2,
+            "fixture must rotate inside the transaction"
+        );
+        let target = FixtureTarget::new();
+
+        let report =
+            replay_generation_wal(fixture.dir.path(), boundary(), &target.replay_target()).unwrap();
+
+        assert_clean_report(&report, 11, 1, 9, 40);
+        assert_primary_state(&target);
+    }
+
+    #[test]
+    fn straddling_uncommitted_tail_is_discarded_at_the_active_file() {
+        let fixture = WalFixture::tiny();
+        fixture.committed(
+            [WalRecord::CreateNode {
+                id: NodeId::new(70),
+                labels: vec!["Committed".to_string()],
+            }],
+            70,
+            15,
+        );
+        let tail_start = fixture.wal.current_sequence();
+        for id in 71..81 {
+            fixture.log(WalRecord::CreateNode {
+                id: NodeId::new(id),
+                labels: vec!["Torn".to_string()],
+            });
+        }
+        fixture.wal.flush().unwrap();
+        let active = fixture.wal.current_sequence();
+        assert!(active >= tail_start + 2, "the open tail must straddle");
+        let target = FixtureTarget::new();
+
+        let report =
+            replay_generation_wal(fixture.dir.path(), boundary(), &target.replay_target()).unwrap();
+
+        assert_eq!(report.applied_records, 1);
+        assert_eq!(report.committed_transactions, 1);
+        // The cut is reported in the active file (the only file a writable
+        // open may truncate); the earlier records are closed by the abort
+        // the open appends.
+        assert!(matches!(
+            report.tail,
+            WalTailClass::TornTail { seq, discard_records: true, .. } if seq == active
+        ));
+        assert!(target.layered.get_node(NodeId::new(70)).is_some());
+        for id in 71..81 {
+            assert!(target.layered.get_node(NodeId::new(id)).is_none());
+        }
     }
 }

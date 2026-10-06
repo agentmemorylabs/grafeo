@@ -22,7 +22,7 @@
 ))]
 
 use grafeo_common::types::Value;
-use grafeo_engine::{generation_build_request, GrafeoDB};
+use grafeo_engine::{GrafeoDB, generation_build_request};
 use tempfile::tempdir;
 
 /// Build a generation root whose base holds `CodeDocument`-shaped nodes keyed
@@ -164,8 +164,8 @@ fn generation_root_keyed_lookup_after_create_property_index_finds_base_rows() {
     // drive MappedPropertyIndex postings; the data contract asserted here is
     // identical.)
     drop(db);
-    let reopened = GrafeoDB::open_generation_root(&root, false)
-        .expect("reopen generation root writable");
+    let reopened =
+        GrafeoDB::open_generation_root(&root, false).expect("reopen generation root writable");
     assert_eq!(
         keyed(&reopened, "repo-x", "ports.md").as_deref(),
         Some("hash-ports.md"),

@@ -40,10 +40,6 @@ mod gc;
 mod pins;
 mod restore;
 
-pub use backup::{
-    BACKUP_MANIFEST_NAME, BackedUpWalFile, GenerationBackupManifest, GenerationBackupReceipt,
-    backup_generation_root,
-};
 #[cfg(all(
     feature = "wal",
     feature = "lpg",
@@ -53,6 +49,10 @@ pub use backup::{
     feature = "mmap"
 ))]
 pub(crate) use backup::backup_live_generation_root;
+pub use backup::{
+    BACKUP_MANIFEST_NAME, BackedUpWalFile, GenerationBackupManifest, GenerationBackupReceipt,
+    backup_generation_root,
+};
 pub use gc::{RetirementPlan, collect_retirement, plan_retirement};
 pub use pins::{BackupPin, BackupPinGuard};
 pub use restore::restore_generation_root;

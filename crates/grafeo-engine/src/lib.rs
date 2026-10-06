@@ -65,6 +65,15 @@ pub use database::IndexedVectorRead;
 ))]
 #[doc(hidden)]
 pub use database::generation::epoch_handoff::{FREEZE_STALL_BEFORE_CAPTURE, FREEZE_STALL_ENTERED};
+#[cfg(all(
+    debug_assertions,
+    feature = "wal",
+    feature = "generation",
+    feature = "lpg",
+    feature = "compact-store"
+))]
+#[doc(hidden)]
+pub use database::generation::replay::GENERATION_ROOT_WAL_MAX_LOG_SIZE;
 #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
 pub use database::generation::{
     BACKUP_MANIFEST_NAME, BackedUpWalFile, BackupPin, BackupPinGuard, ClassifiedGeneration,
@@ -129,5 +138,10 @@ pub use metrics::{MetricsRegistry, MetricsSnapshot};
 #[cfg(all(feature = "gql", feature = "lpg"))]
 pub use query::executor::stream::{OwnedResultStream, OwnedRowIterator, ResultStream, RowIterator};
 pub use session::Session;
+#[cfg(all(debug_assertions, feature = "wal"))]
+#[doc(hidden)]
+pub use transaction::wal_buffer::{
+    COMMIT_STALL_BEFORE_GROUP, COMMIT_STALL_BEFORE_VALIDATION, COMMIT_STALL_PARKED,
+};
 #[cfg(feature = "lpg")]
 pub use transaction::{CommitInfo, PreparedCommit};
