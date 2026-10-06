@@ -813,6 +813,9 @@ impl GrafeoDB {
                     durability: wal_durability,
                     ..WalConfig::default()
                 };
+                // Spill files only live as long as their session: any left
+                // here are from a crash.
+                grafeo_storage::wal::remove_leftover_spill_files(&wal_path)?;
                 let wal_manager = LpgWal::with_config(&wal_path, wal_config)?;
                 #[cfg(feature = "lpg")]
                 {
@@ -1300,6 +1303,9 @@ impl GrafeoDB {
                     wal_config.max_log_size = max;
                 }
             }
+            // Spill files only live as long as their session: any left here
+            // are from a crash.
+            grafeo_storage::wal::remove_leftover_spill_files(&wal_dir)?;
             let wal = Arc::new(LpgWal::with_config(&wal_dir, wal_config)?);
             // The torn tail's unfinished transaction left complete records
             // before the cut. Close it with an abort so the next commit in the
@@ -3769,8 +3775,9 @@ impl GrafeoDB {
 
     /// A WAL buffer for one session or one database-level statement, or
     /// `None` without a WAL. Buffers of one database share its commit order
-    /// and the configured `wal_transaction_buffer_cap`; a group that fails to
-    /// append poisons the WAL.
+    /// and the configured `wal_transaction_buffer_cap`, and spill to disk
+    /// past `wal_spill_threshold`; a group that fails to append poisons the
+    /// WAL.
     #[cfg(feature = "wal")]
     pub(crate) fn new_wal_buffer(&self) -> Option<Arc<crate::transaction::wal_buffer::WalBuffer>> {
         let wal = self.wal.as_ref()?;
@@ -3778,7 +3785,19 @@ impl GrafeoDB {
             crate::transaction::wal_buffer::WalBuffer::for_database(
                 Arc::clone(wal),
                 Arc::clone(&self.wal_commit_order),
-                self.config.wal_transaction_buffer_cap,
+                grafeo_storage::wal::GroupLimits {
+                    spill_threshold: self.config.wal_spill_threshold,
+                    max_bytes: self
+                        .config
+                        .wal_transaction_buffer_cap
+                        .map_or(u64::MAX, |cap| u64::try_from(cap).unwrap_or(u64::MAX)),
+                },
+                // Encryption at rest configured: spill files never hold
+                // plaintext, even while the WAL itself is not encrypted.
+                #[cfg(feature = "encryption")]
+                self.config.encryption.is_some(),
+                #[cfg(not(feature = "encryption"))]
+                false,
             ),
         ))
     }

@@ -20,25 +20,24 @@
 //! Fork additions: every group ends with a `TransactionCommit` followed by an
 //! `EpochAdvance`, implicit groups included, because generation-root replay
 //! rejects a commit without its epoch advance. A group that fails to append
-//! poisons the WAL (#13's rule, on every database: the group is the only
-//! copy of its records). Sessions of one database share a commit-order lock,
-//! so groups reach the WAL in commit order.
+//! poisons the WAL (#13), on every kind of database. Sessions of one database
+//! share a commit-order lock, so groups reach the WAL in commit order.
 //!
-//! Records are encoded when they are pushed, so a commit holds one encoded
-//! copy of the transaction, not the records plus their encoding. The buffer
-//! has a byte cap (`Config::wal_transaction_buffer_cap`, 512 MiB by default):
-//! a push that would exceed it is refused and leaves the buffer faulted, so
-//! the statement fails with a retryable error and the transaction cannot
-//! commit until it is rolled back (or rolled back to a savepoint before the
-//! refused push). The cap is a stopgap until transaction buffers are charged
-//! to a process-wide memory ledger; it keeps one huge transaction from
-//! taking the process down.
+//! Bounded RAM: records are encoded when they are pushed, into a
+//! [`GroupBuffer`] that moves to a spill file next to the WAL once it holds
+//! more than the configured threshold (`Config::wal_spill_threshold`). A
+//! spilled group is copied into the WAL at commit under its append lock, so
+//! it is still one contiguous group there. The configured cap
+//! (`Config::wal_transaction_buffer_cap`) bounds the group's size, in RAM or
+//! on disk; a record past it, or one that cannot be spilled, is refused and
+//! the transaction can only be rolled back.
 
 use std::sync::Arc;
 
+use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EpochId, TransactionId};
 use grafeo_common::utils::error::{Error, Result};
-use grafeo_storage::wal::{LpgWal, WalEntry, WalRecord};
+use grafeo_storage::wal::{GroupBuffer, GroupLimits, GroupPosition, LpgWal, WalRecord};
 use parking_lot::Mutex;
 
 /// Debug-only test seam: when set, the next committing transaction clears it
@@ -100,87 +99,69 @@ pub(crate) fn maybe_stall_before_validation() {
 #[cfg(not(debug_assertions))]
 pub(crate) fn maybe_stall_before_validation() {}
 
-/// One encoded record waiting for its group, with the named graph it
-/// applies to (`None` = default graph).
-struct PendingFrame {
-    graph: Option<String>,
-    frame: Vec<u8>,
-}
-
-/// Why the buffer refused a push. Sticky until the records from `at` on are
-/// dropped (rollback, or rollback to a savepoint at or before `at`).
-#[derive(Debug, Clone)]
-enum Fault {
-    /// The push would have taken the buffer to `size` bytes, over `cap`.
-    Cap { cap: usize, size: usize, at: usize },
-    /// The record could not be encoded.
-    Encode { message: String, at: usize },
-}
-
-impl Fault {
-    fn at(&self) -> usize {
-        match self {
-            Self::Cap { at, .. } | Self::Encode { at, .. } => *at,
-        }
-    }
-
-    fn to_error(&self) -> Error {
-        match self {
-            Self::Cap { cap, size, .. } => Error::AdmissionRetryable(format!(
-                "the transaction's WAL records need at least {size} bytes, over the \
-                 {cap}-byte transaction WAL buffer cap (Config::wal_transaction_buffer_cap); \
-                 nothing of it was written to the WAL. Roll the transaction back and retry \
-                 the work in smaller transactions. The cap stands in for a memory ledger \
-                 that does not exist yet."
-            )),
-            Self::Encode { message, .. } => Error::Internal(format!(
-                "a WAL record of the transaction could not be encoded ({message}); nothing \
-                 of it was written to the WAL; roll the transaction back"
-            )),
-        }
-    }
-}
-
-#[derive(Default)]
-struct Pending {
-    frames: Vec<PendingFrame>,
-    /// Encoded bytes held (frames plus graph names).
-    bytes: usize,
-    fault: Option<Fault>,
-}
-
-/// Buffers one session's WAL records, encoded, until they are written as a
-/// group.
+/// Buffers one session's WAL records until they are written as a group.
 pub(crate) struct WalBuffer {
     wal: Arc<LpgWal>,
-    pending: Mutex<Pending>,
+    state: Mutex<BufferState>,
     /// Shared by every session of the database (see
     /// [`commit_order`](Self::commit_order)).
     commit_order: Arc<Mutex<()>>,
-    /// Byte cap on the buffered records (`None` = no cap).
-    cap: Option<usize>,
+    /// Spill threshold and byte cap of the buffer's groups.
+    limits: GroupLimits,
+    /// Encrypt spill files although the WAL is not (encryption at rest is
+    /// configured).
+    encrypt_spill: bool,
+}
+
+/// The buffered group and what it needs to resume at a savepoint.
+struct BufferState {
+    /// The group's frames, encoded at push time; spilled to disk past the
+    /// configured threshold.
+    group: GroupBuffer,
+    /// The graph the group's last record applies to (`None` = default).
+    context: Option<String>,
+    /// Records pushed, not counting the `SwitchGraph` records the buffer adds.
+    records: usize,
+}
+
+/// A position in a [`WalBuffer`], for savepoints.
+#[derive(Debug, Clone)]
+pub(crate) struct WalBufferMark {
+    position: GroupPosition,
+    context: Option<String>,
+    records: usize,
 }
 
 impl WalBuffer {
-    /// Creates an empty, uncapped buffer writing to `wal`, with its own
-    /// commit-order lock.
+    /// Creates an empty buffer writing to `wal`, with its own commit-order
+    /// lock and the default limits.
     #[cfg(test)]
     pub(crate) fn new(wal: Arc<LpgWal>) -> Self {
-        Self::for_database(wal, Arc::new(Mutex::new(())), None)
+        Self::for_database(wal, Arc::new(Mutex::new(())), GroupLimits::default(), false)
     }
 
     /// Creates an empty buffer writing to `wal` for a session of a database
-    /// whose sessions share `commit_order`, holding at most `cap` bytes.
+    /// whose sessions share `commit_order`. `limits` set when the buffer
+    /// spills to disk and how large its group may grow (the
+    /// `wal_transaction_buffer_cap`, in RAM or on disk). Spill files are
+    /// encrypted when the WAL is, or when `encrypt_spill` is set.
     pub(crate) fn for_database(
         wal: Arc<LpgWal>,
         commit_order: Arc<Mutex<()>>,
-        cap: Option<usize>,
+        limits: GroupLimits,
+        encrypt_spill: bool,
     ) -> Self {
+        let group = wal.new_group_with(limits, encrypt_spill);
         Self {
             wal,
-            pending: Mutex::new(Pending::default()),
+            state: Mutex::new(BufferState {
+                group,
+                context: None,
+                records: 0,
+            }),
             commit_order,
-            cap,
+            limits,
+            encrypt_spill,
         }
     }
 
@@ -200,154 +181,169 @@ impl WalBuffer {
         &self.wal
     }
 
-    /// Adds a record for `graph` (`None` = default graph), encoded.
+    /// Adds a record for `graph` (`None` = default graph), encoded right away,
+    /// preceded by a `SwitchGraph` when the graph changes.
     ///
-    /// Refused, leaving the buffer faulted (see [`check`](Self::check)), when
-    /// it would take the buffer over its cap or cannot be encoded. Once
-    /// faulted, later pushes are dropped: the transaction cannot commit.
+    /// Store mutations cannot fail, so neither does this call: if the record
+    /// cannot be buffered (over the cap, spilling to disk failed, or it
+    /// cannot be encoded), the buffer keeps the error, refuses every later
+    /// record and reports it from [`check`](Self::check). The statement and
+    /// the commit check that, so the transaction can only be rolled back.
     pub(crate) fn push(&self, graph: Option<String>, record: WalRecord) {
-        let mut pending = self.pending.lock();
-        if pending.fault.is_some() {
-            return;
-        }
-        let at = pending.frames.len();
-        let frame = match LpgWal::encode(&record) {
-            Ok(frame) => frame,
-            Err(e) => {
-                pending.fault = Some(Fault::Encode {
-                    message: e.to_string(),
-                    at,
-                });
+        let mut state = self.state.lock();
+        if graph != state.context {
+            if let Err(e) = state.group.push(&WalRecord::SwitchGraph {
+                name: graph.clone(),
+            }) {
+                grafeo_warn!("WAL buffer refused a record: {}", e);
                 return;
             }
-        };
-        let size = pending.bytes + frame.len() + graph.as_ref().map_or(0, String::len);
-        if let Some(cap) = self.cap
-            && size > cap
-        {
-            pending.fault = Some(Fault::Cap { cap, size, at });
-            return;
+            state.context = graph;
         }
-        pending.bytes = size;
-        pending.frames.push(PendingFrame { graph, frame });
+        match state.group.push(&record) {
+            Ok(()) => state.records += 1,
+            Err(e) => grafeo_warn!("WAL buffer refused a record: {}", e),
+        }
     }
 
-    /// The error of a refused push, if the buffer is faulted. A faulted
-    /// transaction must be rolled back (or rolled back to a savepoint
-    /// before the refused push) before it can commit.
+    /// The error of a refused push, if any: over the cap or a failed spill
+    /// give a retryable [`Error::AdmissionRetryable`]. A transaction with a
+    /// refused push must be rolled back (or rolled back to a savepoint
+    /// before it) before it can commit.
     ///
     /// # Errors
     ///
     /// Returns the refused push's error.
+    ///
+    /// [`Error::AdmissionRetryable`]: grafeo_common::utils::error::Error::AdmissionRetryable
     pub(crate) fn check(&self) -> Result<()> {
-        match &self.pending.lock().fault {
-            Some(fault) => Err(fault.to_error()),
+        match self.state.lock().group.failure() {
+            Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
-    /// Number of buffered records, used as a savepoint position.
-    pub(crate) fn len(&self) -> usize {
-        self.pending.lock().frames.len()
-    }
-
-    /// Bytes held by the buffered records.
-    #[cfg(test)]
-    pub(crate) fn bytes(&self) -> usize {
-        self.pending.lock().bytes
-    }
-
-    /// Drops the records added after position `len` (savepoint rollback),
-    /// and a fault raised at or after it.
-    pub(crate) fn truncate(&self, len: usize) {
-        let mut pending = self.pending.lock();
-        pending.frames.truncate(len);
-        pending.bytes = pending
-            .frames
-            .iter()
-            .map(|f| f.frame.len() + f.graph.as_ref().map_or(0, String::len))
-            .sum();
-        if pending.fault.as_ref().is_some_and(|f| f.at() >= len) {
-            pending.fault = None;
-        }
-    }
-
-    /// Drops every buffered record and any fault (rollback).
-    pub(crate) fn clear(&self) {
-        *self.pending.lock() = Pending::default();
-    }
-
-    /// Writes the buffered records as one group, closed by `markers`.
-    ///
-    /// The markers are written even when no record is buffered.
+    /// Like [`check`](Self::check), and also writes a spilled group's last
+    /// buffered frames to its spill file, so that a disk error there is still
+    /// a refused push the transaction can roll back, instead of a failure
+    /// inside the commit's copy (which poisons the WAL after the commit is
+    /// applied). Call it right before committing.
     ///
     /// # Errors
     ///
-    /// Returns the fault of a refused push without writing anything.
-    /// Otherwise returns an error if the WAL write fails or the WAL is
-    /// poisoned; a write failure has poisoned the WAL by then (see
-    /// `TypedWal::log_encoded_or_poison`): the records may be partly on
-    /// disk, and nothing may be appended after them. The buffered records are
-    /// dropped either way.
-    pub(crate) fn flush(&self, markers: &[WalRecord]) -> Result<()> {
-        let pending = std::mem::take(&mut *self.pending.lock());
-        if let Some(fault) = pending.fault {
-            return Err(fault.to_error());
+    /// Returns the refused push's error, or the spill write's.
+    pub(crate) fn prepare_commit(&self) -> Result<()> {
+        self.state.lock().group.prepare_commit()
+    }
+
+    /// Number of buffered records.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn len(&self) -> usize {
+        self.state.lock().records
+    }
+
+    /// Whether nothing is buffered.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.state.lock().group.is_empty()
+    }
+
+    /// The current position, to return to with [`truncate`](Self::truncate).
+    pub(crate) fn savepoint(&self) -> WalBufferMark {
+        let state = self.state.lock();
+        WalBufferMark {
+            position: state.group.position(),
+            context: state.context.clone(),
+            records: state.records,
         }
-        self.write_group(&pending.frames, markers)
+    }
+
+    /// Drops the records added after `mark` (savepoint rollback).
+    pub(crate) fn truncate(&self, mark: &WalBufferMark) {
+        let mut state = self.state.lock();
+        // Also at the end: that clears a push refused right after `mark`.
+        state.group.truncate(mark.position);
+        state.context = mark.context.clone();
+        state.records = mark.records;
+    }
+
+    /// Drops every buffered record and the spill file (rollback).
+    pub(crate) fn clear(&self) {
+        let mut state = self.state.lock();
+        state.group.clear();
+        state.context = None;
+        state.records = 0;
+    }
+
+    /// Whether the buffered records have moved to a spill file.
+    #[doc(hidden)]
+    pub(crate) fn is_spilled(&self) -> bool {
+        self.state.lock().group.is_spilled()
+    }
+
+    /// The highest number of bytes this buffer has held in RAM.
+    #[doc(hidden)]
+    pub(crate) fn peak_ram_bytes(&self) -> usize {
+        self.state.lock().group.peak_ram_bytes()
+    }
+
+    /// Writes the buffered records as one group, closed by a switch back to
+    /// the default graph if needed and then `markers`.
+    ///
+    /// The markers are written even when no record is buffered. A spilled
+    /// group is copied from its spill file under the WAL's append lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refused push's error (see [`check`](Self::check)) without
+    /// writing anything. Otherwise returns an error if the
+    /// WAL write fails or the WAL is poisoned; a failed write has poisoned
+    /// the WAL by then, on every kind of database: the group may be partly
+    /// on disk, and a later group must not land after it. The buffered
+    /// records are dropped either way.
+    pub(crate) fn flush(&self, markers: &[WalRecord]) -> Result<()> {
+        let mut state = self.state.lock();
+        let mut trailer = Vec::with_capacity(markers.len() + 1);
+        if state.context.is_some() {
+            trailer.push(WalRecord::SwitchGraph { name: None });
+        }
+        trailer.extend(markers.iter().cloned());
+        let result = self.wal.log_group(&mut state.group, &trailer, true);
+        state.context = None;
+        state.records = 0;
+        result
     }
 
     /// Writes `records` (default graph) right away as their own implicit
     /// group, leaving the buffer alone: for schema changes, which take effect
     /// immediately and are not undone by a rollback, and for `GrafeoDB`-level
-    /// writes. Not subject to the cap.
+    /// writes. Not subject to the cap (the records are applied already), but
+    /// spilled past the threshold like any group.
     ///
     /// # Errors
     ///
-    /// Returns an error if a record cannot be encoded, the WAL write fails or
-    /// the WAL is poisoned.
+    /// Returns an error if a record cannot be encoded or spilled, or the WAL
+    /// write fails (either poisons the WAL), or the WAL is poisoned. Never a
+    /// retryable error: the records are applied already.
     pub(crate) fn write_implicit_group(&self, records: &[WalRecord], epoch: EpochId) -> Result<()> {
-        let frames = records
-            .iter()
-            .map(|record| {
-                Ok(PendingFrame {
-                    graph: None,
-                    frame: LpgWal::encode(record)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.write_group(&frames, &implicit_markers(epoch))
-    }
-
-    /// Writes `frames` and `markers` as one group in one append, poisoning
-    /// the WAL on a write failure.
-    fn write_group(&self, frames: &[PendingFrame], markers: &[WalRecord]) -> Result<()> {
-        let slots = layout(frames.iter().map(|f| f.graph.as_deref()), markers.len());
-        if slots.is_empty() {
-            return Ok(());
+        let mut group = self.wal.new_group_with(
+            GroupLimits {
+                max_bytes: u64::MAX,
+                ..self.limits
+            },
+            self.encrypt_spill,
+        );
+        for record in records {
+            if let Err(e) = group.push(record) {
+                // The records are applied already and will never reach the
+                // WAL: like a failed append, poison it, and never report this
+                // as retryable (a retry would apply them twice).
+                let reason = format!("an implicit WAL group could not be buffered: {e}");
+                self.wal.poison(reason.clone());
+                return Err(Error::Internal(reason));
+            }
         }
-        // Encode the switches and markers; the data frames are already
-        // encoded and are written from the buffer without a copy.
-        let extra = slots
-            .iter()
-            .map(|slot| match slot {
-                Slot::Switch(name) => {
-                    LpgWal::encode(&WalRecord::SwitchGraph { name: name.clone() })
-                }
-                Slot::Marker(i) => LpgWal::encode(&markers[*i]),
-                Slot::Frame(_) => Ok(Vec::new()),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let refs: Vec<&[u8]> = slots
-            .iter()
-            .zip(&extra)
-            .map(|(slot, encoded)| match slot {
-                Slot::Frame(i) => frames[*i].frame.as_slice(),
-                Slot::Switch(_) | Slot::Marker(_) => encoded.as_slice(),
-            })
-            .collect();
-        let force_sync = markers.iter().any(WalEntry::requires_sync);
-        self.wal.log_encoded_or_poison(&refs, force_sync)
+        self.wal
+            .log_group(&mut group, &implicit_markers(epoch), true)
     }
 
     /// Writes buffered records from outside a transaction as an implicit
@@ -362,19 +358,25 @@ impl WalBuffer {
     ///
     /// Returns the refused push's error, or an error if the WAL write fails.
     pub(crate) fn flush_implicit(&self, epoch: EpochId) -> Result<()> {
-        {
-            let mut pending = self.pending.lock();
-            if let Some(fault) = pending.fault.take() {
-                *pending = Pending::default();
-                let error = fault.to_error();
-                self.wal.poison(format!(
-                    "a write outside a transaction could not be logged: {error}"
-                ));
-                return Err(error);
-            }
-            if pending.frames.is_empty() {
-                return Ok(());
-            }
+        if let Err(error) = self.check() {
+            self.clear();
+            self.wal.poison(format!(
+                "a write outside a transaction could not be logged: {error}"
+            ));
+            // Keep the error's kind (#27 keeps the cap retryable), but say
+            // that nothing succeeds before a reopen.
+            const REOPEN: &str = " The write is applied in memory but not logged; the WAL \
+                                  refuses writes until the database is reopened.";
+            return Err(match error {
+                Error::AdmissionRetryable(message) => {
+                    Error::AdmissionRetryable(format!("{message}.{REOPEN}"))
+                }
+                Error::Internal(message) => Error::Internal(format!("{message}.{REOPEN}")),
+                other => other,
+            });
+        }
+        if self.is_empty() {
+            return Ok(());
         }
         self.flush(&implicit_markers(epoch))
     }
@@ -409,39 +411,11 @@ pub(crate) fn implicit_markers(epoch: EpochId) -> [WalRecord; 2] {
     ]
 }
 
-/// One frame of a group: a buffered data frame, a `SwitchGraph`, or a
-/// marker.
-#[derive(Debug, PartialEq, Eq)]
-enum Slot {
-    Frame(usize),
-    Switch(Option<String>),
-    Marker(usize),
-}
-
-/// Lays out a group: the data frames (given by their graphs) with a
-/// `SwitchGraph` wherever the graph changes, a switch back to the default
-/// graph if needed, then the markers.
-fn layout<'a>(graphs: impl Iterator<Item = Option<&'a str>>, markers: usize) -> Vec<Slot> {
-    let mut slots = Vec::new();
-    let mut context: Option<&str> = None;
-    for (i, graph) in graphs.enumerate() {
-        if graph != context {
-            slots.push(Slot::Switch(graph.map(str::to_string)));
-            context = graph;
-        }
-        slots.push(Slot::Frame(i));
-    }
-    if context.is_some() {
-        slots.push(Slot::Switch(None));
-    }
-    slots.extend((0..markers).map(Slot::Marker));
-    slots
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use grafeo_common::types::NodeId;
+    use grafeo_storage::wal::WalRecovery;
 
     fn create(id: u64) -> WalRecord {
         WalRecord::CreateNode {
@@ -456,73 +430,9 @@ mod tests {
         }
     }
 
-    /// Short form of a layout for assertions.
-    fn shape(slots: &[Slot]) -> Vec<String> {
-        slots
-            .iter()
-            .map(|slot| match slot {
-                Slot::Frame(i) => format!("frame {i}"),
-                Slot::Switch(name) => format!("switch {name:?}"),
-                Slot::Marker(i) => format!("marker {i}"),
-            })
-            .collect()
-    }
-
-    /// Every record in the WAL at `dir`, committed ones only.
-    fn wal_records(dir: &std::path::Path) -> Vec<WalRecord> {
-        grafeo_storage::wal::WalRecovery::new(dir)
-            .recover()
-            .unwrap()
-    }
-
-    #[test]
-    fn default_graph_group_has_no_switches() {
-        let slots = layout([None, None].into_iter(), 1);
-        assert_eq!(shape(&slots), ["frame 0", "frame 1", "marker 0"]);
-    }
-
-    #[test]
-    fn group_switches_graphs_and_returns_to_default() {
-        let slots = layout([Some("g"), Some("g"), None, Some("h")].into_iter(), 2);
-        assert_eq!(
-            shape(&slots),
-            [
-                "switch Some(\"g\")",
-                "frame 0",
-                "frame 1",
-                "switch None",
-                "frame 2",
-                "switch Some(\"h\")",
-                "frame 3",
-                "switch None",
-                "marker 0",
-                "marker 1",
-            ]
-        );
-    }
-
-    #[test]
-    fn empty_group_is_only_markers() {
-        assert_eq!(shape(&layout(std::iter::empty(), 1)), ["marker 0"]);
-        assert!(layout(std::iter::empty(), 0).is_empty());
-    }
-
-    #[test]
-    fn flushed_group_decodes_in_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let buffer = WalBuffer::new(Arc::new(LpgWal::open(dir.path()).unwrap()));
-        buffer.push(Some("g".to_string()), create(1));
-        buffer.push(None, create(2));
-        buffer
-            .flush(&[
-                commit(),
-                WalRecord::EpochAdvance {
-                    epoch: EpochId::new(5),
-                },
-            ])
-            .unwrap();
-        let records = wal_records(dir.path());
-        let names: Vec<String> = records
+    /// Short form of a group for assertions.
+    fn shape(group: &[WalRecord]) -> Vec<String> {
+        group
             .iter()
             .map(|record| match record {
                 WalRecord::CreateNode { id, .. } => format!("node {}", id.as_u64()),
@@ -531,15 +441,116 @@ mod tests {
                 WalRecord::EpochAdvance { epoch } => format!("epoch {}", epoch.as_u64()),
                 other => format!("{other:?}"),
             })
-            .collect();
+            .collect()
+    }
+
+    /// Pushes `pending`, flushes with `markers` and returns what the WAL holds.
+    fn written(
+        pending: Vec<(Option<String>, WalRecord)>,
+        markers: &[WalRecord],
+        limits: GroupLimits,
+    ) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let wal = Arc::new(LpgWal::open(dir.path()).unwrap());
+            let buffer = WalBuffer::for_database(Arc::clone(&wal), Arc::default(), limits, false);
+            for (graph, record) in pending {
+                buffer.push(graph, record);
+            }
+            buffer.flush(markers).unwrap();
+            wal.sync().unwrap();
+        }
+        let records = WalRecovery::new(dir.path()).recover().unwrap();
+        shape(&records)
+    }
+
+    #[test]
+    fn default_graph_group_has_no_switches() {
         assert_eq!(
-            names[..5],
+            written(
+                vec![(None, create(1)), (None, create(2))],
+                &[commit()],
+                GroupLimits::default()
+            ),
+            ["node 1", "node 2", "commit"]
+        );
+    }
+
+    fn switches_graphs_and_returns_to_default(limits: GroupLimits) {
+        let pending = vec![
+            (Some("g".to_string()), create(1)),
+            (Some("g".to_string()), create(2)),
+            (None, create(3)),
+            (Some("h".to_string()), create(4)),
+        ];
+        let markers = [
+            commit(),
+            WalRecord::EpochAdvance {
+                epoch: EpochId::new(5),
+            },
+        ];
+        assert_eq!(
+            written(pending, &markers, limits),
             [
                 "switch Some(\"g\")",
                 "node 1",
-                "switch None",
                 "node 2",
+                "switch None",
+                "node 3",
+                "switch Some(\"h\")",
+                "node 4",
+                "switch None",
                 "commit",
+                "epoch 5",
+            ]
+        );
+    }
+
+    #[test]
+    fn group_switches_graphs_and_returns_to_default() {
+        switches_graphs_and_returns_to_default(GroupLimits::default());
+    }
+
+    #[test]
+    fn spilled_group_switches_graphs_and_returns_to_default() {
+        switches_graphs_and_returns_to_default(GroupLimits {
+            spill_threshold: 0,
+            max_bytes: u64::MAX,
+        });
+    }
+
+    #[test]
+    fn empty_group_is_only_markers() {
+        assert_eq!(
+            written(Vec::new(), &[commit()], GroupLimits::default()),
+            ["commit"]
+        );
+    }
+
+    #[test]
+    fn truncate_restores_the_graph_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(LpgWal::open(dir.path()).unwrap());
+        let buffer = WalBuffer::new(Arc::clone(&wal));
+        buffer.push(Some("g".to_string()), create(1));
+        let mark = buffer.savepoint();
+        buffer.push(None, create(2));
+        buffer.truncate(&mark);
+        // Still in graph g: the next record of g needs no switch, and the
+        // group switches back to the default graph before its marker.
+        buffer.push(Some("g".to_string()), create(3));
+        assert_eq!(buffer.len(), 2);
+        buffer.flush(&[commit()]).unwrap();
+        wal.sync().unwrap();
+        let records = WalRecovery::new(dir.path()).recover().unwrap();
+        assert_eq!(
+            shape(&records),
+            [
+                "switch Some(\"g\")",
+                "node 1",
+                "node 3",
+                "switch None",
+                "commit"
             ]
         );
     }
@@ -549,32 +560,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let buffer = WalBuffer::new(Arc::new(LpgWal::open(dir.path()).unwrap()));
         buffer.push(None, create(1));
-        let savepoint = buffer.len();
-        let bytes_at_savepoint = buffer.bytes();
+        let savepoint = buffer.savepoint();
         buffer.push(None, create(2));
         buffer.push(None, create(3));
-        buffer.truncate(savepoint);
+        buffer.truncate(&savepoint);
         assert_eq!(buffer.len(), 1);
-        assert_eq!(buffer.bytes(), bytes_at_savepoint);
         buffer.clear();
-        assert_eq!(buffer.len(), 0);
-        assert_eq!(buffer.bytes(), 0);
+        assert!(buffer.is_empty());
         // Nothing buffered: an implicit flush writes nothing.
         buffer.flush_implicit(EpochId::new(1)).unwrap();
         assert_eq!(buffer.wal().record_count(), 0);
     }
 
+    fn capped(wal: Arc<LpgWal>, cap: u64) -> WalBuffer {
+        WalBuffer::for_database(
+            wal,
+            Arc::default(),
+            GroupLimits {
+                spill_threshold: usize::MAX,
+                max_bytes: cap,
+            },
+            false,
+        )
+    }
+
     #[test]
     fn push_over_the_cap_faults_until_rolled_back() {
         let dir = tempfile::tempdir().unwrap();
-        let one = LpgWal::encode(&create(1)).unwrap().len();
-        let buffer = WalBuffer::for_database(
-            Arc::new(LpgWal::open(dir.path()).unwrap()),
-            Arc::new(Mutex::new(())),
-            Some(2 * one),
-        );
+        // RAM frame (length prefix) plus the spill frame's CRC, as the cap charges.
+        let one = 8 + LpgWal::encode(&create(1)).unwrap().len() as u64;
+        let buffer = capped(Arc::new(LpgWal::open(dir.path()).unwrap()), 2 * one);
         buffer.push(None, create(1));
-        let savepoint = buffer.len();
         buffer.push(None, create(2));
         buffer.check().unwrap();
         buffer.push(None, create(3));
@@ -589,28 +605,55 @@ mod tests {
         assert_eq!(buffer.len(), 2);
         assert!(buffer.flush(&[commit()]).is_err());
         assert_eq!(buffer.wal().record_count(), 0, "nothing was written");
+        assert!(buffer.wal().poisoned_reason().is_none());
 
         // Rolling back to a savepoint before the refused push clears it.
         buffer.push(None, create(1));
+        let savepoint_after = buffer.savepoint();
         buffer.push(None, create(2));
         buffer.push(None, create(3));
         assert!(buffer.check().is_err());
-        buffer.truncate(savepoint);
+        buffer.truncate(&savepoint_after);
         buffer.check().unwrap();
         buffer.flush(&[commit()]).unwrap();
-        assert_eq!(wal_records(dir.path()).len(), 2, "node 1 and the commit");
+        let records = WalRecovery::new(dir.path()).recover().unwrap();
+        assert_eq!(shape(&records), ["node 1", "commit"]);
     }
 
     #[test]
     fn refused_push_outside_a_transaction_poisons_the_wal() {
         let dir = tempfile::tempdir().unwrap();
-        let buffer = WalBuffer::for_database(
-            Arc::new(LpgWal::open(dir.path()).unwrap()),
-            Arc::new(Mutex::new(())),
-            Some(1),
-        );
+        let buffer = capped(Arc::new(LpgWal::open(dir.path()).unwrap()), 1);
         buffer.push(None, create(1));
         assert!(buffer.flush_implicit(EpochId::new(1)).is_err());
         assert!(buffer.wal().poisoned_reason().is_some());
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn implicit_group_is_not_capped_but_spills() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(LpgWal::open(dir.path()).unwrap());
+        let buffer = WalBuffer::for_database(
+            Arc::clone(&wal),
+            Arc::default(),
+            GroupLimits {
+                spill_threshold: 64,
+                max_bytes: 1,
+            },
+            false,
+        );
+        let records: Vec<WalRecord> = (0..200).map(create).collect();
+        buffer
+            .write_implicit_group(&records, EpochId::new(3))
+            .unwrap();
+        wal.sync().unwrap();
+        let recovered = WalRecovery::new(dir.path()).recover().unwrap();
+        assert_eq!(recovered.len(), 202);
+        assert!(
+            std::fs::read_dir(dir.path().join(grafeo_storage::wal::SPILL_DIR))
+                .map_or(0, |d| d.count())
+                == 0
+        );
     }
 }

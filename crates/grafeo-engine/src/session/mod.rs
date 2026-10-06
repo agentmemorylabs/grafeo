@@ -291,7 +291,7 @@ struct SavepointState {
     /// WAL buffer position at savepoint creation.
     /// On rollback-to-savepoint, the buffer is truncated to this position.
     #[cfg(feature = "wal")]
-    wal_position: usize,
+    wal_position: Option<crate::transaction::wal_buffer::WalBufferMark>,
 }
 
 /// What [`Session::abort_transaction`] could not finish. The abort itself
@@ -473,6 +473,25 @@ impl Session {
     #[cfg(all(feature = "wal", feature = "lpg"))]
     pub(crate) fn attach_wal(&mut self, buffer: Arc<crate::transaction::wal_buffer::WalBuffer>) {
         self.wal = Some(buffer);
+    }
+
+    /// Whether this session's buffered WAL records have moved to a spill file.
+    /// For tests.
+    #[cfg(feature = "wal")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn wal_buffer_is_spilled(&self) -> bool {
+        self.wal.as_ref().is_some_and(|wal| wal.is_spilled())
+    }
+
+    /// The most bytes this session's WAL buffer has held in RAM (encoded
+    /// records, encoding and I/O buffers), or 0 without a WAL. For tests of
+    /// the spill bound.
+    #[cfg(feature = "wal")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn wal_buffer_peak_ram_bytes(&self) -> usize {
+        self.wal.as_ref().map_or(0, |wal| wal.peak_ram_bytes())
     }
 
     /// Records a WAL record for the active graph. No-op for in-memory sessions.
@@ -4330,9 +4349,14 @@ impl Session {
             let _ = self.rollback_inner();
             return Err(e);
         }
-        // Nor can a buffer that refused a record (over its byte cap): the
-        // transaction's records are incomplete, so roll it back.
-        if let Err(e) = self.check_wal_buffer() {
+        // Nor can a buffer that refused a record (over its byte cap, or a
+        // failed spill): the transaction's records are incomplete, so roll it
+        // back. This also writes a spilled group's last frames out, so a disk
+        // error there still rolls back instead of failing the commit's copy.
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
+            && let Err(e) = wal.prepare_commit()
+        {
             let _ = self.rollback_inner();
             return Err(e);
         }
@@ -4454,10 +4478,11 @@ impl Session {
             use grafeo_storage::wal::WalRecord;
             crate::transaction::wal_buffer::maybe_stall_before_group();
             // One atomic append: generation-root replay rejects any record
-            // between the commit and its epoch advance. On a layered database
-            // a failure poisons the WAL inside that append: the transaction
-            // is applied in memory but its group may or may not be on disk,
-            // and a later group could otherwise land after a partial one.
+            // between the commit and its epoch advance. A failure poisons the
+            // WAL inside that append: the transaction is applied in memory but
+            // its group may or may not be on disk, and a later group could
+            // otherwise land after a partial one. A spilled group is copied
+            // from its spill file inside the same append.
             let markers = [
                 WalRecord::TransactionCommit { transaction_id },
                 WalRecord::EpochAdvance {
@@ -4727,7 +4752,7 @@ impl Session {
                 .as_ref()
                 .map_or(0, |l| l.transaction_layer_position(tx_id)),
             #[cfg(feature = "wal")]
-            wal_position: self.wal.as_ref().map_or(0, |w| w.len()),
+            wal_position: self.wal.as_ref().map(|w| w.savepoint()),
         });
         Ok(())
     }
@@ -4808,8 +4833,10 @@ impl Session {
 
         // Drop the WAL records buffered after the savepoint.
         #[cfg(feature = "wal")]
-        if let Some(ref wal) = self.wal {
-            wal.truncate(sp_state.wal_position);
+        if let Some(ref wal) = self.wal
+            && let Some(ref mark) = sp_state.wal_position
+        {
+            wal.truncate(mark);
         }
 
         // Restore touched_graphs to only the graphs that were known at savepoint time.

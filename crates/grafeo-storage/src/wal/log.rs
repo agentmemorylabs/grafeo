@@ -1,6 +1,7 @@
 //! WAL log file management.
 
 use super::WalRecord;
+use super::group::GroupBuffer;
 use grafeo_common::types::{EpochId, TransactionId};
 use grafeo_common::utils::error::{Error, Result};
 use parking_lot::Mutex;
@@ -89,6 +90,34 @@ impl Default for WalConfig {
             max_log_size: 64 * 1024 * 1024, // 64 MB
             compression: false,
         }
+    }
+}
+
+/// The frames of one append, produced while the active-log lock is held.
+trait FrameSource {
+    /// Calls `sink` with each frame, in order.
+    fn for_each_frame(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>;
+}
+
+/// Frames already in RAM.
+struct SliceFrames<'a>(&'a [&'a [u8]]);
+
+impl FrameSource for SliceFrames<'_> {
+    fn for_each_frame(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.0.iter().try_for_each(|frame| sink(frame))
+    }
+}
+
+/// A buffered group followed by its trailer.
+struct GroupFrames<'a> {
+    group: &'a mut GroupBuffer,
+    trailer: &'a [&'a [u8]],
+}
+
+impl FrameSource for GroupFrames<'_> {
+    fn for_each_frame(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.group.for_each_frame(sink)?;
+        self.trailer.iter().try_for_each(|frame| sink(frame))
     }
 }
 
@@ -260,7 +289,7 @@ impl WalManager {
     /// rejects any record between the two). Durability and rotation are
     /// handled once for the whole group, as for a single frame.
     pub(crate) fn write_frames(&self, frames: &[&[u8]], force_sync: bool) -> Result<()> {
-        self.write_frames_inner(frames, force_sync, false)
+        self.write_frames_inner(&mut SliceFrames(frames), force_sync, false)
     }
 
     /// [`write_frames`](Self::write_frames) for a group whose failure leaves
@@ -269,7 +298,30 @@ impl WalManager {
     /// other writer can append after the failed group. The fsync, when
     /// needed, runs under that lock too.
     pub(crate) fn write_frames_or_poison(&self, frames: &[&[u8]], force_sync: bool) -> Result<()> {
-        self.write_frames_inner(frames, force_sync, true)
+        self.write_frames_inner(&mut SliceFrames(frames), force_sync, true)
+    }
+
+    /// Writes a buffered group, then `trailer` (its commit markers), as one
+    /// contiguous run of frames under one hold of the active-log lock, as
+    /// [`write_frames`](Self::write_frames) does for frames in RAM.
+    ///
+    /// A spilled group is copied from its spill file while the lock is held,
+    /// through a bounded buffer: other appends wait for the whole copy. With
+    /// `poison_on_error`, any failure (including a damaged spill file) poisons
+    /// the WAL before the lock is released, as in
+    /// [`write_frames_or_poison`](Self::write_frames_or_poison).
+    pub(crate) fn write_group(
+        &self,
+        group: &mut GroupBuffer,
+        trailer: &[&[u8]],
+        force_sync: bool,
+        poison_on_error: bool,
+    ) -> Result<()> {
+        self.write_frames_inner(
+            &mut GroupFrames { group, trailer },
+            force_sync,
+            poison_on_error,
+        )
     }
 
     fn poisoned_error(reason: &str) -> Error {
@@ -280,7 +332,7 @@ impl WalManager {
 
     fn write_frames_inner(
         &self,
-        frames: &[&[u8]],
+        frames: &mut dyn FrameSource,
         force_sync: bool,
         poison_on_error: bool,
     ) -> Result<()> {
@@ -311,89 +363,7 @@ impl WalManager {
                 // Test hook: fail the whole append before any byte is written.
                 grafeo_common::testing::crash::maybe_fail_io("wal_write")?;
 
-                for data in frames.iter().copied() {
-                    maybe_crash("wal_before_write");
-
-                    // Encrypt or write plaintext depending on encryption configuration.
-                    // Encrypted frame: [len:4][nonce(12) || ciphertext || tag(16)]
-                    // Plaintext frame:  [len:4][data][crc32:4]
-                    #[cfg(feature = "encryption")]
-                    let (frame_data, record_size) = if let Some(ref enc) = self.encryptor {
-                        let file_seq = self.current_sequence.load(Ordering::Relaxed);
-                        // Use the file byte offset as the nonce counter, not the ephemeral
-                        // record count. The byte offset survives restarts (file is append-only)
-                        // and is unique per record within a file. Combined with the file sequence,
-                        // this guarantees nonce uniqueness even after crash + restart.
-                        //
-                        // The nonce high word is 4 bytes, so the file sequence must fit in u32.
-                        // With one rotation per ~64 MB of WAL, this allows ~256 exabytes of
-                        // total WAL writes before exhaustion, which is effectively unlimited.
-                        let seq_u32 = u32::try_from(file_seq).map_err(|_| {
-                            Error::Internal(
-                            "WAL file sequence exceeds u32::MAX: encryption nonce space exhausted"
-                                .to_string(),
-                        )
-                        })?;
-                        let byte_offset = log_file.size;
-                        let nonce = grafeo_common::encryption::build_nonce(seq_u32, byte_offset);
-                        let aad = b"grafeo-wal";
-                        let encrypted = enc
-                            .encrypt(data, &nonce, aad)
-                            .map_err(|e| Error::Internal(format!("WAL encryption failed: {e}")))?;
-                        // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
-                        #[allow(clippy::cast_possible_truncation)]
-                        let len = encrypted.len() as u32;
-                        log_file.writer.write_all(&len.to_le_bytes())?;
-                        log_file.writer.write_all(&encrypted)?;
-                        let size = 4 + encrypted.len() as u64;
-                        (true, size)
-                    } else {
-                        (false, 0u64)
-                    };
-
-                    #[cfg(feature = "encryption")]
-                    if !frame_data {
-                        // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
-                        #[allow(clippy::cast_possible_truncation)]
-                        let len = data.len() as u32;
-                        log_file.writer.write_all(&len.to_le_bytes())?;
-                        log_file.writer.write_all(data)?;
-                        let checksum = crc32fast::hash(data);
-                        log_file.writer.write_all(&checksum.to_le_bytes())?;
-                    }
-
-                    #[cfg(not(feature = "encryption"))]
-                    {
-                        // Write length prefix
-                        // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
-                        #[allow(clippy::cast_possible_truncation)]
-                        let len = data.len() as u32;
-                        log_file.writer.write_all(&len.to_le_bytes())?;
-
-                        // Write data
-                        log_file.writer.write_all(data)?;
-
-                        // Write checksum
-                        let checksum = crc32fast::hash(data);
-                        log_file.writer.write_all(&checksum.to_le_bytes())?;
-                    }
-
-                    maybe_crash("wal_after_write");
-
-                    // Update size tracking
-                    #[cfg(feature = "encryption")]
-                    let record_size = if frame_data {
-                        record_size
-                    } else {
-                        4 + data.len() as u64 + 4
-                    };
-                    #[cfg(not(feature = "encryption"))]
-                    let record_size = 4 + data.len() as u64 + 4; // length + data + checksum
-                    log_file.size += record_size;
-
-                    self.total_record_count.fetch_add(1, Ordering::Relaxed);
-                    self.records_since_sync.fetch_add(1, Ordering::Relaxed);
-                }
+                frames.for_each_frame(&mut |data| self.write_one_frame(log_file, data))?;
 
                 let needs_rotation = log_file.size >= self.config.max_log_size;
 
@@ -483,6 +453,95 @@ impl WalManager {
             return Err(e);
         }
 
+        Ok(())
+    }
+
+    /// Writes one frame to `log_file` (encrypted when configured) and counts
+    /// it. The caller holds the active-log lock.
+    fn write_one_frame(&self, log_file: &mut LogFile, data: &[u8]) -> Result<()> {
+        use grafeo_common::testing::crash::maybe_crash;
+
+        maybe_crash("wal_before_write");
+
+        // Encrypt or write plaintext depending on encryption configuration.
+        // Encrypted frame: [len:4][nonce(12) || ciphertext || tag(16)]
+        // Plaintext frame:  [len:4][data][crc32:4]
+        #[cfg(feature = "encryption")]
+        let (frame_data, record_size) = if let Some(ref enc) = self.encryptor {
+            let file_seq = self.current_sequence.load(Ordering::Relaxed);
+            // Use the file byte offset as the nonce counter, not the ephemeral
+            // record count. The byte offset survives restarts (file is append-only)
+            // and is unique per record within a file. Combined with the file sequence,
+            // this guarantees nonce uniqueness even after crash + restart.
+            //
+            // The nonce high word is 4 bytes, so the file sequence must fit in u32.
+            // With one rotation per ~64 MB of WAL, this allows ~256 exabytes of
+            // total WAL writes before exhaustion, which is effectively unlimited.
+            let seq_u32 = u32::try_from(file_seq).map_err(|_| {
+                Error::Internal(
+                    "WAL file sequence exceeds u32::MAX: encryption nonce space exhausted"
+                        .to_string(),
+                )
+            })?;
+            let byte_offset = log_file.size;
+            let nonce = grafeo_common::encryption::build_nonce(seq_u32, byte_offset);
+            let aad = b"grafeo-wal";
+            let encrypted = enc
+                .encrypt(data, &nonce, aad)
+                .map_err(|e| Error::Internal(format!("WAL encryption failed: {e}")))?;
+            // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
+            #[allow(clippy::cast_possible_truncation)]
+            let len = encrypted.len() as u32;
+            log_file.writer.write_all(&len.to_le_bytes())?;
+            log_file.writer.write_all(&encrypted)?;
+            let size = 4 + encrypted.len() as u64;
+            (true, size)
+        } else {
+            (false, 0u64)
+        };
+
+        #[cfg(feature = "encryption")]
+        if !frame_data {
+            // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
+            #[allow(clippy::cast_possible_truncation)]
+            let len = data.len() as u32;
+            log_file.writer.write_all(&len.to_le_bytes())?;
+            log_file.writer.write_all(data)?;
+            let checksum = crc32fast::hash(data);
+            log_file.writer.write_all(&checksum.to_le_bytes())?;
+        }
+
+        #[cfg(not(feature = "encryption"))]
+        {
+            // Write length prefix
+            // reason: WAL wire format uses u32 length prefix; individual records are well under 4 GiB
+            #[allow(clippy::cast_possible_truncation)]
+            let len = data.len() as u32;
+            log_file.writer.write_all(&len.to_le_bytes())?;
+
+            // Write data
+            log_file.writer.write_all(data)?;
+
+            // Write checksum
+            let checksum = crc32fast::hash(data);
+            log_file.writer.write_all(&checksum.to_le_bytes())?;
+        }
+
+        maybe_crash("wal_after_write");
+
+        // Update size tracking
+        #[cfg(feature = "encryption")]
+        let record_size = if frame_data {
+            record_size
+        } else {
+            4 + data.len() as u64 + 4
+        };
+        #[cfg(not(feature = "encryption"))]
+        let record_size = 4 + data.len() as u64 + 4; // length + data + checksum
+        log_file.size += record_size;
+
+        self.total_record_count.fetch_add(1, Ordering::Relaxed);
+        self.records_since_sync.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

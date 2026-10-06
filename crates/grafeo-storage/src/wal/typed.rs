@@ -14,6 +14,7 @@ use grafeo_common::types::TransactionId;
 use grafeo_common::utils::error::{Error, Result};
 
 use super::WalRecord;
+use super::group::{GroupBuffer, GroupLimits, SPILL_DIR};
 use super::log::{CheckpointMetadata, DurabilityMode, WalConfig, WalManager};
 use super::record::WalEntry;
 
@@ -185,6 +186,75 @@ impl<R: WalEntry> TypedWal<R> {
         let frame_refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
         let force_sync = records.iter().any(WalEntry::requires_sync);
         self.manager.write_frames(&frame_refs, force_sync)
+    }
+
+    /// Creates an empty group for this WAL: its spill file, if it needs one,
+    /// goes into the WAL directory's spill subdirectory, encrypted when this
+    /// WAL is.
+    #[must_use]
+    pub fn new_group(&self, limits: GroupLimits) -> GroupBuffer {
+        self.new_group_with(limits, false)
+    }
+
+    /// [`new_group`](Self::new_group), also encrypting the spill file when
+    /// `encrypt_spill` is set although this WAL is not encrypted (the caller
+    /// was configured for encryption at rest). Encryption needs the
+    /// `encryption` feature; without it the flag is ignored.
+    #[must_use]
+    pub fn new_group_with(&self, limits: GroupLimits, encrypt_spill: bool) -> GroupBuffer {
+        #[cfg(feature = "encryption")]
+        let encrypt = encrypt_spill || self.manager.is_encrypted();
+        #[cfg(not(feature = "encryption"))]
+        let encrypt = {
+            let _ = encrypt_spill;
+            false
+        };
+        GroupBuffer::new(self.manager.dir().join(SPILL_DIR), limits, encrypt)
+    }
+
+    /// Writes `group`'s records followed by `trailer` (its commit markers) as
+    /// one contiguous run: no other writer's record can land between them,
+    /// and the trailer comes last, so recovery commits the group only if all
+    /// of it reached the log. A spilled group is copied from its spill file
+    /// under the WAL's append lock (see [`GroupBuffer`]). The group is empty
+    /// afterwards, its spill file deleted, whatever the outcome.
+    ///
+    /// With `poison_on_error`, any failure poisons the WAL before another
+    /// writer can append (see [`log_atomic_or_poison`](Self::log_atomic_or_poison)).
+    ///
+    /// # Errors
+    ///
+    /// Returns the group's own error, writing nothing, if a push to it failed
+    /// (see [`GroupBuffer::push`]); otherwise an error if serialization,
+    /// reading the spill file or writing fails, or the WAL is poisoned.
+    pub fn log_group(
+        &self,
+        group: &mut GroupBuffer,
+        trailer: &[R],
+        poison_on_error: bool,
+    ) -> Result<()> {
+        let result = (|| {
+            if let Some(error) = group.failure() {
+                return Err(error);
+            }
+            let mut encoded = Vec::with_capacity(trailer.len());
+            let mut force_sync = group.requires_sync();
+            for record in trailer {
+                encoded.push(
+                    bincode::serde::encode_to_vec(record, bincode::config::standard())
+                        .map_err(|e| Error::Serialization(e.to_string()))?,
+                );
+                force_sync |= record.requires_sync();
+            }
+            if group.is_empty() && encoded.is_empty() {
+                return Ok(());
+            }
+            let frames: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+            self.manager
+                .write_group(group, &frames, force_sync, poison_on_error)
+        })();
+        group.clear();
+        result
     }
 
     /// Writes a checkpoint marker and persists checkpoint metadata.
@@ -543,5 +613,297 @@ mod tests {
         assert_eq!(log_files_with_data(dir.path()), 1);
         wal.log_batch(&group).unwrap();
         assert_eq!(log_files_with_data(dir.path()), 2);
+    }
+
+    // --- Spilling groups (`log_group`) ---
+
+    fn spill_limits() -> GroupLimits {
+        GroupLimits {
+            spill_threshold: 128,
+            max_bytes: u64::MAX,
+        }
+    }
+
+    fn spill_node(id: u64) -> WalRecord {
+        WalRecord::CreateNode {
+            id: NodeId::new(id),
+            labels: vec!["Spill".to_string()],
+        }
+    }
+
+    fn created(records: &[WalRecord]) -> Vec<u64> {
+        records
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::CreateNode { id, .. } => Some(id.as_u64()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn spill_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join(SPILL_DIR)).map_or(0, |d| d.count())
+    }
+
+    fn commit_marker(tx: u64) -> WalRecord {
+        WalRecord::TransactionCommit {
+            transaction_id: TransactionId::new(tx),
+        }
+    }
+
+    #[test]
+    fn test_spilled_group_commits_as_one_contiguous_run() {
+        use super::super::WalRecovery;
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        {
+            let wal: Arc<LpgWal> = Arc::new(TypedWal::open(dir.path()).unwrap());
+            // Small writers keep appending while two large spilled groups commit.
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let small = {
+                let wal = Arc::clone(&wal);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut n = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let id = 1_000_000 + n;
+                        wal.log_batch(&[spill_node(id), commit_marker(id)]).unwrap();
+                        n += 1;
+                    }
+                    n
+                })
+            };
+            let large: Vec<_> = (0..2u64)
+                .map(|writer| {
+                    let wal = Arc::clone(&wal);
+                    std::thread::spawn(move || {
+                        let mut group = wal.new_group(spill_limits());
+                        for k in 0..3000 {
+                            group.push(&spill_node(writer * 10_000 + k)).unwrap();
+                        }
+                        assert!(group.is_spilled());
+                        let path = group.spill_path().unwrap().to_path_buf();
+                        wal.log_group(&mut group, &[commit_marker(writer)], true)
+                            .unwrap();
+                        assert!(!path.exists(), "the commit deletes the spill file");
+                    })
+                })
+                .collect();
+            for writer in large {
+                writer.join().unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(small.join().unwrap() > 0);
+            wal.sync().unwrap();
+        }
+        assert_eq!(spill_files(dir.path()), 0);
+
+        // Each large group is one unbroken run closed by its own commit.
+        let records = WalRecovery::new(dir.path()).recover().unwrap();
+        for writer in 0..2u64 {
+            let base = writer * 10_000;
+            let start = records
+                .iter()
+                .position(|r| created(std::slice::from_ref(r)) == [base])
+                .unwrap();
+            let run = &records[start..start + 3001];
+            assert_eq!(
+                created(&run[..3000]),
+                (base..base + 3000).collect::<Vec<_>>()
+            );
+            assert!(matches!(
+                run[3000],
+                WalRecord::TransactionCommit { transaction_id } if transaction_id.as_u64() == writer
+            ));
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn test_spilled_group_in_encrypted_wal() {
+        use super::super::WalRecovery;
+        let key = [7u8; 32];
+        let dir = tempdir().unwrap();
+        {
+            let mut manager = WalManager::open(dir.path()).unwrap();
+            manager.set_encryptor(grafeo_common::encryption::PageEncryptor::new(&key));
+            let wal: LpgWal = TypedWal {
+                manager,
+                _record: PhantomData,
+            };
+            let mut group = wal.new_group(spill_limits());
+            for k in 0..500 {
+                group.push(&spill_node(k)).unwrap();
+            }
+            assert!(group.is_spilled());
+            wal.log_group(&mut group, &[commit_marker(1)], true)
+                .unwrap();
+            wal.sync().unwrap();
+        }
+        let mut recovery = WalRecovery::new(dir.path());
+        recovery.set_encryptor(grafeo_common::encryption::PageEncryptor::new(&key));
+        let records = recovery.recover().unwrap();
+        assert_eq!(created(&records), (0..500).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_failed_group_writes_nothing() {
+        use super::super::WalRecovery;
+        let dir = tempdir().unwrap();
+        let wal: LpgWal = TypedWal::open(dir.path()).unwrap();
+        let mut group = wal.new_group(GroupLimits {
+            spill_threshold: 64,
+            max_bytes: 200,
+        });
+        while group.push(&spill_node(1)).is_ok() {}
+        let err = wal
+            .log_group(&mut group, &[commit_marker(1)], true)
+            .unwrap_err();
+        assert!(err.error_code().is_retryable(), "{err}");
+        assert!(group.is_empty());
+        assert!(wal.poisoned_reason().is_none(), "nothing was appended");
+        wal.sync().unwrap();
+        assert!(WalRecovery::new(dir.path()).recover().unwrap().is_empty());
+        assert_eq!(spill_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn test_damaged_spill_file_poisons_and_commits_nothing() {
+        use super::super::WalRecovery;
+        let dir = tempdir().unwrap();
+        {
+            let wal: LpgWal = TypedWal::open(dir.path()).unwrap();
+            wal.log_batch(&[spill_node(1), commit_marker(1)]).unwrap();
+            let mut group = wal.new_group(spill_limits());
+            for k in 100..400 {
+                group.push(&spill_node(k)).unwrap();
+            }
+            // Write the frames out, then flip a byte in the middle of the file.
+            let path = group.spill_path().unwrap().to_path_buf();
+            let mut sink_count = 0;
+            group
+                .for_each_frame(&mut |_| {
+                    sink_count += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(sink_count, 300);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0xFF;
+            std::fs::write(&path, &bytes).unwrap();
+
+            let err = wal
+                .log_group(&mut group, &[commit_marker(2)], true)
+                .unwrap_err();
+            assert!(err.to_string().contains("damaged"), "{err}");
+            assert!(wal.poisoned_reason().is_some());
+            assert!(wal.log(&spill_node(5)).is_err(), "poisoned");
+        }
+        let recovered = WalRecovery::new(dir.path()).recover_with_tail().unwrap();
+        assert_eq!(created(&recovered.records), vec![1]);
+        assert!(recovered.torn_tail, "the partial group is an open tail");
+    }
+
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn test_crash_mid_copy_leaves_an_uncommitted_tail() {
+        use super::super::WalRecovery;
+        use grafeo_common::testing::crash::{CrashResult, with_crash_at};
+
+        let dir = tempdir().unwrap();
+        let leftover;
+        {
+            let wal: LpgWal = TypedWal::open(dir.path()).unwrap();
+            wal.log_batch(&[spill_node(1), commit_marker(1)]).unwrap();
+            let mut group = wal.new_group(spill_limits());
+            for k in 100..1100 {
+                group.push(&spill_node(k)).unwrap();
+            }
+            leftover = group.spill_path().unwrap().to_path_buf();
+            // Each frame passes two crash points: crash halfway through the copy.
+            let wal_ref = std::panic::AssertUnwindSafe(&wal);
+            let mut group = std::panic::AssertUnwindSafe(group);
+            let outcome = with_crash_at(1000, move || {
+                let _ = wal_ref.log_group(&mut group, &[commit_marker(2)], true);
+                // A real crash runs no destructor: keep the spill file.
+                std::mem::forget(std::mem::replace(
+                    &mut *group,
+                    GroupBuffer::new(PathBuf::new(), GroupLimits::default(), false),
+                ));
+            });
+            assert!(matches!(outcome, CrashResult::Crashed));
+        }
+        // The panic unwound through the group, which deleted its file; put a
+        // stand-in back to check that reopening cleans up after a hard crash.
+        std::fs::create_dir_all(leftover.parent().unwrap()).unwrap();
+        std::fs::write(&leftover, b"left by a crash").unwrap();
+
+        let recovered = WalRecovery::new(dir.path()).recover_with_tail().unwrap();
+        assert_eq!(
+            created(&recovered.records),
+            vec![1],
+            "the group is not committed"
+        );
+        assert!(recovered.torn_tail);
+
+        // Reopen as the engine does: seal the tail, then commit more.
+        {
+            // As the engine does at a writable open.
+            assert_eq!(
+                super::super::remove_leftover_spill_files(dir.path()).unwrap(),
+                1
+            );
+            let wal: LpgWal = TypedWal::open(dir.path()).unwrap();
+            assert!(
+                !leftover.exists(),
+                "the cleanup removes leftover spill files"
+            );
+            wal.seal_torn_tail().unwrap();
+            wal.log_batch(&[spill_node(9), commit_marker(9)]).unwrap();
+            wal.sync().unwrap();
+        }
+        let records = WalRecovery::new(dir.path()).recover().unwrap();
+        assert_eq!(created(&records), vec![1, 9]);
+    }
+
+    /// Measures how long a commit holds the WAL's append lock for a spilled
+    /// group, against the same group in RAM. Run with
+    /// `cargo test -p grafeo-storage --release --lib measure_spilled_commit -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement, not a check"]
+    fn measure_spilled_commit_lock_hold() {
+        for mib in [16u64, 64, 256] {
+            let records = mib * 1024; // ~1 KiB each
+            let record = |k: u64| WalRecord::SetNodeProperty {
+                id: NodeId::new(k),
+                key: "payload".to_string(),
+                value: grafeo_common::types::Value::from("x".repeat(1000)),
+            };
+            for spill in [false, true] {
+                let dir = tempdir().unwrap();
+                let wal: LpgWal = TypedWal::open(dir.path()).unwrap();
+                let mut group = wal.new_group(GroupLimits {
+                    spill_threshold: if spill { 8 << 20 } else { usize::MAX },
+                    max_bytes: u64::MAX,
+                });
+                for k in 0..records {
+                    group.push(&record(k)).unwrap();
+                }
+                assert_eq!(group.is_spilled(), spill);
+                let peak = group.peak_ram_bytes();
+                let start = std::time::Instant::now();
+                wal.log_group(&mut group, &[commit_marker(1)], true)
+                    .unwrap();
+                let held = start.elapsed();
+                println!(
+                    "{mib:>4} MiB group, {}: append (lock held) {:>7.1} ms, peak buffer RAM {:>6} KiB",
+                    if spill { "spilled" } else { "in RAM " },
+                    held.as_secs_f64() * 1000.0,
+                    peak.max(group.peak_ram_bytes()) / 1024
+                );
+            }
+        }
     }
 }
