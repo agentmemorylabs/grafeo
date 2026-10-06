@@ -254,8 +254,9 @@ mod generation_root {
     }
 
     #[test]
-    fn generation_root_rollback_walks_only_the_changes() {
+    fn generation_root_rollback_and_commit_walk_only_the_changes() {
         let mut walked = Vec::new();
+        let mut commits = Vec::new();
         for overlay_rows in [100, 5_000] {
             let dir = tempdir().unwrap();
             let root = dir.path().join("root");
@@ -285,13 +286,15 @@ mod generation_root {
             );
             walked.push(rollback);
 
-            // The same changes still commit.
+            // The same changes still commit, also walking only the changes.
             let mut session = db.session();
             session.begin_transaction().unwrap();
             for query in MUTATIONS {
                 session.execute(query).expect(query);
             }
+            let start = overlay.transaction_versions_walked();
             session.commit().unwrap();
+            commits.push(overlay.transaction_versions_walked() - start);
             let after = state(&db);
             assert_eq!(after["lookup alix"], "[]");
             assert_eq!(after["lookup gus-renamed"].matches("NodeId").count(), 1);
@@ -303,5 +306,10 @@ mod generation_root {
             "versions walked by the rollback must not grow with the overlay: {walked:?}"
         );
         assert!(walked[0] <= 16, "the rollback walked {walked:?} versions");
+        assert_eq!(
+            commits[0], commits[1],
+            "versions walked by the commit must not grow with the overlay: {commits:?}"
+        );
+        assert!(commits[0] <= 16, "the commit walked {commits:?} versions");
     }
 }
