@@ -3715,6 +3715,23 @@ impl GrafeoDB {
         false
     }
 
+    /// Refuses a write once the WAL is poisoned, before anything is mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the poison's "WAL refuses writes" error.
+    #[cfg(feature = "wal")]
+    pub(super) fn check_wal_writable(&self) -> Result<()> {
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            return Err(Error::Internal(format!(
+                "WAL refuses writes until the database is reopened: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
     /// A WAL buffer for one session or one database-level statement, or
     /// `None` without a WAL. Buffers of one database share its commit order
     /// and the configured `wal_transaction_buffer_cap`; a group that fails to
@@ -3743,22 +3760,30 @@ impl GrafeoDB {
     /// contiguous append closed by `[TransactionCommit(SYSTEM),
     /// EpochAdvance]`, so a crash cannot keep part of it and a later commit
     /// marker cannot settle it (#411). A failed append poisons the WAL.
+    ///
+    /// The `GrafeoDB`-level writes apply their change before this group is
+    /// written and do not take the sessions' commit-order lock, on every
+    /// kind of database (generation roots included). A session that sees
+    /// such a write and overwrites it can commit before the group lands, and
+    /// replay then applies the older value last. Callers mixing these writes
+    /// with session transactions on the same entities must serialize them.
     #[cfg(feature = "wal")]
     pub(super) fn log_wal_group(&self, records: Vec<WalRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
         match self.new_wal_buffer() {
-            Some(buffer) => {
-                buffer.write_implicit_group(&records, self.transaction_manager.current_epoch())
-            }
+            Some(buffer) => buffer
+                .write_implicit_group(&records, self.transaction_manager.current_epoch())
+                .map_err(crate::transaction::wal_buffer::unconfirmed_write_error),
             None => Ok(()),
         }
     }
 
     /// Logs a bare WAL record, outside any group, if WAL is enabled. Only for
-    /// [`save`](Self::save), which fills a fresh target database that its
-    /// `close()` then commits as a whole.
+    /// [`save`](Self::save), which fills a target database that its
+    /// `close()` then commits as a whole; the target must be new and unused
+    /// while the save runs (see `save`).
     #[cfg(feature = "wal")]
     pub(super) fn log_wal_bare(&self, record: &WalRecord) -> Result<()> {
         if let Some(ref wal) = self.wal {

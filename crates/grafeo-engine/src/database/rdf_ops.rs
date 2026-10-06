@@ -62,11 +62,15 @@ impl GrafeoDB {
         #[cfg(feature = "wal")]
         let wal_buffer = self.new_wal_buffer();
         #[cfg(feature = "wal")]
-        let flush_wal = || {
-            if let Some(ref buffer) = wal_buffer
-                && let Err(e) = buffer.flush_implicit(self.transaction_manager.current_epoch())
-            {
-                grafeo_common::grafeo_warn!("Failed to write SPARQL update to WAL: {}", e);
+        let flush_wal = || -> Result<()> {
+            match wal_buffer {
+                Some(ref buffer) => buffer
+                    .flush_implicit(self.transaction_manager.current_epoch())
+                    .map_err(|e| {
+                        grafeo_common::grafeo_warn!("Failed to write SPARQL update to WAL: {}", e);
+                        crate::transaction::wal_buffer::unconfirmed_write_error(e)
+                    }),
+                None => Ok(()),
             }
         };
 
@@ -81,8 +85,10 @@ impl GrafeoDB {
             let executor = Executor::with_columns(physical_plan.columns.clone());
             let result = executor.execute(physical_plan.operator.as_mut());
             #[cfg(feature = "wal")]
-            flush_wal();
+            let flushed = flush_wal();
             let _result = result?;
+            #[cfg(feature = "wal")]
+            flushed?;
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
             let tree = crate::query::profile::build_profile_tree(
@@ -101,9 +107,14 @@ impl GrafeoDB {
         // Execute the plan
         let executor = Executor::with_columns(physical_plan.columns.clone());
         let result = executor.execute(physical_plan.operator.as_mut());
+        // A record refused by the cap, or a failed group, fails the update
+        // (it is applied in memory and cannot be undone).
         #[cfg(feature = "wal")]
-        flush_wal();
-        result
+        let flushed = flush_wal();
+        let result = result?;
+        #[cfg(feature = "wal")]
+        flushed?;
+        Ok(result)
     }
 
     /// Returns the RDF store.

@@ -121,10 +121,9 @@ impl Session {
         let mut physical_plan = planner.plan(&optimized_plan)?;
 
         let executor = self.make_executor(physical_plan.columns.clone());
-        let result = executor.execute(physical_plan.operator.as_mut());
-        // Without a transaction, the statement's WAL records form their own group.
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
+        // Without a transaction, the statement's WAL records form their own
+        // group; a failure to write it fails the statement.
+        let result = self.finish_write(executor.execute(physical_plan.operator.as_mut()));
 
         #[cfg(feature = "metrics")]
         {
@@ -192,10 +191,9 @@ impl Session {
         let mut physical_plan = planner.plan(&optimized_plan)?;
 
         let executor = self.make_executor(physical_plan.columns.clone());
-        let result = executor.execute(physical_plan.operator.as_mut());
-        // Without a transaction, the statement's WAL records form their own group.
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
+        // Without a transaction, the statement's WAL records form their own
+        // group; a failure to write it fails the statement.
+        let result = self.finish_write(executor.execute(physical_plan.operator.as_mut()));
 
         #[cfg(feature = "metrics")]
         {
@@ -250,10 +248,9 @@ impl Session {
         let mut physical_plan = planner.plan(&optimized_plan)?;
 
         let executor = self.make_executor(physical_plan.columns.clone());
-        let result = executor.execute(physical_plan.operator.as_mut());
-        // Without a transaction, the statement's WAL records form their own group.
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
+        // Without a transaction, the statement's WAL records form their own
+        // group; a failure to write it fails the statement.
+        let result = self.finish_write(executor.execute(physical_plan.operator.as_mut()));
 
         #[cfg(feature = "metrics")]
         {
@@ -317,10 +314,9 @@ impl Session {
         let mut physical_plan = planner.plan(&optimized_plan)?;
 
         let executor = self.make_executor(physical_plan.columns.clone());
-        let result = executor.execute(physical_plan.operator.as_mut());
-        // Without a transaction, the statement's WAL records form their own group.
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
+        // Without a transaction, the statement's WAL records form their own
+        // group; a failure to write it fails the statement.
+        let result = self.finish_write(executor.execute(physical_plan.operator.as_mut()));
 
         #[cfg(feature = "metrics")]
         {

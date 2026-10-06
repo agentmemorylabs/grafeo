@@ -31,6 +31,9 @@ impl super::GrafeoDB {
     /// Returns an error if the WAL log (when enabled) fails to record the
     /// creation.
     pub fn create_node(&self, labels: &[&str]) -> Result<grafeo_common::types::NodeId> {
+        // Refused before anything is mutated once the WAL is poisoned.
+        #[cfg(feature = "wal")]
+        self.check_wal_writable()?;
         let id = self.lpg_store().create_node(labels);
 
         // Log to WAL if enabled
@@ -71,6 +74,9 @@ impl super::GrafeoDB {
             ),
         >,
     ) -> Result<grafeo_common::types::NodeId> {
+        // Refused before anything is mutated once the WAL is poisoned.
+        #[cfg(feature = "wal")]
+        self.check_wal_writable()?;
         // Collect properties first so we can log them to WAL
         let props: Vec<(
             grafeo_common::types::PropertyKey,
@@ -314,6 +320,9 @@ impl super::GrafeoDB {
     /// Returns an error if the WAL log (when enabled) fails to record the
     /// deletion.
     pub fn delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {
+        // Refused before anything is mutated once the WAL is poisoned.
+        #[cfg(feature = "wal")]
+        self.check_wal_writable()?;
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if self.layered_store.is_some() {
             return self.layered_delete_node(id);
@@ -429,6 +438,9 @@ impl super::GrafeoDB {
         key: &str,
         value: grafeo_common::types::Value,
     ) -> Result<()> {
+        // Refused before anything is mutated once the WAL is poisoned.
+        #[cfg(feature = "wal")]
+        self.check_wal_writable()?;
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if self.layered_store.is_some() {
             return self.layered_set_node_property(id, key, value);
@@ -549,6 +561,10 @@ impl super::GrafeoDB {
     /// assert!(added);
     /// ```
     pub fn add_node_label(&self, id: grafeo_common::types::NodeId, label: &str) -> bool {
+        // Refused before anything is mutated once the WAL is poisoned.
+        if self.refuse_write_if_wal_poisoned("add_node_label") {
+            return false;
+        }
         let result = self.lpg_store().add_label(id, label);
 
         #[cfg(feature = "wal")]
@@ -617,6 +633,10 @@ impl super::GrafeoDB {
     /// assert!(removed);
     /// ```
     pub fn remove_node_label(&self, id: grafeo_common::types::NodeId, label: &str) -> bool {
+        // Refused before anything is mutated once the WAL is poisoned.
+        if self.refuse_write_if_wal_poisoned("remove_node_label") {
+            return false;
+        }
         // Collect text indexes to clean BEFORE removing the label
         #[cfg(feature = "text-index")]
         let text_indexes_to_clean: Vec<
@@ -703,6 +723,10 @@ impl super::GrafeoDB {
         dst: grafeo_common::types::NodeId,
         edge_type: &str,
     ) -> grafeo_common::types::EdgeId {
+        // Refused before anything is mutated once the WAL is poisoned.
+        if self.refuse_write_if_wal_poisoned("create_edge") {
+            return grafeo_common::types::EdgeId::INVALID;
+        }
         let id = self.lpg_store().create_edge(src, dst, edge_type);
 
         // Log to WAL if enabled
@@ -746,6 +770,10 @@ impl super::GrafeoDB {
             ),
         >,
     ) -> grafeo_common::types::EdgeId {
+        // Refused before anything is mutated once the WAL is poisoned.
+        if self.refuse_write_if_wal_poisoned("create_edge_with_props") {
+            return grafeo_common::types::EdgeId::INVALID;
+        }
         // Collect properties first so we can log them to WAL
         let props: Vec<(
             grafeo_common::types::PropertyKey,
@@ -911,6 +939,10 @@ impl super::GrafeoDB {
     ///
     /// If WAL is enabled, the operation is logged for durability.
     pub fn delete_edge(&self, id: grafeo_common::types::EdgeId) -> bool {
+        // Refused before anything is mutated once the WAL is poisoned.
+        if self.refuse_write_if_wal_poisoned("delete_edge") {
+            return false;
+        }
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if self.layered_store.is_some() {
             return self.layered_delete_edge(id);
@@ -957,6 +989,10 @@ impl super::GrafeoDB {
         key: &str,
         value: grafeo_common::types::Value,
     ) {
+        // Refused before anything is mutated once the WAL is poisoned.
+        if self.refuse_write_if_wal_poisoned("set_edge_property") {
+            return;
+        }
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if self.layered_store.is_some() {
             self.layered_set_edge_property(id, key, value);
@@ -1008,6 +1044,10 @@ impl super::GrafeoDB {
     ///
     /// Returns true if the property existed and was removed, false otherwise.
     pub fn remove_node_property(&self, id: grafeo_common::types::NodeId, key: &str) -> bool {
+        // Refused before anything is mutated once the WAL is poisoned.
+        if self.refuse_write_if_wal_poisoned("remove_node_property") {
+            return false;
+        }
         let removed = self.lpg_store().remove_node_property(id, key).is_some();
 
         #[cfg(feature = "wal")]
@@ -1037,6 +1077,10 @@ impl super::GrafeoDB {
     ///
     /// Returns true if the property existed and was removed, false otherwise.
     pub fn remove_edge_property(&self, id: grafeo_common::types::EdgeId, key: &str) -> bool {
+        // Refused before anything is mutated once the WAL is poisoned.
+        if self.refuse_write_if_wal_poisoned("remove_edge_property") {
+            return false;
+        }
         let removed = self.lpg_store().remove_edge_property(id, key).is_some();
 
         #[cfg(feature = "wal")]
@@ -1155,11 +1199,13 @@ impl super::GrafeoDB {
     /// vector indexes. Text values are automatically inserted into matching text
     /// indexes.
     ///
-    /// **Atomicity note:** Individual node creations within the batch are NOT
-    /// atomic as a group. If a failure occurs mid-batch (e.g. WAL write error),
-    /// nodes created before the failure will persist while later nodes may not.
-    /// If you need all-or-nothing semantics, wrap the call in an explicit
-    /// transaction.
+    /// The whole batch is one WAL group, written after the nodes are created
+    /// and outside the sessions' commit order: callers that let sessions
+    /// overwrite the new nodes while the batch runs must serialize the two.
+    /// If it cannot be written the nodes exist in memory but may not survive a
+    /// reopen, and the WAL is poisoned. This method only logs that failure;
+    /// use [`try_batch_create_nodes_with_props`](Self::try_batch_create_nodes_with_props)
+    /// to get it as an error.
     ///
     /// # Arguments
     ///
@@ -1180,11 +1226,56 @@ impl super::GrafeoDB {
             >,
         >,
     ) -> Vec<grafeo_common::types::NodeId> {
+        let (ids, wal_result) = self.batch_create_nodes_with_props_logged(label, properties_list);
+        if let Err(e) = wal_result {
+            grafeo_common::grafeo_warn!("batch_create_nodes_with_props: {e}");
+        }
+        ids
+    }
+
+    /// [`batch_create_nodes_with_props`](Self::batch_create_nodes_with_props)
+    /// that reports a lost WAL group.
+    ///
+    /// # Errors
+    ///
+    /// Returns the "WAL refuses writes" error, with nothing created, once
+    /// the WAL is poisoned. Returns the durability-unconfirmed error when the
+    /// batch's WAL group cannot be written: the nodes were created in memory
+    /// and are not undone, they may not survive a reopen, and the WAL is
+    /// poisoned.
+    pub fn try_batch_create_nodes_with_props(
+        &self,
+        label: &str,
+        properties_list: Vec<
+            std::collections::HashMap<
+                grafeo_common::types::PropertyKey,
+                grafeo_common::types::Value,
+            >,
+        >,
+    ) -> Result<Vec<grafeo_common::types::NodeId>> {
+        let (ids, wal_result) = self.batch_create_nodes_with_props_logged(label, properties_list);
+        wal_result.map(|()| ids)
+    }
+
+    /// The body of the batch creates: the created IDs, and whether the WAL
+    /// accepted the batch.
+    fn batch_create_nodes_with_props_logged(
+        &self,
+        label: &str,
+        properties_list: Vec<
+            std::collections::HashMap<
+                grafeo_common::types::PropertyKey,
+                grafeo_common::types::Value,
+            >,
+        >,
+    ) -> (Vec<grafeo_common::types::NodeId>, Result<()>) {
         #[cfg(any(feature = "vector-index", feature = "text-index"))]
         use grafeo_common::types::Value;
 
-        if self.refuse_write_if_wal_poisoned("batch_create_nodes_with_props") {
-            return Vec::new();
+        // Refused before anything is created once the WAL is poisoned.
+        #[cfg(feature = "wal")]
+        if let Err(e) = self.check_wal_writable() {
+            return (Vec::new(), Err(e));
         }
 
         let labels: &[&str] = &[label];
@@ -1249,9 +1340,9 @@ impl super::GrafeoDB {
             .collect();
 
         #[cfg(feature = "wal")]
-        if let Err(e) = self.log_wal_group(wal_records) {
-            grafeo_warn!("Failed to log batch_create_nodes_with_props to WAL: {}", e);
-        }
+        let wal_result = self.log_wal_group(wal_records);
+        #[cfg(not(feature = "wal"))]
+        let wal_result: Result<()> = Ok(());
 
         // Auto-insert into matching vector indexes for any vector properties
         #[cfg(feature = "vector-index")]
@@ -1313,7 +1404,7 @@ impl super::GrafeoDB {
             }
         }
 
-        ids
+        (ids, wal_result)
     }
 
     /// Offline bulk loader for a fresh, unpublished graph.

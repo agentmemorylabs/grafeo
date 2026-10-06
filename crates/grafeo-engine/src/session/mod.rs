@@ -497,15 +497,39 @@ impl Session {
     /// group with its own commit marker. Does nothing inside a transaction,
     /// whose records are written at commit.
     ///
-    /// WAL write failures are logged via `grafeo_warn!` and not propagated.
+    /// # Errors
+    ///
+    /// A refused record (over the cap) keeps its retryable error. A failed
+    /// append becomes the durability-unconfirmed error: the write is applied
+    /// in memory and cannot be undone, and the WAL is poisoned.
     #[cfg(feature = "wal")]
-    fn flush_wal_outside_transaction(&self) {
-        if let Some(ref wal) = self.wal
-            && self.current_transaction.lock().is_none()
-            && let Err(e) = wal.flush_implicit(self.transaction_manager.current_epoch())
-        {
-            grafeo_warn!("Session: failed to write WAL records: {}", e);
+    fn flush_wal_outside_transaction(&self) -> Result<()> {
+        let Some(ref wal) = self.wal else {
+            return Ok(());
+        };
+        if self.current_transaction.lock().is_some() {
+            return Ok(());
         }
+        wal.flush_implicit(self.transaction_manager.current_epoch())
+            .map_err(|e| {
+                grafeo_warn!("Session: failed to write WAL records: {}", e);
+                crate::transaction::wal_buffer::unconfirmed_write_error(e)
+            })
+    }
+
+    /// Finishes a write's result for the WAL: inside a transaction a record
+    /// the buffer refused (over the cap) fails the statement; outside one the
+    /// write's records are written as an implicit group, and a failure to
+    /// write them fails the call. The first error wins.
+    fn finish_write<T>(&self, result: Result<T>) -> Result<T> {
+        let result = result.and_then(|value| self.check_wal_buffer().map(|()| value));
+        #[cfg(feature = "wal")]
+        let flushed = self.flush_wal_outside_transaction();
+        #[cfg(not(feature = "wal"))]
+        let flushed: Result<()> = Ok(());
+        let value = result?;
+        flushed?;
+        Ok(value)
     }
 
     /// Records a direct write's WAL record, after the store write took
@@ -835,11 +859,8 @@ impl Session {
     ) -> Result<T> {
         self.check_wal_writable()?;
         if !store.is_layered() {
-            let result = write().and_then(|v| self.check_wal_buffer().map(|()| v));
             // Outside a transaction the write's records form their own group.
-            #[cfg(feature = "wal")]
-            self.flush_wal_outside_transaction();
-            return result;
+            return self.finish_write(write());
         }
         if self.db_read_only || *self.read_only_tx.lock() {
             return Err(grafeo_common::utils::error::Error::Transaction(
@@ -847,10 +868,7 @@ impl Session {
             ));
         }
         if !self.needs_auto_commit(true) {
-            let result = write().and_then(|v| self.check_wal_buffer().map(|()| v));
-            #[cfg(feature = "wal")]
-            self.flush_wal_outside_transaction();
-            return result;
+            return self.finish_write(write());
         }
         self.check_no_active_streams("write")?;
         self.begin_transaction_inner(false, None)?;
@@ -4633,6 +4651,9 @@ impl Session {
     /// Returns an error if no transaction is active.
     #[cfg(feature = "lpg")]
     pub fn savepoint(&self, name: &str) -> Result<()> {
+        // A savepoint after a refused WAL record would let a rollback to it
+        // clear the refusal while the refused write stays in the transaction.
+        self.check_wal_buffer()?;
         let tx_id = self.current_transaction.lock().ok_or_else(|| {
             grafeo_common::utils::error::Error::Transaction(
                 grafeo_common::utils::error::TransactionError::InvalidState(
@@ -4947,11 +4968,8 @@ impl Session {
         } else {
             // Inside a transaction a refused WAL record fails the statement
             // (the transaction can still be rolled back); outside one the
-            // flush below poisons the WAL.
-            let result = body().and_then(|r| self.check_wal_buffer().map(|()| r));
-            #[cfg(feature = "wal")]
-            self.flush_wal_outside_transaction();
-            result
+            // statement's group is written, or its failure reported.
+            self.finish_write(body())
         }
     }
 
@@ -4961,10 +4979,7 @@ impl Session {
     where
         F: FnOnce() -> Result<QueryResult>,
     {
-        let result = body();
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
-        result
+        self.finish_write(body())
     }
 
     /// Quick heuristic: returns `true` when the query text looks like it
@@ -5444,8 +5459,9 @@ impl Session {
             labels: labels.iter().map(|s| (*s).to_string()).collect(),
         });
 
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
+        if let Err(e) = self.finish_write(Ok(())) {
+            grafeo_warn!("Session: create_node's WAL write failed: {e}");
+        }
 
         id
     }
@@ -5467,6 +5483,8 @@ impl Session {
         for (key, value) in &props {
             self.check_property_size(key, value)?;
         }
+        // Refused before anything is created once the WAL is poisoned.
+        self.check_wal_writable()?;
 
         // Snapshot the props for WAL before passing them to the LPG store.
         // The LPG store consumes `props` by value; we need owned copies for
@@ -5521,10 +5539,7 @@ impl Session {
             })?;
         }
 
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
-
-        Ok(id)
+        self.finish_write(Ok(id))
     }
 
     /// Creates an edge between two nodes.
@@ -5561,8 +5576,9 @@ impl Session {
             edge_type: edge_type.to_string(),
         });
 
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
+        if let Err(e) = self.finish_write(Ok(())) {
+            grafeo_warn!("Session: create_edge's WAL write failed: {e}");
+        }
 
         eid
     }
@@ -5584,6 +5600,8 @@ impl Session {
         for (key, value) in &props {
             self.check_property_size(key, value)?;
         }
+        // Refused before anything is created once the WAL is poisoned.
+        self.check_wal_writable()?;
         let (epoch, transaction_id) = self.get_transaction_context();
         let tid = transaction_id.unwrap_or(TransactionId::SYSTEM);
         let store = self.active_lpg_store();
@@ -5609,10 +5627,7 @@ impl Session {
             }
         }
 
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
-
-        Ok(eid)
+        self.finish_write(Ok(eid))
     }
 
     /// Sets a node property within the active transaction context.
@@ -6052,7 +6067,9 @@ impl Drop for Session {
         // Records made outside a transaction that no statement boundary wrote
         // yet.
         #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
+        if let Err(e) = self.flush_wal_outside_transaction() {
+            grafeo_warn!("Session: WAL records written at drop failed: {e}");
+        }
 
         #[cfg(feature = "metrics")]
         if let Some(ref reg) = self.metrics {

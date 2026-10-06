@@ -528,6 +528,12 @@ impl super::GrafeoDB {
     ///
     /// The original database remains unchanged.
     ///
+    /// The target must be a new path that nothing else uses while the save
+    /// runs. A WAL-directory target is filled with WAL records that only its
+    /// final `close()` commits; this is not checked. An existing target is
+    /// opened (and recovered) like any database and the copy is written on
+    /// top of it, and a crash before the save returns can lose the copy.
+    ///
     /// # Errors
     ///
     /// Returns an error if the save operation fails.

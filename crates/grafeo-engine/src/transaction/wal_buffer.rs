@@ -356,6 +356,21 @@ impl WalBuffer {
     }
 }
 
+/// The error for a write outside a transaction whose implicit group failed:
+/// a refused record (over the cap) keeps its retryable error; a failed
+/// append becomes "durability unconfirmed", because the write is applied in
+/// memory, cannot be undone, and the WAL is poisoned.
+pub(crate) fn unconfirmed_write_error(error: Error) -> Error {
+    match error {
+        Error::AdmissionRetryable(_) => error,
+        other => Error::Internal(format!(
+            "write applied in memory; durability unconfirmed (it may have been written): \
+             its WAL group failed ({other}); the WAL refuses further writes until the \
+             database is reopened"
+        )),
+    }
+}
+
 /// Markers closing an implicit group (writes and schema changes outside a
 /// transaction): a system commit, and the epoch advance generation-root
 /// replay requires right after every commit. `epoch` is the current epoch;
