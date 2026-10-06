@@ -60,7 +60,9 @@ fn as_u64(value: &Value) -> u64 {
 
 fn node(db: &GrafeoDB, name: &str) -> NodeId {
     let r = db
-        .execute_cypher(&format!("MATCH (n:MemoryEntity {{name: '{name}'}}) RETURN id(n)"))
+        .execute_cypher(&format!(
+            "MATCH (n:MemoryEntity {{name: '{name}'}}) RETURN id(n)"
+        ))
         .expect("node lookup");
     assert_eq!(r.row_count(), 1, "exactly one node named {name}");
     NodeId::new(as_u64(&r.rows()[0][0]))
@@ -107,7 +109,11 @@ fn create_rel(db: &GrafeoDB, rel_type: &str, in_txn: bool) -> EdgeId {
     if in_txn {
         session.commit().expect("commit create");
     }
-    assert_eq!(rel_count(db, rel_type), 1, "overlay edge {rel_type} visible");
+    assert_eq!(
+        rel_count(db, rel_type),
+        1,
+        "overlay edge {rel_type} visible"
+    );
     id
 }
 
@@ -207,7 +213,10 @@ fn e_base_edge_deletes_in_txn() {
         .execute_cypher(&format!("{} RETURN id(r)", rel_match("base")))
         .expect("base edge id");
     let e = EdgeId::new(as_u64(&r.rows()[0][0]));
-    assert!(delete_edge(&db, e, true), "delete_edge(base) returned false");
+    assert!(
+        delete_edge(&db, e, true),
+        "delete_edge(base) returned false"
+    );
     assert_edge_gone(&db, e, "base", "E");
 }
 
