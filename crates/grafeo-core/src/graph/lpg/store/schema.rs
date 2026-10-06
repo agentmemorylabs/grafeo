@@ -7,18 +7,30 @@ use grafeo_common::types::{NodeId, TransactionId};
 use grafeo_common::utils::hash::FxHashMap;
 
 impl LpgStore {
-    /// Adds a label to a node.
+    /// Adds a label to a node that exists for `viewer`: visible at the
+    /// current epoch (`None`), or to that transaction, its own PENDING
+    /// creations included (`Some`). The transactional writes and every
+    /// undo use `Some`, so a node the transaction created keeps its labels.
     ///
     /// Returns true if the label was added, false if the node doesn't exist
     /// or already has the label.
     #[cfg(not(feature = "tiered-storage"))]
-    pub fn add_label(&self, node_id: NodeId, label: &str) -> bool {
+    pub(super) fn add_label_as(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        viewer: Option<TransactionId>,
+    ) -> bool {
         let epoch = self.current_epoch();
 
         // Check if node exists
         let nodes = self.nodes.read();
         if let Some(chain) = nodes.get(&node_id) {
-            if chain.visible_at(epoch).map_or(true, |r| r.is_deleted()) {
+            let record = match viewer {
+                Some(tx) => chain.visible_to(epoch, tx),
+                None => chain.visible_at(epoch),
+            };
+            if record.map_or(true, |r| r.is_deleted()) {
                 return false;
             }
         } else {
@@ -80,16 +92,24 @@ impl LpgStore {
         true
     }
 
-    /// Adds a label to a node.
-    /// (Tiered storage version)
+    /// [`Self::add_label_as`] (tiered storage version).
     #[cfg(feature = "tiered-storage")]
-    pub fn add_label(&self, node_id: NodeId, label: &str) -> bool {
+    pub(super) fn add_label_as(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        viewer: Option<TransactionId>,
+    ) -> bool {
         let epoch = self.current_epoch();
 
         // Check if node exists
         let versions = self.node_versions.read();
         if let Some(index) = versions.get(&node_id) {
-            if let Some(vref) = index.visible_at(epoch) {
+            let vref = match viewer {
+                Some(tx) => index.visible_to(epoch, tx),
+                None => index.visible_at(epoch),
+            };
+            if let Some(vref) = vref {
                 if let Some(record) = self.read_node_record(&vref) {
                     if record.is_deleted() {
                         return false;
@@ -150,18 +170,28 @@ impl LpgStore {
         true
     }
 
-    /// Removes a label from a node.
+    /// Removes a label from a node that exists for `viewer` (see
+    /// [`Self::add_label_as`]).
     ///
     /// Returns true if the label was removed, false if the node doesn't exist
     /// or doesn't have the label.
     #[cfg(not(feature = "tiered-storage"))]
-    pub fn remove_label(&self, node_id: NodeId, label: &str) -> bool {
+    pub(super) fn remove_label_as(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        viewer: Option<TransactionId>,
+    ) -> bool {
         let epoch = self.current_epoch();
 
         // Check if node exists
         let nodes = self.nodes.read();
         if let Some(chain) = nodes.get(&node_id) {
-            if chain.visible_at(epoch).map_or(true, |r| r.is_deleted()) {
+            let record = match viewer {
+                Some(tx) => chain.visible_to(epoch, tx),
+                None => chain.visible_at(epoch),
+            };
+            if record.map_or(true, |r| r.is_deleted()) {
                 return false;
             }
         } else {
@@ -230,16 +260,24 @@ impl LpgStore {
         true
     }
 
-    /// Removes a label from a node.
-    /// (Tiered storage version)
+    /// [`Self::remove_label_as`] (tiered storage version).
     #[cfg(feature = "tiered-storage")]
-    pub fn remove_label(&self, node_id: NodeId, label: &str) -> bool {
+    pub(super) fn remove_label_as(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        viewer: Option<TransactionId>,
+    ) -> bool {
         let epoch = self.current_epoch();
 
         // Check if node exists
         let versions = self.node_versions.read();
         if let Some(index) = versions.get(&node_id) {
-            if let Some(vref) = index.visible_at(epoch) {
+            let vref = match viewer {
+                Some(tx) => index.visible_to(epoch, tx),
+                None => index.visible_at(epoch),
+            };
+            if let Some(vref) = vref {
                 if let Some(record) = self.read_node_record(&vref) {
                     if record.is_deleted() {
                         return false;
@@ -407,6 +445,22 @@ impl LpgStore {
         self.next_edge_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Adds a label to a node.
+    ///
+    /// Returns true if the label was added, false if the node doesn't exist
+    /// (is not visible at the current epoch) or already has the label.
+    pub fn add_label(&self, node_id: NodeId, label: &str) -> bool {
+        self.add_label_as(node_id, label, None)
+    }
+
+    /// Removes a label from a node.
+    ///
+    /// Returns true if the label was removed, false if the node doesn't exist
+    /// (is not visible at the current epoch) or doesn't have the label.
+    pub fn remove_label(&self, node_id: NodeId, label: &str) -> bool {
+        self.remove_label_as(node_id, label, None)
+    }
+
     /// Adds a label to a node within a transaction, recording the change
     /// in the undo log so it can be reversed on rollback.
     #[cfg(not(feature = "temporal"))]
@@ -416,7 +470,7 @@ impl LpgStore {
         label: &str,
         transaction_id: TransactionId,
     ) -> bool {
-        let added = self.add_label(node_id, label);
+        let added = self.add_label_as(node_id, label, Some(transaction_id));
         if added {
             self.property_undo_log
                 .write()
@@ -488,7 +542,7 @@ impl LpgStore {
         label: &str,
         transaction_id: TransactionId,
     ) -> bool {
-        let removed = self.remove_label(node_id, label);
+        let removed = self.remove_label_as(node_id, label, Some(transaction_id));
         if removed {
             self.property_undo_log
                 .write()

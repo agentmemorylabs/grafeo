@@ -200,8 +200,10 @@ impl DiskRunSink {
             (record.key.capacity() as u64).saturating_add(record.payload.capacity() as u64);
         let total_delta = backing_delta.saturating_add(heap_delta);
 
-        // R2-B1: flush based on the CONFIGURED sort_run_bytes — true 64 MiB
-        // arena semantics. Concurrent arenas are coordinated by the shared
+        // R2-B1: flush based on the CONFIGURED sort_run_bytes — true
+        // sort_run_bytes arena semantics (32 MiB under acceptance, so two
+        // concurrent arenas + I/O overlap fit 128 MiB). Concurrent arenas
+        // are coordinated by the shared
         // enforcing JobAnonLedger (max_anon_bytes = 128 MiB under the
         // acceptance profile), NOT by halving the per-sink flush threshold.
         // Two coordination triggers:

@@ -93,6 +93,11 @@ impl LpgStore {
         #[allow(clippy::cast_possible_wrap)]
         let count_i64 = count as i64;
         self.live_node_count.fetch_add(count_i64, Ordering::Relaxed);
+        self.record_changes(
+            transaction_id,
+            ids.iter()
+                .map(|&node_id| super::PropertyUndoEntry::NodeCreated { node_id }),
+        );
 
         // Properties + secondary property indexes, locks hoisted.
         let prop_rows = build_node_prop_rows(nodes, &ids);
@@ -151,6 +156,11 @@ impl LpgStore {
         #[allow(clippy::cast_possible_wrap)]
         let count_i64 = count as i64;
         self.live_edge_count.fetch_add(count_i64, Ordering::Relaxed);
+        self.record_changes(
+            transaction_id,
+            ids.iter()
+                .map(|&edge_id| super::PropertyUndoEntry::EdgeCreated { edge_id }),
+        );
 
         // Edge properties (edges are not property-indexed; no props_count on record).
         let prop_rows = build_edge_prop_rows(edges, &ids);

@@ -158,6 +158,39 @@ impl LpgStore {
         node_ids.into_iter().filter_map(move |id| self.get_node(id))
     }
 
+    /// Returns the ids of all edges visible at the current epoch, without
+    /// building the edges.
+    #[cfg(not(feature = "tiered-storage"))]
+    pub(crate) fn edge_ids(&self) -> Vec<EdgeId> {
+        let epoch = self.current_epoch();
+        self.edges
+            .read()
+            .iter()
+            .filter_map(|(id, chain)| {
+                chain
+                    .visible_at(epoch)
+                    .and_then(|r| if !r.is_deleted() { Some(*id) } else { None })
+            })
+            .collect()
+    }
+
+    /// Returns the ids of all edges visible at the current epoch, without
+    /// building the edges. (Tiered storage version)
+    #[cfg(feature = "tiered-storage")]
+    pub(crate) fn edge_ids(&self) -> Vec<EdgeId> {
+        let epoch = self.current_epoch();
+        self.edge_versions
+            .read()
+            .iter()
+            .filter_map(|(id, index)| {
+                index.visible_at(epoch).and_then(|vref| {
+                    self.read_edge_record(&vref)
+                        .and_then(|r| if !r.is_deleted() { Some(*id) } else { None })
+                })
+            })
+            .collect()
+    }
+
     /// Returns an iterator over all edges in the database.
     ///
     /// This creates a snapshot of all visible edges at the current epoch.
