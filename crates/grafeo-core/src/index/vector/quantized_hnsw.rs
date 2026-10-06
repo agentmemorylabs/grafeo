@@ -1283,6 +1283,67 @@ mod tests {
         }
     }
 
+    /// Filtered search must return `min(k, |allowlist|)` results when that many
+    /// allowlisted vectors exist. `search_with_filter` and
+    /// `search_with_ef_and_filter` post-filter the global top
+    /// `max(k, |allowlist|)`, so an allowlist that is not near the query comes
+    /// back empty. Plain `HnswIndex` filters during traversal and returns all
+    /// five here.
+    #[test]
+    #[ignore = "reproduces quantized filtered-search post-filter returning empty; engine fix pending owner decision"]
+    fn test_filtered_search_returns_min_k_allowed_when_allowlist_is_far() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let vectors = create_test_vectors(30, 4);
+        let query = vectors[0].clone();
+        // The ten vectors furthest from `query`.
+        let allowlist: std::collections::HashSet<NodeId> = (21..=30).map(NodeId::new).collect();
+        let expected: Vec<NodeId> = (21..=25).map(NodeId::new).collect();
+
+        let plain = super::super::HnswIndex::with_seed(config.clone(), 42);
+        let store: StdHashMap<NodeId, Arc<[f32]>> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (NodeId::new(i as u64 + 1), Arc::from(v.as_slice())))
+            .collect();
+        let plain_acc = map_accessor(store);
+        for (i, vec) in vectors.iter().enumerate() {
+            plain.insert(NodeId::new(i as u64 + 1), vec, &plain_acc);
+        }
+        let plain_ids: Vec<NodeId> = plain
+            .search_with_filter(&query, 5, &allowlist, &plain_acc)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(plain_ids, expected, "plain HNSW baseline");
+
+        for quantization in [
+            QuantizationType::None,
+            QuantizationType::Scalar,
+            QuantizationType::Binary,
+        ] {
+            let index = QuantizedHnswIndex::with_seed(config.clone(), quantization, 42);
+            for (i, vec) in vectors.iter().enumerate() {
+                index.test_insert(NodeId::new(i as u64 + 1), vec);
+            }
+            let acc = index.accessor();
+            let filtered: Vec<NodeId> = index
+                .search_with_filter(&query, 5, &allowlist, &acc)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(filtered, expected, "{quantization:?} search_with_filter");
+            let filtered_ef: Vec<NodeId> = index
+                .search_with_ef_and_filter(&query, 5, 200, &allowlist, &acc)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(
+                filtered_ef, expected,
+                "{quantization:?} search_with_ef_and_filter"
+            );
+        }
+    }
+
     #[test]
     fn test_snapshot_and_restore_topology() {
         let config = HnswConfig::new(4, DistanceMetric::Euclidean);

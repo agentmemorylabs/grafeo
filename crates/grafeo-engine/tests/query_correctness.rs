@@ -2268,10 +2268,10 @@ mod profile_tests {
 }
 
 // ============================================================================
-// SQL/PGQ Cross-Language Correctness
+// GQL Conformance Edge Cases
 // ============================================================================
 
-#[cfg(feature = "sql-pgq")]
+#[cfg(feature = "gql")]
 mod gql_conformance_edge_cases {
     use super::*;
 
@@ -2368,6 +2368,11 @@ mod gql_conformance_edge_cases {
     }
 }
 
+// ============================================================================
+// SQL/PGQ Cross-Language Correctness
+// ============================================================================
+
+#[cfg(feature = "sql-pgq")]
 mod sql_pgq_correctness {
     use super::*;
 

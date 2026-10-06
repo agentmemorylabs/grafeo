@@ -38,6 +38,36 @@ use tempfile::TempDir;
 
 const HELPER_ENV: &str = "GRAFEO5C_HELPER";
 
+/// Serializes child spawns against root-lock cycles (acquire after release)
+/// across the parallel test threads of this binary.
+///
+/// The root ownership lock is a `flock`, which belongs to the *open file
+/// description*, not to the process or the fd number. Spawning a child forks,
+/// and between fork and exec the child holds a copy of every fd this process
+/// has open, including another test thread's locked root file (O_CLOEXEC only
+/// closes them at exec). If that thread drops its lock holder (unlock by
+/// close) and immediately re-acquires in that window, the child's copy still
+/// holds the lock and the re-acquire fails with "root already locked by
+/// another process". So child starts and parent-side lock cycles take turns:
+/// `std`'s `spawn` returns only once the child has exec'd, so a cycle that
+/// takes this mutex starts after every earlier fork has dropped its inherited
+/// copies. Keep the critical sections short and never hold this across a wait
+/// on a child. Same fix as `compact_store_generation_retirement`.
+static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take one turn of the lock-cycle mutex (poison-tolerant: a panicking test
+/// must not cascade into every other test in the binary).
+fn lock_cycle() -> std::sync::MutexGuard<'static, ()> {
+    LOCK_CYCLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `f` (a parent-side root-lock acquisition or publish/handoff cycle) as
+/// one turn of the lock-cycle mutex.
+fn in_cycle<T>(f: impl FnOnce() -> T) -> T {
+    let _cycle = lock_cycle();
+    f()
+}
+
 fn populate(db: &GrafeoDB, tag: &str) {
     let a = db
         .create_node_with_props(&["Person"], [("name", Value::from(format!("{tag}-a")))])
@@ -149,9 +179,7 @@ fn freeze_build_publish_retires_only_epoch_n_prefix() {
     layered.set_node_property(b, "name", Value::from("epoch-n-b"));
     let _e = layered.create_edge(a, b, "KNOWS");
 
-    let handle = db
-        .freeze_epoch_for_handoff(&gen_root)
-        .expect("freeze epoch N");
+    let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze epoch N");
     assert_eq!(db.epoch_handoff_phase(), EpochHandoffPhase::FreezeCaptured);
     assert!(db.epoch_handoff_active());
     assert_eq!(handle.next_epoch, handle.frozen_epoch + 1);
@@ -166,9 +194,10 @@ fn freeze_build_publish_retires_only_epoch_n_prefix() {
     layered.set_node_property(n1, "name", Value::from("epoch-n1-only"));
     assert!(layered.get_node(n1).is_some());
 
-    let report = db
-        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-handoff-1"))
-        .expect("complete handoff");
+    let report = in_cycle(|| {
+        db.complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-handoff-1"))
+    })
+    .expect("complete handoff");
 
     assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
     assert!(!db.epoch_handoff_active());
@@ -235,9 +264,9 @@ fn run_epoch_handoff_one_shot() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "oneshot");
-    let report = db
-        .run_epoch_handoff(generation_build_request(&gen_root, "g-oneshot"))
-        .expect("one-shot handoff");
+    let report =
+        in_cycle(|| db.run_epoch_handoff(generation_build_request(&gen_root, "g-oneshot")))
+            .expect("one-shot handoff");
     assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
     assert_eq!(
         report
@@ -248,7 +277,7 @@ fn run_epoch_handoff_one_shot() {
             .generation_id,
         "g-oneshot"
     );
-    let recovery = recover_generation_root(&gen_root).expect("recover");
+    let recovery = in_cycle(|| recover_generation_root(&gen_root)).expect("recover");
     assert_eq!(recovery.selected.slot.generation_id, "g-oneshot");
 }
 
@@ -281,7 +310,7 @@ fn dual_epoch_backpressure_counts_frozen_and_next() {
         before_freeze.categories[RetainedCategory::MutationPayload.index()].current_bytes;
     assert!(frozen_payload > 0, "epoch N must charge MutationPayload");
 
-    let _handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let _handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
     // Post-freeze writes charge NextEpoch.
     for i in 0..5 {
         let n = db.layered_store().unwrap().create_node(&["Person"]);
@@ -334,17 +363,18 @@ fn cancel_before_publish_leaves_prior_recoverable() {
     let db = GrafeoDB::new_in_memory();
     populate(&db, "first");
     // Establish a prior generation via ordinary build.
-    let first = db
-        .build_and_publish_generation(generation_build_request(&gen_root, "g-prior"))
-        .expect("prior publish");
+    let first = in_cycle(|| {
+        db.build_and_publish_generation(generation_build_request(&gen_root, "g-prior"))
+    })
+    .expect("prior publish");
 
     populate(&db, "pending");
-    let _handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let _handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
     assert_eq!(db.epoch_handoff_phase(), EpochHandoffPhase::FreezeCaptured);
     db.cancel_epoch_handoff();
     assert_eq!(db.epoch_handoff_phase(), EpochHandoffPhase::Cancelled);
 
-    let recovery = recover_generation_root(&gen_root).expect("recover after cancel");
+    let recovery = in_cycle(|| recover_generation_root(&gen_root)).expect("recover after cancel");
     assert_eq!(
         recovery.selected.slot.generation_id, "g-prior",
         "cancel must not change selected generation"
@@ -373,7 +403,7 @@ fn phase_ordering_is_observable() {
 fn build_prior_generation(gen_root: &std::path::Path) -> BuildPublication {
     let db = GrafeoDB::new_in_memory();
     populate(&db, "prior");
-    db.build_and_publish_generation(generation_build_request(gen_root, "g-prior"))
+    in_cycle(|| db.build_and_publish_generation(generation_build_request(gen_root, "g-prior")))
         .expect("prior generation")
 }
 
@@ -393,7 +423,12 @@ fn spawn_crash_child(
     if !abort_point.is_empty() {
         cmd.env("GRAFEO_5C_ABORT", abort_point);
     }
-    cmd.status().expect("spawn child")
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut child = {
+        let _cycle = lock_cycle();
+        cmd.spawn().expect("spawn child")
+    };
+    child.wait().expect("wait for child")
 }
 
 /// Child-side two-step handoff with real next-epoch state: two frozen
@@ -476,7 +511,8 @@ fn fresh_process_abort_after_freeze_keeps_prior_selection() {
         "child must abort (non-success): {status}"
     );
 
-    let recovery = recover_generation_root(&gen_root).expect("recover after freeze abort");
+    let recovery =
+        in_cycle(|| recover_generation_root(&gen_root)).expect("recover after freeze abort");
     assert_eq!(
         recovery.selected.slot.generation_id, "g-prior",
         "freeze abort must leave prior generation selected"
@@ -532,7 +568,8 @@ fn fresh_process_abort_after_publication_selects_new() {
         let status = spawn_crash_child(&gen_root, "abort_after_publication", "after_publication");
         assert!(!status.success(), "child must abort after publication");
 
-        let recovery = recover_generation_root(&gen_root).expect("recover after pub abort");
+        let recovery =
+            in_cycle(|| recover_generation_root(&gen_root)).expect("recover after pub abort");
         assert_eq!(
             recovery.selected.slot.generation_id, "g-crash-pub",
             "post-commit abort must leave NEW generation selected"
@@ -597,7 +634,8 @@ fn fresh_process_abort_after_build_keeps_prior_selection() {
     let status = spawn_crash_child(&gen_root, "abort_after_build", "after_build");
     assert!(!status.success(), "child must abort after build");
 
-    let recovery = recover_generation_root(&gen_root).expect("recover after build abort");
+    let recovery =
+        in_cycle(|| recover_generation_root(&gen_root)).expect("recover after build abort");
     assert_eq!(
         recovery.selected.slot.generation_id, "g-prior",
         "pre-commit build abort must leave prior generation selected"
@@ -661,7 +699,8 @@ fn fresh_process_abort_after_retire_selects_new() {
     let status = spawn_crash_child(&gen_root, "abort_after_retire", "after_retire");
     assert!(!status.success(), "child must abort after retire");
 
-    let recovery = recover_generation_root(&gen_root).expect("recover after retire abort");
+    let recovery =
+        in_cycle(|| recover_generation_root(&gen_root)).expect("recover after retire abort");
     assert_eq!(
         recovery.selected.slot.generation_id, "g-crash-retire",
         "post-retire abort must leave NEW generation selected (commit already durable)"
@@ -704,16 +743,14 @@ fn second_handoff_advances_sequence_and_retains_previous() {
 
     let db = GrafeoDB::new_in_memory();
     populate(&db, "first");
-    let r1 = db
-        .run_epoch_handoff(generation_build_request(&gen_root, "g-1"))
+    let r1 = in_cycle(|| db.run_epoch_handoff(generation_build_request(&gen_root, "g-1")))
         .expect("first");
     assert!(
         !db.epoch_handoff_active(),
         "first handoff must fully retire"
     );
     populate(&db, "second");
-    let r2 = db
-        .run_epoch_handoff(generation_build_request(&gen_root, "g-2"))
+    let r2 = in_cycle(|| db.run_epoch_handoff(generation_build_request(&gen_root, "g-2")))
         .expect("second");
 
     assert_eq!(
@@ -787,6 +824,11 @@ fn freeze_is_a_writer_linearization_point() {
     let db_f = Arc::clone(&db);
     let root_f = gen_root.clone();
     let freeze_thread = thread::spawn(move || {
+        // Deliberately NOT under the lock-cycle mutex: `FREEZE_STALL_*` is
+        // process-global, so a sibling test's freeze can park in the stall
+        // too. If a parked freeze held the mutex, this thread (which releases
+        // the stall) could never take its turn: deadlock. This is the first
+        // acquisition of a fresh root, so there is no release to race.
         db_f.freeze_epoch_for_handoff(&root_f)
             .expect("freeze epoch N")
     });
@@ -841,9 +883,10 @@ fn freeze_is_a_writer_linearization_point() {
         "concurrent write must be tracked as post-freeze (N+1)"
     );
 
-    let report = db
-        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-lin"))
-        .expect("complete");
+    let report = in_cycle(|| {
+        db.complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-lin"))
+    })
+    .expect("complete");
     let names = generation_person_names(&report.publication.as_ref().unwrap().generation_abs_path);
     assert!(
         names
@@ -928,13 +971,14 @@ fn retire_keeps_live_reads_identical() {
     );
     assert_eq!(before[2].as_deref(), Some("overlay-only"));
 
-    let handle = db.freeze_epoch_for_handoff(&gen_root).expect("freeze");
+    let handle = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze");
     // One N+1 write so both absorbed and retained paths are exercised.
     let n1 = layered.create_node(&["Person"]);
     layered.set_node_property(n1, "name", Value::from("n1-retained"));
-    let report = db
-        .complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-nondestr"))
-        .expect("complete");
+    let report = in_cycle(|| {
+        db.complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-nondestr"))
+    })
+    .expect("complete");
 
     // Absorbed/retained counts remain correct (pure set arithmetic over the
     // freeze and post-freeze id sets — no live-state mutation involved).
@@ -1001,7 +1045,7 @@ fn next_epoch_reattribution_prevents_budget_ratchet() {
         let n = layered.create_node(&["Person"]);
         layered.set_node_property(n, "bio", bio(i));
     }
-    let h1 = db.freeze_epoch_for_handoff(&gen_root).expect("freeze 1");
+    let h1 = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze 1");
     for i in 3..5 {
         let n = layered.create_node(&["Person"]);
         layered.set_node_property(n, "bio", bio(i));
@@ -1019,7 +1063,7 @@ fn next_epoch_reattribution_prevents_budget_ratchet() {
     );
     let mid1_total = mid1.total_bytes;
 
-    db.complete_epoch_handoff(h1, generation_build_request(&gen_root, "g-1"))
+    in_cycle(|| db.complete_epoch_handoff(h1, generation_build_request(&gen_root, "g-1")))
         .expect("complete 1");
 
     let after1 = ctl.snapshot();
@@ -1040,7 +1084,7 @@ fn next_epoch_reattribution_prevents_budget_ratchet() {
     );
 
     // ── Cycle 2: freeze the retained working set, add 3 more post-freeze ──
-    let h2 = db.freeze_epoch_for_handoff(&gen_root).expect("freeze 2");
+    let h2 = in_cycle(|| db.freeze_epoch_for_handoff(&gen_root)).expect("freeze 2");
     for i in 5..8 {
         let n = layered.create_node(&["Person"]);
         layered.set_node_property(n, "bio", bio(i));
@@ -1052,7 +1096,7 @@ fn next_epoch_reattribution_prevents_budget_ratchet() {
         "cycle-2 post-freeze writes must charge NextEpoch: {mid2:?}"
     );
 
-    db.complete_epoch_handoff(h2, generation_build_request(&gen_root, "g-2"))
+    in_cycle(|| db.complete_epoch_handoff(h2, generation_build_request(&gen_root, "g-2")))
         .expect("complete 2");
 
     let after2 = ctl.snapshot();
