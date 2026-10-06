@@ -125,7 +125,15 @@ pub struct WalManager {
     /// Encryptor for WAL records (None = unencrypted).
     #[cfg(feature = "encryption")]
     encryptor: Option<grafeo_common::encryption::PageEncryptor>,
+    /// Test hook: called by [`rotate_if_full`](Self::rotate_if_full) before
+    /// it takes the active-log lock, so a test can hold writers that have
+    /// all seen the same full file and release them in a chosen order.
+    #[cfg(test)]
+    rotate_hook: Mutex<Option<RotateHook>>,
 }
+
+#[cfg(test)]
+type RotateHook = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
 
 impl WalManager {
     /// Opens or creates a WAL in the given directory.
@@ -173,6 +181,8 @@ impl WalManager {
             poisoned: Mutex::new(None),
             #[cfg(feature = "encryption")]
             encryptor: None,
+            #[cfg(test)]
+            rotate_hook: Mutex::new(None),
         };
 
         // Open or create the active log
@@ -629,6 +639,13 @@ impl WalManager {
     /// `max_log_size`. Several writers can see the same file full; the first
     /// rotates it and the others find a fresh file and leave it.
     pub(crate) fn rotate_if_full(&self, written_sequence: u64) -> Result<()> {
+        #[cfg(test)]
+        {
+            let hook = self.rotate_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(written_sequence);
+            }
+        }
         let mut guard = self.active_log.lock();
         let still_full = guard
             .as_ref()
@@ -1193,9 +1210,9 @@ mod tests {
         assert_eq!(wal.checkpoint_epoch(), Some(EpochId::new(10)));
     }
 
-    /// `rotate()` bumps the sequence before it swaps in the new log file. A
-    /// checkpointer that reads `current_sequence()` inside that window sees
-    /// S+1 while a racing commit still lands in file S. Covering
+    /// A checkpointer whose sequence capture runs ahead of the file a racing
+    /// commit lands in (as `rotate()` allowed before it swapped files under
+    /// the append lock) must still keep that file. Covering
     /// `current_sequence() - 1` keeps file S in recovery; covering the raw
     /// value skips it and loses the commit.
     #[test]
@@ -1206,7 +1223,7 @@ mod tests {
             let dir = tempdir().unwrap();
             let wal = WalManager::open(dir.path()).unwrap();
 
-            // Simulate rotate() between its sequence bump and its file swap.
+            // Simulate a sequence bump ahead of the file swap.
             wal.current_sequence.fetch_add(1, Ordering::SeqCst);
             let covered = wal.current_sequence().saturating_sub(step_back);
 
@@ -1520,5 +1537,118 @@ mod tests {
         assert_eq!(wal.current_sequence(), seq0 + 1, "no second rotation");
         let (cut_seq, _) = wal.flush_for_cut().unwrap();
         assert_eq!(cut_seq, seq0 + 1);
+    }
+
+    #[test]
+    fn writers_that_saw_the_same_full_file_rotate_it_once_in_any_release_order() {
+        // Forced schedule: writer A then writer B each append to file N and
+        // see it full, and both are held before rotating. B (the later one)
+        // is released first, a third append arrives, then A is released.
+        // A's stale request must not rotate, the active file must be the
+        // newest, and files read in sequence order must give append order.
+        use std::collections::HashMap;
+        use std::sync::mpsc;
+
+        let dir = tempdir().unwrap();
+        let wal = std::sync::Arc::new(
+            WalManager::with_config(
+                dir.path(),
+                WalConfig {
+                    max_log_size: 8,
+                    ..WalConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let seq_n = wal.current_sequence();
+
+        let (arrived_tx, arrived_rx) = mpsc::channel::<(String, u64)>();
+        let gates: std::sync::Arc<parking_lot::Mutex<HashMap<String, mpsc::Receiver<()>>>> =
+            std::sync::Arc::default();
+        let mut release = HashMap::new();
+        for name in ["A", "B"] {
+            let (tx, rx) = mpsc::channel::<()>();
+            gates.lock().insert(name.to_string(), rx);
+            release.insert(name, tx);
+        }
+        {
+            let gates = std::sync::Arc::clone(&gates);
+            let arrived_tx = parking_lot::Mutex::new(arrived_tx);
+            *wal.rotate_hook.lock() = Some(std::sync::Arc::new(move |seq| {
+                let name = std::thread::current().name().unwrap_or("").to_string();
+                let Some(gate) = gates.lock().remove(&name) else {
+                    return;
+                };
+                arrived_tx.lock().send((name, seq)).unwrap();
+                gate.recv().unwrap();
+            }));
+        }
+
+        let spawn = |name: &'static str, id: u64| {
+            let wal = std::sync::Arc::clone(&wal);
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || {
+                    wal.log(&WalRecord::CreateNode {
+                        id: NodeId::new(id),
+                        labels: vec![],
+                    })
+                    .unwrap();
+                })
+                .unwrap()
+        };
+        let a = spawn("A", 1);
+        assert_eq!(arrived_rx.recv().unwrap(), ("A".to_string(), seq_n));
+        let b = spawn("B", 2);
+        assert_eq!(
+            arrived_rx.recv().unwrap(),
+            ("B".to_string(), seq_n),
+            "B appended to the same full file A is about to rotate"
+        );
+
+        release["B"].send(()).unwrap();
+        b.join().unwrap();
+        // Another append arrives between B's rotation and A's: it lands in
+        // the file B opened (and, being full, rotates it in turn).
+        wal.log(&WalRecord::CreateNode {
+            id: NodeId::new(4),
+            labels: vec![],
+        })
+        .unwrap();
+        release["A"].send(()).unwrap();
+        a.join().unwrap();
+
+        // A's request was for file N, which B already rotated: no-op. Only
+        // B's rotation and the third append's rotation happened.
+        assert_eq!(wal.current_sequence(), seq_n + 2, "A did not rotate again");
+        let newest_on_disk = wal
+            .log_files()
+            .unwrap()
+            .iter()
+            .filter_map(|p| WalManager::sequence_from_path(p))
+            .max()
+            .unwrap();
+        let (cut_seq, _) = wal.flush_for_cut().unwrap();
+        assert_eq!(cut_seq, newest_on_disk, "the active file is the newest");
+
+        // A later append lands in the newest file, and reading files in
+        // sequence order gives every record in append order.
+        wal.log(&WalRecord::CreateNode {
+            id: NodeId::new(3),
+            labels: vec![],
+        })
+        .unwrap();
+        wal.flush().unwrap();
+        let placed: Vec<(u64, u64)> = read_all_frames(dir.path())
+            .iter()
+            .map(|(seq, r)| match r {
+                WalRecord::CreateNode { id, .. } => (*seq, id.as_u64()),
+                other => panic!("unexpected record {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            vec![(seq_n, 1), (seq_n, 2), (seq_n + 1, 4), (seq_n + 2, 3)]
+        );
     }
 }
