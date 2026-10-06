@@ -1434,7 +1434,7 @@ mod tests {
                 },
             )
             .unwrap();
-            let barrier = std::sync::Barrier::new(WRITERS as usize);
+            let barrier = std::sync::Barrier::new(usize::try_from(WRITERS).unwrap());
             std::thread::scope(|scope| {
                 for writer in 0..WRITERS {
                     let (wal, barrier) = (&wal, &barrier);
@@ -1482,17 +1482,15 @@ mod tests {
             // own size rotation opened).
             let newest_written = frames.iter().map(|(seq, _)| *seq).max().unwrap();
             assert_eq!(*last_seq, newest_written, "the active file is the newest");
-            let mut next = vec![0u64; WRITERS as usize];
+            let mut next = vec![0u64; usize::try_from(WRITERS).unwrap()];
             for (seq, record) in &frames[..frames.len() - 1] {
                 let WalRecord::CreateNode { id, .. } = record else {
                     panic!("unexpected record {record:?}");
                 };
                 let (writer, i) = (id.as_u64() / 1_000_000, id.as_u64() % 1_000_000);
-                assert_eq!(
-                    i, next[writer as usize],
-                    "writer {writer} out of order in file {seq}"
-                );
-                next[writer as usize] += 1;
+                let slot = usize::try_from(writer).unwrap();
+                assert_eq!(i, next[slot], "writer {writer} out of order in file {seq}");
+                next[slot] += 1;
             }
         }
     }
