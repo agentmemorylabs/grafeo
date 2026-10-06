@@ -17,7 +17,8 @@ use grafeo_common::types::{EdgeId, NodeId, Value};
 use crate::graph::compact::CompactStore;
 use crate::graph::compact::generation::emit::{SegmentDescriptor, V5PayloadAssembler};
 use crate::graph::compact::generation::{
-    GenerationBudget, GenerationEdge, GenerationInput, GenerationNode, InMemoryRunStore,
+    GenerationBudget, GenerationEdge, GenerationError, GenerationInput, GenerationNode,
+    InMemoryRunStore,
 };
 use crate::graph::compact::generation_builder::dict_pass::make_resident_desc;
 use crate::graph::compact::generation_builder::orchestrator::{
@@ -32,6 +33,57 @@ use crate::graph::compact::section::CompactStoreSection;
 use crate::graph::compact::section_v5::deserialize_v5;
 use crate::graph::traits::GraphStore;
 use tempfile::TempDir;
+
+fn try_build(
+    input: &GenerationInput,
+    policy: PayloadVersionPolicy,
+) -> Result<Vec<u8>, GenerationError> {
+    let tmp = TempDir::new().unwrap();
+    let config = BoundedBuildConfig {
+        budget: GenerationBudget::for_tests(),
+        temp_dir: tmp.path().to_path_buf(),
+        correlation_id: "v6".into(),
+        spool_buf_cap: 64 * 1024,
+        rel_schemas: Vec::new(),
+        frozen_epoch: 0,
+    };
+    let mut store = InMemoryRunStore::new();
+    let mut builder = BoundedGenerationBuilder::new(config).with_payload_version_policy(policy);
+    let mut lease = builder.build(
+        &mut input.node_source(),
+        &mut input.edge_source(),
+        &mut store,
+    )?;
+    let mut payload = Vec::new();
+    lease.stream_to(&mut payload)?;
+    Ok(payload)
+}
+
+/// Round-2 review N1: whatever the v6 builder emits, the v6 reader must
+/// accept. A zero-dimension vector column used to build (forced v6 wrote a
+/// wide body the reader refuses; v5 wrote one that reads back as nothing),
+/// so the build now fails with a typed error naming the column.
+#[test]
+fn zero_dim_vectors_fail_the_build_instead_of_publishing() {
+    let input = GenerationInput::new()
+        .node(GenerationNode::new(1u64, "Emb").with_prop("vec", Value::Vector(vec![].into())))
+        .node(GenerationNode::new(2u64, "Emb").with_prop("vec", Value::Vector(vec![].into())));
+    for policy in [PayloadVersionPolicy::V6, PayloadVersionPolicy::Auto] {
+        match try_build(&input, policy) {
+            Err(GenerationError::UnsupportedValue { kind, context }) => {
+                assert_eq!(kind, "Vector(zero dims)");
+                assert!(context.contains("vec"), "{context}");
+            }
+            other => panic!("{policy:?}: expected a zero-dims error, got {other:?}"),
+        }
+    }
+    // Non-empty vectors under forced v6: builder output is reader input.
+    let ok = GenerationInput::new()
+        .node(GenerationNode::new(1u64, "Emb").with_prop("vec", Value::Vector(vec![1.0].into())));
+    let payload = try_build(&ok, PayloadVersionPolicy::V6).unwrap();
+    let store = deserialize_v5(&Bytes::from(payload)).expect("v6 reader accepts v6 builder output");
+    assert_eq!(snapshot(&store, &ok), expected(&ok));
+}
 
 fn build(input: &GenerationInput, policy: PayloadVersionPolicy) -> Vec<u8> {
     let tmp = TempDir::new().unwrap();
