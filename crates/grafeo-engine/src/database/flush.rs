@@ -106,7 +106,10 @@ pub(super) fn flush(
     // reached it (a refused record, a failed append). Snapshotting memory now
     // would make that write durable behind the caller's back, after it was
     // reported as failed (and possibly retried). Refuse: the next open
-    // replays the WAL instead, so such a write is gone, as reported.
+    // replays the WAL instead. Defence in depth, not a guarantee that such a
+    // write is gone: this checks once at entry, and other snapshot paths
+    // (or a write refused while this flush runs) can still persist it, which
+    // is why it is reported as durability unconfirmed.
     #[cfg(feature = "wal")]
     if let Some(wal) = wal
         && let Some(reason) = wal.poisoned_reason()

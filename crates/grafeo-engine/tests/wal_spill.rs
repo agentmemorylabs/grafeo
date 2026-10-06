@@ -590,6 +590,7 @@ fn disk_full_while_spilling_is_retryable_and_rolls_back() {
 }
 
 /// Properties for `rows` nodes of about [`PAYLOAD`] bytes each.
+#[cfg(feature = "testing-crash-injection")]
 fn batch_props(
     rows: usize,
 ) -> Vec<std::collections::HashMap<grafeo_common::types::PropertyKey, Value>> {
@@ -605,8 +606,11 @@ fn batch_props(
 
 /// Reopens after the WAL was poisoned: the writes before it (`Kept`) are
 /// there, the poisoning write (label `Lost`, `lost_rows` nodes) never reached
-/// the WAL and is gone (close does not snapshot memory over a poisoned WAL),
-/// and the database writes again.
+/// the WAL, and the database writes again. `Lost` is asserted absent only
+/// because these callers run no snapshot path while poisoned (close does not
+/// snapshot memory over a poisoned WAL); in general a durability-unconfirmed
+/// write may or may not survive.
+#[cfg(feature = "testing-crash-injection")]
 fn check_reopen_after_poison(kind: Kind, path: &Path, db: GrafeoDB, lost_rows: usize) {
     assert!(
         db.session().execute("INSERT (:After {seq: 0})").is_err(),
@@ -754,6 +758,7 @@ fn session_write_outside_a_transaction_refused_records_are_durability_unconfirme
 
 /// Poisons `db`'s WAL with a write outside a transaction over the cap (the
 /// database must be open with [`SESSION_CAP`]).
+#[cfg(feature = "testing-crash-injection")]
 fn poison_with_a_refused_write(kind: Kind, db: &GrafeoDB) {
     let err = failing_session_write(&db.session(), "cap");
     assert!(is_unconfirmed(&err), "{kind:?}: {err}");

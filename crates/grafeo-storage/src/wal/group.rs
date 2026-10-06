@@ -229,8 +229,20 @@ impl SpillFile {
             self.written = end;
             return Ok(());
         }
-        maybe_fail_io("wal_spill_write")?;
         let offset = self.offset(self.written);
+        if let Err(e) = maybe_fail_io("wal_spill_write") {
+            // Testing only: a real write can fail after a short write (disk
+            // full part way through the buffer). Leave half of it behind, so
+            // the recovery (the next write seeks back to `written` and
+            // overwrites; reads stop at the group's end) is exercised against
+            // a partially written tail, not only an untouched file.
+            let partial = &self.pending[..self.pending.len() / 2];
+            let _ = self
+                .file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| self.file.write_all(partial));
+            return Err(e.into());
+        }
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&self.pending)?;
         maybe_crash("wal_spill_after_write");
@@ -1222,7 +1234,10 @@ mod tests {
             g.push(&node(next)).unwrap();
             next += 1;
         }
-        // The next write of the buffered frames to the file fails once.
+        let spill_path = g.spill_path().unwrap().to_path_buf();
+        let len_before = fs::metadata(&spill_path).unwrap().len();
+        // The next write of the buffered frames to the file fails once, after
+        // a short write (the injection leaves half the buffer in the file).
         enable_io_failure_at(1);
         let savepoint = loop {
             let before = g.position();
@@ -1233,6 +1248,10 @@ mod tests {
         };
         disable_io_failure();
         assert!(g.failure().is_some());
+        assert!(
+            fs::metadata(&spill_path).unwrap().len() > len_before,
+            "the failed write left a partial tail behind"
+        );
         assert_eq!(
             g.position(),
             savepoint,

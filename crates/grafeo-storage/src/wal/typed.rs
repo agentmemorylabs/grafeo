@@ -757,6 +757,92 @@ mod tests {
         assert_eq!(created(&records), (0..500).collect::<Vec<_>>());
     }
 
+    /// Encrypted spilled groups are copied into the WAL while other writers
+    /// keep forcing rotations (a tiny `max_log_size` plus explicit
+    /// `rotate()`). Each WAL frame's nonce comes from the active file's
+    /// sequence and offset, so a rotation in the middle of a group copy would
+    /// leave frames that do not decrypt, or split the group. Every group must
+    /// decrypt on recovery and stay contiguous.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn test_encrypted_spilled_groups_under_competing_rotations() {
+        use super::super::WalRecovery;
+        const GROUPS: u64 = 4;
+        const PER_GROUP: u64 = 300;
+        const SMALL: u64 = 400;
+        let key: [u8; 32] = {
+            use std::hash::{BuildHasher, Hasher};
+            let mut key = [0u8; 32];
+            for chunk in key.chunks_mut(8) {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u64(0);
+                chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+            }
+            key
+        };
+        let dir = tempdir().unwrap();
+        {
+            let mut manager = WalManager::with_config(
+                dir.path(),
+                WalConfig {
+                    durability: DurabilityMode::NoSync,
+                    max_log_size: 256,
+                    ..WalConfig::default()
+                },
+            )
+            .unwrap();
+            manager.set_encryptor(grafeo_common::encryption::PageEncryptor::new(&key));
+            let wal: LpgWal = TypedWal {
+                manager,
+                _record: PhantomData,
+            };
+            let barrier = std::sync::Barrier::new(usize::try_from(GROUPS + 1).unwrap());
+            std::thread::scope(|scope| {
+                for g in 0..GROUPS {
+                    let (wal, barrier) = (&wal, &barrier);
+                    scope.spawn(move || {
+                        let mut group = wal.new_group(spill_limits());
+                        for k in 0..PER_GROUP {
+                            group.push(&spill_node(g * 1_000_000 + k)).unwrap();
+                        }
+                        assert!(group.is_spilled());
+                        barrier.wait();
+                        wal.log_group(&mut group, &[commit_marker(g + 1)], true)
+                            .unwrap();
+                    });
+                }
+                let (wal, barrier) = (&wal, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for i in 0..SMALL {
+                        let mut group = wal.new_group(spill_limits());
+                        group.push(&spill_node(900_000_000 + i)).unwrap();
+                        wal.log_group(&mut group, &[commit_marker(1_000 + i)], true)
+                            .unwrap();
+                        if i % 7 == 0 {
+                            wal.rotate().unwrap();
+                        }
+                    }
+                });
+            });
+            wal.sync().unwrap();
+            assert!(wal.log_files().unwrap().len() > 10, "rotations happened");
+        }
+        let mut recovery = WalRecovery::new(dir.path());
+        recovery.set_encryptor(grafeo_common::encryption::PageEncryptor::new(&key));
+        let ids = created(&recovery.recover().unwrap());
+        assert_eq!(ids.len() as u64, GROUPS * PER_GROUP + SMALL);
+        for g in 0..GROUPS {
+            let first = g * 1_000_000;
+            let at = ids.iter().position(|&id| id == first).unwrap();
+            assert_eq!(
+                ids[at..at + PER_GROUP as usize],
+                (first..first + PER_GROUP).collect::<Vec<_>>(),
+                "group {g} is contiguous and complete"
+            );
+        }
+    }
+
     #[test]
     fn test_failed_group_writes_nothing() {
         use super::super::WalRecovery;
