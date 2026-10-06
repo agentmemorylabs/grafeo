@@ -139,6 +139,10 @@ enum Load {
     /// `test_insert`: trains the quantizer and keeps codes, exercising the
     /// code-scoring and rescoring branches.
     Codes,
+    /// `insert`, then `rehydrate_payloads_from_vectors` as on reopen: a
+    /// trained quantizer with codes and no internal f32 copy (AMH's steady
+    /// state after a restart).
+    Reopened,
 }
 
 fn build_quantized(
@@ -152,11 +156,38 @@ fn build_quantized(
     let index = QuantizedHnswIndex::with_seed(config, q, seed).with_training_threshold(256);
     for (i, v) in vectors.iter().enumerate() {
         match load {
-            Load::Production => index.insert(node(i), v, acc),
+            Load::Production | Load::Reopened => index.insert(node(i), v, acc),
             Load::Codes => index.test_insert(node(i), v),
         }
     }
+    if let Load::Reopened = load {
+        index.rehydrate_payloads_from_vectors(
+            vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (node(i), v.clone())),
+        );
+    }
     index
+}
+
+/// Plain HNSW plus every quantization type under every load.
+fn all_kinds(
+    vectors: &[Vec<f32>],
+    seed: u64,
+    acc: &impl VectorAccessor,
+) -> Vec<(String, VectorIndexKind)> {
+    let mut kinds: Vec<(String, VectorIndexKind)> =
+        vec![("Hnsw".into(), build_plain(vectors, seed, acc).into())];
+    for q in QUANTIZATIONS {
+        for load in [Load::Production, Load::Codes, Load::Reopened] {
+            kinds.push((
+                format!("{q:?}/{load:?}"),
+                build_quantized(vectors, q, load, seed, acc).into(),
+            ));
+        }
+    }
+    kinds
 }
 
 fn build_plain(vectors: &[Vec<f32>], seed: u64, acc: &impl VectorAccessor) -> HnswIndex {
@@ -210,16 +241,7 @@ fn far_allowlist_returns_min_k_for_every_kind_and_entry_point() {
     let expected = exact(&vectors, &query, 5, &allowlist);
     assert_eq!(expected.len(), 5);
 
-    let mut kinds: Vec<(String, VectorIndexKind)> =
-        vec![("Hnsw".into(), build_plain(&vectors, 42, &acc).into())];
-    for q in QUANTIZATIONS {
-        for load in [Load::Production, Load::Codes] {
-            kinds.push((
-                format!("{q:?}/{load:?}"),
-                build_quantized(&vectors, q, load, 42, &acc).into(),
-            ));
-        }
-    }
+    let kinds = all_kinds(&vectors, 42, &acc);
     for (name, kind) in &kinds {
         for (entry, got) in all_entry_points(kind, &query, 5, &allowlist, &acc) {
             assert_eq!(got, expected, "{name} {entry}");
@@ -227,21 +249,15 @@ fn far_allowlist_returns_min_k_for_every_kind_and_entry_point() {
     }
 }
 
+/// Edge cases, through the exact scan (default gate) and through the walk
+/// (gate forced to 0, so any non-empty allowlist walks the graph).
 #[test]
 fn filtered_edge_cases() {
     let vectors = random_vectors(200, 8, 11);
     let st = store(&vectors);
     let acc = map_accessor(&st);
     let query = vectors[3].clone();
-
-    let mut kinds: Vec<(String, VectorIndexKind)> =
-        vec![("Hnsw".into(), build_plain(&vectors, 1, &acc).into())];
-    for q in QUANTIZATIONS {
-        kinds.push((
-            format!("{q:?}"),
-            build_quantized(&vectors, q, Load::Codes, 1, &acc).into(),
-        ));
-    }
+    let kinds = all_kinds(&vectors, 1, &acc);
 
     let empty = HashSet::new();
     let larger_than_k: HashSet<NodeId> = (0..40).map(node).collect();
@@ -251,41 +267,74 @@ fn filtered_edge_cases() {
         .chain((1000..1010).map(NodeId::new))
         .collect();
     let three: HashSet<NodeId> = [node(150), node(20), node(99)].into_iter().collect();
+    // An indexed, allowlisted node whose vector the accessor cannot supply
+    // (property removed or wrong width) is returned by neither path.
+    let missing = node(4);
+    let mut st_missing = st.clone();
+    st_missing.remove(&missing);
+    let acc_missing = map_accessor(&st_missing);
+    let with_missing: HashSet<NodeId> = (0..12).map(node).collect();
+    let without: HashSet<NodeId> = with_missing
+        .iter()
+        .copied()
+        .filter(|&id| id != missing)
+        .collect();
 
-    for (name, kind) in &kinds {
-        for (entry, got) in all_entry_points(kind, &query, 5, &empty, &acc) {
-            assert!(got.is_empty(), "{name} {entry}: empty allowlist");
+    for gate in [None, Some(0)] {
+        let run = || {
+            for (name, kind) in &kinds {
+                let ctx = format!("{name} gate={gate:?}");
+                for (entry, got) in all_entry_points(kind, &query, 5, &empty, &acc) {
+                    assert!(got.is_empty(), "{ctx} {entry}: empty allowlist");
+                }
+                for (entry, got) in all_entry_points(kind, &query, 5, &larger_than_k, &acc) {
+                    assert_eq!(
+                        got,
+                        exact(&vectors, &query, 5, &larger_than_k),
+                        "{ctx} {entry}: allowlist larger than k"
+                    );
+                }
+                for (entry, got) in all_entry_points(kind, &query, 5, &not_indexed, &acc) {
+                    assert!(got.is_empty(), "{ctx} {entry}: ids not in the index");
+                }
+                for (entry, got) in all_entry_points(kind, &query, 5, &mixed, &acc) {
+                    assert_eq!(
+                        got,
+                        exact(&vectors, &query, 5, &mixed),
+                        "{ctx} {entry}: only indexed ids come back"
+                    );
+                }
+                for (entry, got) in all_entry_points(kind, &query, 10, &three, &acc) {
+                    assert_eq!(
+                        got,
+                        exact(&vectors, &query, 10, &three),
+                        "{ctx} {entry}: k larger than the allowlist returns all allowed"
+                    );
+                }
+                // Indexes that keep their own f32 copy (quantization None, or
+                // the code-keeping test loader) can still score the node, on
+                // every path; the others cannot, on any path.
+                let own_copy = name.starts_with("None") || name.ends_with("/Codes");
+                let expected = if own_copy { &with_missing } else { &without };
+                for (entry, got) in all_entry_points(kind, &query, 20, &with_missing, &acc_missing)
+                {
+                    assert_eq!(
+                        got,
+                        exact(&vectors, &query, 20, expected),
+                        "{ctx} {entry}: a node with no vector is not returned"
+                    );
+                }
+                assert!(
+                    kind.search_with_filter(&query, 0, &larger_than_k, &acc)
+                        .is_empty(),
+                    "{ctx}: k = 0"
+                );
+            }
+        };
+        match gate {
+            Some(g) => filtered_scan_stats::with_threshold(g, run),
+            None => run(),
         }
-        for (entry, got) in all_entry_points(kind, &query, 5, &larger_than_k, &acc) {
-            assert_eq!(
-                got,
-                exact(&vectors, &query, 5, &larger_than_k),
-                "{name} {entry}: allowlist larger than k"
-            );
-        }
-        for (entry, got) in all_entry_points(kind, &query, 5, &not_indexed, &acc) {
-            assert!(got.is_empty(), "{name} {entry}: ids not in the index");
-        }
-        for (entry, got) in all_entry_points(kind, &query, 5, &mixed, &acc) {
-            assert_eq!(
-                got,
-                exact(&vectors, &query, 5, &mixed),
-                "{name} {entry}: only indexed ids come back"
-            );
-        }
-        for (entry, got) in all_entry_points(kind, &query, 10, &three, &acc) {
-            assert_eq!(
-                got,
-                exact(&vectors, &query, 10, &three),
-                "{name} {entry}: k larger than the allowlist returns all allowed"
-            );
-            assert_eq!(got.len(), 3);
-        }
-        assert!(
-            kind.search_with_filter(&query, 0, &larger_than_k, &acc)
-                .is_empty(),
-            "{name}: k = 0"
-        );
     }
 }
 
@@ -311,44 +360,49 @@ fn unfiltered_recall(
     total / 50.0
 }
 
-/// Seeded recall against the exact filtered top-k at about 1%, 10%, 33% and
-/// 90% selectivity, for random allowlists and far-region ones (the allowlist
-/// is the part of the index furthest from the query). 200 seeds per case.
+/// Seeded recall against the exact filtered top-k at about 1%, 3%, 10%, 33%
+/// and 90% selectivity, for random allowlists and far-region ones (the
+/// allowlist is the part of the index furthest from the query). 200 seeds
+/// per case, over plain HNSW, None (production), Scalar (production, codes,
+/// reopened), and Binary and Product (codes, reopened).
 ///
-/// * Default threshold: every allowlist here (at most 900 ids) takes the exact
+/// * Default gate: every allowlist here (at most 900 ids) takes the exact
 ///   scan, so results must equal the exact filtered top-k.
-/// * Threshold lowered to 64 on this thread: the 10%, 33% and 90% allowlists
-///   go through the in-traversal filter and must never come back short, with
-///   mean recall at least 0.95 (0.5 where the unfiltered pipeline is itself
-///   approximate: product quantization with codes).
+/// * Gate replaced by `|A| <= 49` on this thread (no visit-estimate term, so
+///   only allowlists smaller than ef are scanned): the 10%, 33% and 90%
+///   allowlists go through the walk, including the low-selectivity regime a
+///   large production index sends there. They must never come back short,
+///   and mean recall must be at least 0.95 (0.5 where the unfiltered pipeline
+///   is itself approximate: product quantization with codes).
 #[test]
 fn seeded_filtered_recall_matches_exact() {
     const N: usize = 1000;
-    const DIM: usize = 16;
+    const DIM: usize = 8;
     const K: usize = 10;
     const SEEDS: u64 = 200;
+    // Below ef (50) an allowlist is always scanned, as in production.
+    const WALK_GATE: usize = 49;
     let vectors = random_vectors(N, DIM, 2026);
     let st = store(&vectors);
     let acc = map_accessor(&st);
-
-    let mut kinds: Vec<(String, VectorIndexKind)> =
-        vec![("Hnsw".into(), build_plain(&vectors, 5, &acc).into())];
-    for q in QUANTIZATIONS {
-        kinds.push((
-            format!("{q:?}/Production"),
-            build_quantized(&vectors, q, Load::Production, 5, &acc).into(),
-        ));
-        kinds.push((
-            format!("{q:?}/Codes"),
-            build_quantized(&vectors, q, Load::Codes, 5, &acc).into(),
-        ));
-    }
+    // Production loads of Binary and Product search exactly like plain HNSW
+    // (no codes, accessor distances), and None keeps the same internal copy
+    // under both loaders, so those duplicates are left out here; the
+    // edge-case and far-allowlist tests cover every kind and load.
+    let kinds: Vec<(String, VectorIndexKind)> = all_kinds(&vectors, 5, &acc)
+        .into_iter()
+        .filter(|(name, _)| {
+            !(name.starts_with("Binary/Production")
+                || name.starts_with("Product") && name.ends_with("/Production")
+                || name == "None/Codes")
+        })
+        .collect();
     let baselines: Vec<f64> = kinds
         .iter()
         .map(|(_, kind)| unfiltered_recall(kind, &vectors, K, &acc))
         .collect();
 
-    for pct in [1usize, 10, 33, 90] {
+    for pct in [1usize, 3, 10, 33, 90] {
         let count = N * pct / 100;
         for far in [false, true] {
             let cases: Vec<(Vec<f32>, HashSet<NodeId>, Vec<NodeId>)> = (0..SEEDS)
@@ -365,19 +419,44 @@ fn seeded_filtered_recall_matches_exact() {
                 })
                 .collect();
             for ((name, kind), baseline) in kinds.iter().zip(&baselines) {
-                for threshold in [FILTERED_EXACT_SCAN_THRESHOLD, 64] {
-                    let exact_expected = count <= threshold;
+                for gate in [None, Some(WALK_GATE)] {
+                    // The default-gate pass scans every allowlist here; the
+                    // scan has two implementations (plain, and quantized with
+                    // its internal-first lookup), so one kind per lookup
+                    // source covers it. The walk pass covers every kind, and
+                    // is skipped where it would scan too.
+                    let scan_representative = matches!(
+                        name.as_str(),
+                        "Hnsw" | "None/Production" | "Scalar/Reopened" | "Binary/Codes"
+                    );
+                    match gate {
+                        None if !scan_representative => continue,
+                        Some(g) if count <= g => continue,
+                        _ => {}
+                    }
+                    let exact_expected = gate.is_none_or(|g| count <= g);
                     let mut total_recall = 0.0;
-                    filtered_scan_stats::with_threshold(threshold, || {
+                    let mut calls = 0usize;
+                    let mut run = || {
                         for (seed, (query, allowlist, want)) in cases.iter().enumerate() {
-                            let single = ids(&kind.search_with_filter(query, K, allowlist, &acc));
-                            let with_ef =
-                                ids(&kind.search_with_ef_and_filter(query, K, 50, allowlist, &acc));
-                            for (entry, got) in
-                                [("search_with_filter", &single), ("with_ef", &with_ef)]
-                            {
+                            // The default ef is 50, so `search_with_filter` is
+                            // `search_with_ef_and_filter(.., 50, ..)`; the walk
+                            // pass also checks a wider beam on 20 seeds.
+                            let mut results = vec![(
+                                "search_with_filter",
+                                ids(&kind.search_with_filter(query, K, allowlist, &acc)),
+                            )];
+                            if gate.is_some() && seed < 20 {
+                                results.push((
+                                    "with_ef(100)",
+                                    ids(&kind
+                                        .search_with_ef_and_filter(query, K, 100, allowlist, &acc)),
+                                ));
+                            }
+                            for (entry, got) in &results {
+                                calls += 1;
                                 let ctx = format!(
-                                    "{name} {pct}% far={far} threshold={threshold} seed={seed} {entry}"
+                                    "{name} {pct}% far={far} gate={gate:?} seed={seed} {entry}"
                                 );
                                 assert_eq!(got.len(), want.len(), "{ctx}: short result");
                                 assert!(got.iter().all(|id| allowlist.contains(id)), "{ctx}");
@@ -387,8 +466,19 @@ fn seeded_filtered_recall_matches_exact() {
                                 total_recall += recall(got, want);
                             }
                         }
-                    });
-                    let mean = total_recall / (2 * cases.len()) as f64;
+                    };
+                    filtered_scan_stats::reset();
+                    match gate {
+                        Some(g) => filtered_scan_stats::with_threshold(g, run),
+                        None => run(),
+                    }
+                    if !exact_expected {
+                        assert!(
+                            filtered_scan_stats::get().scored > 0,
+                            "{name} {pct}% far={far}: the walk never ran"
+                        );
+                    }
+                    let mean = total_recall / calls as f64;
                     // Product quantization with codes ranks candidates by PQ
                     // distance and truncates to k before rescoring (unchanged
                     // here; production `insert` keeps no PQ codes), so it is
@@ -397,7 +487,7 @@ fn seeded_filtered_recall_matches_exact() {
                     let bound = if *baseline >= 0.95 { 0.95 } else { 0.5 };
                     assert!(
                         mean >= bound,
-                        "{name} {pct}% far={far} threshold={threshold}: mean recall@{K} \
+                        "{name} {pct}% far={far} gate={gate:?}: mean recall@{K} \
                          {mean:.3} below {bound:.3} (unfiltered {baseline:.3})"
                     );
                 }
@@ -406,72 +496,206 @@ fn seeded_filtered_recall_matches_exact() {
     }
 }
 
-/// Large allowlists keep using the graph: no exact scan of either kind for
-/// random allowlists at 33% and 90% selectivity once they are above the
-/// threshold (lowered here so a small index has "large" allowlists).
-/// Allowlists at or below the default threshold take the scan.
+/// Large allowlists keep using the graph, and the walk stays cheap: for
+/// random allowlists at 50% and 90% selectivity (gate lowered so a small
+/// index has "large" allowlists) no exact scan of any kind runs, and every
+/// walk scores fewer nodes than the scan would (`|A|`) and than half the index. At 33% (1,320 ids) a healthy walk
+/// on this 4,000-node graph scores more nodes than the scan would, so the
+/// budget hands it to the scan; `walk_budget_falls_back_to_exact_scan` checks
+/// that case. Covers plain HNSW, untrained production Scalar and
+/// trained-after-reopen Scalar.
 #[test]
 fn large_allowlists_use_the_index_not_a_scan() {
-    const N: usize = 2000;
-    const THRESHOLD: usize = 64;
-    let vectors = random_vectors(N, 16, 99);
+    const N: usize = 4000;
+    const GATE: usize = 64;
+    let vectors = random_vectors(N, 8, 99);
     let st = store(&vectors);
     let acc = map_accessor(&st);
-    let plain = build_plain(&vectors, 3, &acc);
-    let quantized = build_quantized(
-        &vectors,
-        QuantizationType::Scalar,
-        Load::Production,
-        3,
-        &acc,
-    );
+    let kinds: Vec<(&str, VectorIndexKind)> = vec![
+        ("Hnsw", build_plain(&vectors, 3, &acc).into()),
+        (
+            "Scalar/Production",
+            build_quantized(
+                &vectors,
+                QuantizationType::Scalar,
+                Load::Production,
+                3,
+                &acc,
+            )
+            .into(),
+        ),
+        (
+            "Scalar/Reopened",
+            build_quantized(&vectors, QuantizationType::Scalar, Load::Reopened, 3, &acc).into(),
+        ),
+    ];
 
-    filtered_scan_stats::with_threshold(THRESHOLD, || {
-        for pct in [33usize, 90] {
-            let count = N * pct / 100;
-            for seed in 0..50u64 {
-                let mut rng = Rng::new(seed);
-                let query: Vec<f32> = (0..16).map(|_| rng.next_f32()).collect();
-                let allowlist = random_allowlist(N, count, &mut rng);
-                let before = filtered_scan_stats::get();
+    filtered_scan_stats::with_threshold(GATE, || {
+        for (name, kind) in &kinds {
+            for pct in [50usize, 90] {
+                let count = N * pct / 100;
+                filtered_scan_stats::reset();
+                for seed in 0..50u64 {
+                    let mut rng = Rng::new(seed);
+                    let query: Vec<f32> = (0..8).map(|_| rng.next_f32()).collect();
+                    let allowlist = random_allowlist(N, count, &mut rng);
+                    assert_eq!(
+                        kind.search_with_filter(&query, 10, &allowlist, &acc).len(),
+                        10
+                    );
+                    assert_eq!(
+                        kind.search_with_ef_and_filter(&query, 10, 50, &allowlist, &acc)
+                            .len(),
+                        10
+                    );
+                }
+                let stats = filtered_scan_stats::get();
                 assert_eq!(
-                    plain.search_with_filter(&query, 10, &allowlist, &acc).len(),
-                    10
+                    (stats.small, stats.shortfall, stats.budget),
+                    (0, 0, 0),
+                    "{name} {pct}%: large allowlist fell back to an exact scan"
                 );
-                assert_eq!(
-                    plain
-                        .search_with_ef_and_filter(&query, 10, 50, &allowlist, &acc)
-                        .len(),
-                    10
-                );
-                assert_eq!(
-                    quantized
-                        .search_with_filter(&query, 10, &allowlist, &acc)
-                        .len(),
-                    10
-                );
-                assert_eq!(
-                    quantized
-                        .search_with_ef_and_filter(&query, 10, 50, &allowlist, &acc)
-                        .len(),
-                    10
-                );
-                assert_eq!(
-                    filtered_scan_stats::get(),
-                    before,
-                    "{pct}% seed={seed}: large allowlist fell back to an exact scan"
+                assert!(
+                    stats.max_walk < count.min(N / 2),
+                    "{name} {pct}%: a walk scored {} of {N} nodes (allowlist {count})",
+                    stats.max_walk
                 );
             }
         }
     });
 
-    // At the default threshold, the same 33% allowlist (660 ids) is small.
+    // At the default gate, a 33% allowlist (1320 ids) is small.
     let allowlist = random_allowlist(N, N / 3, &mut Rng::new(1));
     assert!(allowlist.len() <= FILTERED_EXACT_SCAN_THRESHOLD);
-    let (small_before, _) = filtered_scan_stats::get();
-    let _ = plain.search_with_filter(&vectors[0], 10, &allowlist, &acc);
-    let _ = quantized.search_with_filter(&vectors[0], 10, &allowlist, &acc);
-    assert_eq!(filtered_scan_stats::get().0, small_before + 2);
+    filtered_scan_stats::reset();
+    for (_, kind) in &kinds {
+        let _ = kind.search_with_filter(&vectors[0], 10, &allowlist, &acc);
+    }
+    let stats = filtered_scan_stats::get();
+    assert_eq!((stats.small, stats.scored), (kinds.len(), 0));
+}
+
+/// The gate counts allowlisted ids **in the index**: an engine allowlist of
+/// 3,000 label nodes of which only 40 have an embedding is a small allowlist
+/// and is scanned exactly, without walking the graph.
+#[test]
+fn gate_counts_only_indexed_ids() {
+    const N: usize = 2000;
+    let vectors = random_vectors(N, 8, 21);
+    let st = store(&vectors);
+    let acc = map_accessor(&st);
+    let query = vectors[7].clone();
+    let allowlist: HashSet<NodeId> = (0..40)
+        .map(|i| node(i * 50))
+        .chain((100_000..102_960).map(NodeId::new))
+        .collect();
+    assert_eq!(allowlist.len(), 3000);
+    assert!(allowlist.len() > FILTERED_EXACT_SCAN_THRESHOLD);
+    let want = exact(&vectors, &query, 10, &allowlist);
+
+    let kinds: Vec<(&str, VectorIndexKind)> = vec![
+        ("Hnsw", build_plain(&vectors, 4, &acc).into()),
+        (
+            "Scalar/Reopened",
+            build_quantized(&vectors, QuantizationType::Scalar, Load::Reopened, 4, &acc).into(),
+        ),
+    ];
+    for (name, kind) in &kinds {
+        filtered_scan_stats::reset();
+        assert_eq!(
+            ids(&kind.search_with_filter(&query, 10, &allowlist, &acc)),
+            want,
+            "{name}"
+        );
+        let stats = filtered_scan_stats::get();
+        assert_eq!((stats.small, stats.scored), (1, 0), "{name}: {stats:?}");
+    }
+}
+
+/// The walk's work budget: when a walk scores more nodes than its budget, the
+/// search falls back to the exact scan and still returns the exact filtered
+/// top-k.
+/// * Forced: a far-region allowlist above the gate with the budget set to 100
+///   makes every walk hit it, for every kind.
+/// * Default budget: random and far-region 33% allowlists on a 4,000-node
+///   index. No walk scores more than `|A|` nodes (the default budget there),
+///   results are never short, recall stays high, and far-region walks, which
+///   would otherwise expand most of the graph, do hit the budget.
+#[test]
+fn walk_budget_falls_back_to_exact_scan() {
+    const N: usize = 1000;
+    const BUDGET: usize = 100;
+    let vectors = random_vectors(N, 8, 33);
+    let st = store(&vectors);
+    let acc = map_accessor(&st);
+    let kinds = all_kinds(&vectors, 6, &acc);
+
+    for seed in 0..10u64 {
+        let mut rng = Rng::new(seed);
+        let query: Vec<f32> = (0..8).map(|_| rng.next_f32()).collect();
+        let allowlist = far_allowlist(&vectors, &query, N / 3);
+        let want = exact(&vectors, &query, 10, &allowlist);
+        filtered_scan_stats::with_threshold(64, || {
+            filtered_scan_stats::with_budget(BUDGET, || {
+                for (name, kind) in &kinds {
+                    filtered_scan_stats::reset();
+                    let got = ids(&kind.search_with_filter(&query, 10, &allowlist, &acc));
+                    let stats = filtered_scan_stats::get();
+                    assert_eq!(got, want, "{name} seed={seed}");
+                    assert_eq!(stats.budget, 1, "{name} seed={seed}: {stats:?}");
+                    assert!(stats.max_walk <= BUDGET, "{name} seed={seed}: {stats:?}");
+                }
+            });
+        });
+    }
+
+    // Default budget, gate lowered so the 33% allowlists walk.
+    const N2: usize = 4000;
+    let vectors = random_vectors(N2, 8, 99);
+    let st = store(&vectors);
+    let acc = map_accessor(&st);
+    let kinds: Vec<(&str, VectorIndexKind)> = vec![
+        ("Hnsw", build_plain(&vectors, 3, &acc).into()),
+        (
+            "Scalar/Reopened",
+            build_quantized(&vectors, QuantizationType::Scalar, Load::Reopened, 3, &acc).into(),
+        ),
+    ];
+    let count = N2 / 3;
+    for far in [false, true] {
+        for (name, kind) in &kinds {
+            let mut total_recall = 0.0;
+            filtered_scan_stats::reset();
+            filtered_scan_stats::with_threshold(64, || {
+                for seed in 0..50u64 {
+                    let mut rng = Rng::new(seed);
+                    let query: Vec<f32> = (0..8).map(|_| rng.next_f32()).collect();
+                    let allowlist = if far {
+                        far_allowlist(&vectors, &query, count)
+                    } else {
+                        random_allowlist(N2, count, &mut rng)
+                    };
+                    let want = exact(&vectors, &query, 10, &allowlist);
+                    let got = ids(&kind.search_with_filter(&query, 10, &allowlist, &acc));
+                    assert_eq!(got.len(), 10, "{name} far={far} seed={seed}");
+                    total_recall += recall(&got, &want);
+                }
+            });
+            let stats = filtered_scan_stats::get();
+            assert!(
+                stats.max_walk <= count,
+                "{name} far={far}: a walk scored past its budget: {stats:?}"
+            );
+            let mean = total_recall / 50.0;
+            assert!(mean >= 0.95, "{name} far={far}: recall {mean:.3}");
+            if far {
+                assert!(
+                    stats.budget > 0,
+                    "{name}: far-region walks never hit the budget: {stats:?}"
+                );
+            }
+        }
+    }
 }
 
 /// Shortfall fallback, both index kinds: the layer-0 graph has two components
@@ -486,8 +710,6 @@ fn unreachable_allowlist_falls_back_to_exact_scan() {
     let st = store(&vectors);
     let acc = map_accessor(&st);
     // Component A = ids of 0..HALF, component B = ids of HALF..N, each a ring.
-    // |B| = 200 is above both visit estimates (50 / 0.5 and 20 / 0.5) and the
-    // lowered threshold, so the traversal runs first.
     let topology: Vec<(NodeId, Vec<Vec<NodeId>>)> = (0..N)
         .map(|i| {
             let (lo, hi) = if i < HALF { (0, HALF) } else { (HALF, N) };
@@ -511,9 +733,11 @@ fn unreachable_allowlist_falls_back_to_exact_scan() {
     let want = exact(&vectors, &query, 5, &allowlist);
     assert_eq!(want.len(), 5);
 
+    // Gate lowered so the |B| = 200 allowlist walks; the walk exhausts
+    // component A (200 nodes) well within its budget.
     filtered_scan_stats::with_threshold(10, || {
         for (name, kind) in &kinds {
-            let before = filtered_scan_stats::get().1;
+            filtered_scan_stats::reset();
             assert_eq!(
                 ids(&kind.search_with_filter(&query, 5, &allowlist, &acc)),
                 want,
@@ -524,18 +748,19 @@ fn unreachable_allowlist_falls_back_to_exact_scan() {
                 want,
                 "{name} search_with_ef_and_filter"
             );
+            let stats = filtered_scan_stats::get();
             assert_eq!(
-                filtered_scan_stats::get().1,
-                before + 2,
-                "{name}: both searches took the shortfall fallback"
+                (stats.shortfall, stats.budget),
+                (2, 0),
+                "{name}: both searches took the shortfall fallback: {stats:?}"
             );
         }
     });
 
     // The traversal on its own really does come back empty here.
     if let Some(plain) = kinds[0].1.as_hnsw() {
-        let traversal = plain.filtered_traversal(&query, 5, 20, &allowlist, &acc);
-        assert_eq!(traversal.len(), 0, "{traversal:?}");
+        let traversal = plain.filtered_traversal(&query, 5, 20, &allowlist, usize::MAX, &acc);
+        assert_eq!(traversal.map(|t| t.len()), Some(0));
     }
 }
 
@@ -571,8 +796,11 @@ fn filtered_search_latency_report() {
             )
             .into(),
         ),
+        (
+            "Scalar (reopened, trained)",
+            build_quantized(&vectors, QuantizationType::Scalar, Load::Reopened, 9, &acc).into(),
+        ),
     ];
-
     for (name, kind) in &kinds {
         // Warm up.
         for q in queries.iter().take(20) {
@@ -612,16 +840,43 @@ fn filtered_search_latency_report() {
                     .collect();
                 let mut total_recall = 0.0;
                 let mut elapsed = 0.0;
-                for (q, allow) in queries.iter().zip(&allowlists) {
-                    let t = Instant::now();
-                    let res = std::hint::black_box(kind.search_with_filter(q, K, allow, &acc));
-                    elapsed += t.elapsed().as_secs_f64();
-                    total_recall += recall(&ids(&res), &exact(&vectors, q, K, allow));
+                filtered_scan_stats::reset();
+                // BENCH_GATE / BENCH_BUDGET override the gate and the walk
+                // budget, to measure the walk on its own.
+                let gate = std::env::var("BENCH_GATE")
+                    .ok()
+                    .and_then(|v| v.parse().ok());
+                let budget = std::env::var("BENCH_BUDGET")
+                    .ok()
+                    .and_then(|v| v.parse().ok());
+                let mut run = || {
+                    for (q, allow) in queries.iter().zip(&allowlists) {
+                        let t = Instant::now();
+                        let res = std::hint::black_box(kind.search_with_filter(q, K, allow, &acc));
+                        elapsed += t.elapsed().as_secs_f64();
+                        total_recall += recall(&ids(&res), &exact(&vectors, q, K, allow));
+                    }
+                };
+                match (gate, budget) {
+                    (Some(g), Some(b)) => filtered_scan_stats::with_threshold(g, || {
+                        filtered_scan_stats::with_budget(b, run);
+                    }),
+                    (Some(g), None) => filtered_scan_stats::with_threshold(g, run),
+                    (None, Some(b)) => filtered_scan_stats::with_budget(b, run),
+                    (None, None) => run(),
                 }
+                let stats = filtered_scan_stats::get();
                 let us = elapsed * 1e6 / QUERIES as f64;
                 let rec = total_recall / QUERIES as f64;
                 let shape = if far { "far region" } else { "random" };
-                println!("| {name} | {pct}% ({count}) | {shape} | {us:.1} | {rec:.3} |");
+                println!(
+                    "| {name} | {pct}% ({count}) | {shape} | {us:.1} | {rec:.3} | {} | {} | {}/{}/{} |",
+                    stats.scored / QUERIES,
+                    stats.max_walk,
+                    stats.small,
+                    stats.budget,
+                    stats.shortfall
+                );
                 if let (false, Some(plain)) = (far, kind.as_hnsw()) {
                     // Cost of answering the same queries by exact scan alone.
                     let t = Instant::now();
@@ -635,7 +890,9 @@ fn filtered_search_latency_report() {
                         ));
                     }
                     let us = t.elapsed().as_secs_f64() * 1e6 / QUERIES as f64;
-                    println!("| (exact scan only) | {pct}% ({count}) | random | {us:.1} | 1.000 |");
+                    println!(
+                        "| (exact scan only) | {pct}% ({count}) | random | {us:.1} | 1.000 | 0 | 0 | - |"
+                    );
                 }
             }
         }

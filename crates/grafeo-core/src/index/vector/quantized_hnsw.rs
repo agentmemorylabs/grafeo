@@ -36,7 +36,7 @@
 //! ```
 
 use super::VectorAccessor;
-use super::hnsw::{FilteredScanReason, use_filtered_exact_scan};
+use super::hnsw::FilteredScanReason;
 use super::quantization::{BinaryQuantizer, ProductQuantizer, QuantizationType, ScalarQuantizer};
 use super::{HnswConfig, HnswIndex, compute_distance};
 use grafeo_common::types::NodeId;
@@ -710,8 +710,11 @@ impl QuantizedHnswIndex {
             return Vec::new();
         }
 
-        let visit_estimate = self.hnsw.filtered_visit_estimate(ef, k, allowlist.len());
-        if use_filtered_exact_scan(allowlist.len(), visit_estimate) {
+        let plan = self.hnsw.filtered_plan(ef, k, allowlist);
+        if plan.indexed == 0 {
+            return Vec::new();
+        }
+        if plan.exact_scan() {
             return self.filtered_exact_scan(
                 query,
                 k,
@@ -722,25 +725,39 @@ impl QuantizedHnswIndex {
         }
 
         // The pipeline asks for `k * rescore_factor` (or more) candidates;
-        // the filtered traversal returns that many allowlisted nodes.
-        let results = self.search_pipeline(query, k, accessor, |n| {
-            self.hnsw
-                .filtered_traversal(query, n, ef.max(n), allowlist, accessor)
-        });
+        // the filtered walk returns that many allowlisted nodes, or gives up
+        // once it has scored more than the plan's budget. When the index keeps
+        // its own f32 copy, the walk reads it first, as rescoring and the
+        // exact scan do, so all three agree on which nodes can be scored.
+        let over_budget = std::cell::Cell::new(false);
+        let has_own_copy = !self.vectors.read().is_empty();
+        let walk = |n: usize| {
+            let found = if has_own_copy {
+                let lookup = |id: NodeId| -> Option<Arc<[f32]>> {
+                    let own = self.vectors.read().get(&id).cloned();
+                    own.or_else(|| accessor.get_vector(id))
+                };
+                self.hnsw
+                    .filtered_traversal(query, n, ef.max(n), allowlist, plan.budget, &lookup)
+            } else {
+                self.hnsw
+                    .filtered_traversal(query, n, ef.max(n), allowlist, plan.budget, accessor)
+            };
+            found.unwrap_or_else(|| {
+                over_budget.set(true);
+                Vec::new()
+            })
+        };
+        let results = self.search_pipeline(query, k, accessor, walk);
 
-        if self
-            .hnsw
-            .filtered_traversal_is_short(results.len(), k, allowlist)
-        {
-            return self.filtered_exact_scan(
-                query,
-                k,
-                allowlist,
-                accessor,
-                FilteredScanReason::Shortfall,
-            );
-        }
-        results
+        let reason = if over_budget.get() {
+            FilteredScanReason::BudgetExceeded
+        } else if results.len() < k.min(plan.indexed) {
+            FilteredScanReason::Shortfall
+        } else {
+            return results;
+        };
+        self.filtered_exact_scan(query, k, allowlist, accessor, reason)
     }
 
     /// Exact scan of the allowlisted ids, reading full-precision vectors in
