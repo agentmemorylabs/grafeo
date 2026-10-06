@@ -9,7 +9,7 @@ tags:
 
 # Layered overlay as a diff for base entities (D10)
 
-**Status:** design; slice 1 (node property diffs, fork PR #40) and slice 2 (edge property diffs) implemented. **Grounded in:** fork trunk `83710123` plus fork PR #38 (overlay-only deletes).
+**Status:** design; slices 1–3 implemented (fork PRs #40, #42, and the slice-3 PR); slice 4 open. **Grounded in:** fork trunk `83710123` plus fork PR #38 (overlay-only deletes).
 **Decision source:** AMH `docs/planning/disk-backed-memory-graph/DESIGN.md` D10, §4.3, §11.2 (gap G6).
 
 ## 1. Problem
@@ -105,7 +105,7 @@ Then:
 | set property `k = v` | diff row `k = v` (versioned as today) |
 | remove property `k` | if the base row has `k`: diff row `k = Null` (tombstone), returning the merged old value; else an overlay remove |
 | add/remove label | on the diff row's label set (it holds all labels) |
-| create edge with a base endpoint | `ensure_diff_row(endpoint)`: labels only (see §9 on dropping it) |
+| create edge with a base endpoint | nothing for the endpoint (slice 3; slice 1 made a labels-only row) |
 | set/remove edge property | edge diff row (`src`/`dst`/type plus changed properties); endpoints as above |
 
 **Cost after the change:** a single-property update on a base entity costs the property plus one labels-only row,
@@ -261,8 +261,15 @@ Each slice is one fork PR with tests, against `fix/root-mount-covers-nested`.
 2. **Edge property diffs** (done): the same for `ensure_edge_in_overlay`. That covers merged `get_edge*` and
    `get_edge_property` reads, tombstones, merged capture in all three build sources, and
    `GrafeoDB::remove_edge_property`. Edges have no property indexes, so no probe changes are needed.
-3. **Endpoint rows on edge create:** measure whether labels-only endpoint rows can be dropped entirely (no overlay row
-   for an endpoint whose only change is a new edge).
+3. **No endpoint rows on edge create** (done).
+   - **Measured first:** a labels-only endpoint row cost ~206 B, i.e. 412 of the 1070 B per relation between two base
+     entities. The edge itself is ~658 B.
+   - **Now:** an endpoint whose only change is a new edge gets no overlay row. The overlay keys adjacency by node id,
+     `edges_from` always reads overlay adjacency, and endpoint reads merge with the base. The session's direct edge
+     create always worked this way.
+   - **Applies to** the live creates, batch creates, WAL replay and edge copy-up.
+   - **Unchanged:** already-dirty endpoints keep their journal touch and post-freeze record.
+   - **Also:** `GrafeoDB::validate` checks overlay edge endpoints through the merged view.
 4. **Vector search merge:** the explicit overlay flat scan of §5.5, shared with the per-tier vector work (DESIGN §5).
 
 ## 10. Test plan
