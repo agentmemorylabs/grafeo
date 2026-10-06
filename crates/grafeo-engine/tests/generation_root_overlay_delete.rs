@@ -420,3 +420,204 @@ fn rollback_of_overlay_delete_restores_rows() {
     assert!(delete_edge(&db, x, true), "delete_edge(x) after rollback");
     assert_edge_gone(&db, x, "x", "delete after rollback");
 }
+
+// ── Coverage follow-ups from #38's review ─────────────────────────────
+
+/// Create and delete in one transaction: the rows never become visible and
+/// stay gone after reopen.
+#[test]
+fn create_and_delete_in_one_transaction() {
+    let (_dir, root) = fresh_root();
+    {
+        let db = open(&root);
+        let (a, b) = (node(&db, "a"), node(&db, "b"));
+        let mut session = db.session();
+        session.begin_transaction().expect("begin");
+        let c = session
+            .create_node_with_props(&["MemoryEntity"], [("name", Value::from("c"))])
+            .expect("create c");
+        let e = session
+            .create_edge_with_props(a, b, REL, [("rel_type", Value::from("x"))])
+            .expect("create x");
+        assert!(session.delete_edge(e), "delete own edge");
+        assert!(session.delete_node(c), "delete own node");
+        session.commit().expect("commit");
+        assert_edge_gone(&db, e, "x", "commit");
+        assert_eq!(entity_count(&db, "c"), 0, "[commit] c");
+        db.close().expect("close");
+    }
+    let db = open(&root);
+    assert_eq!(rel_count(&db, "x"), 0, "[reopen] x");
+    assert_eq!(entity_count(&db, "c"), 0, "[reopen] c");
+}
+
+/// Rolling back a Cypher `DETACH DELETE` of an overlay node restores the
+/// node and both incident overlay edges, also after reopen.
+#[test]
+fn rollback_of_cypher_detach_delete_restores_node_and_edges() {
+    let (_dir, root) = fresh_root();
+    {
+        let db = open(&root);
+        let c = create_entity(&db, "c");
+        let (a, b) = (node(&db, "a"), node(&db, "b"));
+        let session = db.session();
+        session
+            .create_edge_with_props(a, c, REL, [("rel_type", Value::from("a_c"))])
+            .expect("a->c");
+        session
+            .create_edge_with_props(c, b, REL, [("rel_type", Value::from("c_b"))])
+            .expect("c->b");
+        let mut session = db.session();
+        session.begin_transaction().expect("begin");
+        session
+            .execute_cypher("MATCH (n:MemoryEntity {name: 'c'}) DETACH DELETE n")
+            .expect("DETACH DELETE");
+        session.rollback().expect("rollback");
+        let check = |stage: &str| {
+            assert_eq!(entity_count(&db, "c"), 1, "[{stage}] c");
+            assert_eq!(
+                count(
+                    &db,
+                    "MATCH (:MemoryEntity {name: 'a'})-[r:MemoryEntityRelation {rel_type: 'a_c'}]->(:MemoryEntity {name: 'c'}) RETURN count(r)"
+                ),
+                1,
+                "[{stage}] a->c"
+            );
+            assert_eq!(
+                count(
+                    &db,
+                    "MATCH (:MemoryEntity {name: 'c'})-[r:MemoryEntityRelation {rel_type: 'c_b'}]->(:MemoryEntity {name: 'b'}) RETURN count(r)"
+                ),
+                1,
+                "[{stage}] c->b"
+            );
+        };
+        check("rollback");
+        db.close().expect("close");
+    }
+    let db = open(&root);
+    assert_eq!(entity_count(&db, "c"), 1, "[reopen] c");
+    assert_eq!(
+        count(
+            &db,
+            "MATCH (n:MemoryEntity {name: 'c'})-[r]-() RETURN count(r)"
+        ),
+        2,
+        "[reopen] c's edges"
+    );
+}
+
+/// A WAL checkpoint between create and delete changes nothing: the delete
+/// still works and survives reopen. A Cypher node delete is checked across
+/// reopen too.
+#[test]
+fn delete_after_a_wal_checkpoint_and_cypher_node_delete_survive_reopen() {
+    let (_dir, root) = fresh_root();
+    {
+        let db = open(&root);
+        let x = create_rel(&db, "x", true);
+        let _c = create_entity(&db, "c");
+        let _d = create_entity(&db, "d");
+        db.wal_checkpoint().expect("wal checkpoint");
+        assert!(delete_edge(&db, x, true), "delete_edge after checkpoint");
+        db.execute_cypher("MATCH (n:MemoryEntity {name: 'c'}) DETACH DELETE n")
+            .expect("Cypher DETACH DELETE c");
+        db.execute_cypher("MATCH (n:MemoryEntity {name: 'd'}) DELETE n")
+            .expect("Cypher DELETE d");
+        db.close().expect("close");
+    }
+    let db = open(&root);
+    assert_eq!(rel_count(&db, "x"), 0, "[reopen] x");
+    assert_eq!(entity_count(&db, "c"), 0, "[reopen] c");
+    assert_eq!(entity_count(&db, "d"), 0, "[reopen] d");
+    assert_eq!(rel_count(&db, "base"), 1, "[reopen] base edge untouched");
+}
+
+/// A transaction that began before an overlay edge was deleted and
+/// committed still finds the edge by id; later readers do not. (Existence
+/// only: non-temporal deletion drops the properties at delete time, a known
+/// isolation limit noted in #38's review.)
+#[test]
+fn older_snapshot_still_sees_a_deleted_overlay_edge() {
+    let (_dir, root) = fresh_root();
+    let db = open(&root);
+    let e = create_rel(&db, "x", true);
+    let mut reader = db.session();
+    reader.begin_transaction().expect("reader begin");
+    assert!(reader.get_edge(e).is_some(), "reader sees the edge");
+    assert!(delete_edge(&db, e, true), "writer deletes and commits");
+    assert!(reader.get_edge(e).is_some(), "older snapshot still sees it");
+    reader.commit().expect("reader commit");
+    assert!(db.session().get_edge(e).is_none(), "later reader does not");
+}
+
+/// A deleted overlay node leaves the vector index (direct delete), also
+/// after reopen.
+#[cfg(feature = "vector-index")]
+#[test]
+fn direct_delete_of_an_overlay_node_leaves_the_vector_index() {
+    let (_dir, root) = fresh_root();
+    let query = [0.9f32, 0.1, 0.0, 0.0];
+    let (hits, c) = {
+        let db = open(&root);
+        db.create_vector_index(
+            "MemoryEntity",
+            "embedding",
+            Some(4),
+            Some("cosine"),
+            None,
+            None,
+            None,
+        )
+        .expect("vector index");
+        let c = db
+            .session()
+            .create_node_with_props(
+                &["MemoryEntity"],
+                [
+                    ("name", Value::from("c")),
+                    ("embedding", Value::Vector(query.to_vec().into())),
+                ],
+            )
+            .expect("create c with vector");
+        let found = db
+            .vector_search("MemoryEntity", "embedding", &query, 5, None, None)
+            .expect("search");
+        assert!(found.iter().any(|(id, _)| *id == c), "c indexed");
+        assert!(db.session().delete_node(c), "delete c");
+        let hits = db
+            .vector_search("MemoryEntity", "embedding", &query, 5, None, None)
+            .expect("search");
+        db.close().expect("close");
+        (hits, c)
+    };
+    assert!(
+        !hits.iter().any(|(id, _)| *id == c),
+        "c still in the index after delete"
+    );
+    // Reopen: whether the index definition persisted or is rebuilt from the
+    // layered view, the deleted node must not be in it.
+    let db = open(&root);
+    if db
+        .vector_search("MemoryEntity", "embedding", &query, 5, None, None)
+        .is_err()
+    {
+        db.create_vector_index(
+            "MemoryEntity",
+            "embedding",
+            Some(4),
+            Some("cosine"),
+            None,
+            None,
+            None,
+        )
+        .expect("rebuild vector index after reopen");
+    }
+    let hits = db
+        .vector_search("MemoryEntity", "embedding", &query, 5, None, None)
+        .expect("search after reopen");
+    assert!(
+        !hits.iter().any(|(id, _)| *id == c),
+        "[reopen] c in the index"
+    );
+}
