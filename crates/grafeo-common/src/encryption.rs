@@ -74,6 +74,18 @@ impl PageEncryptor {
         }
     }
 
+    /// Creates an encryptor with a fresh random key that is never stored.
+    ///
+    /// For scratch data that only this process reads back (a transaction's
+    /// WAL spill file): once the process exits the key is gone, so a file
+    /// left behind by a crash cannot be decrypted by anyone.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        let mut key = Zeroizing::new([0u8; KEY_SIZE]);
+        rand::rng().fill(&mut key[..]);
+        Self::new(&key)
+    }
+
     /// Encrypts plaintext with the given nonce and AAD.
     ///
     /// Returns `nonce || ciphertext || tag`.
