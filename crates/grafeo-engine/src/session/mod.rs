@@ -511,9 +511,10 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// A refused record (over the cap) keeps its retryable error. A failed
-    /// append becomes the durability-unconfirmed error: the write is applied
-    /// in memory and cannot be undone, and the WAL is poisoned.
+    /// Both a refused record (over the cap, or a spill that failed) and a
+    /// failed append become the non-retryable durability-unconfirmed error:
+    /// the write is applied in memory and cannot be undone, and the WAL is
+    /// poisoned.
     #[cfg(feature = "wal")]
     fn flush_wal_outside_transaction(&self) -> Result<()> {
         let Some(ref wal) = self.wal else {
