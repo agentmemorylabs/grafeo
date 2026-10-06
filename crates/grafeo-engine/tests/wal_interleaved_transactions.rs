@@ -456,8 +456,126 @@ fn run_scenario(scenario: &str, db: &GrafeoDB) -> Vec<String> {
             );
             strings(&["alix"])
         }
+        // A schema command whose implicit group cannot be written reports
+        // it, and once the WAL is poisoned schema commands are refused
+        // before they change anything. `CREATE GRAPH` is a session command;
+        // `CREATE SCHEMA` goes through the schema DDL path.
+        #[cfg(feature = "testing-crash-injection")]
+        "schema_failure" => {
+            use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+            insert(&db.session(), "alix");
+            let session = db.session();
+            enable_io_failure_at(1);
+            let r = session.execute("CREATE GRAPH lost");
+            disable_io_failure();
+            assert_unconfirmed(&r.expect_err("a lost schema group is not Ok"));
+            assert_schema_refused(db, &session);
+            strings(&["alix"])
+        }
+        #[cfg(feature = "testing-crash-injection")]
+        "schema_ddl_failure" => {
+            use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+            insert(&db.session(), "alix");
+            let session = db.session();
+            enable_io_failure_at(1);
+            let r = session.execute("CREATE SCHEMA lost_schema");
+            disable_io_failure();
+            assert_unconfirmed(&r.expect_err("a lost schema group is not Ok"));
+            assert_schema_refused(db, &session);
+            strings(&["alix"])
+        }
+        // A nested begin after a refused (over-cap) write is refused without
+        // adding a nesting level: one rollback ends the whole transaction
+        // and releases what it wrote.
+        "cap_nested_begin" => {
+            let alix = db
+                .session()
+                .create_node_with_props(&["Person"], [("name", Value::from("alix"))])
+                .unwrap();
+            let base_before = count(db, "MATCH (n:Base) RETURN count(n)");
+            let mut s = db.session();
+            s.begin_transaction().unwrap();
+            insert(&s, "gus");
+            s.execute("MATCH (n:Base) DETACH DELETE n").unwrap();
+            let err = s
+                .set_node_property(alix, "name", Value::from(big()))
+                .expect_err("over the cap");
+            assert_cap_error(&err);
+            let err = s.begin_transaction().expect_err("nested begin refused");
+            assert_cap_error(&err);
+            s.rollback().expect("one rollback ends the transaction");
+            assert!(!s.in_transaction(), "no phantom nesting level");
+            assert_released(db, base_before);
+            strings(&["alix"])
+        }
+        // The same, with the session dropped right after the refused nested
+        // begin: the drop's rollback aborts the transaction fully.
+        "cap_nested_begin_drop" => {
+            let alix = db
+                .session()
+                .create_node_with_props(&["Person"], [("name", Value::from("alix"))])
+                .unwrap();
+            let base_before = count(db, "MATCH (n:Base) RETURN count(n)");
+            let mut s = db.session();
+            s.begin_transaction().unwrap();
+            insert(&s, "gus");
+            s.execute("MATCH (n:Base) DETACH DELETE n").unwrap();
+            s.execute("MATCH (n:Person {name: 'alix'}) SET n.age = 1")
+                .unwrap();
+            let err = s
+                .set_node_property(alix, "name", Value::from(big()))
+                .expect_err("over the cap");
+            assert_cap_error(&err);
+            let err = s.begin_transaction().expect_err("nested begin refused");
+            assert_cap_error(&err);
+            drop(s);
+            assert_released(db, base_before);
+            strings(&["alix"])
+        }
         other => panic!("unknown scenario {other}"),
     }
+}
+
+/// `n` from a `RETURN count(...)` query.
+fn count(db: &GrafeoDB, query: &str) -> i64 {
+    match &db.session().execute(query).unwrap().rows()[0][0] {
+        Value::Int64(n) => *n,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// After an aborted transaction that deleted the `:Base` nodes and wrote
+/// `alix`: the live state is back (the base nodes are visible again), and
+/// `alix` is released, so another transaction can write it and commit.
+fn assert_released(db: &GrafeoDB, base_before: i64) {
+    assert_eq!(
+        count(db, "MATCH (n:Base) RETURN count(n)"),
+        base_before,
+        "the deleted base nodes are back"
+    );
+    let mut other = db.session();
+    other.begin_transaction().unwrap();
+    other
+        .execute("MATCH (n:Person {name: 'alix'}) SET n.age = 2")
+        .expect("alix is released");
+    other
+        .commit()
+        .expect("no conflict with the aborted transaction");
+}
+
+/// Once the WAL is poisoned, `CREATE GRAPH` and `CREATE SCHEMA` are refused
+/// and create nothing.
+#[cfg(feature = "testing-crash-injection")]
+fn assert_schema_refused(db: &GrafeoDB, session: &Session) {
+    for ddl in ["CREATE GRAPH refused", "CREATE SCHEMA refused_schema"] {
+        let err = session.execute(ddl).expect_err(ddl);
+        assert!(err.to_string().contains("WAL refuses"), "{ddl}: {err}");
+    }
+    let graphs = db.list_graphs();
+    assert!(
+        !graphs.iter().any(|g| g.starts_with("refused")),
+        "nothing was created: {graphs:?}"
+    );
 }
 
 /// A small transaction WAL buffer cap for the scenarios that test it.
@@ -682,6 +800,52 @@ fn checked_batch_failure_crash_reopen() {
 fn writes_after_poison_crash_reopen() {
     let _serial = serial();
     check_crash_reopen("writes_after_poison");
+}
+
+/// After the crash, the schema objects whose group was lost (and the ones
+/// refused afterwards) are gone.
+#[cfg(feature = "testing-crash-injection")]
+fn check_schema_crash_reopen(scenario: &str) {
+    check_crash_reopen(scenario);
+    for kind in kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = kind.create(dir.path());
+        crash_after(scenario, &path, kind);
+        let db = kind.open(&path);
+        let graphs = db.list_graphs();
+        assert!(
+            !graphs
+                .iter()
+                .any(|g| g.starts_with("lost") || g.starts_with("refused")),
+            "{kind:?} {scenario}: after a crash: {graphs:?}"
+        );
+    }
+}
+
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn schema_failure_crash_reopen() {
+    let _serial = serial();
+    check_schema_crash_reopen("schema_failure");
+}
+
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn schema_ddl_failure_crash_reopen() {
+    let _serial = serial();
+    check_schema_crash_reopen("schema_ddl_failure");
+}
+
+#[test]
+fn cap_nested_begin_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("cap_nested_begin");
+}
+
+#[test]
+fn cap_nested_begin_drop_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("cap_nested_begin_drop");
 }
 
 #[test]
