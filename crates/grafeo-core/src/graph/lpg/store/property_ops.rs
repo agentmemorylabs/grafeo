@@ -145,6 +145,31 @@ impl LpgStore {
         self.edge_properties.get_all_history(id)
     }
 
+    /// [`Self::node_property_history`] without the entries of open
+    /// transactions (PENDING epochs), for checkpoints and snapshots: an
+    /// uncommitted SET or delete tombstone must not be persisted. Keys left
+    /// with no entry are dropped.
+    #[cfg(feature = "temporal")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn committed_node_property_history(
+        &self,
+        id: NodeId,
+    ) -> Vec<(PropertyKey, Vec<(EpochId, Value)>)> {
+        without_pending(self.node_properties.get_all_history(id))
+    }
+
+    /// Edge variant of [`Self::committed_node_property_history`].
+    #[cfg(feature = "temporal")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn committed_edge_property_history(
+        &self,
+        id: EdgeId,
+    ) -> Vec<(PropertyKey, Vec<(EpochId, Value)>)> {
+        without_pending(self.edge_properties.get_all_history(id))
+    }
+
     /// Removes a property from a node.
     ///
     /// Returns the previous value if it existed, or None if the property didn't exist.
@@ -486,6 +511,12 @@ impl LpgStore {
             // Replay in reverse order: latest change first
             for entry in entries.into_iter().rev() {
                 match entry {
+                    PropertyUndoEntry::NodeCreated { node_id } => {
+                        self.discard_created_node(node_id, transaction_id);
+                    }
+                    PropertyUndoEntry::EdgeCreated { edge_id } => {
+                        self.discard_created_edge(edge_id, transaction_id);
+                    }
                     PropertyUndoEntry::NodeProperty {
                         node_id,
                         key,
@@ -511,10 +542,10 @@ impl LpgStore {
                         }
                     }
                     PropertyUndoEntry::LabelAdded { node_id, label } => {
-                        self.remove_label(node_id, &label);
+                        self.remove_label_as(node_id, &label, Some(transaction_id));
                     }
                     PropertyUndoEntry::LabelRemoved { node_id, label } => {
-                        self.add_label(node_id, &label);
+                        self.add_label_as(node_id, &label, Some(transaction_id));
                     }
                     PropertyUndoEntry::NodeDeleted {
                         node_id,
@@ -590,6 +621,12 @@ impl LpgStore {
             // First pass: collect touched entries and handle entity deletions
             for entry in entries.into_iter().rev() {
                 match entry {
+                    PropertyUndoEntry::NodeCreated { node_id } => {
+                        self.discard_created_node(node_id, transaction_id);
+                    }
+                    PropertyUndoEntry::EdgeCreated { edge_id } => {
+                        self.discard_created_edge(edge_id, transaction_id);
+                    }
                     PropertyUndoEntry::NodeProperty { node_id, key, .. } => {
                         node_props.insert((node_id, key));
                     }
@@ -733,6 +770,12 @@ impl LpgStore {
             // Replay in reverse order
             for entry in to_undo.into_iter().rev() {
                 match entry {
+                    PropertyUndoEntry::NodeCreated { node_id } => {
+                        self.discard_created_node(node_id, transaction_id);
+                    }
+                    PropertyUndoEntry::EdgeCreated { edge_id } => {
+                        self.discard_created_edge(edge_id, transaction_id);
+                    }
                     PropertyUndoEntry::NodeProperty {
                         node_id,
                         key,
@@ -756,10 +799,10 @@ impl LpgStore {
                         }
                     }
                     PropertyUndoEntry::LabelAdded { node_id, label } => {
-                        self.remove_label(node_id, &label);
+                        self.remove_label_as(node_id, &label, Some(transaction_id));
                     }
                     PropertyUndoEntry::LabelRemoved { node_id, label } => {
-                        self.add_label(node_id, &label);
+                        self.add_label_as(node_id, &label, Some(transaction_id));
                     }
                     PropertyUndoEntry::NodeDeleted {
                         node_id,
@@ -818,6 +861,12 @@ impl LpgStore {
 
             for entry in to_undo.into_iter().rev() {
                 match entry {
+                    PropertyUndoEntry::NodeCreated { node_id } => {
+                        self.discard_created_node(node_id, transaction_id);
+                    }
+                    PropertyUndoEntry::EdgeCreated { edge_id } => {
+                        self.discard_created_edge(edge_id, transaction_id);
+                    }
                     PropertyUndoEntry::NodeProperty { node_id, key, .. } => {
                         *node_prop_counts.entry((node_id, key)).or_default() += 1;
                     }
@@ -946,14 +995,34 @@ impl LpgStore {
             }
         }
 
-        // Restore label index entries
+        // Restore label index entries. The node may be one this transaction
+        // created (still PENDING), so it must exist for the transaction,
+        // not only at the current epoch.
         for label in labels {
-            self.add_label(node_id, label);
+            self.add_label_as(node_id, label, Some(transaction_id));
         }
 
-        // Restore properties
+        // Restore properties (this also restores property and text index entries)
+        #[cfg(not(feature = "temporal"))]
         for (key, value) in properties {
             self.set_node_property(node_id, key.as_str(), value);
+        }
+        // Temporal: the delete wrote one PENDING tombstone per value; dropping
+        // them brings the values back, and the index entries go back here.
+        #[cfg(feature = "temporal")]
+        {
+            let mut columns = self.node_properties.columns_write();
+            for (key, _) in &properties {
+                if let Some(column) = columns.get_mut(key) {
+                    column.pop_n_pending_for(node_id, 1);
+                }
+            }
+            drop(columns);
+            for (key, value) in &properties {
+                self.update_property_index_on_set(node_id, key, value);
+                #[cfg(feature = "text-index")]
+                self.update_text_index_on_set(node_id, key.as_str(), value);
+            }
         }
 
         self.live_node_count.fetch_add(1, Ordering::Relaxed);
@@ -994,8 +1063,19 @@ impl LpgStore {
         }
 
         // Restore properties
+        #[cfg(not(feature = "temporal"))]
         for (key, value) in properties {
             self.set_edge_property(edge_id, key.as_str(), value);
+        }
+        // Temporal: drop the delete's PENDING tombstones, one per value.
+        #[cfg(feature = "temporal")]
+        {
+            let mut columns = self.edge_properties.columns_write();
+            for (key, _) in &properties {
+                if let Some(column) = columns.get_mut(key) {
+                    column.pop_n_pending_for(edge_id, 1);
+                }
+            }
         }
 
         self.live_edge_count.fetch_add(1, Ordering::Relaxed);
@@ -1047,4 +1127,19 @@ impl LpgStore {
     pub fn node_properties_mark_spilled(&self, key: &PropertyKey) {
         self.node_properties.mark_column_spilled(key);
     }
+}
+
+/// Drops the PENDING (uncommitted) entries of a property history, and the
+/// keys left empty.
+#[cfg(feature = "temporal")]
+fn without_pending(
+    history: Vec<(PropertyKey, Vec<(EpochId, Value)>)>,
+) -> Vec<(PropertyKey, Vec<(EpochId, Value)>)> {
+    history
+        .into_iter()
+        .filter_map(|(key, mut entries)| {
+            entries.retain(|(epoch, _)| *epoch != EpochId::PENDING);
+            (!entries.is_empty()).then_some((key, entries))
+        })
+        .collect()
 }
