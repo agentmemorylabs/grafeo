@@ -24,7 +24,8 @@ env:
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
   # No debuginfo: keeps target/ small on the hosted runner. TEST is needed too,
-  # since cargo test builds with the test profile.
+  # since cargo test builds with the test profile. Side effect: panic
+  # backtraces have no line numbers.
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   # Matches the feature set agent-memory-hosted builds Grafeo with.
@@ -80,12 +81,16 @@ jobs:
           # compact_store_generation_contract: cannot compile with generation-streaming
           #   (imports the eager generate_compact_store, which that feature seals as
           #   pub(crate)). Runs in the "no-streaming" job below instead.
-          # crash_atomic_checkpoint, crash_injection_single_file: compile to 0 tests
-          #   without testing-crash-injection; run in the next step with it on.
+          # crash_atomic_checkpoint, crash_injection_single_file,
+          # layered_rollback_base_mutations, layered_session_direct_api,
+          # wal_conflict_poison_window, wal_interleaved_transactions,
+          # wal_rdf_group_failures: contain tests gated on testing-crash-injection
+          #   (all of wal_conflict_poison_window, wal_rdf_group_failures), so they
+          #   run in the next step with it on. Keep both lists in sync.
           # n_vs_4n_peak_memory: asserts a 128 MiB peak RssAnon budget, which a debug
           #   build exceeds on the hosted runner (143628 kB before fork #24). It runs
           #   in the "peak-memory-release" job below, where it fits since #24.
-          skip='^(compact_store_generation_contract|crash_atomic_checkpoint|crash_injection_single_file|n_vs_4n_peak_memory)$'
+          skip='^(compact_store_generation_contract|crash_atomic_checkpoint|crash_injection_single_file|layered_rollback_base_mutations|layered_session_direct_api|wal_conflict_poison_window|wal_interleaved_transactions|wal_rdf_group_failures|n_vs_4n_peak_memory)$'
           targets=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="grafeo-engine") | .targets[]
                      | select(.kind | index("test")) | .name' \
@@ -93,10 +98,12 @@ jobs:
           echo "targets: $targets"
           cargo test -p grafeo-engine --features "$FEATURES" --no-fail-fast $targets
 
-      # Kept separate so the injection hooks are only compiled in for these two.
+      # Every engine target with tests gated on testing-crash-injection, run once
+      # here with it (and sparql, for wal_rdf_group_failures) on. Kept separate so
+      # the injection hooks are only compiled in for these targets.
       - name: Engine crash-injection tests
         if: ${{ !cancelled() }}
-        run: cargo test -p grafeo-engine --features "$FEATURES,testing-crash-injection" --no-fail-fast --test crash_atomic_checkpoint --test crash_injection_single_file
+        run: cargo test -p grafeo-engine --features "$FEATURES,testing-crash-injection,sparql" --no-fail-fast --test crash_atomic_checkpoint --test crash_injection_single_file --test layered_rollback_base_mutations --test layered_session_direct_api --test wal_conflict_poison_window --test wal_interleaved_transactions --test wal_rdf_group_failures
 
   no-streaming:
     name: compact_store_generation_contract (without generation-streaming)
