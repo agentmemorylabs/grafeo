@@ -5,7 +5,7 @@ use crate::file::generation_writer::OsGenerationFileOps;
 use crate::generation::lock::RootLock;
 use crate::generation::publication::{PublicationInput, publish_generation};
 use crate::generation::recovery::{RecoveryError, recover};
-use crate::generation::tests::support::{fixture_section, new_root};
+use crate::generation::tests::support::{fixture_section, new_root, try_acquire_root};
 
 fn publish_once(
     lock: &RootLock,
@@ -29,11 +29,11 @@ fn publish_once(
 #[test]
 fn recovery_genesis() {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_once(&lock, &fixture, "g-one");
     drop(lock);
 
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let selected = recover(&lock).expect("recovery must succeed");
     assert_eq!(selected.slot.publication_sequence, 1);
     assert_eq!(selected.slot.generation_id, "g-one");
@@ -44,12 +44,12 @@ fn recovery_genesis() {
 #[test]
 fn recovery_newest_valid_selected() {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_once(&lock, &fixture, "g-one");
     publish_once(&lock, &fixture, "g-two");
     drop(lock);
 
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let selected = recover(&lock).expect("recovery must succeed");
     assert_eq!(selected.slot.publication_sequence, 2);
     assert_eq!(selected.slot.generation_id, "g-two");
@@ -58,13 +58,13 @@ fn recovery_newest_valid_selected() {
 #[test]
 fn recovery_fallback_to_previous() {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_once(&lock, &fixture, "g-one");
     publish_once(&lock, &fixture, "g-two");
     drop(lock);
 
     // Corrupt the newest generation file (truncate it).
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let (_, newest) =
         crate::generation::manifest::read_manifest(&fixture.root().join("manifest.bin")).unwrap();
     let newest_path = fixture.root().join(&newest.generation_path);
@@ -81,13 +81,13 @@ fn recovery_fallback_to_previous() {
 #[test]
 fn recovery_both_invalid_typed_error() {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_once(&lock, &fixture, "g-one");
     publish_once(&lock, &fixture, "g-two");
     drop(lock);
 
     // Corrupt BOTH generation files.
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let (_, newest) =
         crate::generation::manifest::read_manifest(&fixture.root().join("manifest.bin")).unwrap();
     std::fs::write(fixture.root().join(&newest.generation_path), b"torn").unwrap();
@@ -111,13 +111,13 @@ fn recovery_both_invalid_typed_error() {
 #[test]
 fn recovery_never_selects_by_mtime() {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_once(&lock, &fixture, "g-one");
     publish_once(&lock, &fixture, "g-two");
     drop(lock);
 
     // Give the OLD slot's generation file a future mtime.
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let [slot0, slot1] =
         crate::generation::manifest::read_both_slots(&fixture.root().join("manifest.bin")).unwrap();
     let old = match (slot0, slot1) {
@@ -146,12 +146,12 @@ fn recovery_never_selects_by_mtime() {
 #[test]
 fn recovery_never_promotes_orphan() {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_once(&lock, &fixture, "g-one");
     drop(lock);
 
     // Drop a VALID container into generations/ that no slot references.
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let (_, slot) =
         crate::generation::manifest::read_manifest(&fixture.root().join("manifest.bin")).unwrap();
     let orphan_path = fixture

@@ -3,6 +3,7 @@
 //! (tempdir + WAL) for publication/recovery/snapshot/fault tests.
 
 use std::path::Path;
+use std::process::{Child, Command};
 
 use grafeo_common::types::Value;
 use grafeo_core::graph::compact::generation::{
@@ -11,6 +12,7 @@ use grafeo_core::graph::compact::generation::{
 use tempfile::TempDir;
 
 use crate::file::generation_writer::{ExactSectionSource, GenerationContainerHeader};
+use crate::generation::lock::{RootLock, RootLockError};
 use crate::wal::WalManager;
 
 /// Build a streaming CompactStore section + container header from a small
@@ -176,4 +178,53 @@ pub(crate) const CHILD_ENV_VARS: [&str; 3] = [
 /// True when this process is a re-exec'd child of any process test.
 pub(crate) fn in_any_child() -> bool {
     CHILD_ENV_VARS.iter().any(|v| std::env::var(v).is_ok())
+}
+
+/// Serializes child spawns against root-lock re-acquires in this lib-test
+/// process.
+///
+/// The root lock is a `flock` on the open file description, released by
+/// closing the fd (`RootLock` does not call `LOCK_UN`). Spawning a child
+/// forks; between fork and exec the child holds a copy of every fd this
+/// process has open (`O_CLOEXEC` closes them only at exec). If another test
+/// drops its `RootLock` and re-acquires in that window, the child's copy
+/// still holds the lock and the re-acquire returns
+/// [`RootLockError::AlreadyLocked`].
+///
+/// Engine integration tests keep a file-local mutex (fork PRs #29, #31, #33)
+/// because each test file is its own binary. These modules compile into one
+/// `cargo test --lib` binary, so one mutex here covers every parent-side
+/// acquire and every child `spawn` in the crate. `std`'s `spawn` returns
+/// only once the child has exec'd, so an acquire that takes this mutex
+/// starts after every earlier fork has dropped its inherited copies. Keep
+/// the critical section short and never hold this across a wait on a child.
+static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One turn of [`LOCK_CYCLE`]. Poison-tolerant: a panicking test must not
+/// wedge every later acquire in the binary.
+pub(crate) fn lock_cycle() -> std::sync::MutexGuard<'static, ()> {
+    LOCK_CYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// [`RootLock::try_acquire`] as one turn of [`lock_cycle`].
+///
+/// # Errors
+///
+/// Returns the same [`RootLockError`] as [`RootLock::try_acquire`].
+pub(crate) fn try_acquire_root(root: &Path) -> Result<RootLock, RootLockError> {
+    let _cycle = lock_cycle();
+    RootLock::try_acquire(root)
+}
+
+/// `Command::spawn` (fork through exec) under [`lock_cycle`]. The caller
+/// waits on the child outside the mutex.
+///
+/// # Errors
+///
+/// Returns the [`std::io::Error`] from [`Command::spawn`].
+pub(crate) fn spawn_under_lock_cycle(command: &mut Command) -> std::io::Result<Child> {
+    let _cycle = lock_cycle();
+    command.spawn()
 }
