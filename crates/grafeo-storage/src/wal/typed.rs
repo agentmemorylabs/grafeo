@@ -723,7 +723,17 @@ mod tests {
     #[test]
     fn test_spilled_group_in_encrypted_wal() {
         use super::super::WalRecovery;
-        let key = [7u8; 32];
+        // A fresh random key per run, never a constant.
+        let key: [u8; 32] = {
+            use std::hash::{BuildHasher, Hasher};
+            let mut key = [0u8; 32];
+            for chunk in key.chunks_mut(8) {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u64(0);
+                chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+            }
+            key
+        };
         let dir = tempdir().unwrap();
         {
             let mut manager = WalManager::open(dir.path()).unwrap();
