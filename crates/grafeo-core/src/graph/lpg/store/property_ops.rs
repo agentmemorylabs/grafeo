@@ -542,10 +542,10 @@ impl LpgStore {
                         }
                     }
                     PropertyUndoEntry::LabelAdded { node_id, label } => {
-                        self.remove_label(node_id, &label);
+                        self.remove_label_as(node_id, &label, Some(transaction_id));
                     }
                     PropertyUndoEntry::LabelRemoved { node_id, label } => {
-                        self.add_label(node_id, &label);
+                        self.add_label_as(node_id, &label, Some(transaction_id));
                     }
                     PropertyUndoEntry::NodeDeleted {
                         node_id,
@@ -799,10 +799,10 @@ impl LpgStore {
                         }
                     }
                     PropertyUndoEntry::LabelAdded { node_id, label } => {
-                        self.remove_label(node_id, &label);
+                        self.remove_label_as(node_id, &label, Some(transaction_id));
                     }
                     PropertyUndoEntry::LabelRemoved { node_id, label } => {
-                        self.add_label(node_id, &label);
+                        self.add_label_as(node_id, &label, Some(transaction_id));
                     }
                     PropertyUndoEntry::NodeDeleted {
                         node_id,
@@ -995,9 +995,11 @@ impl LpgStore {
             }
         }
 
-        // Restore label index entries
+        // Restore label index entries. The node may be one this transaction
+        // created (still PENDING), so it must exist for the transaction,
+        // not only at the current epoch.
         for label in labels {
-            self.add_label(node_id, label);
+            self.add_label_as(node_id, label, Some(transaction_id));
         }
 
         // Restore properties (this also restores property and text index entries)
