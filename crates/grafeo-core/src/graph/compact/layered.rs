@@ -4588,10 +4588,9 @@ mod tests {
         }
     }
 
-    /// Mutating a base-only edge promotes the edge into the overlay together
-    /// with both its endpoints, and its properties are preserved. Covers
-    /// `ensure_edge_in_overlay` including its cascade into
-    /// `ensure_in_overlay` for src and dst.
+    /// Mutating a base-only edge promotes the edge into the overlay (a diff
+    /// row, D10) and its base properties stay readable. Its endpoints get no
+    /// overlay row (D10 slice 3) and stay reachable through the merged view.
     #[test]
     fn test_layered_promote_edge_on_mutation() {
         let layered = build_test_layered();
@@ -4624,14 +4623,23 @@ mod tests {
             Some(Value::Float64(0.75))
         );
 
-        // Both endpoints are promoted and reachable from the overlay.
+        // Neither endpoint is copied; both stay reachable through the
+        // merged view, and the edge from its source.
         assert!(
-            layered.overlay.load().get_node(persons[0]).is_some(),
-            "edge source must be in the overlay after promotion"
+            layered.overlay.load().get_node(persons[0]).is_none(),
+            "edge source must not get an overlay row"
         );
         assert!(
-            layered.overlay.load().get_node(target_dst).is_some(),
-            "edge destination must be in the overlay after promotion"
+            layered.overlay.load().get_node(target_dst).is_none(),
+            "edge destination must not get an overlay row"
+        );
+        assert!(layered.get_node(persons[0]).is_some());
+        assert!(layered.get_node(target_dst).is_some());
+        assert!(
+            layered
+                .edges_from(persons[0], Direction::Outgoing)
+                .iter()
+                .any(|(_, eid)| *eid == target_eid)
         );
 
         // Endpoints' existing properties are intact through the layered view.
@@ -5514,7 +5522,8 @@ mod tests {
         // overlay node so the LIVES_IN edge between alix and amsterdam is
         // not touched in any way.
         let oslo = layered.create_node(&["City"]);
-        layered.create_edge(alix, oslo, "VISITS"); // promotes alix
+        layered.create_edge(alix, oslo, "VISITS"); // no endpoint row (D10)
+        layered.set_node_property(alix, "touched", Value::Bool(true)); // promotes alix
         layered.set_node_property(amsterdam, "touched", Value::Bool(true)); // promotes amsterdam
 
         // Both endpoints are now dirty.
@@ -5711,6 +5720,7 @@ mod tests {
         assert!(!layered.node_ids().contains(&gus));
         assert_eq!(layered.node_count(), layered.node_ids().len());
         // A live dirty node is not reported.
+        layered.set_node_property(alix, "age", Value::Int64(31));
         assert!(layered.is_node_dirty(alix));
         assert!(!layered.snapshot_deleted_promoted_node_ids().contains(&alix));
     }
