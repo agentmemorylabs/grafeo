@@ -1047,7 +1047,7 @@ mod tests {
     fn cap_charges_the_spill_overhead() {
         // 100 tiny frames: the RAM form fits a cap the spill file would not.
         let dir = tempfile::tempdir().unwrap();
-        let frame = 4 + bincode::serde::encode_to_vec(&node(1), bincode::config::standard())
+        let frame = 4 + bincode::serde::encode_to_vec(node(1), bincode::config::standard())
             .unwrap()
             .len() as u64;
         let mut g = GroupBuffer::new(
@@ -1217,9 +1217,7 @@ mod tests {
         g.clear();
         g.push(&node(1)).unwrap();
         assert_eq!(ids(&decode_all(&mut g)), vec![1]);
-        let leftovers = fs::read_dir(dir.path().join(SPILL_DIR))
-            .map(|d| d.count())
-            .unwrap_or(0);
+        let leftovers = fs::read_dir(dir.path().join(SPILL_DIR)).map_or(0, |d| d.count());
         assert_eq!(leftovers, 0);
     }
 

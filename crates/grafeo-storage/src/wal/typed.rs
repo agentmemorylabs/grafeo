@@ -836,7 +836,7 @@ mod tests {
             let first = g * 1_000_000;
             let at = ids.iter().position(|&id| id == first).unwrap();
             assert_eq!(
-                ids[at..at + PER_GROUP as usize],
+                ids[at..at + usize::try_from(PER_GROUP).unwrap()],
                 (first..first + PER_GROUP).collect::<Vec<_>>(),
                 "group {g} is contiguous and complete"
             );

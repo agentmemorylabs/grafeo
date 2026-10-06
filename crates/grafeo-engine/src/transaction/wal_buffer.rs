@@ -262,7 +262,7 @@ impl WalBuffer {
         let mut state = self.state.lock();
         // Also at the end: that clears a push refused right after `mark`.
         state.group.truncate(mark.position);
-        state.context = mark.context.clone();
+        state.context.clone_from(&mark.context);
         state.records = mark.records;
     }
 
@@ -650,10 +650,10 @@ mod tests {
         wal.sync().unwrap();
         let recovered = WalRecovery::new(dir.path()).recover().unwrap();
         assert_eq!(recovered.len(), 202);
-        assert!(
+        assert_eq!(
             std::fs::read_dir(dir.path().join(grafeo_storage::wal::SPILL_DIR))
-                .map_or(0, |d| d.count())
-                == 0
+                .map_or(0, |d| d.count()),
+            0
         );
     }
 }
