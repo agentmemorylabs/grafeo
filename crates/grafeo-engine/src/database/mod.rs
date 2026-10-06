@@ -3660,9 +3660,9 @@ impl GrafeoDB {
             *is_open = false;
             return Err(Error::Internal(format!(
                 "database closed without a checkpoint: the WAL was poisoned ({reason}); the \
-                 next writable open replays the WAL, and a write reported as durability \
-                 unconfirmed may or may not be there. Drop this database before reopening \
-                 it{file_error}"
+                 next writable open replays the WAL, and a write whose durability was \
+                 reported unconfirmed may or may not be there. Drop this database before \
+                 reopening it{file_error}"
             )));
         }
 

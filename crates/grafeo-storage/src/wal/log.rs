@@ -1511,6 +1511,24 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_append_is_classified_wal_poisoned() {
+        let dir = tempdir().unwrap();
+        let wal = WalManager::open(dir.path()).unwrap();
+        wal.poison("test: injected");
+        let err = wal
+            .log(&WalRecord::CreateNode {
+                id: NodeId::new(1),
+                labels: vec![],
+            })
+            .expect_err("a poisoned WAL refuses appends");
+        assert_eq!(
+            err.write_outcome(),
+            Some(grafeo_common::utils::WriteOutcome::WalPoisoned),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn concurrent_size_rotations_keep_files_in_append_order() {
         // Many writers cross max_log_size at once, so several of them see the
         // same full file and ask for a rotation. The active file must only
