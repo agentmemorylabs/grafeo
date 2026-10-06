@@ -631,7 +631,7 @@ pub fn emit_v5_segments(
         });
     }
 
-    let code_index_body = build_dictionary_code_index(&str_refs);
+    let code_index_body = build_dictionary_code_index(&str_refs)?;
     if !code_index_body.is_empty() {
         segments.push(V5Segment {
             kind: SegmentKind::DictionaryCodeIndex,

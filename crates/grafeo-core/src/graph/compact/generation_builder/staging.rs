@@ -129,12 +129,22 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) -> Result<(), GenerationError> {
         Value::String(s) => {
             out.push(3);
             let b = s.as_bytes();
-            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            let len = u32::try_from(b.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "string_value_len",
+                count: b.len() as u64,
+                max: u64::from(u32::MAX),
+            })?;
+            out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(b);
         }
         Value::Vector(vec) => {
             out.push(5);
-            out.extend_from_slice(&(vec.len() as u16).to_le_bytes());
+            let dims = u16::try_from(vec.len()).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "vector_dims",
+                count: vec.len() as u64,
+                max: u64::from(u16::MAX),
+            })?;
+            out.extend_from_slice(&dims.to_le_bytes());
             for f in vec.iter() {
                 out.extend_from_slice(&f.to_le_bytes());
             }

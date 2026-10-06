@@ -845,7 +845,7 @@ impl StreamingGenerationBuilder {
         }
 
         // ── Dictionary code index ────────────────────────────────────
-        let code_index = build_dictionary_code_index(&dict_result.strings);
+        let code_index = build_dictionary_code_index(&dict_result.strings)?;
         if !code_index.is_empty() {
             let mut ci_sink = Box::new(make_sink(
                 SegmentKind::DictionaryCodeIndex,
@@ -1477,24 +1477,9 @@ fn build_string_segments(strings: &[String]) -> (Vec<u8>, Vec<u8>) {
     (offsets, bytes)
 }
 
-fn build_dictionary_code_index(strings: &[String]) -> Vec<u8> {
-    use crate::graph::compact::mapped::CODE_INDEX_RECORD_LEN;
-    let mut records: Vec<(u64, u32, u32, &str)> = Vec::with_capacity(strings.len());
-    let mut offset = 0u64;
-    for (i, s) in strings.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation)]
-        let code = i as u32;
-        #[allow(clippy::cast_possible_truncation)]
-        let len = s.len() as u32;
-        records.push((offset, len, code, s.as_str()));
-        offset += u64::from(len);
-    }
-    records.sort_by(|a, b| a.3.cmp(b.3));
-    let mut out = Vec::with_capacity(records.len() * CODE_INDEX_RECORD_LEN);
-    for (off, len, code, _) in records {
-        out.extend_from_slice(&off.to_le_bytes());
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&code.to_le_bytes());
-    }
-    out
+fn build_dictionary_code_index(
+    strings: &[String],
+) -> Result<Vec<u8>, crate::graph::compact::mapped::WireOverflow> {
+    let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+    crate::graph::compact::mapped::build_dictionary_code_index(&refs)
 }

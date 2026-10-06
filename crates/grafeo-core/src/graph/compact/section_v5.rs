@@ -386,7 +386,7 @@ pub fn serialize_v5_with_string_order(
             block_zm,
         ));
     }
-    let code_index_body = build_dictionary_code_index(&str_refs);
+    let code_index_body = build_dictionary_code_index(&str_refs).map_err(|e| e.to_string())?;
     if !code_index_body.is_empty() {
         segments.push((
             SegmentKind::DictionaryCodeIndex,
@@ -621,13 +621,14 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
         for c in 0..rec.column_count as usize {
             let col_idx = rec.column_start as usize + c;
             let col_meta = nt_meta.columns.get(c).ok_or("metadata column missing")?;
-            let body = column_body_slice(&col_block_bytes, &col_bodies, col_idx, version)?;
+            let (body, rows) = column_body_slice(&col_block_bytes, &col_bodies, col_idx, version)?;
             let codec = read_column_body_with_index(
                 &body,
                 col_meta.disc,
                 &global_dict,
                 code_index_raw.clone(),
                 version,
+                rows,
             )?;
             let key = PropertyKey::new(&col_meta.key);
             col_defs.push(ColumnDef::new(
@@ -716,13 +717,14 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
                 .columns
                 .get(c)
                 .ok_or("rel metadata column missing")?;
-            let body = column_body_slice(&col_block_bytes, &col_bodies, col_idx, version)?;
+            let (body, rows) = column_body_slice(&col_block_bytes, &col_bodies, col_idx, version)?;
             let codec = read_column_body_with_index(
                 &body,
                 col_meta.disc,
                 &global_dict,
                 code_index_raw.clone(),
                 version,
+                rows,
             )?;
             let key = PropertyKey::new(&col_meta.key);
             prop_defs.push(ColumnDef::new(
@@ -1135,7 +1137,7 @@ fn column_body_slice(
     bodies: &Bytes,
     col_idx: usize,
     version: PayloadVersion,
-) -> Result<Bytes, String> {
+) -> Result<(Bytes, u32), String> {
     let rec = read_block_index_record(block_index, version, col_idx)?;
     let start = usize::try_from(rec.body_offset).map_err(|_| "column body offset exceeds usize")?;
     let len = usize::try_from(rec.body_len).map_err(|_| "column body length exceeds usize")?;
@@ -1143,7 +1145,7 @@ fn column_body_slice(
     if end > bodies.len() {
         return Err("column body out of range".into());
     }
-    Ok(bodies.slice(start..end))
+    Ok((bodies.slice(start..end), rec.row_count))
 }
 
 pub(crate) fn write_column_body(
@@ -1200,7 +1202,7 @@ fn read_column_body(
     expected_disc: u16,
     global_dict: &MappedStringDictionary,
 ) -> Result<ColumnCodec, String> {
-    read_column_body_with_index(body, expected_disc, global_dict, None, PayloadVersion::V5)
+    read_column_body_with_index(body, expected_disc, global_dict, None, PayloadVersion::V5, 0)
 }
 
 fn read_column_body_with_index(
@@ -1209,6 +1211,7 @@ fn read_column_body_with_index(
     global_dict: &MappedStringDictionary,
     code_index: Option<Bytes>,
     version: PayloadVersion,
+    rows: u32,
 ) -> Result<ColumnCodec, String> {
     let bytes = body.as_ref();
     if bytes.is_empty() {
@@ -1216,7 +1219,7 @@ fn read_column_body_with_index(
     }
     let disc = bytes[0];
     if disc == DISC_F32_VECTOR_WIDE || disc == DISC_I8_VECTOR_WIDE {
-        return read_wide_vector_body(body, version);
+        return read_wide_vector_body(body, version, rows);
     }
     if u16::from(disc) != expected_disc && expected_disc != 0 {
         // expected_disc from metadata; still trust body disc for decoding.
@@ -1248,8 +1251,15 @@ fn read_column_body_with_index(
 /// Reads a v6 wide vector body: `[disc][dims u16][count u64][data]`.
 ///
 /// Disc 7 is `Float32Vector` (count = components, 4 bytes each); disc 8 is
-/// `Int8Vector` (count = bytes). Both are refused in a v5 payload.
-fn read_wide_vector_body(body: &Bytes, version: PayloadVersion) -> Result<ColumnCodec, String> {
+/// `Int8Vector` (count = bytes, 1 per component). Both are refused in a v5
+/// payload. Being new, the wide form is strict where the v5 codec is
+/// permissive: `dims` must be non-zero, `count` must equal the block-index
+/// row count × `dims`, and the body must end exactly at the data.
+fn read_wide_vector_body(
+    body: &Bytes,
+    version: PayloadVersion,
+    rows: u32,
+) -> Result<ColumnCodec, String> {
     let bytes = body.as_ref();
     let disc = bytes[0];
     if version != PayloadVersion::V6 {
@@ -1260,10 +1270,17 @@ fn read_wide_vector_body(body: &Bytes, version: PayloadVersion) -> Result<Column
     let mut pos = 1usize;
     let dimensions = read_u16(bytes, &mut pos)?;
     let count = read_u64(bytes, &mut pos)?;
+    if dimensions == 0 {
+        return Err(format!("wide vector body (disc {disc}) has zero dimensions"));
+    }
+    let expected = u64::from(rows) * u64::from(dimensions);
+    if count != expected {
+        return Err(format!(
+            "wide vector body (disc {disc}) count {count} != {rows} rows x {dimensions} dims"
+        ));
+    }
     let byte_need = if disc == DISC_F32_VECTOR_WIDE {
-        count
-            .checked_mul(4)
-            .ok_or("wide Float32Vector length overflow")?
+        count.checked_mul(4).ok_or("wide Float32Vector length overflow")?
     } else {
         count
     };
@@ -1273,6 +1290,12 @@ fn read_wide_vector_body(body: &Bytes, version: PayloadVersion) -> Result<Column
         .ok_or("wide vector body range overflow")?;
     if end > bytes.len() {
         return Err(format!("truncated wide vector body (disc {disc})"));
+    }
+    if end != bytes.len() {
+        return Err(format!(
+            "wide vector body (disc {disc}) has {} trailing bytes",
+            bytes.len() - end
+        ));
     }
     let storage = body.slice(pos..end);
     Ok(if disc == DISC_F32_VECTOR_WIDE {
@@ -1486,58 +1509,5 @@ fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn wide_f32_body(components: u64, data: &[u8]) -> Bytes {
-        let mut body = vec![DISC_F32_VECTOR_WIDE];
-        body.extend_from_slice(&2u16.to_le_bytes());
-        body.extend_from_slice(&components.to_le_bytes());
-        body.extend_from_slice(data);
-        Bytes::from(body)
-    }
-
-    #[test]
-    fn wide_vector_body_reads_in_v6_and_is_refused_in_v5() {
-        let data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        let body = wide_f32_body(4, &data);
-        let dict = MappedStringDictionary::empty();
-        let codec = read_column_body_with_index(&body, 5, &dict, None, PayloadVersion::V6)
-            .expect("v6 reads the wide header");
-        match codec {
-            ColumnCodec::Float32Vector { bytes, dimensions } => {
-                assert_eq!(dimensions, 2);
-                assert_eq!(bytes.as_ref(), data.as_slice());
-            }
-            other => panic!("expected Float32Vector, got {other:?}"),
-        }
-        let err = read_column_body_with_index(&body, 5, &dict, None, PayloadVersion::V5)
-            .expect_err("v5 must refuse a wide body");
-        assert!(err.contains("only valid in a v6 payload"), "{err}");
-    }
-
-    #[test]
-    fn wide_vector_body_truncation_is_refused() {
-        let body = wide_f32_body(5, &[0u8; 16]);
-        let dict = MappedStringDictionary::empty();
-        let err = read_column_body_with_index(&body, 5, &dict, None, PayloadVersion::V6)
-            .expect_err("count past the body must fail");
-        assert!(err.contains("truncated wide vector body"), "{err}");
-    }
-
-    #[test]
-    fn heap_writer_vector_header_matches_the_v1_codec_layout() {
-        let codec = ColumnCodec::Float32Vector {
-            bytes: Bytes::from(vec![0u8; 24]),
-            dimensions: 3,
-        };
-        let mut ours = Vec::new();
-        write_column_body(&mut ours, &codec, &FxHashMap::default()).unwrap();
-        let mut v1 = Vec::new();
-        codec.write_to(&mut v1);
-        assert_eq!(ours, v1);
-    }
-}
+#[path = "section_v5_tests.rs"]
+mod tests;
