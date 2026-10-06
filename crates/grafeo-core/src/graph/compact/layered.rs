@@ -1468,11 +1468,11 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             let hit = self.overlay.load().get_edge(id);
             if hit_found(&hit) {
-                return hit;
+                return self.merge_edge_diff(hit);
             }
             // Miss on a dirty id: see `get_node`.
             if self.is_edge_dirty(id) {
-                return self.overlay.load().get_edge(id);
+                return self.merge_edge_diff(self.overlay.load().get_edge(id));
             }
         }
         // Edges created after `compact()` live only in the overlay; fall
@@ -1536,14 +1536,15 @@ impl GraphStore for LayeredStore {
                 .load()
                 .get_edge_versioned(id, epoch, transaction_id);
             if hit_found(&hit) {
-                return hit;
+                return self.merge_edge_diff(hit);
             }
             // Miss on a dirty id: see `get_node`.
             if self.is_edge_dirty(id) {
-                return self
-                    .overlay
-                    .load()
-                    .get_edge_versioned(id, epoch, transaction_id);
+                return self.merge_edge_diff(self.overlay.load().get_edge_versioned(
+                    id,
+                    epoch,
+                    transaction_id,
+                ));
             }
         }
         self.base.load().get_edge(id).or_else(|| {
@@ -1580,11 +1581,11 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             let hit = self.overlay.load().get_edge_at_epoch(id, epoch);
             if hit_found(&hit) {
-                return hit;
+                return self.merge_edge_diff(hit);
             }
             // Miss on a dirty id: see `get_node`.
             if self.is_edge_dirty(id) {
-                return self.overlay.load().get_edge_at_epoch(id, epoch);
+                return self.merge_edge_diff(self.overlay.load().get_edge_at_epoch(id, epoch));
             }
         }
         self.base
@@ -1632,19 +1633,28 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_edge_dirty(id) {
-            let hit = self.overlay.load().get_edge_property(id, key);
-            if hit_found(&hit) {
-                return hit;
+            let overlay = self.overlay.load();
+            if let Some(value) = overlay.get_edge_property(id, key) {
+                // A diff row's `Null` is a removed base property (D10).
+                if matches!(value, Value::Null) && self.base.load().contains_edge(id) {
+                    return None;
+                }
+                return Some(value);
             }
-            // Miss on a dirty id: see `get_node`.
+            // See `get_node_property`.
+            if overlay.is_edge_visible_at_epoch(id, overlay.current_epoch()) {
+                return self.base.load().get_edge_property(id, key);
+            }
             if self.is_edge_dirty(id) {
-                return self.overlay.load().get_edge_property(id, key);
+                return None;
             }
         }
-        self.base
-            .load()
-            .get_edge_property(id, key)
-            .or_else(|| self.overlay.load().get_edge_property(id, key))
+        // See `get_node_property` (absorbed rows).
+        let base = self.base.load();
+        if base.contains_edge(id) {
+            return base.get_edge_property(id, key);
+        }
+        self.overlay.load().get_edge_property(id, key)
     }
 
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>> {
@@ -2930,7 +2940,7 @@ impl GraphStoreMut for LayeredStore {
     fn remove_edge_property(&self, id: EdgeId, key: &str) -> Option<Value> {
         let _guard = self.merge_guard.read();
         self.ensure_edge_in_overlay(id, None);
-        self.overlay.load().remove_edge_property(id, key)
+        self.remove_edge_property_layered(id, key, None)
     }
 
     fn remove_edge_property_versioned(
@@ -2941,9 +2951,7 @@ impl GraphStoreMut for LayeredStore {
     ) -> Option<Value> {
         let _guard = self.merge_guard.read();
         self.ensure_edge_in_overlay(id, Self::journal_owner(transaction_id));
-        self.overlay
-            .load()
-            .remove_edge_property_versioned(id, key, transaction_id)
+        self.remove_edge_property_layered(id, key, Some(transaction_id))
     }
 
     fn add_label(&self, node_id: NodeId, label: &str) -> bool {
@@ -3028,16 +3036,18 @@ impl LayeredStore {
         self.base.load().contains_node(id)
     }
 
-    /// Whether any overlay node is a diff row of a base node (its id is also
-    /// in the base). Consumers that cannot merge use this to pick a path.
+    /// Whether any overlay node or edge is a diff row of a base entity (its
+    /// id is also in the base). Consumers that cannot merge use this to pick
+    /// a path.
     #[must_use]
-    pub fn overlay_has_base_node_rows(&self) -> bool {
+    pub fn overlay_has_base_rows(&self) -> bool {
         let base = self.base.load();
-        self.overlay
-            .load()
+        let overlay = self.overlay.load();
+        overlay
             .all_node_ids()
             .into_iter()
             .any(|id| base.contains_node(id))
+            || overlay.all_edges().any(|e| base.contains_edge(e.id))
     }
 
     /// Whether `id`'s merged value of `key` equals `value` (strict
@@ -3072,6 +3082,46 @@ impl LayeredStore {
         match transaction_id {
             Some(tid) => overlay.remove_node_property_versioned(id, key, tid),
             None => overlay.remove_node_property(id, key),
+        }
+    }
+
+    /// Edge counterpart of [`Self::merge_node_diff`].
+    fn merge_edge_diff(&self, overlay_row: Option<Edge>) -> Option<Edge> {
+        let edge = overlay_row?;
+        Some(self.materialize_overlay_edge(edge))
+    }
+
+    /// Edge counterpart of [`Self::materialize_overlay_node`].
+    #[must_use]
+    pub fn materialize_overlay_edge(&self, overlay_row: Edge) -> Edge {
+        let Some(base) = self.base.load().get_edge(overlay_row.id) else {
+            return overlay_row;
+        };
+        let mut edge = overlay_row;
+        edge.properties = merge_diff_properties(base.properties, &edge.properties);
+        edge
+    }
+
+    /// Edge counterpart of [`Self::remove_node_property_layered`].
+    fn remove_edge_property_layered(
+        &self,
+        id: EdgeId,
+        key: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        let overlay = self.overlay.load();
+        let prop_key = PropertyKey::new(key);
+        if self.is_edge_dirty(id) && self.base.load().get_edge_property(id, &prop_key).is_some() {
+            let old = self.get_edge_property(id, &prop_key);
+            match transaction_id {
+                Some(tid) => overlay.set_edge_property_versioned(id, key, Value::Null, tid),
+                None => overlay.set_edge_property(id, key, Value::Null),
+            }
+            return old;
+        }
+        match transaction_id {
+            Some(tid) => overlay.remove_edge_property_versioned(id, key, tid),
+            None => overlay.remove_edge_property(id, key),
         }
     }
 
@@ -3181,12 +3231,8 @@ impl LayeredStore {
             return;
         }
 
-        // Copy properties (see `ensure_in_overlay` for `temporal`).
-        for (key, value) in base_edge.properties.iter() {
-            #[cfg(feature = "temporal")]
-            overlay.seed_edge_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
-            overlay.set_edge_property(id, key.as_str(), value.clone());
-        }
+        // D10: a diff row, like a node's (see `ensure_in_overlay`): the
+        // edge's identity and endpoints, no base properties.
 
         self.journal_new(&mut journal, owner, LayerChange::EdgeCopyUp(id));
         self.mark_dirty_edge(id);

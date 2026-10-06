@@ -73,14 +73,20 @@ pub fn live_graph_sources_bounded(
             let base_cursor = BaseEdgeCursor::new(Arc::clone(b), freeze.clone());
             let mut ids: Vec<u64> = freeze.overlay_edge_ids.iter().copied().collect();
             ids.sort_unstable();
-            let overlay_cursor = OverlayEdgeCursor::new(Arc::clone(o), ids, max_record_bytes);
+            let overlay_cursor =
+                OverlayEdgeCursor::new(Arc::clone(o), Some(Arc::clone(b)), ids, max_record_bytes);
             Box::new(MergedEdgeSource::new(base_cursor, overlay_cursor))
         }
         (Some(b), None) => Box::new(BaseEdgeCursor::new(Arc::clone(b), freeze.clone())),
         (None, Some(o)) => {
             let mut ids: Vec<u64> = freeze.overlay_edge_ids.iter().copied().collect();
             ids.sort_unstable();
-            Box::new(OverlayEdgeCursor::new(Arc::clone(o), ids, max_record_bytes))
+            Box::new(OverlayEdgeCursor::new(
+                Arc::clone(o),
+                None,
+                ids,
+                max_record_bytes,
+            ))
         }
         (None, None) => Box::new(EmptyEdgeSource),
     };
@@ -170,15 +176,23 @@ impl NodeRecordSource for OverlayNodeCursor {
 /// Streams overlay (LpgStore) edges by iterating the frozen dirty-id set.
 struct OverlayEdgeCursor {
     overlay: Arc<LpgStore>,
+    /// See `OverlayNodeCursor::base`.
+    base: Option<Arc<CompactStore>>,
     ids: Vec<u64>,
     pos: usize,
     max_record_bytes: u64,
 }
 
 impl OverlayEdgeCursor {
-    fn new(overlay: Arc<LpgStore>, ids: Vec<u64>, max_record_bytes: u64) -> Self {
+    fn new(
+        overlay: Arc<LpgStore>,
+        base: Option<Arc<CompactStore>>,
+        ids: Vec<u64>,
+        max_record_bytes: u64,
+    ) -> Self {
         Self {
             overlay,
+            base,
             ids,
             pos: 0,
             max_record_bytes,
@@ -191,9 +205,15 @@ impl EdgeRecordSource for OverlayEdgeCursor {
         while self.pos < self.ids.len() {
             let raw_id = self.ids[self.pos];
             self.pos += 1;
-            let Some(edge) = self.overlay.get_edge(EdgeId::new(raw_id)) else {
+            let Some(mut edge) = self.overlay.get_edge(EdgeId::new(raw_id)) else {
                 continue;
             };
+            if let Some(base_row) = self.base.as_ref().and_then(|b| b.get_edge(edge.id)) {
+                edge.properties = crate::graph::compact::layered::merge_diff_properties(
+                    base_row.properties,
+                    &edge.properties,
+                );
+            }
             let properties: FxHashMap<PropertyKey, Value> = edge
                 .properties
                 .iter()

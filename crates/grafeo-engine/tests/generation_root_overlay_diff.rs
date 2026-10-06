@@ -8,6 +8,7 @@
 //! (WAL replay), an epoch handoff (the capture materializes whole rows) and a
 //! ForceDisk reopen (a diff row's new vector is not spilled behind a stale
 //! base vector). The last test measures what one small update now costs.
+//! Slice 2 adds the same for a base edge's properties.
 //!
 //! See `docs/architecture/storage/layered-overlay-diff.md`.
 
@@ -67,7 +68,11 @@ fn publish(root: &Path, count: usize, dims: usize) {
             ids[0],
             ids[1],
             "MemoryEntityRelation",
-            [("rel_type", Value::from("base"))],
+            [
+                ("rel_type", Value::from("base")),
+                ("since", Value::Int64(2020)),
+                ("weight", Value::Float64(0.5)),
+            ],
         );
     }
     source
@@ -515,4 +520,121 @@ fn rss_anon_kib() -> u64 {
                 .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
         })
         .unwrap_or(0)
+}
+
+// ── Slice 2: edge property diffs ──────────────────────────────────────
+
+const BASE_REL: &str = "MATCH (:MemoryEntity {name: 'e0'})-[r:MemoryEntityRelation {rel_type: 'base'}]->(:MemoryEntity {name: 'e1'})";
+
+fn base_rel_id(db: &GrafeoDB) -> grafeo_common::types::EdgeId {
+    let r = db
+        .execute_cypher(&format!("{BASE_REL} RETURN id(r)"))
+        .expect("base relation id");
+    assert_eq!(r.row_count(), 1, "one base relation");
+    match &r.rows()[0][0] {
+        Value::Int64(v) => grafeo_common::types::EdgeId::new(*v as u64),
+        other => panic!("id: {other:?}"),
+    }
+}
+
+fn edge_prop(db: &GrafeoDB, key: &str) -> Option<Value> {
+    db.graph_store()
+        .get_edge_property(base_rel_id(db), &PropertyKey::new(key))
+}
+
+/// The base relation's properties, as published, except those in `skip`.
+fn assert_base_rel(db: &GrafeoDB, skip: &[&str], stage: &str) {
+    let want = [
+        ("rel_type", Value::from("base")),
+        ("since", Value::Int64(2020)),
+        ("weight", Value::Float64(0.5)),
+    ];
+    let edge = db
+        .graph_store()
+        .get_edge(base_rel_id(db))
+        .unwrap_or_else(|| panic!("[{stage}] edge"));
+    for (key, value) in want.iter().filter(|(k, _)| !skip.contains(k)) {
+        assert_eq!(
+            edge_prop(db, key).as_ref(),
+            Some(value),
+            "[{stage}] get_edge_property {key}"
+        );
+        assert_eq!(
+            edge.properties.get(&PropertyKey::new(*key)),
+            Some(value),
+            "[{stage}] get_edge {key}"
+        );
+    }
+}
+
+/// SET and REMOVE on a base relation keep its other properties, never copy
+/// them into the overlay, and survive reopen and an epoch handoff.
+#[test]
+fn edge_set_and_remove_keep_the_other_base_properties() {
+    let (_dir, root) = fresh_root(3, DIMS);
+    let check = |db: &GrafeoDB, stage: &str| {
+        assert_eq!(
+            edge_prop(db, "weight"),
+            Some(Value::Float64(0.9)),
+            "[{stage}] weight"
+        );
+        assert_eq!(edge_prop(db, "since"), None, "[{stage}] since removed");
+        assert_eq!(
+            count(
+                db,
+                &format!("{BASE_REL} WHERE r.since IS NULL AND r.weight = 0.9 RETURN count(r)")
+            ),
+            1,
+            "[{stage}] Cypher"
+        );
+        assert_base_rel(db, &["weight", "since"], stage);
+    };
+    {
+        let db = open(&root);
+        db.execute_cypher(&format!("{BASE_REL} SET r.weight = 0.9 REMOVE r.since"))
+            .expect("SET + REMOVE");
+        check(&db, "after write");
+        let overlay = db.layered_store().expect("layered").overlay_store();
+        assert!(
+            overlay
+                .get_edge_property(base_rel_id(&db), &PropertyKey::new("rel_type"))
+                .is_none(),
+            "base edge property rel_type was copied into the overlay"
+        );
+        db.close().expect("close");
+    }
+    let db = open(&root);
+    check(&db, "reopen");
+    handoff(&db, &root, "g2");
+    check(&db, "handoff");
+    db.close().expect("close");
+    drop(db);
+    check(&open(&root), "reopen 2");
+}
+
+/// A rolled-back write on a base relation leaves its base properties.
+#[test]
+fn edge_rollback_restores_the_base_view() {
+    let (_dir, root) = fresh_root(3, DIMS);
+    let db = open(&root);
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher(&format!("{BASE_REL} SET r.weight = 0.1 REMOVE r.since"))
+        .expect("SET + REMOVE");
+    session.rollback().expect("rollback");
+    assert_base_rel(&db, &[], "rollback");
+}
+
+/// The DB-level edge property removal goes through the diff row too.
+#[test]
+fn database_edge_property_removal_on_a_base_relation() {
+    let (_dir, root) = fresh_root(3, DIMS);
+    let db = open(&root);
+    assert!(
+        db.remove_edge_property(base_rel_id(&db), "weight"),
+        "remove_edge_property"
+    );
+    assert_eq!(edge_prop(&db, "weight"), None);
+    assert_base_rel(&db, &["weight"], "after removal");
 }

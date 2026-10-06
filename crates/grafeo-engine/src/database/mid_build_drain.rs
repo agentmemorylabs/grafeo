@@ -209,7 +209,7 @@ impl GrafeoDB {
             // This is O(window) by construction. A tier serves whole rows,
             // so diff rows of base nodes (D10) are first materialized into a
             // scratch store, still O(window).
-            let materialized = if layered.overlay_has_base_node_rows() {
+            let materialized = if layered.overlay_has_base_rows() {
                 Some(materialize_overlay_window(&layered, &overlay_arc)?)
             } else {
                 None
@@ -376,7 +376,7 @@ impl GrafeoDB {
 }
 
 /// A scratch copy of the overlay's live rows with every diff row of a base
-/// node merged with its base row (D10), at the same ids.
+/// node or edge merged with its base row (D10), at the same ids.
 fn materialize_overlay_window(
     layered: &grafeo_core::graph::compact::layered::LayeredStore,
     overlay: &grafeo_core::graph::lpg::LpgStore,
@@ -397,6 +397,7 @@ fn materialize_overlay_window(
         }
     }
     for edge in overlay.all_edges() {
+        let edge = layered.materialize_overlay_edge(edge);
         window
             .create_edge_with_id(edge.id, edge.src, edge.dst, edge.edge_type.as_str())
             .map_err(|e| Error::Internal(format!("window scratch edge {:?}: {e}", edge.id)))?;

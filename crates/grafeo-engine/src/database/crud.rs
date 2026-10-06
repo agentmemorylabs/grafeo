@@ -571,7 +571,7 @@ impl super::GrafeoDB {
         if self.refuse_write_if_wal_poisoned("add_node_label") {
             return false;
         }
-        let result = self.node_write_store().add_label(id, label);
+        let result = self.direct_write_store().add_label(id, label);
 
         #[cfg(feature = "wal")]
         if result {
@@ -660,7 +660,7 @@ impl super::GrafeoDB {
                 .collect()
         };
 
-        let result = self.node_write_store().remove_label(id, label);
+        let result = self.direct_write_store().remove_label(id, label);
 
         #[cfg(feature = "wal")]
         if result {
@@ -1066,7 +1066,7 @@ impl super::GrafeoDB {
             return false;
         }
         let removed = self
-            .node_write_store()
+            .direct_write_store()
             .remove_node_property(id, key)
             .is_some();
 
@@ -1104,7 +1104,10 @@ impl super::GrafeoDB {
         if self.refuse_write_if_wal_poisoned("remove_edge_property") {
             return false;
         }
-        let removed = self.lpg_store().remove_edge_property(id, key).is_some();
+        let removed = self
+            .direct_write_store()
+            .remove_edge_property(id, key)
+            .is_some();
 
         #[cfg(feature = "wal")]
         if removed
@@ -1464,10 +1467,10 @@ impl super::GrafeoDB {
             .map_err(|message| grafeo_common::utils::error::Error::Internal(message.to_owned()))
     }
 
-    /// The store direct node label and property-removal writes go to: on a
-    /// layered database the layered store, which edits a base node through
+    /// The store direct label and property-removal writes go to: on a
+    /// layered database the layered store, which edits a base entity through
     /// its overlay diff row (D10), elsewhere the LPG store.
-    fn node_write_store(&self) -> &dyn grafeo_core::graph::GraphStoreMut {
+    fn direct_write_store(&self) -> &dyn grafeo_core::graph::GraphStoreMut {
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if let Some(layered) = self.layered_store.as_ref() {
             return layered.as_ref();
