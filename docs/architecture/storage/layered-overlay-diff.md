@@ -9,7 +9,7 @@ tags:
 
 # Layered overlay as a diff for base entities (D10)
 
-**Status:** design + slice 1 (node property diffs). **Grounded in:** fork trunk `83710123` plus fork PR #38 (overlay-only deletes).
+**Status:** design; slice 1 (node property diffs, fork PR #40) and slice 2 (edge property diffs) implemented. **Grounded in:** fork trunk `83710123` plus fork PR #38 (overlay-only deletes).
 **Decision source:** AMH `docs/planning/disk-backed-memory-graph/DESIGN.md` D10, §4.3, §11.2 (gap G6).
 
 ## 1. Problem
@@ -258,7 +258,9 @@ Each slice is one fork PR with tests, against `fix/root-mount-covers-nested`.
    - Compaction materializes merged rows (§6); the direct readers of §5.7 are handled.
    - **Exit:** a single-property update on a base entity with a 2048-dim vector retains roughly the property's size
      in overlay bytes and `RssAnon`, not the vector's (measured), and no existing test regresses.
-2. **Edge property diffs:** the same for `ensure_edge_in_overlay`.
+2. **Edge property diffs** (done): the same for `ensure_edge_in_overlay`. That covers merged `get_edge*` and
+   `get_edge_property` reads, tombstones, merged capture in all three build sources, and
+   `GrafeoDB::remove_edge_property`. Edges have no property indexes, so no probe changes are needed.
 3. **Endpoint rows on edge create:** measure whether labels-only endpoint rows can be dropped entirely (no overlay row
    for an endpoint whose only change is a new edge).
 4. **Vector search merge:** the explicit overlay flat scan of §5.5, shared with the per-tier vector work (DESIGN §5).
