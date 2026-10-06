@@ -9,7 +9,9 @@ pub mod error;
 pub mod gqlstatus;
 pub mod hash;
 pub mod strings;
+pub mod write_outcome;
 
 pub use error::{Error, Result};
 pub use gqlstatus::{DiagnosticRecord, GqlStatus};
 pub use hash::FxHasher;
+pub use write_outcome::WriteOutcome;

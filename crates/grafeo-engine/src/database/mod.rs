@@ -3646,6 +3646,7 @@ impl GrafeoDB {
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.poisoned_reason()
         {
+            use grafeo_common::utils::write_outcome::WAL_WAS_POISONED;
             wal.close_active_log();
             // The file manager releases its lock even if its sync fails;
             // report that failure too, without skipping the rest.
@@ -3659,10 +3660,10 @@ impl GrafeoDB {
             }
             *is_open = false;
             return Err(Error::Internal(format!(
-                "database closed without a checkpoint: the WAL was poisoned ({reason}); the \
-                 next writable open replays the WAL, and a write reported as durability \
-                 unconfirmed may or may not be there. Drop this database before reopening \
-                 it{file_error}"
+                "database closed without a checkpoint: {WAL_WAS_POISONED} ({reason}); the \
+                 next writable open replays the WAL, and a write whose durability was \
+                 reported unconfirmed may or may not be there. Drop this database before \
+                 reopening it{file_error}"
             )));
         }
 
@@ -3789,8 +3790,9 @@ impl GrafeoDB {
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.poisoned_reason()
         {
+            use grafeo_common::utils::write_outcome::UNTIL_REOPENED;
             grafeo_warn!(
-                "{api} refused: WAL refuses writes until the database is reopened: {reason}"
+                "{api} refused: WAL refuses writes {UNTIL_REOPENED}: {reason}"
             );
             return true;
         }
@@ -3808,8 +3810,9 @@ impl GrafeoDB {
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.poisoned_reason()
         {
+            use grafeo_common::utils::write_outcome::UNTIL_REOPENED;
             return Err(Error::Internal(format!(
-                "WAL refuses writes until the database is reopened: {reason}"
+                "WAL refuses writes {UNTIL_REOPENED}: {reason}"
             )));
         }
         Ok(())
@@ -3829,8 +3832,9 @@ impl GrafeoDB {
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.poisoned_reason()
         {
+            use grafeo_common::utils::write_outcome::WAL_IS_POISONED;
             return Err(Error::Internal(format!(
-                "refusing to {what}: the WAL is poisoned ({reason}), so memory may hold a \
+                "refusing to {what}: {WAL_IS_POISONED} ({reason}), so memory may hold a \
                  write that never reached it; drop this database and reopen it (the open \
                  replays the WAL), then retry"
             )));

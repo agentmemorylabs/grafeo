@@ -695,6 +695,11 @@ fn rollback_after_overlay_reset_reports_unrestored_changes() {
         err.to_string().contains("rollback incomplete"),
         "unexpected error: {err}"
     );
+    assert_eq!(
+        err.write_outcome(),
+        Some(grafeo_common::utils::WriteOutcome::RollbackIncomplete),
+        "{err}"
+    );
     assert!(!session.in_transaction(), "the transaction still ended");
     drop(session);
 

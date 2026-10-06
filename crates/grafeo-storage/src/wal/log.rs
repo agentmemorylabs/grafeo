@@ -325,8 +325,9 @@ impl WalManager {
     }
 
     fn poisoned_error(reason: &str) -> Error {
+        use grafeo_common::utils::write_outcome::UNTIL_REOPENED;
         Error::Internal(format!(
-            "WAL refuses appends until the database is reopened: {reason}"
+            "WAL refuses appends {UNTIL_REOPENED}: {reason}"
         ))
     }
 
@@ -1508,6 +1509,24 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn poisoned_append_is_classified_wal_poisoned() {
+        let dir = tempdir().unwrap();
+        let wal = WalManager::open(dir.path()).unwrap();
+        wal.poison("test: injected");
+        let err = wal
+            .log(&WalRecord::CreateNode {
+                id: NodeId::new(1),
+                labels: vec![],
+            })
+            .expect_err("a poisoned WAL refuses appends");
+        assert_eq!(
+            err.write_outcome(),
+            Some(grafeo_common::utils::WriteOutcome::WalPoisoned),
+            "{err}"
+        );
     }
 
     #[test]
