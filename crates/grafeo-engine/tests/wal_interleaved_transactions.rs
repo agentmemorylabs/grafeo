@@ -22,7 +22,15 @@
 //!   --features generation,generation-streaming,compact-store,lpg,mmap,wal,cypher,grafeo-file
 //! ```
 
-#![cfg(all(feature = "wal", feature = "lpg"))]
+#![cfg(all(
+    feature = "wal",
+    feature = "lpg",
+    feature = "gql",
+    any(
+        feature = "grafeo-file",
+        all(feature = "generation", feature = "compact-store", feature = "mmap")
+    )
+))]
 #![allow(missing_docs)]
 
 use std::path::{Path, PathBuf};

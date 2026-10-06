@@ -102,19 +102,20 @@ impl super::GrafeoDB {
         // Log node creation to WAL
         #[cfg(feature = "wal")]
         {
-            self.log_wal(&WalRecord::CreateNode {
+            // One implicit group: the node and all its properties.
+            let mut records = Vec::with_capacity(1 + props.len());
+            records.push(WalRecord::CreateNode {
                 id,
                 labels: labels.iter().map(|s| (*s).to_string()).collect(),
-            })?;
-
-            // Log each property to WAL for full durability
+            });
             for (key, value) in props {
-                self.log_wal(&WalRecord::SetNodeProperty {
+                records.push(WalRecord::SetNodeProperty {
                     id,
                     key: key.to_string(),
                     value,
-                })?;
+                });
             }
+            self.log_wal_group(records)?;
         }
 
         #[cfg(feature = "cdc")]
@@ -779,24 +780,23 @@ impl super::GrafeoDB {
         // Log edge creation to WAL
         #[cfg(feature = "wal")]
         {
-            if let Err(e) = self.log_wal(&WalRecord::CreateEdge {
+            // One implicit group: the edge and all its properties.
+            let mut records = Vec::with_capacity(1 + props.len());
+            records.push(WalRecord::CreateEdge {
                 id,
                 src,
                 dst,
                 edge_type: edge_type.to_string(),
-            }) {
-                grafeo_warn!("Failed to log CreateEdge to WAL: {}", e);
-            }
-
-            // Log each property to WAL for full durability
+            });
             for (key, value) in props {
-                if let Err(e) = self.log_wal(&WalRecord::SetEdgeProperty {
+                records.push(WalRecord::SetEdgeProperty {
                     id,
                     key: key.to_string(),
                     value,
-                }) {
-                    grafeo_warn!("Failed to log SetEdgeProperty to WAL: {}", e);
-                }
+                });
+            }
+            if let Err(e) = self.log_wal_group(records) {
+                grafeo_warn!("Failed to log CreateEdge to WAL: {}", e);
             }
         }
 
@@ -1088,6 +1088,9 @@ impl super::GrafeoDB {
 
         let prop_key = PropertyKey::new(property);
         let labels: &[&str] = &[label];
+        // The whole batch is one implicit WAL group, written after the loop.
+        #[cfg(feature = "wal")]
+        let mut wal_records = Vec::new();
 
         let ids: Vec<grafeo_common::types::NodeId> = vectors
             .into_iter()
@@ -1098,27 +1101,27 @@ impl super::GrafeoDB {
                     std::iter::once((prop_key.clone(), value.clone())),
                 );
 
-                // Log to WAL
                 #[cfg(feature = "wal")]
                 {
-                    if let Err(e) = self.log_wal(&WalRecord::CreateNode {
+                    wal_records.push(WalRecord::CreateNode {
                         id,
                         labels: labels.iter().map(|s| (*s).to_string()).collect(),
-                    }) {
-                        grafeo_warn!("Failed to log CreateNode to WAL: {}", e);
-                    }
-                    if let Err(e) = self.log_wal(&WalRecord::SetNodeProperty {
+                    });
+                    wal_records.push(WalRecord::SetNodeProperty {
                         id,
                         key: property.to_string(),
                         value,
-                    }) {
-                        grafeo_warn!("Failed to log SetNodeProperty to WAL: {}", e);
-                    }
+                    });
                 }
 
                 id
             })
             .collect();
+
+        #[cfg(feature = "wal")]
+        if let Err(e) = self.log_wal_group(wal_records) {
+            grafeo_warn!("Failed to log batch_create_nodes to WAL: {}", e);
+        }
 
         // Auto-insert into matching vector index if one exists
         #[cfg(feature = "vector-index")]
@@ -1185,6 +1188,9 @@ impl super::GrafeoDB {
         }
 
         let labels: &[&str] = &[label];
+        // The whole batch is one implicit WAL group, written after the loop.
+        #[cfg(feature = "wal")]
+        let mut wal_records = Vec::new();
 
         let ids: Vec<grafeo_common::types::NodeId> = properties_list
             .into_iter()
@@ -1209,23 +1215,18 @@ impl super::GrafeoDB {
                     None
                 };
 
-                // Log to WAL
                 #[cfg(feature = "wal")]
                 {
-                    if let Err(e) = self.log_wal(&WalRecord::CreateNode {
+                    wal_records.push(WalRecord::CreateNode {
                         id,
                         labels: labels.iter().map(|s| (*s).to_string()).collect(),
-                    }) {
-                        grafeo_warn!("Failed to log CreateNode to WAL: {}", e);
-                    }
+                    });
                     for (key, value) in props {
-                        if let Err(e) = self.log_wal(&WalRecord::SetNodeProperty {
+                        wal_records.push(WalRecord::SetNodeProperty {
                             id,
                             key: key.to_string(),
                             value,
-                        }) {
-                            grafeo_warn!("Failed to log SetNodeProperty to WAL: {}", e);
-                        }
+                        });
                     }
                 }
 
@@ -1246,6 +1247,11 @@ impl super::GrafeoDB {
                 id
             })
             .collect();
+
+        #[cfg(feature = "wal")]
+        if let Err(e) = self.log_wal_group(wal_records) {
+            grafeo_warn!("Failed to log batch_create_nodes_with_props to WAL: {}", e);
+        }
 
         // Auto-insert into matching vector indexes for any vector properties
         #[cfg(feature = "vector-index")]

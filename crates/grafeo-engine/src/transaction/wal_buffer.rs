@@ -19,9 +19,10 @@
 //!
 //! Fork additions: every group ends with a `TransactionCommit` followed by an
 //! `EpochAdvance`, implicit groups included, because generation-root replay
-//! rejects a commit without its epoch advance. On a layered database a group
-//! that fails to append poisons the WAL (#13). Sessions of one database share
-//! a commit-order lock, so groups reach the WAL in commit order.
+//! rejects a commit without its epoch advance. A group that fails to append
+//! poisons the WAL (#13's rule, on every database: the group is the only
+//! copy of its records). Sessions of one database share a commit-order lock,
+//! so groups reach the WAL in commit order.
 
 use std::sync::Arc;
 
@@ -76,32 +77,23 @@ pub(crate) struct WalBuffer {
     /// Shared by every session of the database (see
     /// [`commit_order`](Self::commit_order)).
     commit_order: Arc<Mutex<()>>,
-    /// Whether a failed group append poisons the WAL (layered databases).
-    poison_on_failure: bool,
 }
 
 impl WalBuffer {
     /// Creates an empty buffer writing to `wal`, with its own commit-order
-    /// lock and without poisoning.
+    /// lock.
     #[cfg(test)]
     pub(crate) fn new(wal: Arc<LpgWal>) -> Self {
-        Self::for_database(wal, Arc::new(Mutex::new(())), false)
+        Self::for_database(wal, Arc::new(Mutex::new(())))
     }
 
     /// Creates an empty buffer writing to `wal` for a session of a database
-    /// whose sessions share `commit_order`. With `poison_on_failure` (a
-    /// layered database) a group that fails to append poisons the WAL before
-    /// any other writer can append after it.
-    pub(crate) fn for_database(
-        wal: Arc<LpgWal>,
-        commit_order: Arc<Mutex<()>>,
-        poison_on_failure: bool,
-    ) -> Self {
+    /// whose sessions share `commit_order`.
+    pub(crate) fn for_database(wal: Arc<LpgWal>, commit_order: Arc<Mutex<()>>) -> Self {
         Self {
             wal,
             pending: Mutex::new(Vec::new()),
             commit_order,
-            poison_on_failure,
         }
     }
 
@@ -114,12 +106,6 @@ impl WalBuffer {
     /// WAL first.
     pub(crate) fn commit_order(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.commit_order.lock()
-    }
-
-    /// Whether a failed group append poisons the WAL.
-    #[cfg(feature = "compact-store")]
-    pub(crate) fn poisons_on_failure(&self) -> bool {
-        self.poison_on_failure
     }
 
     /// The WAL this buffer writes to.
@@ -158,10 +144,11 @@ impl WalBuffer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the WAL write fails or the WAL is poisoned. On a
-    /// layered database the failure has poisoned the WAL by then (see
-    /// `TypedWal::log_atomic_or_poison`). The buffered records are dropped
-    /// either way.
+    /// Returns an error if the WAL write fails or the WAL is poisoned. A
+    /// write failure has poisoned the WAL by then (see
+    /// `TypedWal::log_atomic_or_poison`): the records may be partly on disk,
+    /// and nothing may be appended after them. The buffered records are
+    /// dropped either way.
     pub(crate) fn flush(&self, markers: &[WalRecord]) -> Result<()> {
         let pending = std::mem::take(&mut *self.pending.lock());
         let group = build_group(pending, markers);
@@ -175,25 +162,17 @@ impl WalBuffer {
     /// # Errors
     ///
     /// Returns an error if the WAL write fails or the WAL is poisoned.
-    // reason: only the query languages' schema statements call it, so a build
-    // without any of them has no caller.
-    #[allow(dead_code)]
     pub(crate) fn write_implicit_group(&self, records: &[WalRecord], epoch: EpochId) -> Result<()> {
         let pending = records.iter().map(|r| (None, r.clone())).collect();
         self.append(&build_group(pending, &implicit_markers(epoch)))
     }
 
-    /// Appends a built group in one write (poisoning on failure when
-    /// configured).
+    /// Appends a built group in one write, poisoning the WAL on failure.
     fn append(&self, group: &[WalRecord]) -> Result<()> {
         if group.is_empty() {
             return Ok(());
         }
-        if self.poison_on_failure {
-            self.wal.log_atomic_or_poison(group)
-        } else {
-            self.wal.log_batch(group)
-        }
+        self.wal.log_atomic_or_poison(group)
     }
 
     /// Writes buffered records from outside a transaction as an implicit

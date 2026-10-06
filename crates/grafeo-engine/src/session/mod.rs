@@ -508,26 +508,17 @@ impl Session {
         }
     }
 
-    /// Records a direct write's WAL record at the point its store calls for.
+    /// Records a direct write's WAL record, after the store write took
+    /// effect (a delete that found nothing records nothing).
     ///
     /// The record joins the session's WAL buffer, like every other write: it
     /// reaches the WAL with the transaction's group at commit, or (outside a
     /// transaction) when [`with_direct_write`](Self::with_direct_write)
-    /// flushes. The layered target records it **before** the store write
-    /// (`before == true`); a WAL that refuses appends fails the implicit or
-    /// explicit commit, which rolls the write back. Every other target keeps
-    /// its original order (after the store write, `before == false`).
+    /// flushes. A WAL that refuses appends fails that commit (or flush)
+    /// instead of this call.
     #[cfg(all(feature = "wal", feature = "lpg"))]
-    fn log_direct_wal_record(
-        &self,
-        store: &direct_store::DirectStore,
-        record: &grafeo_storage::wal::WalRecord,
-        before: bool,
-    ) -> Result<()> {
-        if store.is_layered() == before {
-            self.log_wal_record(record.clone());
-        }
-        Ok(())
+    fn log_direct_wal_record(&self, record: &grafeo_storage::wal::WalRecord) {
+        self.log_wal_record(record.clone());
     }
 
     /// Sets the CDC log for this session (shared with the database).
@@ -4381,7 +4372,7 @@ impl Session {
         // the commit marker and the epoch advance, so crash recovery can
         // identify committed transactions and their epoch boundaries (#252)
         // and no other session's records can land inside the group (#411).
-        #[cfg(all(feature = "wal", feature = "compact-store"))]
+        #[cfg(feature = "wal")]
         let mut durability_error: Option<String> = None;
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal {
@@ -4400,12 +4391,10 @@ impl Session {
             ];
             if let Err(e) = wal.flush(&markers) {
                 grafeo_warn!("Failed to write transaction to WAL: {}", e);
-                // A layered database poisoned its WAL above: report the
-                // commit as unconfirmed once the in-memory commit finishes.
-                #[cfg(feature = "compact-store")]
-                if wal.poisons_on_failure() {
-                    durability_error = Some(e.to_string());
-                }
+                // The group was the only copy of the transaction's records,
+                // and a write failure has poisoned the WAL: report the commit
+                // as unconfirmed once the in-memory commit finishes.
+                durability_error = Some(e.to_string());
             }
         }
         #[cfg(feature = "wal")]
@@ -4468,11 +4457,11 @@ impl Session {
             }
         }
 
-        #[cfg(all(feature = "wal", feature = "compact-store"))]
+        #[cfg(feature = "wal")]
         if let Some(error) = durability_error {
             return Err(grafeo_common::utils::error::Error::Internal(format!(
                 "transaction applied in memory; durability unconfirmed (it may have \
-                 committed): its WAL commit marker failed ({error}); the WAL refuses \
+                 committed): its WAL group failed ({error}); the WAL refuses \
                  further writes until the database is reopened"
             )));
         }
@@ -5633,11 +5622,9 @@ impl Session {
             if let Some(tid) = transaction_id {
                 self.transaction_manager.record_write(tid, id)?;
             }
-            #[cfg(feature = "wal")]
-            self.log_direct_wal_record(&store, &wal_record, true)?;
             store.set_node_property(id, key, value, transaction_id);
             #[cfg(feature = "wal")]
-            self.log_direct_wal_record(&store, &wal_record, false)?;
+            self.log_direct_wal_record(&wal_record);
 
             #[cfg(feature = "vector-index")]
             self.push_vector_intent(VectorIndexIntent::Upsert {
@@ -5681,11 +5668,9 @@ impl Session {
                     return Err(grafeo_common::utils::error::Error::EdgeNotFound(id));
                 }
             }
-            #[cfg(feature = "wal")]
-            self.log_direct_wal_record(&store, &wal_record, true)?;
             store.set_edge_property(id, key, value, transaction_id);
             #[cfg(feature = "wal")]
-            self.log_direct_wal_record(&store, &wal_record, false)?;
+            self.log_direct_wal_record(&wal_record);
 
             Ok(())
         })
@@ -5720,14 +5705,10 @@ impl Session {
                     .is_some();
             #[cfg(feature = "wal")]
             let wal_record = grafeo_storage::wal::WalRecord::DeleteNode { id };
-            #[cfg(feature = "wal")]
-            if visible {
-                self.log_direct_wal_record(&store, &wal_record, true)?;
-            }
             let deleted = visible && store.delete_node(id, epoch, transaction_id);
             #[cfg(feature = "wal")]
             if deleted {
-                self.log_direct_wal_record(&store, &wal_record, false)?;
+                self.log_direct_wal_record(&wal_record);
             }
 
             #[cfg(feature = "vector-index")]
@@ -5767,14 +5748,10 @@ impl Session {
                     .is_some();
             #[cfg(feature = "wal")]
             let wal_record = grafeo_storage::wal::WalRecord::DeleteEdge { id };
-            #[cfg(feature = "wal")]
-            if visible {
-                self.log_direct_wal_record(&store, &wal_record, true)?;
-            }
             let deleted = visible && store.delete_edge(id, epoch, transaction_id);
             #[cfg(feature = "wal")]
             if deleted {
-                self.log_direct_wal_record(&store, &wal_record, false)?;
+                self.log_direct_wal_record(&wal_record);
             }
 
             Ok(deleted)

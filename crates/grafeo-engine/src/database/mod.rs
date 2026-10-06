@@ -3634,27 +3634,48 @@ impl GrafeoDB {
 
     /// A WAL buffer for one session or one database-level statement, or
     /// `None` without a WAL. Buffers of one database share its commit order;
-    /// on a layered database a group that fails to append poisons the WAL,
-    /// as the commit marker did before (#13).
+    /// a group that fails to append poisons the WAL.
     #[cfg(feature = "wal")]
     pub(crate) fn new_wal_buffer(&self) -> Option<Arc<crate::transaction::wal_buffer::WalBuffer>> {
         let wal = self.wal.as_ref()?;
-        #[cfg(all(feature = "compact-store", feature = "lpg"))]
-        let layered = self.layered_store.is_some();
-        #[cfg(not(all(feature = "compact-store", feature = "lpg")))]
-        let layered = false;
         Some(Arc::new(
             crate::transaction::wal_buffer::WalBuffer::for_database(
                 Arc::clone(wal),
                 Arc::clone(&self.wal_commit_order),
-                layered,
             ),
         ))
     }
 
-    /// Logs a WAL record if WAL is enabled.
+    /// Writes one record as an implicit WAL group (with its own system
+    /// commit and epoch advance), if WAL is enabled. For the `GrafeoDB`-level
+    /// writes, which run outside any session transaction.
     #[cfg(feature = "wal")]
     pub(super) fn log_wal(&self, record: &WalRecord) -> Result<()> {
+        self.log_wal_group(vec![record.clone()])
+    }
+
+    /// Writes `records` as one implicit WAL group, if WAL is enabled: one
+    /// contiguous append closed by `[TransactionCommit(SYSTEM),
+    /// EpochAdvance]`, so a crash cannot keep part of it and a later commit
+    /// marker cannot settle it (#411). A failed append poisons the WAL.
+    #[cfg(feature = "wal")]
+    pub(super) fn log_wal_group(&self, records: Vec<WalRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        match self.new_wal_buffer() {
+            Some(buffer) => {
+                buffer.write_implicit_group(&records, self.transaction_manager.current_epoch())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Logs a bare WAL record, outside any group, if WAL is enabled. Only for
+    /// [`save`](Self::save), which fills a fresh target database that its
+    /// `close()` then commits as a whole.
+    #[cfg(feature = "wal")]
+    pub(super) fn log_wal_bare(&self, record: &WalRecord) -> Result<()> {
         if let Some(ref wal) = self.wal {
             wal.log(record)?;
         }

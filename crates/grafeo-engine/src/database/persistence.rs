@@ -555,7 +555,7 @@ impl super::GrafeoDB {
                 .create_node_with_id(node.id, &label_refs)?;
 
             // Log to WAL
-            target.log_wal(&WalRecord::CreateNode {
+            target.log_wal_bare(&WalRecord::CreateNode {
                 id: node.id,
                 labels: node.labels.iter().map(|s| s.to_string()).collect(),
             })?;
@@ -565,7 +565,7 @@ impl super::GrafeoDB {
                 target
                     .lpg_store()
                     .set_node_property(node.id, key.as_str(), value.clone());
-                target.log_wal(&WalRecord::SetNodeProperty {
+                target.log_wal_bare(&WalRecord::SetNodeProperty {
                     id: node.id,
                     key: key.to_string(),
                     value,
@@ -580,7 +580,7 @@ impl super::GrafeoDB {
                 .create_edge_with_id(edge.id, edge.src, edge.dst, &edge.edge_type)?;
 
             // Log to WAL
-            target.log_wal(&WalRecord::CreateEdge {
+            target.log_wal_bare(&WalRecord::CreateEdge {
                 id: edge.id,
                 src: edge.src,
                 dst: edge.dst,
@@ -592,7 +592,7 @@ impl super::GrafeoDB {
                 target
                     .lpg_store()
                     .set_edge_property(edge.id, key.as_str(), value.clone());
-                target.log_wal(&WalRecord::SetEdgeProperty {
+                target.log_wal_bare(&WalRecord::SetEdgeProperty {
                     id: edge.id,
                     key: key.to_string(),
                     value,
@@ -603,7 +603,7 @@ impl super::GrafeoDB {
         // Copy named graphs
         for graph_name in self.lpg_store().graph_names() {
             if let Some(src_graph) = self.lpg_store().graph(&graph_name) {
-                target.log_wal(&WalRecord::CreateNamedGraph {
+                target.log_wal_bare(&WalRecord::CreateNamedGraph {
                     name: graph_name.clone(),
                 })?;
                 target
@@ -613,20 +613,20 @@ impl super::GrafeoDB {
 
                 if let Some(dst_graph) = target.lpg_store().graph(&graph_name) {
                     // Switch WAL context to this named graph
-                    target.log_wal(&WalRecord::SwitchGraph {
+                    target.log_wal_bare(&WalRecord::SwitchGraph {
                         name: Some(graph_name.clone()),
                     })?;
 
                     for node in src_graph.all_nodes() {
                         let label_refs: Vec<&str> = node.labels.iter().map(|s| &**s).collect();
                         dst_graph.create_node_with_id(node.id, &label_refs)?;
-                        target.log_wal(&WalRecord::CreateNode {
+                        target.log_wal_bare(&WalRecord::CreateNode {
                             id: node.id,
                             labels: node.labels.iter().map(|s| s.to_string()).collect(),
                         })?;
                         for (key, value) in node.properties {
                             dst_graph.set_node_property(node.id, key.as_str(), value.clone());
-                            target.log_wal(&WalRecord::SetNodeProperty {
+                            target.log_wal_bare(&WalRecord::SetNodeProperty {
                                 id: node.id,
                                 key: key.to_string(),
                                 value,
@@ -640,7 +640,7 @@ impl super::GrafeoDB {
                             edge.dst,
                             &edge.edge_type,
                         )?;
-                        target.log_wal(&WalRecord::CreateEdge {
+                        target.log_wal_bare(&WalRecord::CreateEdge {
                             id: edge.id,
                             src: edge.src,
                             dst: edge.dst,
@@ -648,7 +648,7 @@ impl super::GrafeoDB {
                         })?;
                         for (key, value) in edge.properties {
                             dst_graph.set_edge_property(edge.id, key.as_str(), value.clone());
-                            target.log_wal(&WalRecord::SetEdgeProperty {
+                            target.log_wal_bare(&WalRecord::SetEdgeProperty {
                                 id: edge.id,
                                 key: key.to_string(),
                                 value,
@@ -661,7 +661,7 @@ impl super::GrafeoDB {
 
         // Switch WAL context back to default graph
         if !self.lpg_store().graph_names().is_empty() {
-            target.log_wal(&WalRecord::SwitchGraph { name: None })?;
+            target.log_wal_bare(&WalRecord::SwitchGraph { name: None })?;
         }
 
         // Copy RDF data with WAL logging
@@ -675,10 +675,10 @@ impl super::GrafeoDB {
                     graph: None,
                 };
                 target.rdf_store.insert((*triple).clone());
-                target.log_wal(&record)?;
+                target.log_wal_bare(&record)?;
             }
             for name in self.rdf_store.graph_names() {
-                target.log_wal(&WalRecord::CreateRdfGraph { name: name.clone() })?;
+                target.log_wal_bare(&WalRecord::CreateRdfGraph { name: name.clone() })?;
                 if let Some(src_graph) = self.rdf_store.graph(&name) {
                     let dst_graph = target.rdf_store.graph_or_create(&name);
                     for triple in src_graph.triples() {
@@ -689,7 +689,7 @@ impl super::GrafeoDB {
                             graph: Some(name.clone()),
                         };
                         dst_graph.insert((*triple).clone());
-                        target.log_wal(&record)?;
+                        target.log_wal_bare(&record)?;
                     }
                 }
             }
