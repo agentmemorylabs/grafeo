@@ -835,7 +835,7 @@ impl Session {
     ) -> Result<T> {
         self.check_wal_writable()?;
         if !store.is_layered() {
-            let result = write();
+            let result = write().and_then(|v| self.check_wal_buffer().map(|()| v));
             // Outside a transaction the write's records form their own group.
             #[cfg(feature = "wal")]
             self.flush_wal_outside_transaction();
@@ -847,7 +847,7 @@ impl Session {
             ));
         }
         if !self.needs_auto_commit(true) {
-            let result = write();
+            let result = write().and_then(|v| self.check_wal_buffer().map(|()| v));
             #[cfg(feature = "wal")]
             self.flush_wal_outside_transaction();
             return result;
@@ -871,6 +871,17 @@ impl Session {
                 Err(e)
             }
         }
+    }
+
+    /// The error of a WAL record the session's buffer refused (over the
+    /// transaction WAL buffer cap): the statement that wrote it fails, and
+    /// the transaction cannot commit until it is rolled back.
+    fn check_wal_buffer(&self) -> Result<()> {
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal {
+            return wal.check();
+        }
+        Ok(())
     }
 
     /// Refuses a write once the WAL is poisoned (a commit marker could not be
@@ -4269,6 +4280,12 @@ impl Session {
             let _ = self.rollback_inner();
             return Err(e);
         }
+        // Nor can a buffer that refused a record (over its byte cap): the
+        // transaction's records are incomplete, so roll it back.
+        if let Err(e) = self.check_wal_buffer() {
+            let _ = self.rollback_inner();
+            return Err(e);
+        }
 
         // Check the buffered vector-index updates before anything is
         // finalized: they are applied after the commit, where a failure
@@ -4922,7 +4939,10 @@ impl Session {
                 }
             }
         } else {
-            let result = body();
+            // Inside a transaction a refused WAL record fails the statement
+            // (the transaction can still be rolled back); outside one the
+            // flush below poisons the WAL.
+            let result = body().and_then(|r| self.check_wal_buffer().map(|()| r));
             #[cfg(feature = "wal")]
             self.flush_wal_outside_transaction();
             result

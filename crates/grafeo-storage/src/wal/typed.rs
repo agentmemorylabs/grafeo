@@ -119,6 +119,31 @@ impl<R: WalEntry> TypedWal<R> {
         self.manager.write_frames_or_poison(&frames, force_sync)
     }
 
+    /// Encodes `record` as the payload of one WAL frame, the same encoding
+    /// [`log`](Self::log) writes. Lets a caller hold encoded frames instead
+    /// of records and write them later with
+    /// [`log_encoded_or_poison`](Self::log_encoded_or_poison).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn encode(record: &R) -> Result<Vec<u8>> {
+        bincode::serde::encode_to_vec(record, bincode::config::standard())
+            .map_err(|e| Error::Serialization(e.to_string()))
+    }
+
+    /// [`log_atomic_or_poison`](Self::log_atomic_or_poison) for payloads
+    /// already encoded with [`encode`](Self::encode): written as adjacent
+    /// frames under one hold of the append lock, and any write failure
+    /// poisons the WAL. `force_sync` fsyncs in sync durability mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing fails or the WAL is already poisoned.
+    pub fn log_encoded_or_poison(&self, frames: &[&[u8]], force_sync: bool) -> Result<()> {
+        self.manager.write_frames_or_poison(frames, force_sync)
+    }
+
     /// Logs several records as adjacent frames: no other writer's record can
     /// land between them. Fsyncs (in sync durability mode) when any of them
     /// [requires it](WalEntry::requires_sync).

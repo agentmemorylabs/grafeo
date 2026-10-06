@@ -3716,8 +3716,9 @@ impl GrafeoDB {
     }
 
     /// A WAL buffer for one session or one database-level statement, or
-    /// `None` without a WAL. Buffers of one database share its commit order;
-    /// a group that fails to append poisons the WAL.
+    /// `None` without a WAL. Buffers of one database share its commit order
+    /// and the configured `wal_transaction_buffer_cap`; a group that fails to
+    /// append poisons the WAL.
     #[cfg(feature = "wal")]
     pub(crate) fn new_wal_buffer(&self) -> Option<Arc<crate::transaction::wal_buffer::WalBuffer>> {
         let wal = self.wal.as_ref()?;
@@ -3725,6 +3726,7 @@ impl GrafeoDB {
             crate::transaction::wal_buffer::WalBuffer::for_database(
                 Arc::clone(wal),
                 Arc::clone(&self.wal_commit_order),
+                self.config.wal_transaction_buffer_cap,
             ),
         ))
     }
