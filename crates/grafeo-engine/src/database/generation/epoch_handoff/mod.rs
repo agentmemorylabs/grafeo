@@ -44,6 +44,7 @@ pub use handoff::{FREEZE_STALL_BEFORE_CAPTURE, FREEZE_STALL_ENTERED};
 
 pub use types::{
     EpochHandoffCoordinator, EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle,
+    SpilledVectorSnapshot,
 };
 
 // The install surface additionally requires `mmap` (it reaches the

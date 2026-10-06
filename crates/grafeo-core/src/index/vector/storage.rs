@@ -391,6 +391,50 @@ impl MmapStorage {
         self.file.read().metadata().map(|m| m.len())
     }
 
+    /// Reads the vector for `id`, telling an absent entry (`Ok(None)`) apart
+    /// from an entry that exists but cannot be read (`Err`): a seek or read
+    /// failure, or a file truncated under the entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the indexed entry cannot be read.
+    pub fn try_get(&self, id: NodeId) -> io::Result<Option<Arc<[f32]>>> {
+        if let Some(vec) = self.cache.read().get(&id) {
+            return Ok(Some(Arc::clone(vec)));
+        }
+        let Some(offset) = self.index.read().get(&id).copied() else {
+            return Ok(None);
+        };
+
+        let mut file = self.file.write();
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0u8; self.dimensions * 4];
+        file.read_exact(&mut bytes)?;
+        drop(file);
+
+        // Convert bytes to f32
+        let vector: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| {
+                f32::from_le_bytes(
+                    chunk
+                        .try_into()
+                        .expect("chunks_exact(4) yields 4-byte slices"),
+                )
+            })
+            .collect();
+
+        let arc: Arc<[f32]> = vector.into();
+
+        // Update cache
+        let mut cache = self.cache.write();
+        if cache.len() < self.cache_limit {
+            cache.insert(id, Arc::clone(&arc));
+        }
+
+        Ok(Some(arc))
+    }
+
     /// Clears the in-memory cache.
     pub fn clear_cache(&self) {
         self.cache.write().clear();
@@ -454,45 +498,9 @@ impl VectorStorage for MmapStorage {
     }
 
     fn get(&self, id: NodeId) -> Option<Arc<[f32]>> {
-        // Check cache first
-        if let Some(vec) = self.cache.read().get(&id) {
-            return Some(Arc::clone(vec));
-        }
-
-        // Read from file
-        let offset = *self.index.read().get(&id)?;
-
-        let mut file = self.file.write();
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            return None;
-        }
-
-        let mut bytes = vec![0u8; self.dimensions * 4];
-        if file.read_exact(&mut bytes).is_err() {
-            return None;
-        }
-
-        // Convert bytes to f32
-        let vector: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| {
-                f32::from_le_bytes(
-                    chunk
-                        .try_into()
-                        .expect("chunks_exact(4) yields 4-byte slices"),
-                )
-            })
-            .collect();
-
-        let arc: Arc<[f32]> = vector.into();
-
-        // Update cache
-        let mut cache = self.cache.write();
-        if cache.len() < self.cache_limit {
-            cache.insert(id, Arc::clone(&arc));
-        }
-
-        Some(arc)
+        // Infallible view: an unreadable entry reads as absent. Callers that
+        // must not lose data use `MmapStorage::try_get`.
+        self.try_get(id).ok().flatten()
     }
 
     fn contains(&self, id: NodeId) -> bool {
@@ -673,6 +681,39 @@ mod tests {
         assert!(storage.get(NodeId::new(3)).is_some());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// AMH #167 review: `try_get` tells an absent entry apart from one that
+    /// exists but can no longer be read (`get` reports both as `None`).
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn test_mmap_storage_try_get_absent_vs_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("try_get.bin");
+        let storage = MmapStorage::create(&path, 2).unwrap();
+        storage.insert(NodeId::new(1), &[1.0, 2.0]).unwrap();
+        storage.insert(NodeId::new(2), &[3.0, 4.0]).unwrap();
+        storage.flush().unwrap();
+
+        assert_eq!(storage.try_get(NodeId::new(9)).unwrap(), None);
+        assert_eq!(
+            storage.try_get(NodeId::new(1)).unwrap().as_deref(),
+            Some(&[1.0, 2.0][..])
+        );
+
+        // Cold entry over a truncated file: an error, not "absent".
+        storage.clear_cache();
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 4)
+            .unwrap();
+        assert!(storage.try_get(NodeId::new(2)).is_err());
+        assert!(storage.get(NodeId::new(2)).is_none());
+        // Still absent, not an error, for an id that was never stored.
+        assert_eq!(storage.try_get(NodeId::new(9)).unwrap(), None);
     }
 
     #[cfg(feature = "mmap")]

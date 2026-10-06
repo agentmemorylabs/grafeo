@@ -107,7 +107,11 @@ mod imp {
                 }
             };
 
-            if registry.read().contains_key(&key) {
+            // Held from the check through registration so an epoch-handoff
+            // freeze (which takes the same upgradable read) never sees this
+            // column drained but not yet registered (AMH #167 review).
+            let lifecycle = registry.upgradable_read();
+            if lifecycle.contains_key(&key) {
                 let spill_file = spill_file_for_key(&spill_dir, &key);
                 return Ok(SpillVectorColumnReport {
                     label: label.to_string(),
@@ -274,7 +278,8 @@ mod imp {
                 store.restore_node_property_column(&prop_key, restored.into_iter());
             }
 
-            registry.write().insert(key.clone(), Arc::new(mmap_storage));
+            parking_lot::RwLockUpgradableReadGuard::upgrade(lifecycle)
+                .insert(key.clone(), Arc::new(mmap_storage));
 
             // Re-register the VectorStore consumer bound to the LIVE store.
             // After `compact()` the consumer registered at `with_config` time

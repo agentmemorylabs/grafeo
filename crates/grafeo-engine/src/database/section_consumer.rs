@@ -45,7 +45,7 @@ use grafeo_core::index::vector::VectorStorage;
     feature = "mmap",
     not(feature = "temporal")
 ))]
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 #[cfg(all(
     feature = "lpg",
     feature = "vector-index",
@@ -321,7 +321,7 @@ impl VectorIndexConsumer {
         key: &str,
         dimensions: usize,
         vectors: &[(NodeId, Arc<[f32]>)],
-    ) -> Result<(), SpillError> {
+    ) -> Result<Arc<grafeo_core::index::vector::MmapStorage>, SpillError> {
         let spill_dir = self
             .spill_path
             .as_ref()
@@ -343,10 +343,7 @@ impl VectorIndexConsumer {
         mmap_storage
             .flush()
             .map_err(|e| SpillError::IoError(e.to_string()))?;
-        self.spilled
-            .write()
-            .insert(key.to_string(), Arc::new(mmap_storage));
-        Ok(())
+        Ok(Arc::new(mmap_storage))
     }
 }
 
@@ -414,7 +411,14 @@ impl MemoryConsumer for VectorIndexConsumer {
         // its vectors by the labels registered for each index. The previous
         // per-index drain made the first HashMap entry consume every label's
         // vectors and left later indexes with empty spill stores.
-        let already_spilled: HashSet<String> = self.spilled.read().keys().cloned().collect();
+        //
+        // The registry's upgradable read is held from before the first drain
+        // until the last registration (AMH #167 review): an epoch-handoff
+        // freeze takes the same upgradable read, so it never observes a
+        // column that is drained but not yet registered. Plain readers
+        // (vector search) are not blocked.
+        let mut registry = self.spilled.upgradable_read();
+        let already_spilled: HashSet<String> = registry.keys().cloned().collect();
         let mut indexes_by_property: HashMap<String, Vec<(String, usize, HashSet<NodeId>)>> =
             HashMap::new();
         for (key, index) in store.vector_index_entries() {
@@ -459,7 +463,12 @@ impl MemoryConsumer for VectorIndexConsumer {
                     continue;
                 }
                 match self.spill_index(&key, dimensions, &vectors) {
-                    Ok(()) => consumed.extend(vectors.iter().map(|(id, _)| *id)),
+                    Ok(storage) => {
+                        let mut write = RwLockUpgradableReadGuard::upgrade(registry);
+                        write.insert(key.clone(), storage);
+                        registry = RwLockWriteGuard::downgrade_to_upgradable(write);
+                        consumed.extend(vectors.iter().map(|(id, _)| *id));
+                    }
                     Err(error) => eprintln!("failed to spill vector index {key}: {error}"),
                 }
             }

@@ -107,6 +107,104 @@ pub struct FrozenEpochHandle {
     /// generation's Catalog/VectorStore/TextIndex/PropertyIndex sections
     /// from this captured state.
     pub section_capture: crate::database::generation::sections::GenerationSectionCapture,
+    /// AMH #167: spill storages holding overlay vectors that ForceDisk
+    /// drained from the property store, captured at the freeze point. The
+    /// build reads them per node while streaming the frozen overlay
+    /// ([`SpilledVectorSnapshot::fill`]); `frozen_nodes` does not carry them.
+    pub spilled_vectors: SpilledVectorSnapshot,
+}
+
+/// Spilled vector columns captured at an epoch-handoff freeze (AMH #167).
+///
+/// ForceDisk drains a vector-indexed property column of the overlay into one
+/// mmap spill file per `label:property`. Those vectors are not in the
+/// property store the freeze captures, so the build fills them in from here,
+/// one node at a time, as the frozen overlay is streamed into the bounded
+/// builder (which spools them under its budget). Holding the `Arc`s keeps
+/// each storage's open file readable even if a later reload unlinks it.
+#[derive(Debug, Clone, Default)]
+pub struct SpilledVectorSnapshot {
+    #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+    pub(crate) columns: Vec<SpilledVectorColumn>,
+}
+
+/// One spilled `label:property` column in a [`SpilledVectorSnapshot`].
+#[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+#[derive(Debug, Clone)]
+pub(crate) struct SpilledVectorColumn {
+    pub(crate) key: String,
+    pub(crate) label: String,
+    pub(crate) property: grafeo_common::types::PropertyKey,
+    /// Width of the registered vector index at the freeze (falls back to the
+    /// storage's width when the index is no longer registered).
+    pub(crate) dimensions: usize,
+    pub(crate) storage: std::sync::Arc<grafeo_core::index::vector::MmapStorage>,
+}
+
+impl SpilledVectorSnapshot {
+    /// Number of spilled columns captured.
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        return self.columns.len();
+        #[cfg(not(all(feature = "vector-index", feature = "mmap", not(feature = "temporal"))))]
+        0
+    }
+
+    /// Fills `node`'s missing spilled vectors.
+    ///
+    /// An inline value wins (it was written after the spill, as on the read
+    /// path). An id with no spill entry is fine: vectorless nodes are
+    /// legitimate. An entry that exists but cannot be read, or whose width
+    /// does not match the registered index, fails the build, so the
+    /// handoff is cancelled before publication instead of publishing a base
+    /// without the vector.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::Io`] for an unreadable entry or a width mismatch.
+    pub fn fill(
+        &self,
+        node: &mut grafeo_core::graph::compact::generation::GenerationNode,
+    ) -> std::result::Result<(), grafeo_core::graph::compact::generation::GenerationError> {
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        for col in &self.columns {
+            if node.properties.contains_key(&col.property)
+                || !node.labels.iter().any(|l| *l == col.label)
+            {
+                continue;
+            }
+            let id = grafeo_common::types::NodeId::new(node.id.as_u64());
+            let vector = col.storage.try_get(id).map_err(|e| {
+                grafeo_core::graph::compact::generation::GenerationError::Io(format!(
+                    "spilled vector {} for node {} exists but cannot be read: {e}",
+                    col.key,
+                    id.as_u64()
+                ))
+            })?;
+            let Some(vector) = vector else {
+                continue;
+            };
+            if vector.len() != col.dimensions {
+                return Err(
+                    grafeo_core::graph::compact::generation::GenerationError::Io(format!(
+                        "spilled vector {} for node {} has width {}, index expects {}",
+                        col.key,
+                        id.as_u64(),
+                        vector.len(),
+                        col.dimensions
+                    )),
+                );
+            }
+            node.properties.insert(
+                col.property.clone(),
+                grafeo_common::types::Value::Vector(vector),
+            );
+        }
+        #[cfg(not(all(feature = "vector-index", feature = "mmap", not(feature = "temporal"))))]
+        let _ = node;
+        Ok(())
+    }
 }
 
 /// Result of a complete freeze → build → publish → retire cycle.

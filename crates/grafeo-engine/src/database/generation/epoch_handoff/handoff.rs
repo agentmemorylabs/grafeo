@@ -220,12 +220,26 @@ impl GrafeoDB {
         maybe_stall_before_capture();
 
         // Capture freeze identity + materialize overlay payloads.
-        let (freeze, mut frozen_nodes, frozen_edges) =
-            self.capture_frozen_overlay_payloads(frozen_epoch)?;
+        //
         // AMH #167: ForceDisk drains the overlay's vector-indexed columns into
-        // spill files, so the property store no longer holds them; carry them
-        // into G(N) from the spill registry, or the new base loses them.
-        self.fill_spilled_overlay_vectors(&mut frozen_nodes);
+        // spill files, so the captured property maps lack those vectors.
+        // Snapshot the spill registry at the same point, holding its
+        // upgradable read across capture + snapshot: spill and reload hold
+        // the same lock for their whole drain/register (or reload) lifecycle,
+        // so the capture never sees a column drained but not registered.
+        // The vectors themselves are read per node during the build.
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        let spill_registry = self.vector_spill_storages.clone();
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        let spill_guard = spill_registry.as_ref().map(|r| r.upgradable_read());
+        let (freeze, frozen_nodes, frozen_edges) =
+            self.capture_frozen_overlay_payloads(frozen_epoch)?;
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        let spilled_vectors = self.snapshot_spilled_vectors(spill_guard.as_deref());
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        drop(spill_guard);
+        #[cfg(not(all(feature = "vector-index", feature = "mmap", not(feature = "temporal"))))]
+        let spilled_vectors = super::types::SpilledVectorSnapshot::default();
 
         // H-ADOPT.6 decision 3: capture catalog + index section state at the
         // SAME instant as the payload source — inside the writer barrier,
@@ -289,6 +303,7 @@ impl GrafeoDB {
             frozen_category_bytes,
             frozen_retained_bytes,
             section_capture,
+            spilled_vectors,
         };
 
         slot.phase = EpochHandoffPhase::FreezeCaptured;
@@ -473,64 +488,37 @@ impl GrafeoDB {
         ))
     }
 
-    /// Fills each frozen overlay node's missing vector-indexed properties
-    /// from the ForceDisk spill registry (AMH #167).
-    ///
-    /// The `section:VectorStore` consumer drains a vector-indexed property
-    /// column from the overlay's property store into one mmap spill file per
-    /// `label:property` index (`section_consumer.rs`, `spill`). Reads find the
-    /// vector there through `SpillableVectorAccessor`, but the freeze capture
-    /// reads overlay nodes from the property store, so without this a spilled
-    /// overlay node (copy-up or new) enters G(N) without its vector.
-    ///
-    /// Same precedence as the read path: an inline value (written after the
-    /// spill) wins; the spill is used only when the property is absent.
-    /// Only nodes in the frozen overlay are touched, and only for indexes
-    /// whose label the node carries.
+    /// Captures the spill registry's columns for the freeze (AMH #167).
     #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
-    fn fill_spilled_overlay_vectors(&self, nodes: &mut [GenerationNode]) -> usize {
+    fn snapshot_spilled_vectors(
+        &self,
+        registry: Option<
+            &std::collections::HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>,
+        >,
+    ) -> super::types::SpilledVectorSnapshot {
         use grafeo_core::index::vector::VectorStorage as _;
-        let Some(registry) = self.vector_spill_storages.as_ref() else {
-            return 0;
+        let Some(registry) = registry else {
+            return super::types::SpilledVectorSnapshot::default();
         };
-        let registry = registry.read();
-        let spilled: Vec<(
-            &str,
-            grafeo_common::types::PropertyKey,
-            &Arc<grafeo_core::index::vector::MmapStorage>,
-        )> = registry
+        let mut columns: Vec<super::types::SpilledVectorColumn> = registry
             .iter()
             .filter_map(|(key, storage)| {
                 let (label, property) = key.split_once(':')?;
-                Some((
-                    label,
-                    grafeo_common::types::PropertyKey::new(property),
-                    storage,
-                ))
+                let dimensions = self
+                    .lpg_store()
+                    .get_vector_index(label, property)
+                    .map_or_else(|| storage.dimensions(), |index| index.config().dimensions);
+                Some(super::types::SpilledVectorColumn {
+                    key: key.clone(),
+                    label: label.to_string(),
+                    property: grafeo_common::types::PropertyKey::new(property),
+                    dimensions,
+                    storage: Arc::clone(storage),
+                })
             })
             .collect();
-        let mut filled = 0;
-        for node in nodes.iter_mut() {
-            for (label, property, storage) in &spilled {
-                if node.properties.contains_key(property) || !node.labels.iter().any(|l| l == label)
-                {
-                    continue;
-                }
-                if let Some(vector) = storage.get(NodeId::new(node.id.as_u64())) {
-                    node.properties.insert(
-                        property.clone(),
-                        grafeo_common::types::Value::Vector(vector),
-                    );
-                    filled += 1;
-                }
-            }
-        }
-        filled
-    }
-
-    #[cfg(not(all(feature = "vector-index", feature = "mmap", not(feature = "temporal"))))]
-    fn fill_spilled_overlay_vectors(&self, _nodes: &mut [GenerationNode]) -> usize {
-        0
+        columns.sort_by(|a, b| a.key.cmp(&b.key));
+        super::types::SpilledVectorSnapshot { columns }
     }
 
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
@@ -641,6 +629,7 @@ impl GrafeoDB {
             let node_src = FrozenNodeSource {
                 nodes: handle.frozen_nodes.clone(),
                 pos: 0,
+                spilled: handle.spilled_vectors.clone(),
             };
             let edge_src = FrozenEdgeSource {
                 edges: handle.frozen_edges.clone(),
@@ -712,6 +701,7 @@ impl GrafeoDB {
             let mut nodes = FrozenNodeSource {
                 nodes: handle.frozen_nodes.clone(),
                 pos: 0,
+                spilled: handle.spilled_vectors.clone(),
             };
             let mut edges = FrozenEdgeSource {
                 edges: handle.frozen_edges.clone(),
