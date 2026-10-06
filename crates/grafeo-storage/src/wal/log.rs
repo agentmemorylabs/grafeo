@@ -125,7 +125,15 @@ pub struct WalManager {
     /// Encryptor for WAL records (None = unencrypted).
     #[cfg(feature = "encryption")]
     encryptor: Option<grafeo_common::encryption::PageEncryptor>,
+    /// Test hook: called by [`rotate_if_full`](Self::rotate_if_full) before
+    /// it takes the active-log lock, so a test can hold writers that have
+    /// all seen the same full file and release them in a chosen order.
+    #[cfg(test)]
+    rotate_hook: Mutex<Option<RotateHook>>,
 }
+
+#[cfg(test)]
+type RotateHook = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
 
 impl WalManager {
     /// Opens or creates a WAL in the given directory.
@@ -173,6 +181,8 @@ impl WalManager {
             poisoned: Mutex::new(None),
             #[cfg(feature = "encryption")]
             encryptor: None,
+            #[cfg(test)]
+            rotate_hook: Mutex::new(None),
         };
 
         // Open or create the active log
@@ -288,12 +298,12 @@ impl WalManager {
         // so we can release the lock before the (potentially slow) sync_all().
         // The poison check runs under the same lock, so no append can slip in
         // after a writer poisoned the log.
-        let (needs_rotation, sync_file, synced_records) = {
+        let (needs_rotation, sync_file, synced_records, written_sequence) = {
             let mut guard = self.active_log.lock();
             if let Some(reason) = self.poisoned.lock().as_ref() {
                 return Err(Self::poisoned_error(reason));
             }
-            let phase1 = (|| -> Result<(bool, Option<File>, u64)> {
+            let phase1 = (|| -> Result<(bool, Option<File>, u64, u64)> {
                 let log_file = guard
                     .as_mut()
                     .ok_or_else(|| Error::Internal("WAL writer not available".to_string()))?;
@@ -435,7 +445,10 @@ impl WalManager {
                     *self.last_sync.lock() = Instant::now();
                 }
 
-                Ok((needs_rotation, sync_file, synced_records))
+                // The sequence only changes under this lock (see `rotate`), so
+                // it names the file this group was written to.
+                let written_sequence = self.current_sequence.load(Ordering::SeqCst);
+                Ok((needs_rotation, sync_file, synced_records, written_sequence))
             })();
             match phase1 {
                 Ok(done) => done,
@@ -457,8 +470,10 @@ impl WalManager {
             *self.last_sync.lock() = Instant::now();
         }
 
-        // Rotate if needed
-        if needs_rotation && let Err(e) = self.rotate() {
+        // Rotate if needed. The check above ran under the lock that has since
+        // been released, so another writer may already have rotated this
+        // file: rotate_if_full re-checks under the lock.
+        if needs_rotation && let Err(e) = self.rotate_if_full(written_sequence) {
             // The group itself is durable by now, but the writer reports this
             // error as an unconfirmed commit marker and says further writes
             // are refused: poison so that holds.
@@ -627,32 +642,64 @@ impl WalManager {
 
     /// Rotates to a new log file.
     ///
+    /// The new sequence is allocated, its file opened and the active log
+    /// swapped while the active-log lock is held, so the active file only
+    /// ever moves to a higher sequence and `current_sequence()` names it
+    /// whenever that lock is free.
+    ///
     /// # Errors
     ///
     /// Returns an error if rotation fails.
     pub fn rotate(&self) -> Result<()> {
-        let new_sequence = self.current_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        let new_path = self.log_path(new_sequence);
+        let mut guard = self.active_log.lock();
+        self.rotate_locked(&mut guard)
+    }
 
+    /// Size rotation after an append to `written_sequence`: rotates only if
+    /// that file is still the active one and still at or over
+    /// `max_log_size`. Several writers can see the same file full; the first
+    /// rotates it and the others find a fresh file and leave it.
+    pub(crate) fn rotate_if_full(&self, written_sequence: u64) -> Result<()> {
+        #[cfg(test)]
+        {
+            let hook = self.rotate_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(written_sequence);
+            }
+        }
+        let mut guard = self.active_log.lock();
+        let still_full = guard
+            .as_ref()
+            .is_some_and(|log| log.size >= self.config.max_log_size);
+        if still_full && self.current_sequence.load(Ordering::SeqCst) == written_sequence {
+            self.rotate_locked(&mut guard)?;
+        }
+        Ok(())
+    }
+
+    /// Rotation body; the caller holds the active-log lock.
+    fn rotate_locked(&self, active: &mut Option<LogFile>) -> Result<()> {
+        // Make the outgoing file final first: flushed and fsynced. On error
+        // nothing has changed and the same file stays active.
+        if let Some(old_log) = active.as_mut() {
+            old_log.writer.flush()?;
+            old_log.writer.get_ref().sync_all()?;
+        }
+
+        let new_sequence = self.current_sequence.load(Ordering::SeqCst) + 1;
+        let new_path = self.log_path(new_sequence);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&new_path)?;
 
-        let new_log = LogFile {
+        self.current_sequence.store(new_sequence, Ordering::SeqCst);
+        *active = Some(LogFile {
             writer: BufWriter::new(file),
             size: 0,
             path: new_path,
-        };
-
-        // Replace active log, syncing the old one to ensure durability
-        let mut guard = self.active_log.lock();
-        if let Some(mut old_log) = guard.take() {
-            old_log.writer.flush()?;
-            old_log.writer.get_ref().sync_all()?;
-        }
-        *guard = Some(new_log);
+        });
 
         Ok(())
     }
@@ -674,12 +721,11 @@ impl WalManager {
     /// length in bytes)` of the file that is active **under the append lock**.
     ///
     /// This is the cut a live backup needs. The sequence comes from the
-    /// active file itself, not from `current_sequence()`, which
-    /// [`rotate`](Self::rotate) bumps before it swaps the file (so it can
-    /// name a file that is still empty). Because the active log is held while
-    /// the answer is read, every lower sequence is already final (rotated out
-    /// and fsynced), and the length lies on an append-group boundary: appends
-    /// write whole groups under the same lock. The fsync happens after the
+    /// active file itself (which, since [`rotate`](Self::rotate) swaps the
+    /// file under the same lock, is also `current_sequence()`). Because the
+    /// active log is held while the answer is read, every lower sequence is
+    /// already final (rotated out and fsynced), and the length lies on an
+    /// append-group boundary: appends write whole groups under the same lock. The fsync happens after the
     /// lock is released, as in [`sync`](Self::sync).
     ///
     /// # Errors
@@ -753,10 +799,9 @@ impl WalManager {
     /// Returns the current WAL log sequence number.
     ///
     /// Each log file has a sequence number embedded in its name
-    /// (`wal_XXXXXXXX.log`). This returns the sequence of the active log file,
-    /// except while [`rotate`](Self::rotate) is in progress: the sequence is
-    /// bumped before the new file is swapped in, so it can be one ahead of
-    /// the file still receiving writes.
+    /// (`wal_XXXXXXXX.log`). This returns the sequence of the active log file:
+    /// [`rotate`](Self::rotate) changes it and swaps the file under the same
+    /// append lock.
     #[must_use]
     pub fn current_sequence(&self) -> u64 {
         self.current_sequence.load(Ordering::Relaxed)
@@ -1185,9 +1230,9 @@ mod tests {
         assert_eq!(wal.checkpoint_epoch(), Some(EpochId::new(10)));
     }
 
-    /// `rotate()` bumps the sequence before it swaps in the new log file. A
-    /// checkpointer that reads `current_sequence()` inside that window sees
-    /// S+1 while a racing commit still lands in file S. Covering
+    /// A checkpointer whose sequence capture runs ahead of the file a racing
+    /// commit lands in (as `rotate()` allowed before it swapped files under
+    /// the append lock) must still keep that file. Covering
     /// `current_sequence() - 1` keeps file S in recovery; covering the raw
     /// value skips it and loses the commit.
     #[test]
@@ -1198,7 +1243,7 @@ mod tests {
             let dir = tempdir().unwrap();
             let wal = WalManager::open(dir.path()).unwrap();
 
-            // Simulate rotate() between its sequence bump and its file swap.
+            // Simulate a sequence bump ahead of the file swap.
             wal.current_sequence.fetch_add(1, Ordering::SeqCst);
             let covered = wal.current_sequence().saturating_sub(step_back);
 
@@ -1377,5 +1422,253 @@ mod tests {
         assert_eq!(seq2, seq + 1);
         assert_eq!(len2, 0);
         assert_eq!(seq2, wal.current_sequence());
+    }
+
+    /// Decodes every frame of `wal_*.log` files in sequence order as
+    /// `(sequence, record)`.
+    fn read_all_frames(dir: &Path) -> Vec<(u64, WalRecord)> {
+        let mut files: Vec<(u64, PathBuf)> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                Some((WalManager::sequence_from_path(&path)?, path))
+            })
+            .collect();
+        files.sort_by_key(|(seq, _)| *seq);
+        let mut out = Vec::new();
+        for (seq, path) in files {
+            let bytes = fs::read(&path).unwrap();
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                let body = &bytes[at + 4..at + 4 + len];
+                let (record, _): (WalRecord, _) =
+                    bincode::serde::decode_from_slice(body, bincode::config::standard()).unwrap();
+                out.push((seq, record));
+                at += 4 + len + 4;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn concurrent_size_rotations_keep_files_in_append_order() {
+        // Many writers cross max_log_size at once, so several of them see the
+        // same full file and ask for a rotation. The active file must only
+        // ever move to a higher sequence: reading files in sequence order
+        // must give every writer's records in the order it appended them,
+        // and the newest file must be the one still being written.
+        const WRITERS: u64 = 8;
+        const RECORDS: u64 = 400;
+        for _round in 0..5 {
+            let dir = tempdir().unwrap();
+            let wal = WalManager::with_config(
+                dir.path(),
+                WalConfig {
+                    durability: DurabilityMode::NoSync,
+                    max_log_size: 96,
+                    ..WalConfig::default()
+                },
+            )
+            .unwrap();
+            let barrier = std::sync::Barrier::new(usize::try_from(WRITERS).unwrap());
+            std::thread::scope(|scope| {
+                for writer in 0..WRITERS {
+                    let (wal, barrier) = (&wal, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for i in 0..RECORDS {
+                            wal.log(&WalRecord::CreateNode {
+                                id: NodeId::new(writer * 1_000_000 + i),
+                                labels: vec![],
+                            })
+                            .unwrap();
+                        }
+                    });
+                }
+            });
+            // A last record lands in the active file, which must be the newest.
+            wal.log(&WalRecord::CreateNode {
+                id: NodeId::new(u64::MAX - 1),
+                labels: vec![],
+            })
+            .unwrap();
+            wal.flush().unwrap();
+            let max_file_seq = wal
+                .log_files()
+                .unwrap()
+                .iter()
+                .filter_map(|p| WalManager::sequence_from_path(p))
+                .max()
+                .unwrap();
+            assert_eq!(
+                wal.current_sequence(),
+                max_file_seq,
+                "current_sequence names the newest file"
+            );
+
+            let frames = read_all_frames(dir.path());
+            assert_eq!(frames.len() as u64, WRITERS * RECORDS + 1);
+            let (last_seq, last) = frames.last().unwrap();
+            assert!(
+                matches!(last, WalRecord::CreateNode { id, .. } if id.as_u64() == u64::MAX - 1),
+                "the record written last is read last"
+            );
+            // Nothing was written to a file newer than the one that took the
+            // last record (a file after it, if any, is the fresh one its
+            // own size rotation opened).
+            let newest_written = frames.iter().map(|(seq, _)| *seq).max().unwrap();
+            assert_eq!(*last_seq, newest_written, "the active file is the newest");
+            let mut next = vec![0u64; usize::try_from(WRITERS).unwrap()];
+            for (seq, record) in &frames[..frames.len() - 1] {
+                let WalRecord::CreateNode { id, .. } = record else {
+                    panic!("unexpected record {record:?}");
+                };
+                let (writer, i) = (id.as_u64() / 1_000_000, id.as_u64() % 1_000_000);
+                let slot = usize::try_from(writer).unwrap();
+                assert_eq!(i, next[slot], "writer {writer} out of order in file {seq}");
+                next[slot] += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn a_size_rotation_request_for_a_file_already_rotated_is_a_no_op() {
+        // Two writers can both see file N full; only the first rotation may
+        // happen, the second finds a fresh file and leaves it active.
+        let dir = tempdir().unwrap();
+        let wal = WalManager::with_config(
+            dir.path(),
+            WalConfig {
+                max_log_size: 8,
+                ..WalConfig::default()
+            },
+        )
+        .unwrap();
+        let seq0 = wal.current_sequence();
+        wal.log(&WalRecord::CreateNode {
+            id: NodeId::new(1),
+            labels: vec!["Person".to_string()],
+        })
+        .unwrap();
+        assert_eq!(wal.current_sequence(), seq0 + 1, "the full file rotated");
+        // A stale request for the file that is already rotated out.
+        wal.rotate_if_full(seq0).unwrap();
+        assert_eq!(wal.current_sequence(), seq0 + 1, "no second rotation");
+        let (cut_seq, _) = wal.flush_for_cut().unwrap();
+        assert_eq!(cut_seq, seq0 + 1);
+    }
+
+    #[test]
+    fn writers_that_saw_the_same_full_file_rotate_it_once_in_any_release_order() {
+        // Forced schedule: writer A then writer B each append to file N and
+        // see it full, and both are held before rotating. B (the later one)
+        // is released first, a third append arrives, then A is released.
+        // A's stale request must not rotate, the active file must be the
+        // newest, and files read in sequence order must give append order.
+        use std::collections::HashMap;
+        use std::sync::mpsc;
+
+        let dir = tempdir().unwrap();
+        let wal = std::sync::Arc::new(
+            WalManager::with_config(
+                dir.path(),
+                WalConfig {
+                    max_log_size: 8,
+                    ..WalConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let seq_n = wal.current_sequence();
+
+        let (arrived_tx, arrived_rx) = mpsc::channel::<(String, u64)>();
+        let gates: std::sync::Arc<parking_lot::Mutex<HashMap<String, mpsc::Receiver<()>>>> =
+            std::sync::Arc::default();
+        let mut release = HashMap::new();
+        for name in ["A", "B"] {
+            let (tx, rx) = mpsc::channel::<()>();
+            gates.lock().insert(name.to_string(), rx);
+            release.insert(name, tx);
+        }
+        {
+            let gates = std::sync::Arc::clone(&gates);
+            let arrived_tx = parking_lot::Mutex::new(arrived_tx);
+            *wal.rotate_hook.lock() = Some(std::sync::Arc::new(move |seq| {
+                let name = std::thread::current().name().unwrap_or("").to_string();
+                let Some(gate) = gates.lock().remove(&name) else {
+                    return;
+                };
+                arrived_tx.lock().send((name, seq)).unwrap();
+                gate.recv().unwrap();
+            }));
+        }
+
+        let spawn = |name: &'static str, id: u64| {
+            let wal = std::sync::Arc::clone(&wal);
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || {
+                    wal.log(&WalRecord::CreateNode {
+                        id: NodeId::new(id),
+                        labels: vec![],
+                    })
+                    .unwrap();
+                })
+                .unwrap()
+        };
+        let a = spawn("A", 1);
+        assert_eq!(arrived_rx.recv().unwrap(), ("A".to_string(), seq_n));
+        let b = spawn("B", 2);
+        assert_eq!(
+            arrived_rx.recv().unwrap(),
+            ("B".to_string(), seq_n),
+            "B appended to the same full file A is about to rotate"
+        );
+
+        release["B"].send(()).unwrap();
+        b.join().unwrap();
+        // Another append arrives between B's rotation and A's: it lands in
+        // the file B opened (and, being full, rotates it in turn).
+        wal.log(&WalRecord::CreateNode {
+            id: NodeId::new(4),
+            labels: vec![],
+        })
+        .unwrap();
+        release["A"].send(()).unwrap();
+        a.join().unwrap();
+
+        // A's request was for file N, which B already rotated: no-op. Only
+        // B's rotation and the third append's rotation happened.
+        assert_eq!(wal.current_sequence(), seq_n + 2, "A did not rotate again");
+        let newest_on_disk = wal
+            .log_files()
+            .unwrap()
+            .iter()
+            .filter_map(|p| WalManager::sequence_from_path(p))
+            .max()
+            .unwrap();
+        let (cut_seq, _) = wal.flush_for_cut().unwrap();
+        assert_eq!(cut_seq, newest_on_disk, "the active file is the newest");
+
+        // A later append lands in the newest file, and reading files in
+        // sequence order gives every record in append order.
+        wal.log(&WalRecord::CreateNode {
+            id: NodeId::new(3),
+            labels: vec![],
+        })
+        .unwrap();
+        wal.flush().unwrap();
+        let placed: Vec<(u64, u64)> = read_all_frames(dir.path())
+            .iter()
+            .map(|(seq, r)| match r {
+                WalRecord::CreateNode { id, .. } => (*seq, id.as_u64()),
+                other => panic!("unexpected record {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            vec![(seq_n, 1), (seq_n, 2), (seq_n + 1, 4), (seq_n + 2, 3)]
+        );
     }
 }

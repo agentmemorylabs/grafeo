@@ -1287,10 +1287,19 @@ impl GrafeoDB {
                 }
                 crate::config::DurabilityMode::NoSync => WalDurabilityMode::NoSync,
             };
-            let wal_config = WalConfig {
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            let mut wal_config = WalConfig {
                 durability: wal_durability,
                 ..WalConfig::default()
             };
+            #[cfg(debug_assertions)]
+            {
+                let max = generation::replay::GENERATION_ROOT_WAL_MAX_LOG_SIZE
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if max > 0 {
+                    wal_config.max_log_size = max;
+                }
+            }
             let wal = Arc::new(LpgWal::with_config(&wal_dir, wal_config)?);
             // The torn tail's unfinished transaction left complete records
             // before the cut. Close it with an abort so the next commit in the
