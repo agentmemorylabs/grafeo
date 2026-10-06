@@ -122,6 +122,8 @@ impl GrafeoDB {
     /// handoff is already active, or the live graph cannot be snapshotted.
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
     pub fn freeze_epoch_for_handoff(&self, generation_root: &Path) -> Result<FrozenEpochHandle> {
+        #[cfg(feature = "wal")]
+        self.check_snapshot_source("start an epoch handoff")?;
         let mut slot = self.epoch_handoff.slot.lock();
         if !matches!(
             slot.phase,
@@ -546,6 +548,10 @@ impl GrafeoDB {
         handle: FrozenEpochHandle,
         request: GenerationBuildRequest,
     ) -> Result<BuildPublication> {
+        // Poisoned after the freeze: fail before publishing (the caller
+        // cancels the handoff).
+        #[cfg(feature = "wal")]
+        self.check_snapshot_source("publish an epoch handoff")?;
         std::fs::create_dir_all(&request.generation_root)?;
         let root_buf = std::fs::canonicalize(&request.generation_root)
             .map_err(|e| Error::Internal(format!("canonicalize generation root: {e}")))?;

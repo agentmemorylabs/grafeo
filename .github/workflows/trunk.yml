@@ -23,6 +23,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
+  # No debuginfo: keeps target/ small on the hosted runner. TEST is needed too,
+  # since cargo test builds with the test profile. Side effect: panic
+  # backtraces have no line numbers.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   # Matches the feature set agent-memory-hosted builds Grafeo with.
   FEATURES: lpg,cypher,vector-index,text-index,wal,grafeo-file,mmap,parallel,compact-store,generation,generation-streaming,triple-store,tracing
 
@@ -48,15 +53,20 @@ jobs:
       # shows every compile error.
       - name: Common lib tests
         if: ${{ !cancelled() }}
-        run: cargo test -p grafeo-common --lib
+        run: cargo test -p grafeo-common --tests
 
-      - name: Core lib tests
+      # --tests (not --lib alone) also runs the integration targets, e.g.
+      # transactional_batch and rdf_tests (needs triple-store).
+      - name: Core lib and integration tests
         if: ${{ !cancelled() }}
-        run: cargo test -p grafeo-core --lib --features "lpg,mmap,compact-store,generation-streaming,vector-index,text-index,triple-store"
+        run: cargo test -p grafeo-core --tests --features "lpg,mmap,compact-store,generation-streaming,vector-index,text-index,triple-store"
 
-      - name: Storage lib tests
+      # Includes golden_wal_frames and golden_grafeo_file. testing-crash-injection
+      # compiles in the I/O-failure hooks, so the storage tests gated on it (WAL
+      # spill/group failures, file-manager close) run too.
+      - name: Storage lib and integration tests
         if: ${{ !cancelled() }}
-        run: cargo test -p grafeo-storage --lib --features "wal,grafeo-file,generation,generation-streaming,tracing"
+        run: cargo test -p grafeo-storage --tests --features "wal,grafeo-file,generation,generation-streaming,tracing,testing-crash-injection"
 
       - name: Engine lib tests
         if: ${{ !cancelled() }}
@@ -73,20 +83,29 @@ jobs:
           # compact_store_generation_contract: cannot compile with generation-streaming
           #   (imports the eager generate_compact_store, which that feature seals as
           #   pub(crate)). Runs in the "no-streaming" job below instead.
-          # query_correctness: feature-set mismatch, needs sql-pgq (execute_sql),
-          #   which the AMH feature set does not enable.
-          # section_directory_versions: fails on the base branch (reported in #19);
-          #   re-enable once fixed.
+          # crash_atomic_checkpoint, crash_injection_single_file,
+          # layered_rollback_base_mutations, layered_session_direct_api,
+          # wal_conflict_poison_window, wal_interleaved_transactions,
+          # wal_rdf_group_failures, wal_spill: contain tests gated on testing-crash-injection
+          #   (all of wal_conflict_poison_window, wal_rdf_group_failures), so they
+          #   run in the next step with it on. Keep both lists in sync.
           # n_vs_4n_peak_memory: asserts a 128 MiB peak RssAnon budget, which a debug
           #   build exceeds on the hosted runner (143628 kB before fork #24). It runs
           #   in the "peak-memory-release" job below, where it fits since #24.
-          skip='^(compact_store_generation_contract|query_correctness|section_directory_versions|n_vs_4n_peak_memory)$'
+          skip='^(compact_store_generation_contract|crash_atomic_checkpoint|crash_injection_single_file|layered_rollback_base_mutations|layered_session_direct_api|wal_conflict_poison_window|wal_interleaved_transactions|wal_rdf_group_failures|wal_spill|n_vs_4n_peak_memory)$'
           targets=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="grafeo-engine") | .targets[]
                      | select(.kind | index("test")) | .name' \
             | grep -Ev "$skip" | sed 's/^/--test /' | tr '\n' ' ')
           echo "targets: $targets"
           cargo test -p grafeo-engine --features "$FEATURES" --no-fail-fast $targets
+
+      # Every engine target with tests gated on testing-crash-injection, run once
+      # here with it (and sparql, for wal_rdf_group_failures) on. Kept separate so
+      # the injection hooks are only compiled in for these targets.
+      - name: Engine crash-injection tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p grafeo-engine --features "$FEATURES,testing-crash-injection,sparql" --no-fail-fast --test crash_atomic_checkpoint --test crash_injection_single_file --test layered_rollback_base_mutations --test layered_session_direct_api --test wal_conflict_poison_window --test wal_interleaved_transactions --test wal_rdf_group_failures --test wal_spill
 
   no-streaming:
     name: compact_store_generation_contract (without generation-streaming)

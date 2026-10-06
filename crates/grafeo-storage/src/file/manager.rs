@@ -935,19 +935,27 @@ impl GrafeoFileManager {
         Ok(bytes)
     }
 
-    /// Releases the file lock and syncs.
+    /// Syncs and releases the file lock. The lock is released even when the
+    /// sync fails.
     ///
     /// # Errors
     ///
-    /// Returns an error if sync or unlock fails.
+    /// Returns an error if sync or unlock fails (the sync error first).
     pub fn close(&self) -> Result<()> {
         let file = self.file.lock();
-        if !self.read_only {
-            file.sync_all()?;
-        }
-        file.unlock()
-            .map_err(|e| Error::Internal(format!("failed to unlock database file: {e}")))?;
-        Ok(())
+        let synced = if self.read_only {
+            Ok(())
+        } else {
+            grafeo_common::testing::crash::maybe_fail_io("file_close_sync")
+                .and_then(|()| file.sync_all())
+        };
+        // Release the lock even when the sync failed, so a caller that gives
+        // up on this handle can reopen the file; report the sync error first.
+        let unlocked = file
+            .unlock()
+            .map_err(|e| Error::Internal(format!("failed to unlock database file: {e}")));
+        synced?;
+        unlocked
     }
 }
 
@@ -1396,6 +1404,26 @@ mod tests {
         let manager2 = GrafeoFileManager::open(&path).unwrap();
         let data = manager2.read_snapshot().unwrap();
         assert_eq!(data, b"data");
+    }
+
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn lock_released_when_close_sync_fails() {
+        use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+        let dir = test_dir();
+        let path = dir.path().join("lockclosefail.grafeo");
+
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager.write_snapshot(b"data", 1, 1, 0, 0).unwrap();
+        enable_io_failure_at(1);
+        let result = manager.close();
+        disable_io_failure();
+        assert!(result.is_err(), "the sync failure is reported");
+
+        // The lock is released anyway, while the old handle is still alive.
+        let manager2 = GrafeoFileManager::open(&path).unwrap();
+        assert_eq!(manager2.read_snapshot().unwrap(), b"data");
+        drop(manager);
     }
 
     #[test]

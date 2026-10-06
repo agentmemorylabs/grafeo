@@ -40,6 +40,7 @@ mod async_log;
 #[cfg(feature = "async-storage")]
 mod async_typed;
 mod flusher;
+mod group;
 mod log;
 mod record;
 mod recovery;
@@ -49,6 +50,10 @@ pub use async_log::AsyncWalManager;
 #[cfg(feature = "async-storage")]
 pub use async_typed::{AsyncLpgWal, AsyncTypedWal};
 pub use flusher::{AdaptiveFlusher, FlusherStats};
+pub use group::{
+    DEFAULT_MAX_GROUP_BYTES, DEFAULT_SPILL_THRESHOLD, GroupBuffer, GroupLimits, GroupPosition,
+    SPILL_DIR, remove_leftover_spill_files,
+};
 pub use log::{CheckpointMetadata, DurabilityMode, WalConfig, WalManager, truncate_active_tail};
 pub use record::{WalEntry, WalRecord};
 pub use recovery::{RecoveredWal, WalRecovery};
