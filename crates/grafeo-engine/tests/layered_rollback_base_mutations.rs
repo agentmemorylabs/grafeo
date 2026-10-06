@@ -902,6 +902,63 @@ fn failed_commit_appends_nothing_to_the_wal() {
     assert_snapshot_eq("after reopen", &snapshot(&db), &after_write);
 }
 
+/// After another commit poisoned the WAL, a transaction that would conflict
+/// with it is never told to retry: a caller that retries conflicts (AMH's
+/// code-index delta path) would retry against a WAL that refuses every
+/// write. Its conflicting write and its commit both get the WAL's refusal,
+/// which is not retryable.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn conflict_on_a_poisoned_wal_is_not_retryable() {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_from};
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    publish_base(&root);
+    let db = open_root(&root);
+
+    let mut loser = db.session();
+    let mut winner = db.session();
+    loser.begin_transaction().expect("begin loser");
+    winner.begin_transaction().expect("begin winner");
+    loser
+        .execute("MATCH (n:Person {name: 'vincent'}) SET n.age = 50")
+        .expect("loser writes before the poison");
+    winner
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 41")
+        .expect("winner SET");
+    // The winner's group cannot be written: its commit is applied in memory,
+    // reported as unconfirmed, and the WAL is poisoned.
+    enable_io_failure_from(1);
+    let r = winner.commit();
+    disable_io_failure();
+    let err = r.expect_err("the winner's group failed");
+    assert!(
+        err.to_string().contains("durability unconfirmed"),
+        "unexpected error: {err}"
+    );
+    drop(winner);
+
+    let refused = |err: &grafeo_common::utils::error::Error, what: &str| {
+        assert!(
+            !err.error_code().is_retryable(),
+            "{what}: a poisoned WAL must not look retryable: {err}"
+        );
+        assert!(
+            err.to_string().contains("WAL refuses"),
+            "{what}: the caller learns the WAL refuses writes: {err}"
+        );
+    };
+    let err = loser
+        .execute("MATCH (n:Person {name: 'gus'}) SET n.age = 42")
+        .expect_err("the conflicting write is refused");
+    refused(&err, "write");
+    let err = loser
+        .commit()
+        .expect_err("the loser cannot commit on a poisoned WAL");
+    refused(&err, "commit");
+    assert!(!loser.in_transaction(), "the transaction ended");
+}
+
 /// An explicit rollback appends nothing to the WAL: with every append set to
 /// fail it still returns `Ok`, ends the transaction, restores the live
 /// state, and leaves the WAL writable.
