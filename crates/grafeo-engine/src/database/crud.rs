@@ -596,9 +596,13 @@ impl super::GrafeoDB {
                     if let Some(grafeo_common::types::Value::Vector(v)) =
                         node.properties.get(&prop_key)
                     {
+                        // Neighbour vectors through the merged view: on a
+                        // layered database a base node's vector is not in the
+                        // overlay (D10), so an overlay-only accessor cannot
+                        // read it (AMH #174 class).
+                        let graph = self.graph_store();
                         let accessor = grafeo_core::index::vector::PropertyVectorAccessor::new(
-                            &**self.lpg_store(),
-                            property,
+                            &*graph, property,
                         );
                         index.insert(id, v, &accessor);
                     }
