@@ -4333,6 +4333,8 @@ impl Session {
         // Held until this transaction's group is in the WAL, so groups reach
         // the WAL in commit order (see `WalBuffer::commit_order`).
         #[cfg(feature = "wal")]
+        crate::transaction::wal_buffer::maybe_stall_before_validation();
+        #[cfg(feature = "wal")]
         let commit_order = self.wal.as_ref().map(|wal| wal.commit_order());
         let commit_epoch = match self.transaction_manager.commit(transaction_id) {
             Ok(epoch) => epoch,

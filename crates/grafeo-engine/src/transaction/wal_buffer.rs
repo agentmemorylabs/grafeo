@@ -58,11 +58,20 @@ pub static COMMIT_STALL_BEFORE_GROUP: std::sync::atomic::AtomicBool =
 pub static COMMIT_STALL_PARKED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// The [`COMMIT_STALL_BEFORE_GROUP`] seam.
+/// Debug-only test seam, like [`COMMIT_STALL_BEFORE_GROUP`], but the commit
+/// parks after its WAL writability check and before conflict validation.
+/// Lets a test poison the WAL inside that window.
 #[cfg(debug_assertions)]
-pub(crate) fn maybe_stall_before_group() {
+#[doc(hidden)]
+pub static COMMIT_STALL_BEFORE_VALIDATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Parks the calling commit if `seam` is set (clearing it), with
+/// [`COMMIT_STALL_PARKED`] set until the test clears that.
+#[cfg(debug_assertions)]
+fn stall_if(seam: &std::sync::atomic::AtomicBool) {
     use std::sync::atomic::Ordering;
-    if COMMIT_STALL_BEFORE_GROUP
+    if seam
         .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -73,8 +82,23 @@ pub(crate) fn maybe_stall_before_group() {
     }
 }
 
+/// The [`COMMIT_STALL_BEFORE_GROUP`] seam.
+#[cfg(debug_assertions)]
+pub(crate) fn maybe_stall_before_group() {
+    stall_if(&COMMIT_STALL_BEFORE_GROUP);
+}
+
 #[cfg(not(debug_assertions))]
 pub(crate) fn maybe_stall_before_group() {}
+
+/// The [`COMMIT_STALL_BEFORE_VALIDATION`] seam.
+#[cfg(debug_assertions)]
+pub(crate) fn maybe_stall_before_validation() {
+    stall_if(&COMMIT_STALL_BEFORE_VALIDATION);
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn maybe_stall_before_validation() {}
 
 /// One encoded record waiting for its group, with the named graph it
 /// applies to (`None` = default graph).
