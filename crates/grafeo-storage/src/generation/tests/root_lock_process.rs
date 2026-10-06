@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::generation::lock::{RootLock, RootLockError};
+use crate::generation::tests::support::{spawn_under_lock_cycle, try_acquire_root};
 use tempfile::TempDir;
 
 const HELPER_ENV: &str = "GRAFEOROOTPROC_HELPER";
@@ -70,16 +71,17 @@ fn root_lock_second_process_rejected() {
     let Some(dir) = supported_tempdir() else {
         return;
     };
-    let _lock = RootLock::try_acquire(dir.path()).expect("parent acquire");
+    let _lock = try_acquire_root(dir.path()).expect("parent acquire");
 
-    let status = Command::new(std::env::current_exe().expect("current exe"))
-        .env(HELPER_ENV, "1")
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut cmd = Command::new(std::env::current_exe().expect("current exe"));
+    cmd.env(HELPER_ENV, "1")
         .env("GRAFEOROOTPROC_MODE", "second")
         .env("GRAFEOROOTPROC_ROOT", dir.path())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .expect("spawn child");
+        .stderr(Stdio::inherit());
+    let mut child = spawn_under_lock_cycle(&mut cmd).expect("spawn child");
+    let status = child.wait().expect("wait for child");
     assert!(status.success(), "child must observe AlreadyLocked");
 }
 
@@ -95,15 +97,16 @@ fn root_lock_crash_releases_for_fresh_process() {
     let Some(dir) = supported_tempdir() else {
         return;
     };
-    let status = Command::new(std::env::current_exe().expect("current exe"))
-        .env(HELPER_ENV, "1")
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut cmd = Command::new(std::env::current_exe().expect("current exe"));
+    cmd.env(HELPER_ENV, "1")
         .env("GRAFEOROOTPROC_MODE", "crash")
         .env("GRAFEOROOTPROC_ROOT", dir.path())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .expect("spawn child");
+        .stderr(Stdio::inherit());
+    let mut child = spawn_under_lock_cycle(&mut cmd).expect("spawn child");
+    let status = child.wait().expect("wait for child");
     assert!(!status.success(), "child must abort while holding the lock");
 
-    RootLock::try_acquire(dir.path()).expect("fresh process acquires after crash");
+    try_acquire_root(dir.path()).expect("fresh process acquires after crash");
 }

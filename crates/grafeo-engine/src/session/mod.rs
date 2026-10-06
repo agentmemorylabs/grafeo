@@ -5774,7 +5774,8 @@ impl Session {
     }
 
     /// [`delete_node`](Self::delete_node) that returns its failure (a WAL
-    /// append, the implicit commit, a read-only session) instead of `false`.
+    /// append, the implicit commit, a read-only session, a visible row the
+    /// layered store did not delete) instead of `false`.
     #[cfg(feature = "lpg")]
     pub(crate) fn delete_node_checked(&self, id: NodeId) -> Result<bool> {
         let store = self.direct_store();
@@ -5789,6 +5790,14 @@ impl Session {
             #[cfg(feature = "wal")]
             let wal_record = grafeo_storage::wal::WalRecord::DeleteNode { id };
             let deleted = visible && store.delete_node(id, epoch, transaction_id);
+            if visible && !deleted && store.is_layered() {
+                // A visible row the layered store did not delete: an error,
+                // not a silent `false` (AMH #161).
+                return Err(grafeo_common::utils::error::Error::Internal(format!(
+                    "delete_node: node {} is visible but the layered store did not delete it",
+                    id.as_u64()
+                )));
+            }
             #[cfg(feature = "wal")]
             if deleted {
                 self.log_direct_wal_record(&wal_record);
@@ -5832,6 +5841,13 @@ impl Session {
             #[cfg(feature = "wal")]
             let wal_record = grafeo_storage::wal::WalRecord::DeleteEdge { id };
             let deleted = visible && store.delete_edge(id, epoch, transaction_id);
+            if visible && !deleted && store.is_layered() {
+                // See `delete_node_checked`.
+                return Err(grafeo_common::utils::error::Error::Internal(format!(
+                    "delete_edge: edge {} is visible but the layered store did not delete it",
+                    id.as_u64()
+                )));
+            }
             #[cfg(feature = "wal")]
             if deleted {
                 self.log_direct_wal_record(&wal_record);
