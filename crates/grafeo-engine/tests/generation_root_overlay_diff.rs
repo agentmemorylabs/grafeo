@@ -638,3 +638,36 @@ fn database_edge_property_removal_on_a_base_relation() {
     assert_eq!(edge_prop(&db, "weight"), None);
     assert_base_rel(&db, &["weight"], "after removal");
 }
+
+/// What one relation between two base entities costs. Before D10 it copied
+/// both endpoints whole (2 × the 8 KiB embedding); now the edge plus two
+/// labels-only endpoint rows. The number decides slice 3 (whether to drop
+/// the endpoint rows).
+#[test]
+fn relation_between_base_entities_does_not_copy_their_embeddings() {
+    const N: usize = 400;
+    const WIDE: usize = 2048;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("rel-cost.grafeo.d");
+    publish(&root, N, WIDE);
+    let db = open(&root);
+    let layered = db.layered_store().expect("layered").clone();
+    let overlay_before = layered.overlay_memory_bytes();
+    for i in 0..N / 2 {
+        db.execute_cypher(&format!(
+            "MATCH (a:MemoryEntity {{name: 'e{}'}}), (b:MemoryEntity {{name: 'e{}'}}) \
+             CREATE (a)-[:MemoryEntityRelation {{rel_type: 'r'}}]->(b)",
+            2 * i,
+            2 * i + 1
+        ))
+        .expect("relate");
+    }
+    let per = (layered.overlay_memory_bytes() - overlay_before) / (N / 2);
+    eprintln!(
+        "D10 cost per relation between two base entities with a {WIDE}-dim embedding: overlay {per} B"
+    );
+    assert!(
+        per < 2048,
+        "overlay grows {per} B per relation; endpoints are being copied"
+    );
+}
