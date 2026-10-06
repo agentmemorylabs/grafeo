@@ -236,6 +236,51 @@ mod over_4gib {
 
     use super::*;
 
+    /// Samples this process's `RssAnon` / `RssFile` (kB) every 20 ms and
+    /// reports each one's peak for a phase, so heap and mapped-file pages are
+    /// told apart (a max-RSS figure mixes them).
+    struct RssPhase {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        handle: std::thread::JoinHandle<(u64, u64)>,
+    }
+
+    fn rss_kb(field: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with(field))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    impl RssPhase {
+        fn start() -> Self {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                let (mut anon, mut file) = (0, 0);
+                loop {
+                    anon = anon.max(rss_kb("RssAnon:"));
+                    file = file.max(rss_kb("RssFile:"));
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return (anon, file);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            });
+            Self { stop, handle }
+        }
+
+        fn finish(self, phase: &str) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let (anon, file) = self.handle.join().unwrap();
+            eprintln!("G4 rss {phase}: RssAnon_peak_kb={anon} RssFile_peak_kb={file}");
+        }
+    }
+
     fn env_u64(name: &str, default: u64) -> u64 {
         std::env::var(name)
             .ok()
@@ -307,6 +352,7 @@ mod over_4gib {
             ..GenerationBudget::acceptance_linux()
         };
         let started = Instant::now();
+        let rss = RssPhase::start();
         let mut run_store =
             DiskRunStore::new(tmp.path().join("runs"), budget, "g4").expect("DiskRunStore");
         let mut builder = BoundedGenerationBuilder::new(BoundedBuildConfig {
@@ -329,6 +375,8 @@ mod over_4gib {
             )
             .expect("bounded build");
         let built = started.elapsed();
+        rss.finish("build");
+        let rss = RssPhase::start();
         // `[5][dims u16][components u32]` + f32 data, the v5 body size.
         let narrow_body = 1 + 2 + 4 + rows * dims * 4;
         let want = if narrow_body > u64::from(u32::MAX) {
@@ -369,6 +417,8 @@ mod over_4gib {
         drop(sections);
         drop(lock);
         let published = started.elapsed();
+        rss.finish("publish");
+        let rss = RssPhase::start();
 
         let lock = RootLock::try_acquire(&root).expect("re-lock");
         let selected = recover(&lock).expect("recover");
@@ -419,6 +469,7 @@ mod over_4gib {
             checked += 1;
         }
         let opened = started.elapsed();
+        rss.finish("recover+mmap+deserialize+verify");
         eprintln!(
             "G4 evidence: rows={rows} dims={dims} body_len={} file_len={file_len} \
              build={built:?} publish={published:?} reopen+verify={opened:?} rows_checked={checked}",
