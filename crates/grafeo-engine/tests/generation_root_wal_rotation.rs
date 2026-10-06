@@ -8,8 +8,9 @@
 //! damage: the transaction continues in the next file.
 //!
 //! The straddle tests write that old-style WAL by hand: a published base,
-//! then raw `WalRecord`s appended through a `WalManager` with a tiny
-//! `max_log_size` on `root/wal`, then a reopen. That keeps them straddling
+//! then raw `WalRecord`s appended through an `LpgWal` with a tiny
+//! `max_log_size` on `root/wal` (one group per data record, the commit pair
+//! as one atomic group), then a reopen. That keeps them straddling
 //! however the engine groups its own writes, and it is the case the reader
 //! rule exists for once writes are grouped: WAL written before that.
 //!
@@ -32,7 +33,7 @@ use std::sync::atomic::Ordering;
 
 use grafeo_common::types::{EpochId, NodeId, TransactionId, Value};
 use grafeo_engine::{GENERATION_ROOT_WAL_MAX_LOG_SIZE, GrafeoDB, generation_build_request};
-use grafeo_storage::wal::{WalConfig, WalManager, WalRecord};
+use grafeo_storage::wal::{LpgWal, WalConfig, WalRecord};
 use tempfile::tempdir;
 
 /// Small enough that a rotation lands after almost every append group.
@@ -90,15 +91,16 @@ fn explicit_tx(db: &GrafeoDB, label: &str, tag: i64) {
     session.execute("COMMIT").expect("commit");
 }
 
-/// Old-style (ungrouped) WAL on a closed root: one append group per record,
-/// rotating by size after almost every record.
+/// Old-style (ungrouped) WAL on a closed root: one append group per data
+/// record, rotating by size after almost every group. The commit pair is one
+/// atomic group, as the engine has always written it.
 struct RawWal {
-    wal: WalManager,
+    wal: LpgWal,
 }
 
 impl RawWal {
     fn open(root: &Path) -> Self {
-        let wal = WalManager::with_config(
+        let wal = LpgWal::with_config(
             root.join("wal"),
             WalConfig {
                 max_log_size: TINY_MAX_LOG_SIZE / 4,
@@ -130,17 +132,19 @@ impl RawWal {
         }
     }
 
-    /// Commit pair, written as the engine writes it: one atomic group.
+    /// Commit pair, written as the engine writes it: one atomic group, so a
+    /// size rotation can only land after the pair, never between its two
+    /// records.
     fn commit(&self, tx: u64, epoch: u64) {
         self.wal
-            .log(&WalRecord::TransactionCommit {
-                transaction_id: TransactionId::new(tx),
-            })
-            .unwrap();
-        self.wal
-            .log(&WalRecord::EpochAdvance {
-                epoch: EpochId::new(epoch),
-            })
+            .log_atomic(&[
+                WalRecord::TransactionCommit {
+                    transaction_id: TransactionId::new(tx),
+                },
+                WalRecord::EpochAdvance {
+                    epoch: EpochId::new(epoch),
+                },
+            ])
             .unwrap();
     }
 
