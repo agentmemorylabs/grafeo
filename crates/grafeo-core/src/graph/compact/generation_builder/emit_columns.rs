@@ -20,7 +20,9 @@ use crate::graph::compact::generation::{
 };
 use crate::graph::compact::generation_builder::column_pass::ColumnGeometry;
 use crate::graph::compact::generation_builder::emit_meta::{CodecKind, w16, w32, w64};
-use crate::graph::compact::mapped::SegmentKind;
+use crate::graph::compact::mapped::{
+    BlockIndexRecord, PayloadVersion, PayloadVersionPolicy, SegmentKind, write_block_index_record,
+};
 use crate::graph::compact::zone_map::ZoneMap;
 use grafeo_common::types::Value;
 use std::sync::Arc;
@@ -151,11 +153,13 @@ pub struct EmittedColumn {
     /// Codec kind.
     pub kind: CodecKind,
     /// Byte length of the serialized body.
-    pub body_len: u32,
+    pub body_len: u64,
     /// Body start offset within ColumnBodies.
-    pub body_start: u32,
+    pub body_start: u64,
     /// Codec logical row count.
     pub codec_len: u32,
+    /// The body uses a v6-only encoding (wide vector header).
+    pub requires_v6: bool,
     /// Per-block zone maps computed from the emitted codec.
     /// Empty when the column has no zone maps (e.g. Vector columns).
     pub block_zone_maps: Vec<ZoneMap>,
@@ -177,6 +181,23 @@ pub struct ColumnEmissionResult {
     /// `build_block_zone_maps`, so the charge spans the zone maps' whole life
     /// and reconciles to zero before `verify_zero_charges`.
     pub zone_map_guards: Vec<AnonReservation>,
+}
+
+impl ColumnEmissionResult {
+    /// True when some column needs a v6 payload: a body offset or end past
+    /// `u32::MAX`, or a v6-only body encoding.
+    #[must_use]
+    pub fn requires_v6(&self) -> bool {
+        self.columns.iter().any(|c| {
+            c.requires_v6
+                || BlockIndexRecord {
+                    body_offset: c.body_start,
+                    body_len: c.body_len,
+                    row_count: c.codec_len,
+                }
+                .needs_v6()
+        })
+    }
 }
 
 /// Replays the occurrence run, emitting column bodies into `bodies_sink` and
@@ -203,6 +224,7 @@ pub(crate) fn emit_column_bodies(
     metrics: &mut GenerationMetrics,
     cancel: Option<&CancelToken>,
     job_anon: &Arc<JobAnonLedger>,
+    policy: PayloadVersionPolicy,
 ) -> Result<ColumnEmissionResult, GenerationError> {
     let mut result = ColumnEmissionResult::default();
     let mut geo_iter = geometries.iter();
@@ -236,6 +258,7 @@ pub(crate) fn emit_column_bodies(
         let kind = codec_kind_of(_g);
         let column_index = result.columns.len() as u32;
         let body_start = *body_cursor;
+        let requires_v6 = w.requires_v6();
         let (body_len, codec_len, block_zms) = w.finish(bodies_sink)?;
         *body_cursor += body_len;
         // R3 (MAJOR-2): charge the retained zone maps (struct array + string
@@ -261,19 +284,12 @@ pub(crate) fn emit_column_bodies(
             table_id: _g.table_id,
             key: _g.key.clone(),
             kind,
-            body_len: u32::try_from(body_len).map_err(|_| GenerationError::WireWidthOverflow {
-                what: "col_body_len",
-                count: body_len,
-                max: u64::from(u32::MAX),
-            })?,
-            body_start: u32::try_from(body_start).map_err(|_| {
-                GenerationError::WireWidthOverflow {
-                    what: "col_body_offset",
-                    count: body_start,
-                    max: u64::from(u32::MAX),
-                }
-            })?,
+            // u64 here; narrowed (or not) when the block index is encoded
+            // for the resolved payload version (`write_directory_segments`).
+            body_len,
+            body_start,
             codec_len,
+            requires_v6,
             block_zone_maps: block_zms,
         });
         *presence_emitter = None;
@@ -333,6 +349,7 @@ pub(crate) fn emit_column_bodies(
                 null_sink,
                 tid,
                 prop,
+                policy,
             )?;
             writer = Some(w);
             presence_emitter = p_em;
@@ -410,6 +427,7 @@ fn begin_column_streams(
     null_sink: &mut dyn SegmentSink,
     tid: u16,
     prop: &str,
+    policy: PayloadVersionPolicy,
 ) -> Result<
     (
         StreamingBodyWriter,
@@ -421,11 +439,12 @@ fn begin_column_streams(
     let dict_lookup = dict_chunks
         .lookup_for(g.table_id, &g.key)?
         .map(|lk| Box::new(lk) as Box<dyn DictCodeLookup>);
-    let w = StreamingBodyWriter::new(
+    let w = StreamingBodyWriter::new_with_policy(
         bodies_sink,
         g,
         dict_lookup,
         format!("table {tid} column {prop}"),
+        policy,
     )?;
     let column_index = result.columns.len() as u32;
     let row_count = u32::try_from(g.row_count).map_err(|_| GenerationError::WireWidthOverflow {
@@ -454,8 +473,16 @@ fn begin_column_streams(
 
 /// Writes the ColumnDirectory + ColumnBlockIndex + per-table directory rows.
 ///
-/// Mirrors `emit_canonical_descriptors` directory layout byte-exactly.
+/// For [`PayloadVersion::V5`] this mirrors `emit_canonical_descriptors`
+/// directory layout byte-exactly; [`PayloadVersion::V6`] widens only the
+/// ColumnBlockIndex records (24 bytes, `u64` offset and length).
+///
+/// # Errors
+///
+/// [`GenerationError::WireWidthOverflow`] when `version` is v5 and a body
+/// offset or length does not fit `u32`.
 pub fn write_directory_segments(
+    version: PayloadVersion,
     columns: &[EmittedColumn],
     node_tables: &[(u16, u64, Vec<u32>)], // (tid, row_count, col_indices)
     rel_tables: &[(u16, u16, u16, u64, Vec<u32>)], // (rid, src, dst, edge_count, col_indices)
@@ -472,9 +499,15 @@ pub fn write_directory_segments(
         w32(col_dir, 1); // block_count (single block, matching eager)
         w64(col_dir, u64::from(col.codec_len));
         w32(col_dir, 0);
-        w32(col_block_index, col.body_start);
-        w32(col_block_index, col.body_len);
-        w32(col_block_index, col.codec_len);
+        write_block_index_record(
+            col_block_index,
+            version,
+            BlockIndexRecord {
+                body_offset: col.body_start,
+                body_len: col.body_len,
+                row_count: col.codec_len,
+            },
+        )?;
     }
     // NodeTableDirectory.
     let mut running_col = 0u32;

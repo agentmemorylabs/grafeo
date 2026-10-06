@@ -35,7 +35,7 @@ fn streaming_payload(input: &GenerationInput, temp_dir: &std::path::Path) -> Vec
 }
 
 /// Load a committed golden v5 payload fixture.
-fn golden_payload(name: &str) -> Vec<u8> {
+pub(super) fn golden_payload(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/graph/compact/fixtures/v5")
         .join(format!("{name}.v5.bin"));
@@ -59,7 +59,7 @@ fn cleanup(dir: &std::path::Path) {
 }
 
 /// Simple single-label, single-property graph.
-fn simple_input() -> GenerationInput {
+pub(super) fn simple_input() -> GenerationInput {
     GenerationInput::new()
         .node(GenerationNode::new(1u64, "Person").with_prop("name", Value::String("Alice".into())))
         .node(GenerationNode::new(2u64, "Person").with_prop("name", Value::String("Bob".into())))
@@ -73,7 +73,7 @@ fn simple_input() -> GenerationInput {
 }
 
 /// Multi-label, multi-property, multi-edge-type graph.
-fn complex_input() -> GenerationInput {
+pub(super) fn complex_input() -> GenerationInput {
     GenerationInput::new()
         .node(
             GenerationNode::new(100u64, "Person")
@@ -108,7 +108,7 @@ fn complex_input() -> GenerationInput {
 }
 
 /// Sparse IDs (≥ 2^40) to exercise the preserve-ID path.
-fn sparse_id_input() -> GenerationInput {
+pub(super) fn sparse_id_input() -> GenerationInput {
     let base = 1u64 << 42;
     GenerationInput::new()
         .node(GenerationNode::new(base + 1, "Node").with_prop("val", Value::Int64(10)))
@@ -120,7 +120,7 @@ fn sparse_id_input() -> GenerationInput {
 }
 
 /// Duplicate endpoints (same src/dst, distinct edge IDs).
-fn duplicate_endpoint_input() -> GenerationInput {
+pub(super) fn duplicate_endpoint_input() -> GenerationInput {
     GenerationInput::new()
         .node(GenerationNode::new(1u64, "A"))
         .node(GenerationNode::new(2u64, "B"))
@@ -130,7 +130,7 @@ fn duplicate_endpoint_input() -> GenerationInput {
 }
 
 /// Self-loops.
-fn self_loop_input() -> GenerationInput {
+pub(super) fn self_loop_input() -> GenerationInput {
     GenerationInput::new()
         .node(GenerationNode::new(1u64, "Node").with_prop("x", Value::Int64(1)))
         .node(GenerationNode::new(2u64, "Node").with_prop("x", Value::Int64(2)))
@@ -140,7 +140,7 @@ fn self_loop_input() -> GenerationInput {
 }
 
 /// High-cardinality strings for dictionary stress.
-fn high_cardinality_string_input() -> GenerationInput {
+pub(super) fn high_cardinality_string_input() -> GenerationInput {
     let mut input = GenerationInput::new();
     for i in 0..50u64 {
         input = input.node(
@@ -156,7 +156,7 @@ fn high_cardinality_string_input() -> GenerationInput {
 }
 
 /// Signed integers (RawI64 codec path).
-fn signed_int_input() -> GenerationInput {
+pub(super) fn signed_int_input() -> GenerationInput {
     GenerationInput::new()
         .node(GenerationNode::new(1u64, "Sensor").with_prop("reading", Value::Int64(-42)))
         .node(GenerationNode::new(2u64, "Sensor").with_prop("reading", Value::Int64(100)))
@@ -167,7 +167,7 @@ fn signed_int_input() -> GenerationInput {
 }
 
 /// Vector column path.
-fn vector_input() -> GenerationInput {
+pub(super) fn vector_input() -> GenerationInput {
     GenerationInput::new()
         .node(
             GenerationNode::new(1u64, "Embedding")

@@ -116,8 +116,9 @@ pub struct SegmentDescriptor {
     pub length: u64,
     /// CRC-32 of the body bytes.
     pub crc: u32,
-    /// Element count for the directory entry.
-    pub element_count: u32,
+    /// Element count for the directory entry (`u32` on the v5 wire; the
+    /// assembler fails loudly when a v5 payload cannot hold it).
+    pub element_count: u64,
     /// Where the body bytes live.
     pub body: SegmentBody,
 }

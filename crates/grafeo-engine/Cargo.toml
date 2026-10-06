@@ -158,6 +158,16 @@ path = "tests/compact_store_source_true_outer/main.rs"
 required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
 
 [[test]]
+name = "compact_store_v6_payload_large"
+path = "tests/compact_store_v6_payload_large.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "cypher"]
+
+[[test]]
+name = "compact_store_v6_payload"
+path = "tests/compact_store_v6_payload.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "cypher"]
+
+[[test]]
 name = "compact_store_disk_parity"
 path = "tests/compact_store_disk_parity.rs"
 required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]

@@ -773,13 +773,9 @@ impl GrafeoFileManager {
         entry: &grafeo_common::storage::SectionDirectoryEntry,
     ) -> Result<Vec<u8>> {
         let mut file = self.file.lock();
+        let section_len = checked_section_len(&file, entry)?;
         file.seek(SeekFrom::Start(entry.offset))?;
-
-        // reason: section length is bounded by file size, which fits in usize on 64-bit targets;
-        // on 32-bit targets sections would OOM long before reaching 4 GiB
-        // reason: value bounded by collection size, fits usize
-        #[allow(clippy::cast_possible_truncation)]
-        let mut data = vec![0u8; entry.length as usize];
+        let mut data = vec![0u8; section_len];
         std::io::Read::read_exact(&mut *file, &mut data)?;
 
         // Verify CRC on the raw bytes (encrypted or plaintext)
@@ -885,9 +881,10 @@ impl GrafeoFileManager {
         // The section region [offset .. offset+length] was written by
         // write_sections() and its CRC is verified below before the mmap
         // is exposed to callers.
-        // reason: section length is bounded by file size, fits in usize on 64-bit targets
-        #[allow(clippy::cast_possible_truncation)]
-        let section_len = entry.length as usize;
+        // The range is checked against the file before mapping: a corrupt
+        // directory entry fails here with an error instead of mapping past
+        // EOF (SIGBUS on access) or truncating a 64-bit length.
+        let section_len = checked_section_len(&file, entry)?;
         let mmap = unsafe {
             memmap2::MmapOptions::new()
                 .offset(entry.offset)
@@ -1093,6 +1090,39 @@ impl Drop for GrafeoFileManager {
         let file = self.file.lock();
         let _ = file.unlock();
     }
+}
+
+/// Checks a section directory entry's `[offset, offset + length)` against
+/// the file and returns the length as `usize`.
+///
+/// # Errors
+///
+/// Returns an error when the length does not fit `usize`, the end
+/// overflows, or the range passes the end of the file.
+fn checked_section_len(
+    file: &File,
+    entry: &grafeo_common::storage::SectionDirectoryEntry,
+) -> Result<usize> {
+    let section_len = usize::try_from(entry.length).map_err(|_| {
+        Error::Internal(format!(
+            "section {:?} length {} does not fit this platform's address space",
+            entry.section_type, entry.length
+        ))
+    })?;
+    let end = entry.offset.checked_add(entry.length).ok_or_else(|| {
+        Error::Internal(format!(
+            "section {:?} range overflows: offset {} + length {}",
+            entry.section_type, entry.offset, entry.length
+        ))
+    })?;
+    let file_len = file.metadata()?.len();
+    if end > file_len {
+        return Err(Error::Internal(format!(
+            "section {:?} range [{}, {end}) passes the end of the file ({file_len} bytes)",
+            entry.section_type, entry.offset
+        )));
+    }
+    Ok(section_len)
 }
 
 #[cfg(test)]
@@ -1592,6 +1622,36 @@ mod tests {
             Error::Storage(StorageError::DirectMmapUnavailable(_)) => {}
             other => panic!("expected DirectMmapUnavailable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn section_ranges_past_eof_are_refused_before_mapping() {
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("range.grafeo");
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        let data = vec![0xAB; 4096];
+        manager
+            .write_sections(&[(SectionType::VectorStore, &data)], 1, 1, 0, 0)
+            .unwrap();
+        let section_dir = manager.read_section_directory().unwrap().unwrap();
+        let entry = section_dir.find(SectionType::VectorStore).unwrap().clone();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let mut past_eof = entry.clone();
+        past_eof.length = file_len;
+        let mut overflow = entry.clone();
+        overflow.offset = u64::MAX - 1;
+        for bad in [past_eof, overflow] {
+            let mapped = manager.mmap_section(&bad).map(|_| ()).unwrap_err().to_string();
+            assert!(
+                mapped.contains("passes the end of the file") || mapped.contains("overflows"),
+                "{mapped}"
+            );
+            assert!(manager.read_section_data(&bad).is_err());
+        }
+        assert!(manager.mmap_section(&entry).is_ok());
     }
 
     #[test]

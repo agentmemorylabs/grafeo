@@ -502,7 +502,7 @@ pub fn emit_canonical_descriptors(
         )?);
     }
 
-    let code_index_body = build_dictionary_code_index(str_refs);
+    let code_index_body = build_dictionary_code_index(str_refs)?;
     if !code_index_body.is_empty() {
         descriptors.push(emit(
             SegmentKind::DictionaryCodeIndex,

@@ -1,8 +1,10 @@
-//! V5 payload assembler for bounded emission (G-EM0.5b Phase 0).
+//! V5/V6 payload assembler for bounded emission (G-EM0.5b Phase 0, G4).
 //!
 //! Consumes ordered [`SegmentDescriptor`]s and emits the 64-byte header +
 //! 48-byte directory entries + streams each body (from memory or spool) +
-//! trailing CRC-32, **byte-identical** to the eager `serialize_v5` layout.
+//! trailing CRC-32. A v5 payload is **byte-identical** to the eager
+//! `serialize_v5` layout; a v6 payload differs only in the header version
+//! byte and the directory entry layout (`mapped::payload_version`).
 //!
 //! Directory geometry is computed from descriptors only after every segment's
 //! exact length/crc is known (true multi-pass, packet §6).
@@ -14,7 +16,8 @@
 use super::descriptor::SegmentDescriptor;
 use crate::graph::compact::generation::error::GenerationError;
 use crate::graph::compact::mapped::{
-    DIRECTORY_ENTRY_LEN, FORMAT_VERSION_V5, HEADER_LEN, SegmentKind, layout_flags,
+    DIRECTORY_ENTRY_LEN, DirectoryEntryFields, HEADER_LEN, PayloadVersion, SegmentKind,
+    layout_flags, write_directory_entry,
 };
 use crate::graph::compact::section_v5::align_up;
 
@@ -24,11 +27,13 @@ const MAGIC: [u8; 4] = *b"GCST";
 ///
 /// The output is byte-identical to `serialize_v5_with_string_order` when
 /// given the same segments in the same order.
+#[derive(Debug, Clone, Copy)]
 pub struct V5PayloadAssembler {
     total_nodes: u64,
     total_edges: u64,
     preserves_ids: bool,
     layout_flags: u32,
+    version: PayloadVersion,
 }
 
 impl V5PayloadAssembler {
@@ -40,7 +45,24 @@ impl V5PayloadAssembler {
             total_edges,
             preserves_ids,
             layout_flags: 0,
+            version: PayloadVersion::V5,
         }
+    }
+
+    /// Sets the payload version written (default v5).
+    ///
+    /// The caller must have encoded the `ColumnBlockIndex` segment in the
+    /// same version's layout; [`Self::stream_to`] checks its record width.
+    #[must_use]
+    pub fn with_payload_version(mut self, version: PayloadVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// The payload version this assembler writes.
+    #[must_use]
+    pub fn payload_version(&self) -> PayloadVersion {
+        self.version
     }
 
     /// Sets the v5 header layout flags (D0.8.0 extended-payload contract).
@@ -164,17 +186,31 @@ impl V5PayloadAssembler {
         // ── Directory bytes ───────────────────────────────────────────
         let mut dir_bytes = Vec::with_capacity(directory_length as usize);
         for (desc, &(offset, length)) in descriptors.iter().zip(entries.iter()) {
-            write_u16(&mut dir_bytes, desc.kind.as_u16());
-            write_u16(&mut dir_bytes, desc.encoding_version);
-            write_u16(&mut dir_bytes, desc.flags);
-            write_u16(&mut dir_bytes, desc.alignment);
-            write_u64(&mut dir_bytes, offset);
-            write_u64(&mut dir_bytes, length);
-            write_u32(&mut dir_bytes, desc.element_width);
-            write_u32(&mut dir_bytes, desc.element_count);
-            write_u32(&mut dir_bytes, desc.crc);
-            write_u32(&mut dir_bytes, 0); // reserved_a
-            write_u64(&mut dir_bytes, 0); // reserved_b
+            if desc.kind == SegmentKind::ColumnBlockIndex
+                && desc.element_width as usize != self.version.block_index_record_len()
+            {
+                return Err(GenerationError::Codec(format!(
+                    "ColumnBlockIndex record width {} does not match payload {:?} ({})",
+                    desc.element_width,
+                    self.version,
+                    self.version.block_index_record_len()
+                )));
+            }
+            write_directory_entry(
+                &mut dir_bytes,
+                self.version,
+                &DirectoryEntryFields {
+                    kind: desc.kind.as_u16(),
+                    encoding_version: desc.encoding_version,
+                    flags: desc.flags,
+                    alignment: desc.alignment,
+                    offset,
+                    length,
+                    element_width: desc.element_width,
+                    element_count: desc.element_count,
+                    crc32: desc.crc,
+                },
+            )?;
         }
         let directory_crc = crc32fast::hash(&dir_bytes);
 
@@ -182,7 +218,7 @@ impl V5PayloadAssembler {
         let flags: u8 = u8::from(self.preserves_ids);
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(&MAGIC);
-        header.push(FORMAT_VERSION_V5);
+        header.push(self.version.byte());
         header.push(flags);
         #[allow(clippy::cast_possible_truncation)]
         write_u16(&mut header, HEADER_LEN as u16);

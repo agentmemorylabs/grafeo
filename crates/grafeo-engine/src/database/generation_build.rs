@@ -379,7 +379,9 @@ impl GrafeoDB {
                 request.generation_id.clone(),
             )
             .map_err(map_generation_error)?;
-            let mut builder = BoundedGenerationBuilder::new(config);
+            let mut builder = BoundedGenerationBuilder::new(config).with_payload_version_policy(
+                payload_version_policy(self.config.compact_payload_version),
+            );
             let lease = builder
                 .build(
                     live_sources.nodes.as_mut(),
@@ -636,6 +638,19 @@ impl GrafeoDB {
         Err(Error::Internal(
             "no live graph store available for generation build".into(),
         ))
+    }
+}
+
+/// Maps the engine's [`crate::CompactPayloadVersion`] onto the bounded
+/// builder's payload version policy (G4).
+#[cfg(feature = "generation-streaming")]
+pub(crate) fn payload_version_policy(
+    version: crate::CompactPayloadVersion,
+) -> grafeo_core::graph::compact::mapped::PayloadVersionPolicy {
+    use grafeo_core::graph::compact::mapped::PayloadVersionPolicy;
+    match version {
+        crate::CompactPayloadVersion::Auto => PayloadVersionPolicy::Auto,
+        crate::CompactPayloadVersion::V6 => PayloadVersionPolicy::V6,
     }
 }
 
