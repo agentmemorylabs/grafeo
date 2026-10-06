@@ -661,3 +661,75 @@ fn test_filter_ne_excludes_nodes_missing_property() {
         results.len()
     );
 }
+
+/// A small project inside a larger account, on every quantization mode
+/// (AMH builds scalar-quantized indexes). The project's vectors are the ones
+/// furthest from the query, so an unfiltered top-k never contains them.
+/// Before filtered search moved into the traversal, quantized indexes
+/// post-filtered the global nearest `max(k, |allowlist|)` and returned no
+/// hits here.
+#[test]
+fn test_filtered_search_small_far_project_on_quantized_indexes() {
+    for quantization in [None, Some("scalar"), Some("binary"), Some("product")] {
+        let db = GrafeoDB::new_in_memory();
+        let mut project_ids = Vec::new();
+        for i in 0..200u32 {
+            let n = db.create_node(&["Memory"]).unwrap();
+            let t = i as f32 / 200.0;
+            db.set_node_property(n, "emb", Value::Vector(vec![1.0 - t, t, 0.1, 0.2].into()))
+                .unwrap();
+            let project = if i >= 192 { "small" } else { "big" };
+            db.set_node_property(n, "project", Value::String(project.into()))
+                .unwrap();
+            if i >= 192 {
+                project_ids.push(n);
+            }
+        }
+        db.create_property_index("project");
+        db.create_vector_index(
+            "Memory",
+            "emb",
+            Some(4),
+            Some("euclidean"),
+            None,
+            None,
+            quantization,
+        )
+        .expect("create index");
+
+        let filters: HashMap<String, Value> =
+            [("project".to_string(), Value::String("small".into()))]
+                .into_iter()
+                .collect();
+        let query = [1.0, 0.0, 0.1, 0.2];
+        let ctx = format!("{quantization:?}");
+
+        let results = db
+            .vector_search("Memory", "emb", &query, 5, None, Some(&filters))
+            .expect("vector_search");
+        let got: Vec<_> = results.iter().map(|(id, _)| *id).collect();
+        // The five project vectors closest to the query, nearest first.
+        assert_eq!(got, project_ids[..5].to_vec(), "{ctx} vector_search");
+
+        let results = db
+            .vector_search("Memory", "emb", &query, 5, Some(100), Some(&filters))
+            .expect("vector_search with ef");
+        let got: Vec<_> = results.iter().map(|(id, _)| *id).collect();
+        assert_eq!(got, project_ids[..5].to_vec(), "{ctx} vector_search ef");
+
+        let batch = db
+            .batch_vector_search("Memory", "emb", &[query.to_vec()], 20, None, Some(&filters))
+            .expect("batch_vector_search");
+        assert_eq!(
+            batch[0].len(),
+            8,
+            "{ctx}: k > project size returns all of it"
+        );
+
+        let mmr = db
+            .mmr_search("Memory", "emb", &query, 3, None, None, None, Some(&filters))
+            .expect("mmr_search");
+        assert_eq!(mmr.len(), 3, "{ctx} mmr_search");
+        assert!(mmr.iter().all(|(id, _)| project_ids.contains(id)), "{ctx}");
+    }
+}
