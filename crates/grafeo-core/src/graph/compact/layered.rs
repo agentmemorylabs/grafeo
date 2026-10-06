@@ -2691,31 +2691,28 @@ impl GraphStoreMut for LayeredStore {
         // Held across the dirty check and the touches below so they are
         // atomic with a concurrent undo (see `node_dirty_guarded`).
         let mut journal = self.txn_journal.lock();
-        // Delete overlay edges.
-        if self.is_node_dirty(node_id) {
-            let overlay = self.overlay.load();
-            // Record the incident overlay edges as post-freeze mutations
-            // BEFORE removing them: a frozen edge deleted at N+1 must not
-            // resurrect from the new base at the repair swap.
-            let incident: Vec<EdgeId> = overlay
-                .edges_from(node_id, Direction::Both)
-                .map(|(_, eid)| eid)
-                .collect();
-            if !incident.is_empty() {
-                if let Some(h) = self.handoff.write().as_mut() {
-                    for eid in &incident {
-                        h.post_freeze_edges.insert(eid.as_u64());
-                    }
-                }
-            }
-            // Non-transactional: pending copy-ups this relies on become
-            // permanent.
-            self.journal_touch(&mut journal, None, LayerChange::NodeCopyUp(node_id));
-            for eid in &incident {
-                self.journal_touch(&mut journal, None, LayerChange::EdgeCopyUp(*eid));
-            }
-            overlay.delete_node_edges(node_id);
+        // Delete overlay edges. Not gated on the node being dirty: like
+        // `edges_from`, the overlay can hold edges of a node it does not
+        // track (an overlay-only node created by a direct session write, or
+        // a base node a direct session edge create did not copy up).
+        let overlay = self.overlay.load();
+        let incident: Vec<EdgeId> = overlay
+            .edges_from(node_id, Direction::Both)
+            .map(|(_, eid)| eid)
+            .collect();
+        if !incident.is_empty() {
+            // Dirty (and, during a handoff, post-freeze) BEFORE removing
+            // them: a frozen edge deleted at N+1 must not resurrect from the
+            // new base at the repair swap, and the swap keeps only dirty ids.
+            self.mark_dirty_edges(&incident);
         }
+        // Non-transactional: pending copy-ups this relies on become
+        // permanent (a no-op for ids with none).
+        self.journal_touch(&mut journal, None, LayerChange::NodeCopyUp(node_id));
+        for eid in &incident {
+            self.journal_touch(&mut journal, None, LayerChange::EdgeCopyUp(*eid));
+        }
+        overlay.delete_node_edges(node_id);
         // Mark base edges as deleted.
         let mut newly_deleted = 0usize;
         let mut edges = self.deleted_from_base_edges.write();
@@ -3064,7 +3061,19 @@ impl LayeredStore {
             );
             return true;
         }
-        false
+        // Overlay-only and not dirty: a row created after open by a direct
+        // session write (which goes to the overlay `LpgStore`, not through
+        // this store) or a post-freeze create the repair swap undirtied. The
+        // overlay is its only copy (AMH #161: this used to return `false`).
+        let deleted = overlay_delete(&self.overlay.load());
+        if deleted {
+            // Dirty from now on, so a handoff that froze the row (and bakes
+            // it into the new base) keeps the overlay deletion authoritative
+            // at the repair swap instead of resurrecting the row.
+            self.mark_dirty_node(id);
+        }
+        drop(journal);
+        deleted
     }
 
     /// Shared body of `delete_edge` / `delete_edge_versioned`.
@@ -3105,7 +3114,13 @@ impl LayeredStore {
             );
             return true;
         }
-        false
+        // Overlay-only and not dirty: see `delete_node_layered`.
+        let deleted = overlay_delete(&self.overlay.load());
+        if deleted {
+            self.mark_dirty_edge(id);
+        }
+        drop(journal);
+        deleted
     }
 }
 
@@ -4518,6 +4533,75 @@ mod tests {
         // delete on an unknown edge id returns false.
         let missing = EdgeId::from(9_999_999u64);
         assert!(!layered.delete_edge(missing));
+    }
+
+    // AMH #161: rows written straight into the overlay `LpgStore` (as the
+    // session's direct create APIs do) are not dirty; the deletes used to
+    // return `false` for them and leave them in place.
+
+    #[test]
+    fn test_delete_untracked_overlay_rows() {
+        let layered = build_test_layered();
+        let overlay = layered.overlay_store();
+        let a = overlay.create_node(&["Person"]);
+        let b = overlay.create_node(&["Person"]);
+        let e = overlay.create_edge(a, b, "KNOWS");
+        assert!(!layered.is_node_dirty(a) && !layered.is_edge_dirty(e));
+        assert!(layered.get_edge(e).is_some());
+
+        assert!(layered.delete_edge(e), "untracked overlay edge");
+        assert!(layered.get_edge(e).is_none());
+        assert!(layered.delete_node(b), "untracked overlay node");
+        assert!(layered.get_node(b).is_none());
+        assert!(!layered.delete_node(b), "second delete finds nothing");
+        assert!(layered.get_node(a).is_some(), "untouched");
+    }
+
+    #[test]
+    fn test_delete_untracked_overlay_rows_versioned() {
+        let layered = build_test_layered();
+        let overlay = layered.overlay_store();
+        let epoch = overlay.current_epoch();
+        let a = overlay.create_node(&["Person"]);
+        let b = overlay.create_node(&["Person"]);
+        let e = overlay.create_edge(a, b, "KNOWS");
+        let tx = TransactionId::new(7);
+
+        assert!(layered.delete_edge_versioned(e, epoch, tx));
+        assert!(layered.delete_node_versioned(b, epoch, tx));
+        assert!(layered.get_edge_versioned(e, epoch, tx).is_none());
+        assert!(layered.get_node_versioned(b, epoch, tx).is_none());
+
+        // Rolled back (the session's order: overlay versions, then layers),
+        // both come back.
+        overlay.discard_uncommitted_versions(tx);
+        layered.rollback_transaction_layers(tx);
+        assert!(layered.get_edge(e).is_some(), "edge restored by rollback");
+        assert!(layered.get_node(b).is_some(), "node restored by rollback");
+    }
+
+    #[test]
+    fn test_delete_node_edges_removes_untracked_overlay_edges() {
+        let layered = build_test_layered();
+        let base_node = layered.node_ids()[0];
+        let overlay = layered.overlay_store();
+        let c = overlay.create_node(&["Person"]);
+        // Edges the overlay holds for an untracked overlay node and for a base
+        // node it never copied up.
+        let e1 = overlay.create_edge(c, base_node, "KNOWS");
+        let e2 = overlay.create_edge(base_node, c, "KNOWS");
+        assert!(!layered.is_node_dirty(c) && !layered.is_node_dirty(base_node));
+
+        layered.delete_node_edges(c);
+        assert!(layered.get_edge(e1).is_none());
+        assert!(layered.get_edge(e2).is_none());
+        assert!(
+            layered
+                .edges_from(base_node, Direction::Both)
+                .iter()
+                .all(|(_, eid)| *eid != e1 && *eid != e2),
+            "no dangling overlay edge on the base endpoint"
+        );
     }
 
     #[test]
