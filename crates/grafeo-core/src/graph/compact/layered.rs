@@ -5532,11 +5532,17 @@ mod tests {
             let s = Arc::clone(&stop);
             readers.push(thread::spawn(move || {
                 let mut total = 0u64;
-                while !s.load(Ordering::Relaxed) {
+                // Read before checking `stop`, so a reader first scheduled after
+                // the swapper finished still takes a snapshot (under CPU load
+                // the swapper's 200 rounds can complete before a reader runs).
+                loop {
                     let people = l.nodes_by_label("Person");
                     // Person count is base(2) + overlay(0..many); never less than base.
                     assert!(people.len() >= 2, "lost a base node mid-swap");
                     total += people.len() as u64;
+                    if s.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
                 total
             }));
