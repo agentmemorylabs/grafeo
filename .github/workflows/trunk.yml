@@ -52,15 +52,18 @@ jobs:
       # shows every compile error.
       - name: Common lib tests
         if: ${{ !cancelled() }}
-        run: cargo test -p grafeo-common --lib
+        run: cargo test -p grafeo-common --tests
 
-      - name: Core lib tests
+      # --tests (not --lib alone) also runs the integration targets, e.g.
+      # transactional_batch and rdf_tests (needs triple-store).
+      - name: Core lib and integration tests
         if: ${{ !cancelled() }}
-        run: cargo test -p grafeo-core --lib --features "lpg,mmap,compact-store,generation-streaming,vector-index,text-index,triple-store"
+        run: cargo test -p grafeo-core --tests --features "lpg,mmap,compact-store,generation-streaming,vector-index,text-index,triple-store"
 
-      - name: Storage lib tests
+      # Includes golden_wal_frames and golden_grafeo_file.
+      - name: Storage lib and integration tests
         if: ${{ !cancelled() }}
-        run: cargo test -p grafeo-storage --lib --features "wal,grafeo-file,generation,generation-streaming,tracing"
+        run: cargo test -p grafeo-storage --tests --features "wal,grafeo-file,generation,generation-streaming,tracing"
 
       - name: Engine lib tests
         if: ${{ !cancelled() }}
