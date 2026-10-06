@@ -24,6 +24,7 @@ use crate::graph::compact::generation_builder::source_view::{
     estimate_node_bytes, estimate_props_bytes,
 };
 use crate::graph::lpg::LpgStore;
+use crate::graph::traits::GraphStore;
 
 /// Bounded node + edge sources over a live graph store.
 pub struct LiveGraphSources {
@@ -49,14 +50,20 @@ pub fn live_graph_sources_bounded(
             let base_cursor = BaseNodeCursor::new(Arc::clone(b), freeze.clone());
             let mut ids: Vec<u64> = freeze.overlay_node_ids.iter().copied().collect();
             ids.sort_unstable();
-            let overlay_cursor = OverlayNodeCursor::new(Arc::clone(o), ids, max_record_bytes);
+            let overlay_cursor =
+                OverlayNodeCursor::new(Arc::clone(o), Some(Arc::clone(b)), ids, max_record_bytes);
             Box::new(MergedNodeSource::new(base_cursor, overlay_cursor))
         }
         (Some(b), None) => Box::new(BaseNodeCursor::new(Arc::clone(b), freeze.clone())),
         (None, Some(o)) => {
             let mut ids: Vec<u64> = freeze.overlay_node_ids.iter().copied().collect();
             ids.sort_unstable();
-            Box::new(OverlayNodeCursor::new(Arc::clone(o), ids, max_record_bytes))
+            Box::new(OverlayNodeCursor::new(
+                Arc::clone(o),
+                None,
+                ids,
+                max_record_bytes,
+            ))
         }
         (None, None) => Box::new(EmptyNodeSource),
     };
@@ -89,15 +96,24 @@ pub fn live_graph_sources_bounded(
 /// Sorted at construction for deterministic output order.
 struct OverlayNodeCursor {
     overlay: Arc<LpgStore>,
+    /// The base an overlay diff row is merged with (D10): the base cursor
+    /// skips every overlay id, so this row must be the whole row.
+    base: Option<Arc<CompactStore>>,
     ids: Vec<u64>,
     pos: usize,
     max_record_bytes: u64,
 }
 
 impl OverlayNodeCursor {
-    fn new(overlay: Arc<LpgStore>, ids: Vec<u64>, max_record_bytes: u64) -> Self {
+    fn new(
+        overlay: Arc<LpgStore>,
+        base: Option<Arc<CompactStore>>,
+        ids: Vec<u64>,
+        max_record_bytes: u64,
+    ) -> Self {
         Self {
             overlay,
+            base,
             ids,
             pos: 0,
             max_record_bytes,
@@ -110,9 +126,15 @@ impl NodeRecordSource for OverlayNodeCursor {
         while self.pos < self.ids.len() {
             let raw_id = self.ids[self.pos];
             self.pos += 1;
-            let Some(node) = self.overlay.get_node(NodeId::new(raw_id)) else {
+            let Some(mut node) = self.overlay.get_node(NodeId::new(raw_id)) else {
                 continue;
             };
+            if let Some(base_row) = self.base.as_ref().and_then(|b| b.get_node(node.id)) {
+                node.properties = crate::graph::compact::layered::merge_diff_properties(
+                    base_row.properties,
+                    &node.properties,
+                );
+            }
             let mut labels: Vec<String> = node.labels.iter().map(|l| l.to_string()).collect();
             labels.sort();
             labels.dedup();

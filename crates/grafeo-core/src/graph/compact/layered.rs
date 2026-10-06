@@ -168,6 +168,23 @@ impl ReadHit for bool {
     }
 }
 
+/// Merges a diff row's properties over its base row's (D10): a diff value
+/// replaces the base value, a `Null` removes the base property.
+pub(crate) fn merge_diff_properties(
+    base: grafeo_common::types::PropertyMap,
+    diff: &grafeo_common::types::PropertyMap,
+) -> grafeo_common::types::PropertyMap {
+    let mut properties = base;
+    for (key, value) in diff.iter() {
+        if matches!(value, Value::Null) {
+            properties.remove(key);
+        } else {
+            properties.insert(key.clone(), value.clone());
+        }
+    }
+    properties
+}
+
 #[inline]
 fn hit_found(hit: &impl ReadHit) -> bool {
     hit.found()
@@ -1426,7 +1443,7 @@ impl GraphStore for LayeredStore {
         if self.is_node_dirty(id) {
             let hit = self.overlay.load().get_node(id);
             if hit_found(&hit) {
-                return hit;
+                return self.merge_node_diff(hit);
             }
             // An overlay miss on a dirty id can be a copy-up that a concurrent
             // rollback is undoing (undirtied first, then purged): if the id is
@@ -1434,7 +1451,7 @@ impl GraphStore for LayeredStore {
             // read the overlay once more — the copy may have been undone and
             // redone by another writer in between. Hits pay nothing extra.
             if self.is_node_dirty(id) {
-                return self.overlay.load().get_node(id);
+                return self.merge_node_diff(self.overlay.load().get_node(id));
             }
         }
         // dirty_node_ids only tracks modified base nodes; new overlay nodes fall through here.
@@ -1481,14 +1498,15 @@ impl GraphStore for LayeredStore {
                 .load()
                 .get_node_versioned(id, epoch, transaction_id);
             if hit_found(&hit) {
-                return hit;
+                return self.merge_node_diff(hit);
             }
             // Miss on a dirty id: see `get_node`.
             if self.is_node_dirty(id) {
-                return self
-                    .overlay
-                    .load()
-                    .get_node_versioned(id, epoch, transaction_id);
+                return self.merge_node_diff(self.overlay.load().get_node_versioned(
+                    id,
+                    epoch,
+                    transaction_id,
+                ));
             }
         }
         // `dirty_node_ids` only tracks overlay modifications of *base* nodes.
@@ -1542,11 +1560,11 @@ impl GraphStore for LayeredStore {
         if self.is_node_dirty(id) {
             let hit = self.overlay.load().get_node_at_epoch(id, epoch);
             if hit_found(&hit) {
-                return hit;
+                return self.merge_node_diff(hit);
             }
             // Miss on a dirty id: see `get_node`.
             if self.is_node_dirty(id) {
-                return self.overlay.load().get_node_at_epoch(id, epoch);
+                return self.merge_node_diff(self.overlay.load().get_node_at_epoch(id, epoch));
             }
         }
         self.base
@@ -1580,19 +1598,33 @@ impl GraphStore for LayeredStore {
             return None;
         }
         if self.is_node_dirty(id) {
-            let hit = self.overlay.load().get_node_property(id, key);
-            if hit_found(&hit) {
-                return hit;
+            let overlay = self.overlay.load();
+            if let Some(value) = overlay.get_node_property(id, key) {
+                // A diff row's `Null` is a removed base property (D10).
+                if matches!(value, Value::Null) && self.base.load().contains_node(id) {
+                    return None;
+                }
+                return Some(value);
             }
-            // Miss on a dirty id: see `get_node`.
+            // No overlay value: a live diff row inherits the base value (D10).
+            // Read the one property, never the whole base row.
+            if overlay.is_node_visible_at_epoch(id, overlay.current_epoch()) {
+                return self.base.load().get_node_property(id, key);
+            }
+            // Not live in the overlay: deleted, or a copy-up a concurrent
+            // rollback is undoing (see `get_node`).
             if self.is_node_dirty(id) {
-                return self.overlay.load().get_node_property(id, key);
+                return None;
             }
         }
-        self.base
-            .load()
-            .get_node_property(id, key)
-            .or_else(|| self.overlay.load().get_node_property(id, key))
+        // A node the base has is read from the base alone: an overlay row an
+        // install absorbed (undirtied) may still hold a diff `Null` for a
+        // key the new base no longer has.
+        let base = self.base.load();
+        if base.contains_node(id) {
+            return base.get_node_property(id, key);
+        }
+        self.overlay.load().get_node_property(id, key)
     }
 
     fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value> {
@@ -1970,23 +2002,46 @@ impl GraphStore for LayeredStore {
         // CompactStore base scan with those postings double-counts base nodes
         // (planner WHERE / find_nodes_by_properties see 2× hits). Prefer the
         // overlay index exclusively whenever one is registered.
+        let key = PropertyKey::new(property);
         if overlay.has_property_index(property) {
-            return overlay
+            // D10: a diff row's write updates the posting from the overlay's
+            // old value only, so the base value's posting can be stale. Keep
+            // a candidate only if its merged value still matches.
+            let candidates: Vec<NodeId> = overlay
                 .find_nodes_by_property(property, value)
                 .into_iter()
                 .filter(|id| !deleted.contains(id))
                 .collect();
+            // `merged_property_is` takes these locks again.
+            drop((deleted, dirty));
+            return candidates
+                .into_iter()
+                .filter(|id| self.merged_property_is(*id, &key, value))
+                .collect();
         }
 
-        let mut results: Vec<NodeId> = self
-            .base
-            .load()
-            .find_nodes_by_property(property, value)
+        // Base hits of a dirty (diff) node still count when the diff leaves
+        // the property alone (D10): verify those on the merged view. A diff
+        // that sets the property is found by the overlay scan below.
+        let base_hits = self.base.load().find_nodes_by_property(property, value);
+        let dirty_hits: Vec<NodeId> = base_hits
+            .iter()
+            .copied()
+            .filter(|id| !deleted.contains(id) && dirty.contains(id))
+            .collect();
+        let mut results: Vec<NodeId> = base_hits
             .into_iter()
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
-
+        drop((deleted, dirty));
+        results.extend(
+            dirty_hits
+                .into_iter()
+                .filter(|id| self.merged_property_is(*id, &key, value)),
+        );
         results.extend(overlay.find_nodes_by_property(property, value));
+        results.sort_unstable();
+        results.dedup();
         results
     }
 
@@ -2064,27 +2119,60 @@ impl GraphStore for LayeredStore {
             return candidates
                 .into_iter()
                 .filter(|id| {
-                    keyed_conditions
-                        .iter()
-                        .all(|(key, value)| {
-                            self.get_node_property(*id, key)
-                                .is_some_and(|stored| stored == *value)
-                        })
+                    keyed_conditions.iter().all(|(key, value)| {
+                        self.get_node_property(*id, key)
+                            .is_some_and(|stored| stored == *value)
+                    })
                 })
                 .collect();
         }
 
+        let keyed_conditions: Vec<(PropertyKey, Value)> = conditions
+            .iter()
+            .map(|(prop, value)| (PropertyKey::new(*prop), value.clone()))
+            .collect();
+        let base = self.base.load();
+        let base_hits = base.find_nodes_by_properties(conditions);
         let deleted = self.deleted_from_base_nodes.read();
         let dirty = self.dirty_node_ids.read();
-        let mut results: Vec<NodeId> = self
-            .base
-            .load()
-            .find_nodes_by_properties(conditions)
-            .into_iter()
+        let mut results: Vec<NodeId> = base_hits
+            .iter()
+            .copied()
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
-
-        results.extend(overlay.find_nodes_by_properties(conditions));
+        // D10: a dirty base node matches on its merged row, which neither
+        // the base scan (old values) nor the overlay scan (diff keys only)
+        // can see when the diff changes some of the keys. Its merged values
+        // for keys the diff leaves alone are the base values, so it can match
+        // only if the base matched or the diff touches a condition key.
+        let base_matches: FxHashSet<NodeId> = base_hits.into_iter().collect();
+        let dirty_candidates: Vec<NodeId> = dirty
+            .iter()
+            .copied()
+            .filter(|id| !deleted.contains(id) && base.contains_node(*id))
+            .filter(|id| {
+                base_matches.contains(id)
+                    || keyed_conditions
+                        .iter()
+                        .any(|(key, _)| overlay.get_node_property(*id, key).is_some())
+            })
+            .collect();
+        // `merged_property_is` takes these locks again.
+        drop((deleted, dirty));
+        results.extend(dirty_candidates.into_iter().filter(|id| {
+            keyed_conditions
+                .iter()
+                .all(|(key, value)| self.merged_property_is(*id, key, value))
+        }));
+        // Nodes the base lacks are whole overlay rows.
+        results.extend(
+            overlay
+                .find_nodes_by_properties(conditions)
+                .into_iter()
+                .filter(|id| !base.contains_node(*id)),
+        );
+        results.sort_unstable();
+        results.dedup();
         results
     }
 
@@ -2099,14 +2187,28 @@ impl GraphStore for LayeredStore {
         let deleted = self.deleted_from_base_nodes.read();
         let dirty = self.dirty_node_ids.read();
 
-        let mut results: Vec<NodeId> = self
-            .base
-            .load()
-            .find_nodes_in_range(property, min, max, min_inclusive, max_inclusive)
+        let base_hits =
+            self.base
+                .load()
+                .find_nodes_in_range(property, min, max, min_inclusive, max_inclusive);
+        let dirty_hits: Vec<NodeId> = base_hits
+            .iter()
+            .copied()
+            .filter(|id| !deleted.contains(id) && dirty.contains(id))
+            .collect();
+        let mut results: Vec<NodeId> = base_hits
             .into_iter()
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
-
+        drop((deleted, dirty));
+        // Base hits of a dirty (diff) node: verify on the merged view (see
+        // `find_nodes_by_property`).
+        let key = PropertyKey::new(property);
+        results.extend(dirty_hits.into_iter().filter(|id| {
+            self.get_node_property(*id, &key).is_some_and(|v| {
+                super::graph_store_impl::value_in_range(&v, min, max, min_inclusive, max_inclusive)
+            })
+        }));
         results.extend(self.overlay.load().find_nodes_in_range(
             property,
             min,
@@ -2114,6 +2216,8 @@ impl GraphStore for LayeredStore {
             min_inclusive,
             max_inclusive,
         ));
+        results.sort_unstable();
+        results.dedup();
         results
     }
 
@@ -2809,7 +2913,7 @@ impl GraphStoreMut for LayeredStore {
     fn remove_node_property(&self, id: NodeId, key: &str) -> Option<Value> {
         let _guard = self.merge_guard.read();
         self.ensure_in_overlay(id, None);
-        self.overlay.load().remove_node_property(id, key)
+        self.remove_node_property_layered(id, key, None)
     }
 
     fn remove_node_property_versioned(
@@ -2820,9 +2924,7 @@ impl GraphStoreMut for LayeredStore {
     ) -> Option<Value> {
         let _guard = self.merge_guard.read();
         self.ensure_in_overlay(id, Self::journal_owner(transaction_id));
-        self.overlay
-            .load()
-            .remove_node_property_versioned(id, key, transaction_id)
+        self.remove_node_property_layered(id, key, Some(transaction_id))
     }
 
     fn remove_edge_property(&self, id: EdgeId, key: &str) -> Option<Value> {
@@ -2886,8 +2988,96 @@ impl GraphStoreMut for LayeredStore {
 // ── Private helpers ────────────────────────────────────────────────
 
 impl LayeredStore {
+    /// Merges a dirty node's overlay row with its base row (D10).
+    ///
+    /// For a base node the overlay row is a diff: labels and MVCC visibility
+    /// come from it, each property from it if it has the key (`Null` = removed)
+    /// and from the base otherwise. A node the base lacks is a whole overlay
+    /// row and is returned as is, and so is an old full copy-up (it overrides
+    /// every property).
+    fn merge_node_diff(&self, overlay_row: Option<Node>) -> Option<Node> {
+        let mut node = overlay_row?;
+        let Some(base) = self.base.load().get_node(node.id) else {
+            return Some(node);
+        };
+        node.properties = merge_diff_properties(base.properties, &node.properties);
+        Some(node)
+    }
+
+    /// The whole row an overlay node stands for: a diff row of a base node
+    /// merged with its base row (D10), any other overlay row as is.
+    ///
+    /// For consumers that read the overlay `LpgStore` directly and need
+    /// whole rows (compaction capture, tier drains). Applied whether or not
+    /// the id is dirty: a row an earlier handoff absorbed stays in the
+    /// overlay undirtied, and merging it again with the new base (which
+    /// already holds its values) is a no-op.
+    #[must_use]
+    pub fn materialize_overlay_node(&self, overlay_row: Node) -> Node {
+        let Some(base) = self.base.load().get_node(overlay_row.id) else {
+            return overlay_row;
+        };
+        let mut node = overlay_row;
+        node.properties = merge_diff_properties(base.properties, &node.properties);
+        node
+    }
+
+    /// Whether the base has a row for `id` (deleted or not).
+    #[must_use]
+    pub fn base_contains_node(&self, id: NodeId) -> bool {
+        self.base.load().contains_node(id)
+    }
+
+    /// Whether any overlay node is a diff row of a base node (its id is also
+    /// in the base). Consumers that cannot merge use this to pick a path.
+    #[must_use]
+    pub fn overlay_has_base_node_rows(&self) -> bool {
+        let base = self.base.load();
+        self.overlay
+            .load()
+            .all_node_ids()
+            .into_iter()
+            .any(|id| base.contains_node(id))
+    }
+
+    /// Whether `id`'s merged value of `key` equals `value` (strict
+    /// `Value: PartialEq`, like the overlay's own index filters).
+    fn merged_property_is(&self, id: NodeId, key: &PropertyKey, value: &Value) -> bool {
+        self.get_node_property(id, key)
+            .is_some_and(|stored| stored == *value)
+    }
+
+    /// Shared body of `remove_node_property[_versioned]` (after
+    /// `ensure_in_overlay`). A property the base row of a dirty node has is
+    /// removed through the node's diff row (D10): a `Null` tombstone, so the
+    /// base value stops showing through. The tombstone is an ordinary overlay
+    /// write, so the overlay's undo log reverts it on rollback. Anything else
+    /// is a plain overlay remove. Returns the merged value it replaced.
+    fn remove_node_property_layered(
+        &self,
+        id: NodeId,
+        key: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        let overlay = self.overlay.load();
+        let prop_key = PropertyKey::new(key);
+        if self.is_node_dirty(id) && self.base.load().get_node_property(id, &prop_key).is_some() {
+            let old = self.get_node_property(id, &prop_key);
+            match transaction_id {
+                Some(tid) => overlay.set_node_property_versioned(id, key, Value::Null, tid),
+                None => overlay.set_node_property(id, key, Value::Null),
+            }
+            return old;
+        }
+        match transaction_id {
+            Some(tid) => overlay.remove_node_property_versioned(id, key, tid),
+            None => overlay.remove_node_property(id, key),
+        }
+    }
+
     /// Ensures a node exists in the overlay. If the node is base-only,
-    /// copies its labels and properties into the overlay and marks it dirty.
+    /// creates its *diff row* (D10): the base labels and no properties, which
+    /// reads merge with the base row. Then marks it dirty.
     ///
     /// `owner` is the writing transaction (`None` for non-transactional
     /// writes). The copy is created at epoch 0 by the system transaction so
@@ -2932,16 +3122,11 @@ impl LayeredStore {
             return;
         }
 
-        // Copy properties. With `temporal`, also record them at epoch 0 so
-        // historical reads of the epoch-0 row see them, but only where the
-        // property has no history yet: an append behind a later entry would
-        // break the log's epoch order. The plain setter keeps the overlay's
-        // property and text indexes up to date.
-        for (key, value) in base_node.properties.iter() {
-            #[cfg(feature = "temporal")]
-            overlay.seed_node_property_at_epoch(id, key.as_str(), value.clone(), EpochId::new(0));
-            overlay.set_node_property(id, key.as_str(), value.clone());
-        }
+        // D10: the overlay row is a *diff*. It carries the labels (small,
+        // and label writes edit them in place) but no base properties: reads
+        // merge the base values in (`merge_node_diff`, `get_node_property`),
+        // so a write to one property never copies the others, such as an
+        // embedding, into the overlay.
 
         // Register the owner before the dirty mark publishes the copy.
         self.journal_new(&mut journal, owner, LayerChange::NodeCopyUp(id));
