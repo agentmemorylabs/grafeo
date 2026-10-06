@@ -26,19 +26,22 @@ mod tests {
     const FORMAT_VAR: &str = "GRAFEO_WAL_GROUP_FORMAT";
 
     /// Serializes child spawns against database-lock cycles (acquire after
-    /// release) across the parallel test threads of this binary.
+    /// release) across the parallel test threads of this binary. Preventive:
+    /// no failure has been traced in this file.
     ///
-    /// The database lock is a `flock`, which belongs to the *open file
-    /// description*, not to the process or the fd number. Spawning a child forks,
-    /// and between fork and exec the child holds a copy of every fd this process
-    /// has open, including another test thread's locked database file (O_CLOEXEC
-    /// only closes them at exec). If that thread drops its database (unlock by
-    /// close) and the next open of the same path races that window, the child's
-    /// copy still holds the lock and the open fails as already locked. So child
-    /// starts and parent-side opens take turns: `std`'s `spawn` returns only once
-    /// the child has exec'd, so an open that takes this mutex starts after every
+    /// The database file lock is a `flock`, which belongs to the *open file
+    /// description*. Spawning a child forks, and between fork and exec the child
+    /// holds a copy of every fd this process has open (O_CLOEXEC only closes them
+    /// at exec). Single-file `close()` and drop unlock explicitly
+    /// (`flock(LOCK_UN)`), which releases the lock for every copy, and the
+    /// WAL-directory format takes no file lock, so the retained-lock race seen
+    /// with generation roots, which release only by closing the fd, does not
+    /// apply to the paths here today. Child starts and
+    /// parent-side opens take turns anyway, so a later change to a close-only
+    /// release path cannot reintroduce it: `std`'s `spawn` returns only once the
+    /// child has exec'd, so an open that takes this mutex starts after every
     /// earlier fork has dropped its inherited copies. Keep the critical sections
-    /// short and never hold this across a wait on a child. Same fix as
+    /// short and never hold this across a wait on a child. Same pattern as
     /// `compact_store_generation_retirement`.
     static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
