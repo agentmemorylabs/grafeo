@@ -813,6 +813,9 @@ impl GrafeoDB {
                     durability: wal_durability,
                     ..WalConfig::default()
                 };
+                // Spill files only live as long as their session: any left
+                // here are from a crash.
+                grafeo_storage::wal::remove_leftover_spill_files(&wal_path)?;
                 let wal_manager = LpgWal::with_config(&wal_path, wal_config)?;
                 #[cfg(feature = "lpg")]
                 {
@@ -1300,6 +1303,9 @@ impl GrafeoDB {
                     wal_config.max_log_size = max;
                 }
             }
+            // Spill files only live as long as their session: any left here
+            // are from a crash.
+            grafeo_storage::wal::remove_leftover_spill_files(&wal_dir)?;
             let wal = Arc::new(LpgWal::with_config(&wal_dir, wal_config)?);
             // The torn tail's unfinished transaction left complete records
             // before the cut. Close it with an abort so the next commit in the
@@ -3593,6 +3599,15 @@ impl GrafeoDB {
     /// # Errors
     ///
     /// Returns an error if the WAL can't be flushed (check disk space/permissions).
+    /// Also when the WAL was poisoned (a write could not be logged): the
+    /// database then closes without checkpointing memory or writing a
+    /// close-time commit marker, and the next writable open replays the WAL.
+    /// A write reported as "durability unconfirmed" may or may not be there
+    /// afterwards (another snapshot path may have persisted it).
+    ///
+    /// After such a close, **drop** this `GrafeoDB` before reopening the same
+    /// database: a generation root keeps its root lock until drop, and
+    /// retrying `close()` returns `Ok` without confirming anything.
     pub fn close(&self) -> Result<()> {
         let mut is_open = self.is_open.write();
         if !*is_open {
@@ -3616,6 +3631,39 @@ impl GrafeoDB {
             }
             *is_open = false;
             return Ok(());
+        }
+
+        // A poisoned WAL: some write applied in memory may never have reached
+        // it, and was reported as durability unconfirmed. Neither snapshot
+        // memory into the container nor write a close-time commit marker
+        // (either could make that write durable, or settle a partial group).
+        // The WAL handle is closed without appending anything (bytes already
+        // encoded in its write buffer may still be flushed by the drop); the
+        // next writable open replays the WAL. The close itself fails, after
+        // releasing the files it can (a generation root's lock is released
+        // when the database is dropped).
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            wal.close_active_log();
+            // The file manager releases its lock even if its sync fails;
+            // report that failure too, without skipping the rest.
+            #[allow(unused_mut)]
+            let mut file_error = String::new();
+            #[cfg(feature = "grafeo-file")]
+            if let Some(ref fm) = self.file_manager
+                && let Err(e) = fm.close()
+            {
+                file_error = format!(" (closing the database file also failed: {e})");
+            }
+            *is_open = false;
+            return Err(Error::Internal(format!(
+                "database closed without a checkpoint: the WAL was poisoned ({reason}); the \
+                 next writable open replays the WAL, and a write reported as durability \
+                 unconfirmed may or may not be there. Drop this database before reopening \
+                 it{file_error}"
+            )));
         }
 
         // For single-file format: checkpoint to .grafeo file, then clean up sidecar WAL.
@@ -3767,10 +3815,34 @@ impl GrafeoDB {
         Ok(())
     }
 
+    /// Refuses to snapshot or publish this database's live state (`what`)
+    /// while its WAL is poisoned: memory may then hold a write whose records
+    /// never reached the WAL (reported as durability unconfirmed), and a
+    /// snapshot would make it durable. A cheap entry check, not a barrier: a
+    /// write refused while the snapshot runs is not excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming `what` and the poison reason.
+    #[cfg(feature = "wal")]
+    pub(super) fn check_snapshot_source(&self, what: &str) -> Result<()> {
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            return Err(Error::Internal(format!(
+                "refusing to {what}: the WAL is poisoned ({reason}), so memory may hold a \
+                 write that never reached it; drop this database and reopen it (the open \
+                 replays the WAL), then retry"
+            )));
+        }
+        Ok(())
+    }
+
     /// A WAL buffer for one session or one database-level statement, or
     /// `None` without a WAL. Buffers of one database share its commit order
-    /// and the configured `wal_transaction_buffer_cap`; a group that fails to
-    /// append poisons the WAL.
+    /// and the configured `wal_transaction_buffer_cap`, and spill to disk
+    /// past `wal_spill_threshold`; a group that fails to append poisons the
+    /// WAL.
     #[cfg(feature = "wal")]
     pub(crate) fn new_wal_buffer(&self) -> Option<Arc<crate::transaction::wal_buffer::WalBuffer>> {
         let wal = self.wal.as_ref()?;
@@ -3778,7 +3850,19 @@ impl GrafeoDB {
             crate::transaction::wal_buffer::WalBuffer::for_database(
                 Arc::clone(wal),
                 Arc::clone(&self.wal_commit_order),
-                self.config.wal_transaction_buffer_cap,
+                grafeo_storage::wal::GroupLimits {
+                    spill_threshold: self.config.wal_spill_threshold,
+                    max_bytes: self
+                        .config
+                        .wal_transaction_buffer_cap
+                        .map_or(u64::MAX, |cap| u64::try_from(cap).unwrap_or(u64::MAX)),
+                },
+                // Encryption at rest configured: spill files never hold
+                // plaintext, even while the WAL itself is not encrypted.
+                #[cfg(feature = "encryption")]
+                self.config.encryption.is_some(),
+                #[cfg(not(feature = "encryption"))]
+                false,
             ),
         ))
     }

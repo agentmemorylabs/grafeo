@@ -541,6 +541,7 @@ impl super::GrafeoDB {
     /// Requires the `wal` feature for persistence support.
     #[cfg(feature = "wal")]
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.check_snapshot_source("save the database")?;
         let path = path.as_ref();
 
         // Single-file format: export snapshot directly to a .grafeo file
@@ -861,6 +862,8 @@ impl super::GrafeoDB {
     ///
     /// Returns an error if serialization fails.
     pub fn export_snapshot(&self) -> Result<Vec<u8>> {
+        #[cfg(feature = "wal")]
+        self.check_snapshot_source("export a snapshot")?;
         let nodes = collect_snapshot_nodes(self.lpg_store());
         let edges = collect_snapshot_edges(self.lpg_store());
 
