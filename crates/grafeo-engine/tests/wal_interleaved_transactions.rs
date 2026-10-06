@@ -36,8 +36,8 @@
 use std::path::{Path, PathBuf};
 
 use grafeo_common::types::Value;
-use grafeo_engine::GrafeoDB;
 use grafeo_engine::session::Session;
+use grafeo_engine::{Config, GrafeoDB};
 
 /// Serializes the tests of this binary. The crash tests fork child
 /// processes, and a child briefly holds copies of the parent's open file
@@ -58,6 +58,8 @@ const KIND_VAR: &str = "GRAFEO_WAL_INTERLEAVE_KIND";
 /// Which kind of database a scenario runs on.
 #[derive(Clone, Copy, Debug)]
 enum Kind {
+    /// A WAL-directory database (the WAL is the only copy of the data).
+    WalDirectory,
     /// A single `.grafeo` file (sidecar WAL while open).
     #[cfg(feature = "grafeo-file")]
     SingleFile,
@@ -69,6 +71,7 @@ enum Kind {
 impl Kind {
     fn name(self) -> &'static str {
         match self {
+            Kind::WalDirectory => "wal-directory",
             #[cfg(feature = "grafeo-file")]
             Kind::SingleFile => "single-file",
             #[cfg(all(feature = "generation", feature = "compact-store", feature = "mmap"))]
@@ -78,6 +81,7 @@ impl Kind {
 
     fn from_name(name: &str) -> Self {
         match name {
+            "wal-directory" => Kind::WalDirectory,
             #[cfg(feature = "grafeo-file")]
             "single-file" => Kind::SingleFile,
             #[cfg(all(feature = "generation", feature = "compact-store", feature = "mmap"))]
@@ -90,6 +94,7 @@ impl Kind {
     /// published base generation) and returns the path to open.
     fn create(self, dir: &Path) -> PathBuf {
         match self {
+            Kind::WalDirectory => dir.join("dir-db"),
             #[cfg(feature = "grafeo-file")]
             Kind::SingleFile => dir.join("db.grafeo"),
             #[cfg(all(feature = "generation", feature = "compact-store", feature = "mmap"))]
@@ -111,11 +116,29 @@ impl Kind {
     }
 
     fn open(self, path: &Path) -> GrafeoDB {
+        self.open_with_cap(path, None)
+    }
+
+    /// Opens with a transaction WAL buffer cap of `cap` bytes (`None`: the
+    /// default cap).
+    fn open_with_cap(self, path: &Path, cap: Option<usize>) -> GrafeoDB {
+        let with_cap = |config: Config| match cap {
+            Some(bytes) => config.with_wal_transaction_buffer_cap(bytes),
+            None => config,
+        };
         match self {
+            Kind::WalDirectory => GrafeoDB::with_config(with_cap(
+                Config::persistent(path)
+                    .with_storage_format(grafeo_engine::config::StorageFormat::WalDirectory),
+            ))
+            .unwrap(),
             #[cfg(feature = "grafeo-file")]
-            Kind::SingleFile => GrafeoDB::open(path).unwrap(),
+            Kind::SingleFile => GrafeoDB::with_config(with_cap(Config::persistent(path))).unwrap(),
             #[cfg(all(feature = "generation", feature = "compact-store", feature = "mmap"))]
-            Kind::GenerationRoot => GrafeoDB::open_generation_root(path, false).unwrap(),
+            Kind::GenerationRoot => {
+                GrafeoDB::open_generation_root_with_config(with_cap(Config::persistent(path)))
+                    .unwrap()
+            }
         }
     }
 }
@@ -123,7 +146,7 @@ impl Kind {
 /// The kinds compiled in (one or both, by feature).
 #[allow(unused_mut, clippy::vec_init_then_push)]
 fn kinds() -> Vec<Kind> {
-    let mut kinds = Vec::new();
+    let mut kinds = vec![Kind::WalDirectory];
     #[cfg(feature = "grafeo-file")]
     kinds.push(Kind::SingleFile);
     #[cfg(all(feature = "generation", feature = "compact-store", feature = "mmap"))]
@@ -265,8 +288,207 @@ fn run_scenario(scenario: &str, db: &GrafeoDB) -> Vec<String> {
             assert!(err.to_string().contains("WAL refuses"), "{err}");
             strings(&["alix"])
         }
+        // A savepoint taken after a refused (over-cap) write would let a
+        // rollback to it clear the fault while the refused write stays in
+        // the transaction: it is refused, and so is the commit.
+        "cap_savepoint_after_failure" => {
+            let alix = db
+                .session()
+                .create_node_with_props(&["Person"], [("name", Value::from("alix"))])
+                .unwrap();
+            let mut s = db.session();
+            s.begin_transaction().unwrap();
+            let err = s
+                .set_node_property(alix, "name", Value::from(big()))
+                .expect_err("over the cap");
+            assert_cap_error(&err);
+            let err = s
+                .savepoint("after_failure")
+                .expect_err("no savepoint after a refused write");
+            assert_cap_error(&err);
+            let err = s.commit().expect_err("the transaction cannot commit");
+            assert_cap_error(&err);
+            assert!(!s.in_transaction());
+            strings(&["alix"])
+        }
+        // A savepoint taken before the refused write still recovers the
+        // transaction: rolling back to it undoes the write and the fault.
+        "cap_savepoint_before_failure" => {
+            let alix = db
+                .session()
+                .create_node_with_props(&["Person"], [("name", Value::from("alix"))])
+                .unwrap();
+            let mut s = db.session();
+            s.begin_transaction().unwrap();
+            insert(&s, "gus");
+            s.savepoint("before").unwrap();
+            let err = s
+                .set_node_property(alix, "name", Value::from(big()))
+                .expect_err("over the cap");
+            assert_cap_error(&err);
+            s.rollback_to_savepoint("before").unwrap();
+            s.commit().expect("commits without the refused write");
+            strings(&["alix", "gus"])
+        }
+        // The session's create-with-properties APIs report the cap like
+        // every other write.
+        "cap_direct_create_with_props" => {
+            let mut s = db.session();
+            s.begin_transaction().unwrap();
+            let err = s
+                .create_node_with_props(&["Person"], [("name", Value::from(big()))])
+                .expect_err("node over the cap");
+            assert_cap_error(&err);
+            s.rollback().unwrap();
+            s.begin_transaction().unwrap();
+            let a = s
+                .create_node_with_props(&["Thing"], [("k", Value::from(1_i64))])
+                .unwrap();
+            let err = s
+                .create_edge_with_props(a, a, "SELF", [("pad", Value::from(big()))])
+                .expect_err("edge over the cap");
+            assert_cap_error(&err);
+            s.rollback().unwrap();
+            insert(&db.session(), "mia");
+            strings(&["mia"])
+        }
+        // A write outside a transaction whose implicit group cannot be
+        // written reports it (a direct write, then a query with auto-commit
+        // off), instead of returning success.
+        #[cfg(feature = "testing-crash-injection")]
+        "implicit_group_failure" => {
+            use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+            let alix = db
+                .session()
+                .create_node_with_props(&["Person"], [("name", Value::from("alix"))])
+                .unwrap();
+            enable_io_failure_at(1);
+            let r = db
+                .session()
+                .set_node_property(alix, "name", Value::from("lost"));
+            disable_io_failure();
+            assert_unconfirmed(&r.expect_err("a lost implicit group is not Ok"));
+            strings(&["alix"])
+        }
+        #[cfg(feature = "testing-crash-injection")]
+        "implicit_query_failure" => {
+            use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+            insert(&db.session(), "alix");
+            let mut s = db.session();
+            s.set_auto_commit(false);
+            enable_io_failure_at(1);
+            let r = s.execute("INSERT (:Person {name: 'lost'})");
+            disable_io_failure();
+            assert_unconfirmed(&r.expect_err("a lost implicit group is not Ok"));
+            strings(&["alix"])
+        }
+        // The checked batch API reports a lost group; nothing reaches the
+        // disk.
+        #[cfg(feature = "testing-crash-injection")]
+        "checked_batch_failure" => {
+            use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+            insert(&db.session(), "alix");
+            let props = |name: &str| {
+                std::collections::HashMap::from([(
+                    grafeo_common::types::PropertyKey::new("name"),
+                    Value::from(name),
+                )])
+            };
+            enable_io_failure_at(1);
+            let r = db.try_batch_create_nodes_with_props("Person", vec![props("gus")]);
+            disable_io_failure();
+            assert_unconfirmed(&r.expect_err("a lost batch group is not Ok"));
+            strings(&["alix"])
+        }
+        // Once the WAL is poisoned, every write API refuses before it
+        // mutates anything, including the ones without an error channel.
+        #[cfg(feature = "testing-crash-injection")]
+        "writes_after_poison" => {
+            use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+            let alix = db
+                .create_node_with_props(&["Person"], [("name", Value::from("alix"))])
+                .unwrap();
+            let mut s = db.session();
+            s.begin_transaction().unwrap();
+            insert(&s, "gus");
+            enable_io_failure_at(1);
+            let r = s.commit();
+            disable_io_failure();
+            assert_unconfirmed(&r.expect_err("poisons the WAL"));
+            // Applied in memory (durability unconfirmed); not on disk.
+            let refused = |err: grafeo_common::utils::error::Error| {
+                assert!(err.to_string().contains("WAL refuses"), "{err}");
+            };
+            let session = db.session();
+            refused(
+                session
+                    .create_node_with_props(&["Person"], [("name", Value::from("s"))])
+                    .expect_err("session create"),
+            );
+            refused(
+                session
+                    .create_edge_with_props(alix, alix, "E", [("k", Value::from(1_i64))])
+                    .expect_err("session edge create"),
+            );
+            refused(db.create_node(&["Person"]).expect_err("db create_node"));
+            refused(
+                db.create_node_with_props(&["Person"], [("name", Value::from("d"))])
+                    .expect_err("db create"),
+            );
+            assert!(!db.add_node_label(alix, "Extra"), "label refused");
+            assert!(
+                !db.remove_node_property(alix, "name"),
+                "property removal refused"
+            );
+            let count = |q: &str| match &db.session().execute(q).unwrap().rows()[0][0] {
+                Value::Int64(n) => *n,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                count("MATCH (n:Extra) RETURN count(n)"),
+                0,
+                "no label added"
+            );
+            assert_eq!(
+                count("MATCH (n:Person {name: 'alix'}) RETURN count(n)"),
+                1,
+                "the name is still there"
+            );
+            strings(&["alix"])
+        }
         other => panic!("unknown scenario {other}"),
     }
+}
+
+/// A small transaction WAL buffer cap for the scenarios that test it.
+const SMALL_CAP: usize = 4 * 1024;
+
+/// The cap a scenario's database is opened with.
+fn scenario_cap(scenario: &str) -> Option<usize> {
+    scenario.starts_with("cap_").then_some(SMALL_CAP)
+}
+
+/// A string well over [`SMALL_CAP`].
+fn big() -> String {
+    "x".repeat(2 * SMALL_CAP)
+}
+
+/// Asserts `err` is the cap's retryable error.
+fn assert_cap_error(err: &grafeo_common::utils::error::Error) {
+    assert!(err.error_code().is_retryable(), "{err}");
+    assert!(
+        err.to_string().contains("transaction WAL buffer cap"),
+        "not the cap error: {err}"
+    );
+}
+
+/// Asserts `err` reports a lost WAL group (not success, not a retry).
+#[cfg(feature = "testing-crash-injection")]
+fn assert_unconfirmed(err: &grafeo_common::utils::error::Error) {
+    assert!(
+        err.to_string().contains("durability unconfirmed"),
+        "unexpected error: {err}"
+    );
 }
 
 /// Child-process entry for [`crash_after`]; a no-op when run directly.
@@ -277,7 +499,7 @@ fn crash_child() {
     };
     let path = PathBuf::from(std::env::var_os(PATH_VAR).unwrap());
     let kind = Kind::from_name(&std::env::var(KIND_VAR).unwrap());
-    let db = kind.open(&path);
+    let db = kind.open_with_cap(&path, scenario_cap(&scenario));
     run_scenario(&scenario, &db);
     // Crash: no close(), no destructors.
     std::process::exit(0);
@@ -335,7 +557,7 @@ fn check_crash_reopen(scenario: &str) {
             // The expected survivors, from a run that is not crashed.
             let ref_dir = tempfile::tempdir().unwrap();
             let ref_path = kind.create(ref_dir.path());
-            let db = kind.open(&ref_path);
+            let db = kind.open_with_cap(&ref_path, scenario_cap(scenario));
             run_scenario(scenario, &db)
         };
         crash_after(scenario, &path, kind);
@@ -414,6 +636,52 @@ fn failed_group_crash_reopen() {
             "{kind:?}: after one more commit"
         );
     }
+}
+
+#[test]
+fn cap_savepoint_after_failure_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("cap_savepoint_after_failure");
+}
+
+#[test]
+fn cap_savepoint_before_failure_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("cap_savepoint_before_failure");
+}
+
+#[test]
+fn cap_direct_create_with_props_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("cap_direct_create_with_props");
+}
+
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn implicit_group_failure_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("implicit_group_failure");
+}
+
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn implicit_query_failure_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("implicit_query_failure");
+}
+
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn checked_batch_failure_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("checked_batch_failure");
+}
+
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn writes_after_poison_crash_reopen() {
+    let _serial = serial();
+    check_crash_reopen("writes_after_poison");
 }
 
 #[test]
