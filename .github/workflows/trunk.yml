@@ -23,6 +23,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
+  # No debuginfo: keeps target/ small on the hosted runner. TEST is needed too,
+  # since cargo test builds with the test profile.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   # Matches the feature set agent-memory-hosted builds Grafeo with.
   FEATURES: lpg,cypher,vector-index,text-index,wal,grafeo-file,mmap,parallel,compact-store,generation,generation-streaming,triple-store,tracing
 
