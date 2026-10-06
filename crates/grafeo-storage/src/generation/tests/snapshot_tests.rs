@@ -6,7 +6,7 @@ use crate::generation::lock::RootLock;
 use crate::generation::publication::{PublicationInput, publish_generation};
 use crate::generation::recovery::recover;
 use crate::generation::snapshot::{SnapshotError, publish_snapshot};
-use crate::generation::tests::support::{fixture_section, new_root};
+use crate::generation::tests::support::{fixture_section, new_root, try_acquire_root};
 use tempfile::TempDir;
 
 fn publish_once(
@@ -34,10 +34,10 @@ fn selected_fixture() -> (
     crate::generation::recovery::SelectedGeneration,
 ) {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_once(&lock, &fixture, "g-snap");
     drop(lock);
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let selected = recover(&lock).expect("recover");
     let dest = TempDir::new().unwrap();
     (fixture, dest, selected)
@@ -46,7 +46,7 @@ fn selected_fixture() -> (
 #[test]
 fn snapshot_publish_and_verify() {
     let (fixture, dest, selected) = selected_fixture();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
 
     let provenance = publish_snapshot(
         &lock,
@@ -72,7 +72,7 @@ fn snapshot_publish_and_verify() {
 #[test]
 fn snapshot_rejects_inside_root() {
     let (fixture, _dest, selected) = selected_fixture();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
 
     let inside = fixture.root().join("generations");
     match publish_snapshot(
@@ -91,7 +91,7 @@ fn snapshot_rejects_inside_root() {
 #[test]
 fn snapshot_rejects_unsafe_name() {
     let (fixture, dest, selected) = selected_fixture();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
 
     for bad in ["../escape", "/abs", "a/b", "", ".", ".."] {
         let err = publish_snapshot(
@@ -113,7 +113,7 @@ fn snapshot_rejects_unsafe_name() {
 #[test]
 fn snapshot_rejects_stale_source() {
     let (fixture, dest, selected) = selected_fixture();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
 
     // Corrupt the generation file after selection.
     std::fs::write(&selected.generation_abs_path, b"stale").unwrap();
@@ -134,7 +134,7 @@ fn snapshot_rejects_stale_source() {
 #[test]
 fn snapshot_independent_of_root_gc() {
     let (fixture, dest, selected) = selected_fixture();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
 
     publish_snapshot(
         &lock,

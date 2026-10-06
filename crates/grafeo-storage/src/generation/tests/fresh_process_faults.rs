@@ -21,7 +21,9 @@ use crate::file::generation_writer::{ExactSectionSource, OsGenerationFileOps};
 use crate::generation::lock::RootLock;
 use crate::generation::publication::{PublicationInput, publish_generation};
 use crate::generation::recovery::recover;
-use crate::generation::tests::support::{fixture_section, new_root};
+use crate::generation::tests::support::{
+    fixture_section, new_root, spawn_under_lock_cycle, try_acquire_root,
+};
 
 const HELPER_ENV: &str = "GRAFEOPUB_HELPER";
 
@@ -57,7 +59,7 @@ fn child_main() {
 fn crash_child_at(point: &str) -> crate::generation::recovery::SelectedGeneration {
     // Prior durable generation (seq 1) published by the parent.
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).expect("lock");
+    let lock = try_acquire_root(fixture.root()).expect("lock");
     let (section, header) = fixture_section();
     let mut sections: Vec<Box<dyn ExactSectionSource>> = vec![section];
     let input = PublicationInput {
@@ -71,16 +73,17 @@ fn crash_child_at(point: &str) -> crate::generation::recovery::SelectedGeneratio
     publish_generation(&lock, input, &fixture.wal, &OsGenerationFileOps, None).expect("publish");
     drop(lock);
 
-    let status = Command::new(std::env::current_exe().expect("current exe"))
-        .env(HELPER_ENV, "1")
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut cmd = Command::new(std::env::current_exe().expect("current exe"));
+    cmd.env(HELPER_ENV, "1")
         .env("GRAFEOPUB_ROOT", fixture.root())
-        .env("GRAFEOPUB_POINT", point)
-        .status()
-        .expect("spawn child");
+        .env("GRAFEOPUB_POINT", point);
+    let mut child = spawn_under_lock_cycle(&mut cmd).expect("spawn child");
+    let status = child.wait().expect("wait for child");
     assert!(!status.success(), "child must abort at {point}");
 
     // Lock must be released by the child's death.
-    let lock = RootLock::try_acquire(fixture.root()).expect("lock released after child abort");
+    let lock = try_acquire_root(fixture.root()).expect("lock released after child abort");
     let selected = recover(&lock).expect("recovery must succeed on surviving bytes");
     drop(lock);
     let _ = fixture;

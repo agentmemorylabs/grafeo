@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use super::{
     ALLOWED_FILESYSTEMS, MountEntry, RootLock, RootLockError, filesystem_for_path, parse_mountinfo,
 };
+use crate::generation::tests::support::{spawn_under_lock_cycle, try_acquire_root};
 use tempfile::TempDir;
 
 /// Helper-mode env var used by the child re-exec pattern.
@@ -76,14 +77,14 @@ fn lock_acquire_and_release() {
     };
     let root = dir.path().to_path_buf();
 
-    let lock = RootLock::try_acquire(&root).expect("first acquire must succeed");
+    let lock = try_acquire_root(&root).expect("first acquire must succeed");
     assert_eq!(lock.canonical_root(), dir.path());
     assert!(lock.lock_path().starts_with(&root));
     assert!(lock.lock_path().ends_with("root.lock"));
     assert!(lock.lock_path().exists());
 
     drop(lock);
-    RootLock::try_acquire(&root).expect("acquire after drop must succeed");
+    try_acquire_root(&root).expect("acquire after drop must succeed");
 }
 
 #[test]
@@ -100,16 +101,17 @@ fn lock_second_process_rejected() {
     };
     let root = dir.path().to_path_buf();
 
-    let _lock = RootLock::try_acquire(&root).expect("parent acquire must succeed");
+    let _lock = try_acquire_root(&root).expect("parent acquire must succeed");
 
-    let status = Command::new(std::env::current_exe().expect("current exe"))
-        .env(HELPER_ENV, "1")
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut cmd = Command::new(std::env::current_exe().expect("current exe"));
+    cmd.env(HELPER_ENV, "1")
         .env("GRAFEOLOCK_CHILD_MODE", "second")
         .env("GRAFEOLOCK_CHILD_ROOT", &root)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .expect("spawn child");
+        .stderr(Stdio::inherit());
+    let mut child = spawn_under_lock_cycle(&mut cmd).expect("spawn child");
+    let status = child.wait().expect("wait for child");
 
     assert!(
         status.success(),
@@ -131,20 +133,21 @@ fn lock_crash_release() {
     };
     let root = dir.path().to_path_buf();
 
-    let status = Command::new(std::env::current_exe().expect("current exe"))
-        .env(HELPER_ENV, "1")
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut cmd = Command::new(std::env::current_exe().expect("current exe"));
+    cmd.env(HELPER_ENV, "1")
         .env("GRAFEOLOCK_CHILD_MODE", "crash")
         .env("GRAFEOLOCK_CHILD_ROOT", &root)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .expect("spawn child");
+        .stderr(Stdio::inherit());
+    let mut child = spawn_under_lock_cycle(&mut cmd).expect("spawn child");
+    let status = child.wait().expect("wait for child");
 
     // Child aborted (SIGABRT); on Unix the exit code is 134.
     assert!(!status.success(), "child must abort while holding the lock");
 
     // Kernel releases the flock when the child's handle closes on death.
-    RootLock::try_acquire(&root).expect("acquire after child abort must succeed");
+    try_acquire_root(&root).expect("acquire after child abort must succeed");
 }
 
 #[test]
@@ -157,7 +160,7 @@ fn lock_alias_rejected() {
     // Symlink alias.
     let link = dir.path().join("alias-link");
     std::os::unix::fs::symlink(&root, &link).expect("symlink");
-    match RootLock::try_acquire(&link) {
+    match try_acquire_root(&link) {
         Err(RootLockError::AliasMismatch {
             canonical,
             requested,
@@ -171,7 +174,7 @@ fn lock_alias_rejected() {
     // `..` alias.
     let dotdot = root.join("sub").join("..");
     std::fs::create_dir(root.join("sub")).expect("subdir");
-    match RootLock::try_acquire(&dotdot) {
+    match try_acquire_root(&dotdot) {
         Err(RootLockError::AliasMismatch { .. }) => {}
         other => panic!("dot-dot path must be rejected, got {other:?}"),
     }
@@ -224,7 +227,7 @@ fn lock_mount_validation_real_allow() {
     let Some(dir) = supported_tempdir() else {
         return;
     };
-    RootLock::try_acquire(dir.path()).expect("real allowlisted fs must acquire");
+    try_acquire_root(dir.path()).expect("real allowlisted fs must acquire");
 }
 
 #[test]
@@ -263,7 +266,7 @@ fn lock_cloexec_probe() {
     let Some(dir) = supported_tempdir() else {
         return;
     };
-    let lock = RootLock::try_acquire(dir.path()).expect("acquire");
+    let lock = try_acquire_root(dir.path()).expect("acquire");
     let fd = probe_cloexec_for(&lock);
     assert!(
         fd,

@@ -35,7 +35,7 @@ use crate::generation::lock::RootLock;
 use crate::generation::publication::{PublicationInput, PublicationResult, publish_generation};
 use crate::generation::recovery::{SelectedGeneration, recover};
 use crate::generation::snapshot::publish_snapshot;
-use crate::generation::tests::support::{RootFixture, fixture_section, new_root};
+use crate::generation::tests::support::{RootFixture, fixture_section, new_root, try_acquire_root};
 
 /// GenerationFileOps for a RefCell-wrapped deterministic ops: publication
 /// borrows immutably; the fault hook borrows mutably to inject power loss.
@@ -111,11 +111,11 @@ fn publish_real(lock: &RootLock, fixture: &RootFixture, id: &str) -> Publication
 /// (panic, caught here) and only the durable state survives.
 fn crash_at(point: &str) -> SelectedGeneration {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).expect("lock");
+    let lock = try_acquire_root(fixture.root()).expect("lock");
     publish_real(&lock, &fixture, "g-prev");
     drop(lock);
 
-    let lock = RootLock::try_acquire(fixture.root()).expect("lock");
+    let lock = try_acquire_root(fixture.root()).expect("lock");
     let dops = RefCell::new(DeterministicFileOps::new(fixture.root().to_path_buf()));
     let hook = |name: &str| {
         if name == point {
@@ -189,11 +189,11 @@ fn fault_point_01_after_unpublished_dir() {
 #[test]
 fn fault_point_02_during_section_streaming() {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_real(&lock, &fixture, "g-prev");
     drop(lock);
 
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let dops = std::rc::Rc::new(RefCell::new(DeterministicFileOps::new(
         fixture.root().to_path_buf(),
     )));
@@ -273,11 +273,11 @@ fn fault_point_10_after_manifest_sync() {
 #[test]
 fn fault_point_11_during_wal_cleanup() {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_real(&lock, &fixture, "g-prev");
     drop(lock);
 
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let dops = std::rc::Rc::new(RefCell::new(DeterministicFileOps::new(
         fixture.root().to_path_buf(),
     )));
@@ -336,11 +336,11 @@ struct SnapshotCrashFixture {
 
 fn snapshot_crash_setup() -> SnapshotCrashFixture {
     let fixture = new_root();
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     publish_real(&lock, &fixture, "g-one");
     publish_real(&lock, &fixture, "g-two");
     drop(lock);
-    let lock = RootLock::try_acquire(fixture.root()).unwrap();
+    let lock = try_acquire_root(fixture.root()).unwrap();
     let selected = recover(&lock).expect("recover");
     let dest = tempfile::TempDir::new().unwrap();
     SnapshotCrashFixture {
