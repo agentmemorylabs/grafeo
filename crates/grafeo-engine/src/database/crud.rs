@@ -58,7 +58,8 @@ impl super::GrafeoDB {
 
     /// Creates a new node with labels and properties.
     ///
-    /// If WAL is enabled, the operation is logged for durability.
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     ///
     /// # Errors
     ///
@@ -313,7 +314,8 @@ impl super::GrafeoDB {
 
     /// Deletes a node and all its edges.
     ///
-    /// If WAL is enabled, the operation is logged for durability.
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     ///
     /// # Errors
     ///
@@ -426,7 +428,8 @@ impl super::GrafeoDB {
 
     /// Sets a property on a node.
     ///
-    /// If WAL is enabled, the operation is logged for durability.
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     ///
     /// # Errors
     ///
@@ -560,6 +563,9 @@ impl super::GrafeoDB {
     /// let added = db.add_node_label(alix, "Employee");
     /// assert!(added);
     /// ```
+    ///
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn add_node_label(&self, id: grafeo_common::types::NodeId, label: &str) -> bool {
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("add_node_label") {
@@ -632,6 +638,9 @@ impl super::GrafeoDB {
     /// let removed = db.remove_node_label(alix, "Employee");
     /// assert!(removed);
     /// ```
+    ///
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn remove_node_label(&self, id: grafeo_common::types::NodeId, label: &str) -> bool {
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("remove_node_label") {
@@ -717,6 +726,9 @@ impl super::GrafeoDB {
     /// // Alix knows Gus (directed: Alix -> Gus)
     /// let edge = db.create_edge(alix, gus, "KNOWS");
     /// ```
+    ///
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn create_edge(
         &self,
         src: grafeo_common::types::NodeId,
@@ -757,7 +769,8 @@ impl super::GrafeoDB {
 
     /// Creates a new edge with properties.
     ///
-    /// If WAL is enabled, the operation is logged for durability.
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn create_edge_with_props(
         &self,
         src: grafeo_common::types::NodeId,
@@ -937,7 +950,8 @@ impl super::GrafeoDB {
 
     /// Deletes an edge.
     ///
-    /// If WAL is enabled, the operation is logged for durability.
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn delete_edge(&self, id: grafeo_common::types::EdgeId) -> bool {
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("delete_edge") {
@@ -982,7 +996,8 @@ impl super::GrafeoDB {
 
     /// Sets a property on an edge.
     ///
-    /// If WAL is enabled, the operation is logged for durability.
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn set_edge_property(
         &self,
         id: grafeo_common::types::EdgeId,
@@ -1043,6 +1058,9 @@ impl super::GrafeoDB {
     /// Removes a property from a node.
     ///
     /// Returns true if the property existed and was removed, false otherwise.
+    ///
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn remove_node_property(&self, id: grafeo_common::types::NodeId, key: &str) -> bool {
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("remove_node_property") {
@@ -1076,6 +1094,9 @@ impl super::GrafeoDB {
     /// Removes a property from an edge.
     ///
     /// Returns true if the property existed and was removed, false otherwise.
+    ///
+    /// If WAL is enabled, the operation is logged as its own WAL group; see
+    /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn remove_edge_property(&self, id: grafeo_common::types::EdgeId, key: &str) -> bool {
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("remove_edge_property") {
@@ -1102,11 +1123,12 @@ impl super::GrafeoDB {
     /// acquires internal locks once and loops in Rust rather than crossing
     /// the FFI boundary per vector.
     ///
-    /// **Atomicity note:** Individual node creations within the batch are NOT
-    /// atomic as a group. If a failure occurs mid-batch (e.g. WAL write error),
-    /// nodes created before the failure will persist while later nodes may not.
-    /// If you need all-or-nothing semantics, wrap the call in an explicit
-    /// transaction.
+    /// **Durability:** the whole batch is one WAL group, written after every
+    /// node is created and outside any transaction (wrapping the call in a
+    /// session transaction does not change that). If the group cannot be
+    /// written, every node exists in memory and the IDs are returned, but
+    /// none of them may survive a crash, and the WAL is poisoned; the failure
+    /// is only logged. See [Durability of direct writes](Self#durability-of-direct-writes).
     ///
     /// # Arguments
     ///

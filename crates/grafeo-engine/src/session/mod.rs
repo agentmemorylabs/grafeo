@@ -1150,6 +1150,9 @@ impl Session {
                         ),
                     )));
                 }
+                // A poisoned WAL could not record the new graph: refuse
+                // before creating it.
+                self.check_wal_writable()?;
                 let storage_key = self.effective_graph_key(&name);
 
                 // Validate source graph exists for LIKE / AS COPY OF
@@ -1186,7 +1189,7 @@ impl Session {
                     #[cfg(feature = "wal")]
                     self.log_schema_wal(&grafeo_storage::wal::WalRecord::CreateNamedGraph {
                         name: storage_key.clone(),
-                    });
+                    })?;
                 }
 
                 // AS COPY OF: copy data from source graph
@@ -1228,6 +1231,7 @@ impl Session {
             }
             #[cfg(feature = "lpg")]
             SessionCommand::DropGraph { name, if_exists } => {
+                self.check_wal_writable()?;
                 let storage_key = self.effective_graph_key(&name);
                 let dropped = self.store.drop_graph(&storage_key);
                 if !dropped && !if_exists {
@@ -1238,17 +1242,23 @@ impl Session {
                 }
                 if dropped {
                     #[cfg(feature = "wal")]
-                    self.log_schema_wal(&grafeo_storage::wal::WalRecord::DropNamedGraph {
-                        name: storage_key.clone(),
-                    });
-                    // If this session was using the dropped graph, reset to default
-                    let mut current = self.current_graph.lock();
-                    if current
-                        .as_deref()
-                        .is_some_and(|g| g.eq_ignore_ascii_case(&name))
+                    let logged =
+                        self.log_schema_wal(&grafeo_storage::wal::WalRecord::DropNamedGraph {
+                            name: storage_key.clone(),
+                        });
+                    // If this session was using the dropped graph, reset to
+                    // default (the graph is gone in memory either way).
                     {
-                        *current = None;
+                        let mut current = self.current_graph.lock();
+                        if current
+                            .as_deref()
+                            .is_some_and(|g| g.eq_ignore_ascii_case(&name))
+                        {
+                            *current = None;
+                        }
                     }
+                    #[cfg(feature = "wal")]
+                    logged?;
                 }
                 Ok(QueryResult::empty())
             }
@@ -1473,16 +1483,25 @@ impl Session {
     ///
     /// Schema changes take effect immediately, not at commit, so the record is
     /// written as its own committed group instead of joining the transaction.
+    ///
+    /// # Errors
+    ///
+    /// A group that fails to append returns the durability-unconfirmed
+    /// error: the change is applied in memory and cannot be undone, and the
+    /// WAL is poisoned.
     #[cfg(feature = "wal")]
-    fn log_schema_wal(&self, record: &grafeo_storage::wal::WalRecord) {
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.write_implicit_group(
+    fn log_schema_wal(&self, record: &grafeo_storage::wal::WalRecord) -> Result<()> {
+        if let Some(ref wal) = self.wal {
+            wal.write_implicit_group(
                 std::slice::from_ref(record),
                 self.transaction_manager.current_epoch(),
             )
-        {
-            grafeo_warn!("Failed to log schema change to WAL: {}", e);
+            .map_err(|e| {
+                grafeo_warn!("Failed to log schema change to WAL: {}", e);
+                crate::transaction::wal_buffer::unconfirmed_write_error(e)
+            })?;
         }
+        Ok(())
     }
 
     /// Executes a schema DDL command, returning a status result.
@@ -1499,12 +1518,31 @@ impl Session {
         #[cfg(feature = "wal")]
         use grafeo_storage::wal::WalRecord;
 
-        /// Logs a WAL record for schema changes. Compiles to nothing without `wal`.
+        /// Logs a WAL record for schema changes, returning from the command
+        /// if its group cannot be written. Compiles to nothing without `wal`.
         macro_rules! wal_log {
             ($self:expr, $record:expr) => {
                 #[cfg(feature = "wal")]
-                $self.log_schema_wal(&$record);
+                $self.log_schema_wal(&$record)?;
             };
+        }
+
+        // A poisoned WAL could not record the change: refuse it before
+        // anything is changed. (`SHOW` statements change nothing.)
+        let changes_schema = !matches!(
+            cmd,
+            SchemaStatement::ShowConstraints
+                | SchemaStatement::ShowCurrentGraphType
+                | SchemaStatement::ShowEdgeTypes
+                | SchemaStatement::ShowGraphType { .. }
+                | SchemaStatement::ShowGraphTypes
+                | SchemaStatement::ShowGraphs
+                | SchemaStatement::ShowIndexes
+                | SchemaStatement::ShowNodeTypes
+                | SchemaStatement::ShowSchemas
+        );
+        if changes_schema {
+            self.check_wal_writable()?;
         }
 
         let result = match cmd {
@@ -1947,7 +1985,7 @@ impl Session {
                                         name: inline_effective.clone(),
                                         properties: props_for_wal,
                                         constraints: Vec::new(),
-                                    });
+                                    })?;
                                 }
                             }
                             if !node_types.contains(&inline_effective) {
@@ -2001,7 +2039,7 @@ impl Session {
                                         name: inline_effective.clone(),
                                         properties: props_for_wal,
                                         constraints: Vec::new(),
-                                    });
+                                    })?;
                                 }
                             }
                             if !edge_types.contains(&inline_effective) {
@@ -4200,22 +4238,30 @@ impl Session {
         let mut current = self.current_transaction.lock();
         if current.is_some() {
             // Nested transaction: create an auto-savepoint instead of a new tx.
+            // The new depth is only published once the savepoint exists: a
+            // refused savepoint (a WAL record over the cap) must not leave a
+            // level whose rollback would look for a missing savepoint
+            // instead of ending the transaction.
             drop(current);
             let mut depth = self.transaction_nesting_depth.lock();
-            *depth += 1;
-            let sp_name = format!("_nested_tx_{}", *depth);
+            let sp_name = format!("_nested_tx_{}", *depth + 1);
             self.savepoint(&sp_name)?;
+            *depth += 1;
             return Ok(());
         }
 
         // Records made before this transaction must not join its group.
         // (`current` is held, so this cannot go through
-        // `flush_wal_outside_transaction`.)
+        // `flush_wal_outside_transaction`.) Only writes without an error
+        // channel leave records here; if their group fails, the WAL is
+        // poisoned and this transaction could not commit, so the begin
+        // reports it.
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.flush_implicit(self.transaction_manager.current_epoch())
         {
             grafeo_warn!("Session: failed to write WAL records: {}", e);
+            return Err(crate::transaction::wal_buffer::unconfirmed_write_error(e));
         }
 
         let active = self.active_lpg_store();
@@ -5442,6 +5488,12 @@ impl Session {
     /// If a transaction is active, the node will be versioned with the transaction ID.
     /// Once the WAL is poisoned nothing is created and [`NodeId::INVALID`] is
     /// returned.
+    ///
+    /// Outside a transaction the node is its own WAL group. The returned ID
+    /// describes the in-memory change: if that group cannot be written the
+    /// failure is only logged (the WAL is poisoned, so later writes are
+    /// refused). Use [`create_node_with_props`](Self::create_node_with_props),
+    /// which returns the error, where the caller needs to know.
     #[cfg(feature = "lpg")]
     pub fn create_node(&self, labels: &[&str]) -> NodeId {
         if let Err(e) = self.check_wal_writable() {
@@ -5550,6 +5602,12 @@ impl Session {
     /// If a transaction is active, the edge will be versioned with the transaction ID.
     /// Once the WAL is poisoned nothing is created and `EdgeId::INVALID` is
     /// returned.
+    ///
+    /// Outside a transaction the edge is its own WAL group. The returned ID
+    /// describes the in-memory change: if that group cannot be written the
+    /// failure is only logged (the WAL is poisoned, so later writes are
+    /// refused). Use [`create_edge_with_props`](Self::create_edge_with_props),
+    /// which returns the error, where the caller needs to know.
     #[cfg(feature = "lpg")]
     pub fn create_edge(
         &self,

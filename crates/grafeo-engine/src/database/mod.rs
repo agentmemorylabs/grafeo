@@ -227,6 +227,32 @@ struct LoadedCompactBase {
 /// let result = session.execute("MATCH (p:Person) RETURN p")?;
 /// # Ok::<(), grafeo_common::utils::error::Error>(())
 /// ```
+///
+/// # Durability of direct writes
+///
+/// The write methods on `GrafeoDB` itself (`create_node*`, `create_edge*`,
+/// the label and property setters and removers, the deletes and the batch
+/// creates) run outside any session transaction. With a WAL, each call
+/// writes its records as one implicit group (a batch is one group), after
+/// the change is applied in memory:
+///
+/// - **The return value describes the in-memory change, not confirmed
+///   durability.** If the group cannot be written, the change stays applied
+///   in memory but may not survive a crash, and the WAL is poisoned. The
+///   methods that return `Result` report that as an error ("durability
+///   unconfirmed"); the ones that return `bool`, an ID, a `Vec` of IDs or
+///   nothing only log it. Use the `Result` methods, or
+///   [`try_batch_create_nodes_with_props`](Self::try_batch_create_nodes_with_props),
+///   where the caller needs to know.
+/// - **Once the WAL is poisoned, every write method refuses before changing
+///   anything:** the `Result` methods return the WAL's error, the others
+///   return `false`, [`EdgeId::INVALID`](grafeo_common::types::EdgeId::INVALID)
+///   or an empty `Vec` and log a warning. Reopen the database to write again.
+/// - **They do not take the sessions' commit order.** A session transaction
+///   that overwrites an entity a direct write is still logging can reach the
+///   WAL first, and replay then applies the older value last. Callers that
+///   mix direct writes and session transactions on the same entities must
+///   serialize them.
 pub struct GrafeoDB {
     /// Database configuration.
     pub(super) config: Config,
