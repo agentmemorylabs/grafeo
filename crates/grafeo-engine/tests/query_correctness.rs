@@ -2268,7 +2268,7 @@ mod profile_tests {
 }
 
 // ============================================================================
-// SQL/PGQ Cross-Language Correctness
+// GQL Conformance Edge Cases
 // ============================================================================
 
 #[cfg(feature = "gql")]
@@ -2367,6 +2367,10 @@ mod gql_conformance_edge_cases {
         assert_eq!(result.rows()[2][1], Value::String("Harm".into()));
     }
 }
+
+// ============================================================================
+// SQL/PGQ Cross-Language Correctness
+// ============================================================================
 
 #[cfg(feature = "sql-pgq")]
 mod sql_pgq_correctness {
