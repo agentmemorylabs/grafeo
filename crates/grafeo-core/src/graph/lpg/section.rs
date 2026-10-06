@@ -26,7 +26,7 @@ fn collect_block_nodes(store: &LpgStore) -> Vec<BlockNode> {
         .map(|n| {
             #[cfg(feature = "temporal")]
             let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = store
-                .node_property_history(n.id)
+                .committed_node_property_history(n.id)
                 .into_iter()
                 .map(|(k, entries)| (k.to_string(), entries))
                 .collect();
@@ -60,7 +60,7 @@ fn collect_block_edges(store: &LpgStore) -> Vec<BlockEdge> {
         .map(|e| {
             #[cfg(feature = "temporal")]
             let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = store
-                .edge_property_history(e.id)
+                .committed_edge_property_history(e.id)
                 .into_iter()
                 .map(|(k, entries)| (k.to_string(), entries))
                 .collect();

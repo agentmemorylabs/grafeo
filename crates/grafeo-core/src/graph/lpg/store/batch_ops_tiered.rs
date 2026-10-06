@@ -94,6 +94,11 @@ impl LpgStore {
         #[allow(clippy::cast_possible_wrap)]
         let count_i64 = count as i64;
         self.live_node_count.fetch_add(count_i64, Ordering::Relaxed);
+        self.record_changes(
+            transaction_id,
+            ids.iter()
+                .map(|&node_id| super::PropertyUndoEntry::NodeCreated { node_id }),
+        );
 
         let prop_rows = build_node_prop_rows(nodes, &ids);
         self.apply_node_property_index_batch(&prop_rows);
@@ -162,6 +167,11 @@ impl LpgStore {
         #[allow(clippy::cast_possible_wrap)]
         let count_i64 = count as i64;
         self.live_edge_count.fetch_add(count_i64, Ordering::Relaxed);
+        self.record_changes(
+            transaction_id,
+            ids.iter()
+                .map(|&edge_id| super::PropertyUndoEntry::EdgeCreated { edge_id }),
+        );
 
         let prop_rows = build_edge_prop_rows(edges, &ids);
         #[cfg(not(feature = "temporal"))]

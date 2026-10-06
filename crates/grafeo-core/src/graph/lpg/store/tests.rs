@@ -1684,3 +1684,40 @@ fn test_temporal_rollback_restores_property_index_postings() {
     assert_eq!(find("a"), vec![n], "original posting back after savepoint rollback");
     assert!(find("c").is_empty(), "no posting rolled back to the savepoint");
 }
+
+/// With `temporal`, a checkpoint must not persist an open transaction's
+/// PENDING property entries: an uncommitted SET, or the tombstones of an
+/// uncommitted delete (which #410 writes as PENDING).
+#[cfg(feature = "temporal")]
+#[test]
+fn test_committed_property_history_skips_pending_entries() {
+    let store = LpgStore::new().unwrap();
+    let a = store.create_node_with_props(&["L"], [("k", Value::from("a"))]);
+    let b = store.create_node_with_props(&["L"], [("k", Value::from("b"))]);
+    store.sync_epoch(EpochId::new(1));
+    let epoch = store.current_epoch();
+    let tx = TransactionId::new(42);
+
+    store.set_node_property_versioned(a, "k", Value::from("a2"), tx);
+    store.set_node_property_versioned(a, "new", Value::from(1i64), tx);
+    assert!(store.delete_node_transactional(b, epoch, tx));
+
+    let committed = |id| -> Vec<(String, Vec<Value>)> {
+        store
+            .committed_node_property_history(id)
+            .into_iter()
+            .map(|(k, entries)| {
+                assert!(entries.iter().all(|(e, _)| *e != EpochId::PENDING));
+                (k.to_string(), entries.into_iter().map(|(_, v)| v).collect())
+            })
+            .collect()
+    };
+    assert_eq!(
+        committed(a),
+        vec![("k".to_string(), vec![Value::from("a")])]
+    );
+    assert_eq!(
+        committed(b),
+        vec![("k".to_string(), vec![Value::from("b")])]
+    );
+}

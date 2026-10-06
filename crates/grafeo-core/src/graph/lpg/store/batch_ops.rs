@@ -19,12 +19,13 @@
 //! Correctness contract (mirrors the row path exactly, so commit/rollback need
 //! no batch-specific logic):
 //! - every record is versioned under `transaction_id` with `EpochId::PENDING`
-//!   visibility when a real transaction is active (`SYSTEM` otherwise), so the
-//!   transaction-wide `finalize_version_epochs` / `discard_uncommitted_versions`
-//!   scans make the whole batch visible on commit and remove it on rollback;
+//!   visibility when a real transaction is active (`SYSTEM` otherwise), and
+//!   gets a `NodeCreated` / `EdgeCreated` entry in the transaction's change
+//!   log, so `finalize_version_epochs` / `discard_uncommitted_versions` make
+//!   the whole batch visible on commit and remove it on rollback;
 //! - label, property, edge-type and adjacency secondary structures are updated
 //!   identically to the row path; `discard_uncommitted_versions` erases those
-//!   secondary entries for entities whose version chains become empty;
+//!   secondary entries for the created entities;
 //! - returned IDs preserve input order.
 //!
 //! These methods never touch the offline/unindexed bulk loaders.

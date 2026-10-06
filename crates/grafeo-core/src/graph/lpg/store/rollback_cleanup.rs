@@ -1,19 +1,20 @@
 //! Secondary-structure cleanup for transaction rollback.
 //!
-//! `discard_uncommitted_versions` removes PENDING primary version chains, but
-//! create paths (row and batch) also eagerly publish into non-versioned
-//! secondary structures: `label_index`, `node_labels`, property columns /
-//! indexes, adjacency, edge-type live counts, and live counters. The W1
-//! contract requires those staged entries to disappear on rollback rather than
-//! remaining as filtered-but-orphaned residue.
+//! Rollback removes the PENDING version chains of the entities a transaction
+//! created (`discard_created_node` / `discard_created_edge`, driven by its
+//! `NodeCreated` / `EdgeCreated` change-log entries), but create paths (row
+//! and batch) also eagerly publish into non-versioned secondary structures:
+//! `label_index`, `node_labels`, property columns / indexes, adjacency,
+//! edge-type live counts, and live counters. The W1 contract requires those
+//! staged entries to disappear on rollback rather than remaining as
+//! filtered-but-orphaned residue.
 //!
-//! This module walks entities that were *created* inside the rolled-back
-//! transaction (their version chain becomes empty) and erases the matching
-//! secondary state. Property/label *mutations* on pre-existing entities remain
-//! covered by the property undo log.
+//! The helpers here erase that secondary state for one discarded entity at a
+//! time, so rollback stays O(changes) (#410). Property/label *mutations* on
+//! pre-existing entities remain covered by the rest of the change log.
 
 use super::LpgStore;
-use grafeo_common::types::{EdgeId, HashableValue, NodeId, PropertyKey, TransactionId};
+use grafeo_common::types::{EdgeId, HashableValue, NodeId, PropertyKey};
 use std::sync::atomic::Ordering;
 
 /// Edge identity needed to reverse adjacency / type-count publication.
@@ -143,90 +144,6 @@ impl LpgStore {
         let count = edges.len() as i64;
         self.live_edge_count.fetch_sub(count, Ordering::Relaxed);
     }
-
-    /// Collects node IDs whose version chains are solely owned by `transaction_id`.
-    #[cfg(not(feature = "tiered-storage"))]
-    pub(super) fn collect_solely_created_nodes(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Vec<NodeId> {
-        self.nodes
-            .read()
-            .iter()
-            .filter(|(_, chain)| chain.solely_created_by(transaction_id))
-            .map(|(&id, _)| id)
-            .collect()
-    }
-
-    /// Collects edge metadata for chains solely owned by `transaction_id`.
-    #[cfg(not(feature = "tiered-storage"))]
-    pub(super) fn collect_solely_created_edges(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Vec<DiscardedEdge> {
-        self.edges
-            .read()
-            .iter()
-            .filter_map(|(&id, chain)| {
-                if !chain.solely_created_by(transaction_id) {
-                    return None;
-                }
-                let record = chain.latest()?;
-                Some(DiscardedEdge {
-                    id,
-                    src: record.src,
-                    dst: record.dst,
-                    type_id: record.type_id,
-                })
-            })
-            .collect()
-    }
-
-    /// Collects node IDs whose version indexes are solely owned by `transaction_id`.
-    #[cfg(feature = "tiered-storage")]
-    pub(super) fn collect_solely_created_nodes(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Vec<NodeId> {
-        self.node_versions
-            .read()
-            .iter()
-            .filter(|(_, index)| index.solely_created_by(transaction_id))
-            .map(|(&id, _)| id)
-            .collect()
-    }
-
-    /// Collects edge metadata for indexes solely owned by `transaction_id`.
-    #[cfg(feature = "tiered-storage")]
-    pub(super) fn collect_solely_created_edges(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Vec<DiscardedEdge> {
-        let versions = self.edge_versions.read();
-        let mut out = Vec::new();
-        for (&id, index) in versions.iter() {
-            if !index.solely_created_by(transaction_id) {
-                continue;
-            }
-            // Own PENDING versions are visible to the creating transaction.
-            let Some(vref) = index
-                .visible_to(grafeo_common::types::EpochId::PENDING, transaction_id)
-                .or_else(|| index.latest())
-            else {
-                continue;
-            };
-            let Some(record) = self.read_edge_record(&vref) else {
-                continue;
-            };
-            out.push(DiscardedEdge {
-                id,
-                src: record.src,
-                dst: record.dst,
-                type_id: record.type_id,
-            });
-        }
-        out
-    }
 }
 
 impl LpgStore {
@@ -257,7 +174,6 @@ impl LpgStore {
         let existed = self.node_versions.write().remove(&id).is_some();
         if existed {
             self.cleanup_node_secondaries(&[id], false);
-            self.needs_stats_recompute.store(true, Ordering::Relaxed);
         }
         existed
     }
@@ -297,7 +213,6 @@ impl LpgStore {
             return false;
         };
         self.cleanup_discarded_edge_secondaries(&[edge]);
-        self.needs_stats_recompute.store(true, Ordering::Relaxed);
         true
     }
 }
