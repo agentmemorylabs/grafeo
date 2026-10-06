@@ -330,3 +330,30 @@ fn assembler_refuses_a_block_index_in_the_wrong_layout() {
         "{err}"
     );
 }
+
+/// Under `Auto` the production builder's output did not move: length and
+/// trailing whole-payload CRC-32 of each payload, recorded from the same
+/// builder at trunk `60f63f09` (before G4). This covers vector, signed-int
+/// and edge-property columns, which the dense golden parity test does not.
+#[test]
+fn auto_output_is_unchanged_from_trunk() {
+    let cases: &[(fn() -> GenerationInput, usize, u32)] = &[
+        (golden_inputs::simple_input, 1852, 0x35a9_7a86),
+        (golden_inputs::complex_input, 3084, 0x6f2d_45f8),
+        (golden_inputs::sparse_id_input, 1636, 0xb6ec_8fbf),
+        (golden_inputs::duplicate_endpoint_input, 1644, 0x9c15_810e),
+        (golden_inputs::self_loop_input, 1692, 0xdc02_3501),
+        (
+            golden_inputs::high_cardinality_string_input,
+            7940,
+            0xf85f_87b8,
+        ),
+        (golden_inputs::signed_int_input, 1724, 0x89f7_694d),
+        (golden_inputs::vector_input, 1524, 0x1eff_2945),
+    ];
+    for (i, (input_fn, len, crc)) in cases.iter().enumerate() {
+        let p = build(&input_fn(), PayloadVersionPolicy::Auto);
+        let trailer = u32::from_le_bytes(p[p.len() - 4..].try_into().unwrap());
+        assert_eq!((p.len(), trailer), (*len, *crc), "case {i} moved");
+    }
+}
