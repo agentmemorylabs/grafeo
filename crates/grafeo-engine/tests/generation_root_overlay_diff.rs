@@ -363,6 +363,11 @@ fn relation_create_between_base_entities_keeps_both() {
     assert_base_props(&db, e2, 2, &[], "dst");
     assert_not_copied(&db, e1, "embedding", "src");
     assert_not_copied(&db, e2, "embedding", "dst");
+    // Slice 3: an endpoint whose only change is a new edge gets no overlay
+    // row at all.
+    let overlay = db.layered_store().expect("layered").overlay_store();
+    assert!(overlay.get_node(e1).is_none(), "src has an overlay row");
+    assert!(overlay.get_node(e2).is_none(), "dst has an overlay row");
     assert_eq!(
         count(
             &db,
@@ -640,9 +645,9 @@ fn database_edge_property_removal_on_a_base_relation() {
 }
 
 /// What one relation between two base entities costs. Before D10 it copied
-/// both endpoints whole (2 × the 8 KiB embedding); now the edge plus two
-/// labels-only endpoint rows. The number decides slice 3 (whether to drop
-/// the endpoint rows).
+/// both endpoints whole (2 × the 8 KiB embedding); slice 1 left two
+/// labels-only endpoint rows (~206 B each); slice 3 drops them, so the
+/// overlay holds only the edge.
 #[test]
 fn relation_between_base_entities_does_not_copy_their_embeddings() {
     const N: usize = 400;

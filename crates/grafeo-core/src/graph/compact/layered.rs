@@ -392,9 +392,9 @@ impl LayeredStore {
     }
 
     /// Recovery-only: creates an overlay edge at the exact ID recorded in the
-    /// WAL. Base-only endpoints are promoted exactly as in
-    /// [`GraphStoreMut::create_edge`]; the edge is marked dirty and charged the
-    /// same retained bytes as a live mutation.
+    /// WAL. Like [`GraphStoreMut::create_edge`], base-only endpoints get no
+    /// overlay row (D10); the edge is marked dirty and charged the same
+    /// retained bytes as a live mutation.
     ///
     /// # Errors
     ///
@@ -408,8 +408,7 @@ impl LayeredStore {
         edge_type: &str,
     ) -> Result<(), grafeo_common::memory::AllocError> {
         let _guard = self.merge_guard.read();
-        self.ensure_in_overlay(src, None);
-        self.ensure_in_overlay(dst, None);
+        // No endpoint rows (D10): see `create_edge`.
         self.overlay
             .load()
             .create_edge_with_id(id, src, dst, edge_type)?;
@@ -2627,9 +2626,10 @@ impl GraphStoreMut for LayeredStore {
 
     fn create_edge(&self, src: NodeId, dst: NodeId, edge_type: &str) -> EdgeId {
         let _guard = self.merge_guard.read();
-        // Promote base-only endpoints into the overlay.
-        self.ensure_in_overlay(src, None);
-        self.ensure_in_overlay(dst, None);
+        // D10: a new edge needs no overlay row for a base endpoint. The
+        // overlay keys adjacency by node id, `edges_from` always reads the
+        // overlay's adjacency, and endpoint reads merge with the base, so
+        // the endpoint stays a clean base row (no copy, no diff row).
         let id = self.overlay.load().create_edge(src, dst, edge_type);
         self.mark_dirty_edge(id);
         self.charge_retained(
@@ -2648,9 +2648,7 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> EdgeId {
         let _guard = self.merge_guard.read();
-        let owner = Self::journal_owner(transaction_id);
-        self.ensure_in_overlay(src, owner);
-        self.ensure_in_overlay(dst, owner);
+        // No endpoint rows (D10): see `create_edge`.
         let id =
             self.overlay
                 .load()
@@ -2665,9 +2663,10 @@ impl GraphStoreMut for LayeredStore {
 
     fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId> {
         let _guard = self.merge_guard.read();
-        // Endpoint preparation, batched: promote base-resident endpoints once
-        // each, and record the post-freeze identity of already-tracked
-        // endpoints in ONE handoff lock acquisition (not one per endpoint).
+        // Endpoint preparation, batched: record the post-freeze identity of
+        // already-tracked endpoints in ONE handoff lock acquisition (not one
+        // per endpoint). Base-only endpoints get no overlay row (D10, see
+        // `create_edge`).
         let mut endpoints: FxHashSet<NodeId> = FxHashSet::default();
         for &(src, dst, _) in edges {
             endpoints.insert(src);
@@ -2679,9 +2678,6 @@ impl GraphStoreMut for LayeredStore {
             if dirty {
                 self.journal_touch(&mut journal, None, LayerChange::NodeCopyUp(nid));
                 tracked.push(nid);
-            } else {
-                drop(journal);
-                self.ensure_in_overlay(nid, None);
             }
         }
         if !tracked.is_empty() {
@@ -2741,9 +2737,8 @@ impl GraphStoreMut for LayeredStore {
     ) -> Vec<EdgeId> {
         let _guard = self.merge_guard.read();
         // Endpoint preparation, batched exactly like `batch_create_edges`:
-        // promote base-resident endpoints once each, and record the
-        // post-freeze identity of already-tracked endpoints in ONE handoff
-        // lock acquisition.
+        // record the post-freeze identity of already-tracked endpoints in ONE
+        // handoff lock acquisition; base-only endpoints get no overlay row.
         let mut endpoints: FxHashSet<NodeId> = FxHashSet::default();
         for e in edges {
             endpoints.insert(e.source);
@@ -2756,9 +2751,6 @@ impl GraphStoreMut for LayeredStore {
             if dirty {
                 self.journal_touch(&mut journal, owner, LayerChange::NodeCopyUp(nid));
                 tracked.push(nid);
-            } else {
-                drop(journal);
-                self.ensure_in_overlay(nid, owner);
             }
         }
         if !tracked.is_empty()
@@ -3196,11 +3188,6 @@ impl LayeredStore {
         let Some(base_edge) = self.base.load().get_edge(id) else {
             return;
         };
-
-        // Ensure endpoints are in the overlay first (each takes the journal
-        // lock itself, so it is not held here).
-        self.ensure_in_overlay(base_edge.src, owner);
-        self.ensure_in_overlay(base_edge.dst, owner);
 
         // Re-check under the lock: another writer may have copied the edge
         // up meanwhile.
