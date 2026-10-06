@@ -94,6 +94,23 @@ impl V5PayloadLease {
         }
     }
 
+    /// Sets the payload version the lease streams (default v5). The
+    /// descriptors' `ColumnBlockIndex` must use the same version's layout.
+    #[must_use]
+    pub fn with_payload_version(
+        mut self,
+        version: crate::graph::compact::mapped::PayloadVersion,
+    ) -> Self {
+        self.assembler = self.assembler.with_payload_version(version);
+        self
+    }
+
+    /// The payload version the lease streams.
+    #[must_use]
+    pub fn payload_version(&self) -> crate::graph::compact::mapped::PayloadVersion {
+        self.assembler.payload_version()
+    }
+
     /// R1.6: sets the frozen overlay epoch carried in the payload identity.
     #[must_use]
     pub fn with_frozen_epoch(mut self, epoch: u64) -> Self {

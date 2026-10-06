@@ -37,6 +37,8 @@ use super::records::{
 use super::types::{EpochHandoffPhase, EpochHandoffReport, FrozenEpochHandle};
 use crate::database::GrafeoDB;
 use crate::database::generation_build::GenerationBuildRequest;
+#[cfg(feature = "generation-streaming")]
+use crate::database::generation_build::payload_version_policy;
 
 /// Debug-only test seam (G-EM0.5c MAJOR-1): when set, `freeze_epoch_for_handoff`
 /// parks inside its writer-barrier critical section immediately before
@@ -619,7 +621,9 @@ impl GrafeoDB {
                 request.generation_id.clone(),
             )
             .map_err(map_generation_error)?;
-            let mut builder = BoundedGenerationBuilder::new(config);
+            let mut builder = BoundedGenerationBuilder::new(config).with_payload_version_policy(
+                payload_version_policy(self.config.compact_payload_version),
+            );
             let lease = builder
                 .build(
                     sources.nodes.as_mut(),

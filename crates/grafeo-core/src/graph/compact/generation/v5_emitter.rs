@@ -76,10 +76,12 @@ pub fn build_segment_plan(
         let length = seg.bytes.len() as u64;
         let crc = crc32fast::hash(&seg.bytes);
         let element_count = if seg.element_width > 0 {
-            // reason: element count calculation bounded by length / element_width
-            #[allow(clippy::cast_possible_truncation)]
-            let count = (length / u64::from(seg.element_width)) as u32;
-            count
+            let count = length / u64::from(seg.element_width);
+            u32::try_from(count).map_err(|_| GenerationError::WireWidthOverflow {
+                what: "segment_element_count",
+                count,
+                max: u64::from(u32::MAX),
+            })?
         } else {
             0
         };

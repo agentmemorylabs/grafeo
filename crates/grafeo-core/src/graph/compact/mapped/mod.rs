@@ -1,4 +1,4 @@
-//! Mapped CompactStore v5 views and ownership accounting (G-EM0.2).
+//! Mapped CompactStore v5/v6 views and ownership accounting (G-EM0.2).
 //!
 //! Proportional graph structures (CSR arrays, string dictionaries, ID
 //! lookups, column bodies, zone maps) are exposed as checked views over
@@ -11,6 +11,7 @@ pub(crate) mod directory;
 pub(crate) mod id_index;
 pub(crate) mod id_lookup;
 pub(crate) mod label_membership;
+pub(crate) mod payload_version;
 pub(crate) mod presence;
 pub(crate) mod string_dict;
 pub(crate) mod views;
@@ -34,6 +35,12 @@ pub use id_lookup::{
 pub use label_membership::{
     LabelMembership, LabelMembershipView, MEMBERSHIP_HEADER_LEN, MEMBERSHIP_RECORD_LEN,
     write_membership_segment,
+};
+pub use payload_version::{
+    BLOCK_INDEX_RECORD_LEN_V5, BLOCK_INDEX_RECORD_LEN_V6, BlockIndexRecord, DISC_F32_VECTOR_WIDE,
+    DISC_I8_VECTOR_WIDE, DirectoryEntryFields, FORMAT_VERSION_V6, PayloadVersion,
+    PayloadVersionPolicy, WireOverflow, read_block_index_record, read_directory_entry,
+    vector_body_header, write_block_index_record, write_directory_entry,
 };
 pub use presence::{
     PRESENCE_RECORD_HEADER_LEN, RowBitmapView, bitmap_bytes, pack_bits, unpack_bits,

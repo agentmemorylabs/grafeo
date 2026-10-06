@@ -542,7 +542,7 @@ pub(crate) fn make_resident_desc(
         length: bytes.len() as u64,
         crc: crc32fast::hash(bytes),
         element_count: if element_width > 0 {
-            (bytes.len() / element_width as usize) as u32
+            (bytes.len() / element_width as usize) as u64
         } else {
             0
         },

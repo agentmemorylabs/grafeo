@@ -16,12 +16,13 @@ use super::CompactStore;
 use super::column::ColumnCodec;
 use super::csr::CsrAdjacency;
 use super::mapped::{
-    CompactMemoryAccounting, DIRECTORY_ENTRY_LEN, DictionaryCodeIndex, FORMAT_VERSION_V5,
-    HEADER_LEN, MappedEdgeIdLookup, MappedNodeIdLookup, MappedStringDictionary,
-    SCHEMA_OWNER_BUDGET_BYTES, SegmentKind, U32View, ZONE_MAP_RECORD_LEN,
-    build_dictionary_code_index, build_string_segments, build_zone_map_segments, layout_flags,
-    parse_block_zone_maps, parse_segment_directory, parse_table_zone_maps, slice_segment_checked,
-    write_edge_id_record, write_node_id_record,
+    BlockIndexRecord, CompactMemoryAccounting, DIRECTORY_ENTRY_LEN, DISC_F32_VECTOR_WIDE,
+    DISC_I8_VECTOR_WIDE, DictionaryCodeIndex, FORMAT_VERSION_V5, HEADER_LEN, MappedEdgeIdLookup,
+    MappedNodeIdLookup, MappedStringDictionary, PayloadVersion, SCHEMA_OWNER_BUDGET_BYTES,
+    SegmentKind, U32View, ZONE_MAP_RECORD_LEN, build_dictionary_code_index, build_string_segments,
+    build_zone_map_segments, layout_flags, parse_block_zone_maps, parse_segment_directory,
+    parse_table_zone_maps, read_block_index_record, slice_segment_checked, vector_body_header,
+    write_block_index_record, write_edge_id_record, write_node_id_record,
 };
 use super::node_table::NodeTable;
 use super::rel_table::RelTable;
@@ -257,9 +258,9 @@ pub fn serialize_v5_with_string_order(
         keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for key in &keys {
             let codec = nt.columns().get(key).unwrap();
-            let body_start = col_bodies.len() as u32;
+            let body_start = col_bodies.len() as u64;
             write_column_body(&mut col_bodies, codec, &string_index)?;
-            let body_len = (col_bodies.len() as u32).saturating_sub(body_start);
+            let body_len = col_bodies.len() as u64 - body_start;
             // ColumnDirectory record (24 bytes)
             write_u16(&mut col_dir, codec_disc(codec));
             write_u16(&mut col_dir, value_type_code(codec));
@@ -267,10 +268,8 @@ pub fn serialize_v5_with_string_order(
             write_u32(&mut col_dir, 1); // one logical block for v5 body
             write_u64(&mut col_dir, codec.len() as u64);
             write_u32(&mut col_dir, 0); // reserved
-            // ColumnBlockIndex record (12 bytes)
-            write_u32(&mut col_block_index, body_start);
-            write_u32(&mut col_block_index, body_len);
-            write_u32(&mut col_block_index, codec.len() as u32);
+            // ColumnBlockIndex record (12 bytes; this heap writer is v5-only)
+            write_v5_block_index_record(&mut col_block_index, body_start, body_len, codec.len())?;
             column_index += 1;
         }
         // NodeTableDirectory record (24 bytes)
@@ -288,18 +287,16 @@ pub fn serialize_v5_with_string_order(
         keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for key in &keys {
             let codec = rt.properties().get(key).unwrap();
-            let body_start = col_bodies.len() as u32;
+            let body_start = col_bodies.len() as u64;
             write_column_body(&mut col_bodies, codec, &string_index)?;
-            let body_len = (col_bodies.len() as u32).saturating_sub(body_start);
+            let body_len = col_bodies.len() as u64 - body_start;
             write_u16(&mut col_dir, codec_disc(codec));
             write_u16(&mut col_dir, value_type_code(codec));
             write_u32(&mut col_dir, column_index);
             write_u32(&mut col_dir, 1);
             write_u64(&mut col_dir, codec.len() as u64);
             write_u32(&mut col_dir, 0);
-            write_u32(&mut col_block_index, body_start);
-            write_u32(&mut col_block_index, body_len);
-            write_u32(&mut col_block_index, codec.len() as u32);
+            write_v5_block_index_record(&mut col_block_index, body_start, body_len, codec.len())?;
             column_index += 1;
         }
         // RelTableDirectory (24 bytes)
@@ -425,7 +422,8 @@ pub fn serialize_v5_with_string_order(
         let length = body.len() as u64;
         let crc = crc32fast::hash(body);
         let element_count = if *element_width > 0 {
-            (length / u64::from(*element_width)) as u32
+            u32::try_from(length / u64::from(*element_width))
+                .map_err(|_| format!("segment {kind:?} element count exceeds the v5 u32 field"))?
         } else {
             0
         };
@@ -492,7 +490,7 @@ pub fn serialize_v5_with_string_order(
     Ok(out)
 }
 
-/// Deserializes a v5 payload into a mapped-backed [`CompactStore`].
+/// Deserializes a v5 or v6 payload into a mapped-backed [`CompactStore`].
 ///
 /// # Errors
 ///
@@ -519,6 +517,7 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
     }
 
     let directory = parse_segment_directory(data_bytes, payload.len())?;
+    let version = directory.header.version;
     let string_offsets =
         slice_segment_checked(data_bytes, directory.require(SegmentKind::StringOffsets)?)?;
     let string_bytes =
@@ -622,12 +621,13 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
         for c in 0..rec.column_count as usize {
             let col_idx = rec.column_start as usize + c;
             let col_meta = nt_meta.columns.get(c).ok_or("metadata column missing")?;
-            let body = column_body_slice(&col_block_bytes, &col_bodies, col_idx)?;
+            let body = column_body_slice(&col_block_bytes, &col_bodies, col_idx, version)?;
             let codec = read_column_body_with_index(
                 &body,
                 col_meta.disc,
                 &global_dict,
                 code_index_raw.clone(),
+                version,
             )?;
             let key = PropertyKey::new(&col_meta.key);
             col_defs.push(ColumnDef::new(
@@ -716,12 +716,13 @@ pub fn deserialize_v5(data_bytes: &Bytes) -> Result<CompactStore, String> {
                 .columns
                 .get(c)
                 .ok_or("rel metadata column missing")?;
-            let body = column_body_slice(&col_block_bytes, &col_bodies, col_idx)?;
+            let body = column_body_slice(&col_block_bytes, &col_bodies, col_idx, version)?;
             let codec = read_column_body_with_index(
                 &body,
                 col_meta.disc,
                 &global_dict,
                 code_index_raw.clone(),
+                version,
             )?;
             let key = PropertyKey::new(&col_meta.key);
             prop_defs.push(ColumnDef::new(
@@ -1129,21 +1130,20 @@ fn read_rel_table_record(bytes: &Bytes, index: usize) -> Result<RelTableRec, Str
     })
 }
 
-fn column_body_slice(block_index: &Bytes, bodies: &Bytes, col_idx: usize) -> Result<Bytes, String> {
-    let base = col_idx * 12;
-    if base + 12 > block_index.len() {
-        return Err("ColumnBlockIndex truncated".into());
-    }
-    let b = &block_index[base..base + 12];
-    let byte_offset = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
-    let byte_len = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-    let end = byte_offset
-        .checked_add(byte_len)
-        .ok_or("column body range overflow")?;
+fn column_body_slice(
+    block_index: &Bytes,
+    bodies: &Bytes,
+    col_idx: usize,
+    version: PayloadVersion,
+) -> Result<Bytes, String> {
+    let rec = read_block_index_record(block_index, version, col_idx)?;
+    let start = usize::try_from(rec.body_offset).map_err(|_| "column body offset exceeds usize")?;
+    let len = usize::try_from(rec.body_len).map_err(|_| "column body length exceeds usize")?;
+    let end = start.checked_add(len).ok_or("column body range overflow")?;
     if end > bodies.len() {
         return Err("column body out of range".into());
     }
-    Ok(bodies.slice(byte_offset..end))
+    Ok(bodies.slice(start..end))
 }
 
 pub(crate) fn write_column_body(
@@ -1170,6 +1170,20 @@ pub(crate) fn write_column_body(
                 write_u32(buf, gcode);
             }
         }
+        ColumnCodec::Float32Vector { bytes, dimensions } => {
+            // v5 header `[5][dims u16][components u32]`, checked instead of
+            // the v1 writer's panic when the count passes u32.
+            let header = vector_body_header(false, *dimensions, (bytes.len() / 4) as u64, false)
+                .map_err(|e| e.to_string())?;
+            buf.extend_from_slice(&header);
+            buf.extend_from_slice(bytes);
+        }
+        ColumnCodec::Int8Vector { bytes, dimensions } => {
+            let header = vector_body_header(true, *dimensions, bytes.len() as u64, false)
+                .map_err(|e| e.to_string())?;
+            buf.extend_from_slice(&header);
+            buf.extend_from_slice(bytes);
+        }
         other => {
             // Reuse v1 flat layout for non-dict codecs (already Bytes-friendly on read).
             let mut tmp = Vec::new();
@@ -1186,7 +1200,7 @@ fn read_column_body(
     expected_disc: u16,
     global_dict: &MappedStringDictionary,
 ) -> Result<ColumnCodec, String> {
-    read_column_body_with_index(body, expected_disc, global_dict, None)
+    read_column_body_with_index(body, expected_disc, global_dict, None, PayloadVersion::V5)
 }
 
 fn read_column_body_with_index(
@@ -1194,12 +1208,16 @@ fn read_column_body_with_index(
     expected_disc: u16,
     global_dict: &MappedStringDictionary,
     code_index: Option<Bytes>,
+    version: PayloadVersion,
 ) -> Result<ColumnCodec, String> {
     let bytes = body.as_ref();
     if bytes.is_empty() {
         return Err("empty column body".into());
     }
     let disc = bytes[0];
+    if disc == DISC_F32_VECTOR_WIDE || disc == DISC_I8_VECTOR_WIDE {
+        return read_wide_vector_body(body, version);
+    }
     if u16::from(disc) != expected_disc && expected_disc != 0 {
         // expected_disc from metadata; still trust body disc for decoding.
     }
@@ -1227,6 +1245,49 @@ fn read_column_body_with_index(
     ColumnCodec::read_from(body, &mut pos).map_err(|e| e.to_string())
 }
 
+/// Reads a v6 wide vector body: `[disc][dims u16][count u64][data]`.
+///
+/// Disc 7 is `Float32Vector` (count = components, 4 bytes each); disc 8 is
+/// `Int8Vector` (count = bytes). Both are refused in a v5 payload.
+fn read_wide_vector_body(body: &Bytes, version: PayloadVersion) -> Result<ColumnCodec, String> {
+    let bytes = body.as_ref();
+    let disc = bytes[0];
+    if version != PayloadVersion::V6 {
+        return Err(format!(
+            "wide vector column body (disc {disc}) is only valid in a v6 payload"
+        ));
+    }
+    let mut pos = 1usize;
+    let dimensions = read_u16(bytes, &mut pos)?;
+    let count = read_u64(bytes, &mut pos)?;
+    let byte_need = if disc == DISC_F32_VECTOR_WIDE {
+        count
+            .checked_mul(4)
+            .ok_or("wide Float32Vector length overflow")?
+    } else {
+        count
+    };
+    let byte_need = usize::try_from(byte_need).map_err(|_| "wide vector body exceeds usize")?;
+    let end = pos
+        .checked_add(byte_need)
+        .ok_or("wide vector body range overflow")?;
+    if end > bytes.len() {
+        return Err(format!("truncated wide vector body (disc {disc})"));
+    }
+    let storage = body.slice(pos..end);
+    Ok(if disc == DISC_F32_VECTOR_WIDE {
+        ColumnCodec::Float32Vector {
+            bytes: storage,
+            dimensions,
+        }
+    } else {
+        ColumnCodec::Int8Vector {
+            bytes: storage,
+            dimensions,
+        }
+    })
+}
+
 fn slice_u32_range(bytes: &Bytes, start_elem: usize, count: usize) -> Result<Bytes, String> {
     let start = start_elem
         .checked_mul(4)
@@ -1242,6 +1303,28 @@ fn slice_u32_range(bytes: &Bytes, start_elem: usize, count: usize) -> Result<Byt
         ));
     }
     Ok(bytes.slice(start..end))
+}
+
+/// Appends a v5 (12-byte) ColumnBlockIndex record for the heap writers,
+/// which only emit v5 and fail loudly past `u32`.
+pub(crate) fn write_v5_block_index_record(
+    buf: &mut Vec<u8>,
+    body_start: u64,
+    body_len: u64,
+    row_count: usize,
+) -> Result<(), String> {
+    let row_count = u32::try_from(row_count)
+        .map_err(|_| format!("codec_len count {row_count} exceeds wire max {}", u32::MAX))?;
+    write_block_index_record(
+        buf,
+        PayloadVersion::V5,
+        BlockIndexRecord {
+            body_offset: body_start,
+            body_len,
+            row_count,
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub(crate) fn intern_zone_strings(zm: &ZoneMap, intern: &mut impl FnMut(&str) -> u32) {
@@ -1400,4 +1483,61 @@ fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64, String> {
     ]);
     *pos += 8;
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wide_f32_body(components: u64, data: &[u8]) -> Bytes {
+        let mut body = vec![DISC_F32_VECTOR_WIDE];
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&components.to_le_bytes());
+        body.extend_from_slice(data);
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn wide_vector_body_reads_in_v6_and_is_refused_in_v5() {
+        let data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let body = wide_f32_body(4, &data);
+        let dict = MappedStringDictionary::empty();
+        let codec = read_column_body_with_index(&body, 5, &dict, None, PayloadVersion::V6)
+            .expect("v6 reads the wide header");
+        match codec {
+            ColumnCodec::Float32Vector { bytes, dimensions } => {
+                assert_eq!(dimensions, 2);
+                assert_eq!(bytes.as_ref(), data.as_slice());
+            }
+            other => panic!("expected Float32Vector, got {other:?}"),
+        }
+        let err = read_column_body_with_index(&body, 5, &dict, None, PayloadVersion::V5)
+            .expect_err("v5 must refuse a wide body");
+        assert!(err.contains("only valid in a v6 payload"), "{err}");
+    }
+
+    #[test]
+    fn wide_vector_body_truncation_is_refused() {
+        let body = wide_f32_body(5, &[0u8; 16]);
+        let dict = MappedStringDictionary::empty();
+        let err = read_column_body_with_index(&body, 5, &dict, None, PayloadVersion::V6)
+            .expect_err("count past the body must fail");
+        assert!(err.contains("truncated wide vector body"), "{err}");
+    }
+
+    #[test]
+    fn heap_writer_vector_header_matches_the_v1_codec_layout() {
+        let codec = ColumnCodec::Float32Vector {
+            bytes: Bytes::from(vec![0u8; 24]),
+            dimensions: 3,
+        };
+        let mut ours = Vec::new();
+        write_column_body(&mut ours, &codec, &FxHashMap::default()).unwrap();
+        let mut v1 = Vec::new();
+        codec.write_to(&mut v1);
+        assert_eq!(ours, v1);
+    }
 }

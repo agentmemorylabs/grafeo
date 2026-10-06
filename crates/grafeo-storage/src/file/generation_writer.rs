@@ -665,7 +665,8 @@ mod adapter {
         }
 
         fn directory_version(&self) -> u8 {
-            5 // CompactStore v5 format
+            // 5, or 6 when the payload needs 64-bit column geometry (G4).
+            self.lease.payload_version().byte()
         }
 
         fn exact_len(&self) -> u64 {

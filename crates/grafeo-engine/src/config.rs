@@ -180,6 +180,21 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// CompactStore payload version a generation build writes (G4).
+///
+/// v6 widens column-body offsets, lengths, vector component counts and
+/// segment element counts to 64 bits, removing the 4 GiB per-column limit.
+/// Binaries that only know v5 refuse a v6 generation with
+/// "unsupported CompactStore section version 6".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactPayloadVersion {
+    /// v5 when every field fits its v5 width; v6 only when one does not.
+    #[default]
+    Auto,
+    /// Always v6.
+    V6,
+}
+
 /// Database configuration.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // Config structs naturally have many boolean flags
@@ -328,6 +343,12 @@ pub struct Config {
     /// only happen on explicit `wal_checkpoint()` or database close.
     pub checkpoint_interval: Option<Duration>,
 
+    /// CompactStore payload version written by generation builds and epoch
+    /// handoffs (G4). [`CompactPayloadVersion::Auto`] writes v5 whenever
+    /// every field fits and v6 only for payloads that need 64-bit column
+    /// geometry; [`CompactPayloadVersion::V6`] always writes v6.
+    pub compact_payload_version: CompactPayloadVersion,
+
     /// Encryption configuration.
     ///
     /// When set, all data written to disk (WAL records, sections, snapshots) is
@@ -433,6 +454,7 @@ impl Default for Config {
             cdc_retention: crate::cdc::CdcRetentionConfig::default(),
             section_configs: hashbrown::HashMap::new(),
             checkpoint_interval: None,
+            compact_payload_version: CompactPayloadVersion::default(),
             #[cfg(feature = "encryption")]
             encryption: None,
         }
@@ -721,6 +743,13 @@ impl Config {
     #[must_use]
     pub fn with_checkpoint_interval(mut self, interval: Duration) -> Self {
         self.checkpoint_interval = Some(interval);
+        self
+    }
+
+    /// Sets the CompactStore payload version written by generation builds.
+    #[must_use]
+    pub fn with_compact_payload_version(mut self, version: CompactPayloadVersion) -> Self {
+        self.compact_payload_version = version;
         self
     }
 
