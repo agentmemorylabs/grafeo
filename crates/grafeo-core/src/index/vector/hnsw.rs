@@ -66,6 +66,106 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
+/// Allowlist size at or below which filtered search skips the graph and
+/// scans the allowlisted ids exactly.
+///
+/// Filtered search takes the exact scan when
+/// `|allowlist| <= max(visits, FILTERED_EXACT_SCAN_THRESHOLD)`, where
+/// `visits = ef * n / |allowlist|` (capped at `n`) estimates how many nodes
+/// the traversal scores before it has found `ef` allowlisted ones. Why:
+///
+/// * Cost. The scan scores `|allowlist|` vectors; the traversal scores about
+///   `visits` nodes, more once neighbor lists are counted. So the scan wins
+///   whenever `|allowlist| <= visits`, that is `|allowlist|^2 <= ef * n`.
+///   Below the constant the scan is cheap in absolute terms: on a 10k x 64
+///   index in release, scanning 2048 ids costs about one unfiltered search at
+///   `ef = 50` (~0.16 us per id against ~225 us per search).
+/// * Correctness. The scan is exact, so small allowlists, which a graph walk
+///   reaches least reliably, always get the true filtered top-k.
+///
+/// Larger allowlists use the in-traversal filter. If that returns fewer than
+/// `min(k, |allowlist ∩ index|)` results, the search falls back to the same
+/// exact scan rather than return a short list.
+///
+/// Prior art: Qdrant plans a full scan when the filter cardinality is below
+/// `full_scan_threshold`, Weaviate switches to flat search below
+/// `flatSearchCutoff` (default 40,000), and pgvector 0.8 iterative index scans
+/// keep widening until enough rows pass the filter.
+pub const FILTERED_EXACT_SCAN_THRESHOLD: usize = 2048;
+
+/// Whether a filtered search over `allowlist_len` ids, whose traversal would
+/// score about `visit_estimate` nodes, should take the exact scan. See
+/// [`FILTERED_EXACT_SCAN_THRESHOLD`].
+#[inline]
+pub(crate) fn use_filtered_exact_scan(allowlist_len: usize, visit_estimate: usize) -> bool {
+    allowlist_len <= visit_estimate.max(exact_scan_threshold())
+}
+
+#[cfg(not(test))]
+#[inline]
+fn exact_scan_threshold() -> usize {
+    FILTERED_EXACT_SCAN_THRESHOLD
+}
+
+#[cfg(test)]
+fn exact_scan_threshold() -> usize {
+    filtered_scan_stats::threshold()
+}
+
+/// Why a filtered search took the exact scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilteredScanReason {
+    /// The allowlist was at or below the threshold.
+    SmallAllowlist,
+    /// The traversal returned fewer than `min(k, |allowlist ∩ index|)`.
+    Shortfall,
+}
+
+/// Per-thread count of exact-scan fallbacks, so tests can assert when the
+/// index is (and is not) bypassed.
+#[cfg(test)]
+pub(crate) mod filtered_scan_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SMALL: Cell<usize> = const { Cell::new(0) };
+        static SHORTFALL: Cell<usize> = const { Cell::new(0) };
+        static THRESHOLD: Cell<usize> = const { Cell::new(super::FILTERED_EXACT_SCAN_THRESHOLD) };
+    }
+
+    pub(crate) fn threshold() -> usize {
+        THRESHOLD.with(Cell::get)
+    }
+
+    /// Runs `f` with a lower exact-scan threshold on this thread, so tests on
+    /// small indexes can exercise the traversal path. Work that rayon moves
+    /// to other threads (the batch entry points) keeps the default.
+    pub(crate) fn with_threshold<R>(threshold: usize, f: impl FnOnce() -> R) -> R {
+        let previous = THRESHOLD.with(|c| c.replace(threshold));
+        let result = f();
+        THRESHOLD.with(|c| c.set(previous));
+        result
+    }
+
+    pub(crate) fn record(reason: super::FilteredScanReason) {
+        match reason {
+            super::FilteredScanReason::SmallAllowlist => SMALL.with(|c| c.set(c.get() + 1)),
+            super::FilteredScanReason::Shortfall => SHORTFALL.with(|c| c.set(c.get() + 1)),
+        }
+    }
+
+    /// `(small_allowlist, shortfall)` exact scans on this thread so far.
+    pub(crate) fn get() -> (usize, usize) {
+        (SMALL.with(Cell::get), SHORTFALL.with(Cell::get))
+    }
+}
+
+#[inline]
+fn record_filtered_exact_scan(_reason: FilteredScanReason) {
+    #[cfg(test)]
+    filtered_scan_stats::record(_reason);
+}
+
 /// A neighbor entry in the HNSW graph.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Neighbor {
@@ -845,8 +945,12 @@ impl HnswIndex {
     ///
     /// Only nodes in the `allowlist` can appear in results. The HNSW graph
     /// is still fully traversed for connectivity; the filter only restricts
-    /// the result set. The search beam width (`ef`) is automatically scaled
-    /// based on the allowlist selectivity to maintain recall.
+    /// the result set, and the walk continues until `ef` allowlisted nodes
+    /// are found (so the work grows as the allowlist gets more selective).
+    ///
+    /// Small allowlists, and traversals that come back short, are answered by
+    /// an exact scan of the allowlisted ids; see
+    /// [`FILTERED_EXACT_SCAN_THRESHOLD`].
     ///
     /// Returns an empty vector if the allowlist is empty.
     #[must_use]
@@ -857,28 +961,17 @@ impl HnswIndex {
         allowlist: &HashSet<NodeId>,
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
-        if allowlist.is_empty() {
-            return Vec::new();
-        }
-        // Auto-scale ef based on selectivity ratio
-        let total = self.nodes.read().len();
-        let selectivity = if total == 0 {
-            1.0
-        } else {
-            (allowlist.len() as f64 / total as f64).max(0.01)
-        };
-        // reason: ef scaled by selectivity is non-negative and bounded by .min(total)
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let ef_scaled = ((self.config.ef as f64 / selectivity).ceil() as usize)
-            .min(total)
-            .max(k);
-        self.search_with_ef_and_filter(query, k, ef_scaled, allowlist, accessor)
+        self.search_with_ef_and_filter(query, k, self.config.ef, allowlist, accessor)
     }
 
     /// Searches with a custom ef (beam width) and an allowlist filter.
     ///
     /// Only nodes in the `allowlist` can appear in results. Higher ef values
     /// give better recall at the cost of latency.
+    ///
+    /// Small allowlists, and traversals that come back short, are answered by
+    /// an exact scan of the allowlisted ids; see
+    /// [`FILTERED_EXACT_SCAN_THRESHOLD`].
     ///
     /// Returns an empty vector if the allowlist is empty.
     ///
@@ -887,6 +980,69 @@ impl HnswIndex {
     /// Panics if `query.len()` does not match the configured `dimensions`.
     #[must_use]
     pub fn search_with_ef_and_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        allowlist: &HashSet<NodeId>,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        if allowlist.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let visit_estimate = self.filtered_visit_estimate(ef, k, allowlist.len());
+        if use_filtered_exact_scan(allowlist.len(), visit_estimate) {
+            return self.filtered_exact_scan(
+                query,
+                k,
+                allowlist,
+                accessor,
+                FilteredScanReason::SmallAllowlist,
+            );
+        }
+        let results = self.filtered_traversal(query, k, ef, allowlist, accessor);
+        if self.filtered_traversal_is_short(results.len(), k, allowlist) {
+            return self.filtered_exact_scan(
+                query,
+                k,
+                allowlist,
+                accessor,
+                FilteredScanReason::Shortfall,
+            );
+        }
+        results
+    }
+
+    /// Rough number of nodes a filtered traversal scores before it has found
+    /// `max(ef, k)` allowlisted nodes: `ef` divided by the selectivity
+    /// (floored at 1%), capped at the index size, at least `k`.
+    pub(crate) fn filtered_visit_estimate(
+        &self,
+        ef: usize,
+        k: usize,
+        allowlist_len: usize,
+    ) -> usize {
+        let total = self.nodes.read().len();
+        let selectivity = if total == 0 {
+            1.0
+        } else {
+            (allowlist_len as f64 / total as f64).max(0.01)
+        };
+        // reason: ef scaled by selectivity is non-negative and bounded by .min(total)
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ef_scaled = ((ef.max(k) as f64 / selectivity).ceil() as usize)
+            .min(total)
+            .max(k);
+        ef_scaled
+    }
+
+    /// HNSW traversal that only admits allowlisted nodes into the result set,
+    /// with no exact-scan fallback. Returns up to `k` results.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len()` does not match the configured `dimensions`.
+    pub(crate) fn filtered_traversal(
         &self,
         query: &[f32],
         k: usize,
@@ -933,6 +1089,75 @@ impl HnswIndex {
             .take(k)
             .map(|n| (n.id, n.distance))
             .collect()
+    }
+
+    /// True when a filtered traversal that produced `found` results missed
+    /// allowlisted nodes: fewer than `min(k, |allowlist ∩ index|)` came back.
+    ///
+    /// The in-index count is only taken when `found < k`, so the common case
+    /// costs nothing.
+    pub(crate) fn filtered_traversal_is_short(
+        &self,
+        found: usize,
+        k: usize,
+        allowlist: &HashSet<NodeId>,
+    ) -> bool {
+        if found >= k {
+            return false;
+        }
+        let nodes = self.nodes.read();
+        let mut indexed = 0usize;
+        for &id in allowlist {
+            if nodes.contains(id) {
+                indexed += 1;
+                if indexed > found {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Exact k-NN over the allowlisted ids that are in this index, scoring
+    /// through `accessor` with the index metric. Ids with no vector are
+    /// skipped. Ties are broken by id so results are deterministic.
+    pub(crate) fn filtered_exact_scan(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowlist: &HashSet<NodeId>,
+        accessor: &impl VectorAccessor,
+        reason: FilteredScanReason,
+    ) -> Vec<(NodeId, f32)> {
+        assert_eq!(
+            query.len(),
+            self.config.dimensions,
+            "Query dimensions mismatch: expected {}, got {}",
+            self.config.dimensions,
+            query.len()
+        );
+        record_filtered_exact_scan(reason);
+
+        let mut ids: Vec<NodeId> = {
+            let nodes = self.nodes.read();
+            allowlist
+                .iter()
+                .copied()
+                .filter(|&id| nodes.contains(id))
+                .collect()
+        };
+        ids.sort_unstable();
+        let vectors: Vec<(NodeId, Arc<[f32]>)> = ids
+            .into_iter()
+            .filter_map(|id| accessor.get_vector(id).map(|v| (id, v)))
+            .collect();
+        super::brute_force_knn_filtered(
+            vectors.iter().map(|(id, v)| (*id, v.as_ref())),
+            query,
+            k,
+            self.config.metric,
+            |_| true,
+        )
     }
 
     /// Removes a vector from the index.
@@ -1099,9 +1324,13 @@ impl HnswIndex {
 
     /// Beam search at a layer with an allowlist filter on the result set.
     ///
-    /// All nodes are visited for graph traversal (neighbor links followed),
-    /// but only nodes in the `allowlist` can enter the result set. This
-    /// preserves HNSW connectivity while restricting which nodes are returned.
+    /// All nodes can be traversed (neighbor links followed), but only nodes
+    /// in the `allowlist` enter the result set, which holds up to `ef` nodes.
+    /// Exploration and termination are driven by that result set, as in
+    /// hnswlib's filtered search: a node is expanded while fewer than `ef`
+    /// allowlisted nodes have been found or it is closer than the worst of
+    /// them. A walk guided by all visited nodes instead stops near the query
+    /// and misses allowlisted nodes that sit further out.
     #[allow(clippy::too_many_arguments)]
     fn search_layer_filtered(
         &self,
@@ -1122,14 +1351,7 @@ impl HnswIndex {
             distance: ep_dist,
         });
 
-        // best_seen tracks ALL visited candidates (for traversal termination)
-        let mut best_seen: BinaryHeap<FurthestCandidate> = BinaryHeap::new();
-        best_seen.push(FurthestCandidate {
-            id: ep,
-            distance: ep_dist,
-        });
-
-        // results only holds allowlisted nodes
+        // Max-heap of the best allowlisted nodes found so far
         let mut results: BinaryHeap<FurthestCandidate> = BinaryHeap::new();
         if allowlist.contains(&ep) {
             results.push(FurthestCandidate {
@@ -1143,54 +1365,40 @@ impl HnswIndex {
         visited.insert(ep);
 
         while let Some(current) = candidates.pop() {
-            // Terminate when best candidate is worse than worst in best_seen
-            if let Some(furthest) = best_seen.peek()
-                && current.distance > furthest.distance
-                && best_seen.len() >= ef
+            // Terminate when the closest unexplored node is worse than the
+            // worst of `ef` allowlisted results
+            if results.len() >= ef
+                && results
+                    .peek()
+                    .is_some_and(|furthest| current.distance > furthest.distance)
             {
                 break;
             }
 
-            // Explore neighbors
             if let Some(neighbors) = nodes.neighbors_at(current.id, layer) {
                 for neighbor in neighbors {
-                    if visited.contains(&neighbor) {
+                    if !visited.insert(neighbor) {
                         continue;
                     }
-                    visited.insert(neighbor);
 
                     let dist = self.node_distance(accessor, query, neighbor);
-
-                    // Update best_seen for traversal guidance
-                    let should_explore = best_seen.len() < ef
-                        || best_seen.peek().map_or(true, |f| dist < f.distance);
-
-                    if should_explore {
-                        candidates.push(Neighbor {
-                            id: neighbor,
-                            distance: dist,
-                        });
-                        best_seen.push(FurthestCandidate {
-                            id: neighbor,
-                            distance: dist,
-                        });
-                        while best_seen.len() > ef {
-                            best_seen.pop();
-                        }
+                    let improves =
+                        results.len() < ef || results.peek().is_none_or(|f| dist < f.distance);
+                    if !improves {
+                        continue;
                     }
 
-                    // Only add to results if in allowlist
+                    candidates.push(Neighbor {
+                        id: neighbor,
+                        distance: dist,
+                    });
                     if allowlist.contains(&neighbor) {
-                        let should_add = results.len() < ef
-                            || results.peek().map_or(true, |f| dist < f.distance);
-                        if should_add {
-                            results.push(FurthestCandidate {
-                                id: neighbor,
-                                distance: dist,
-                            });
-                            while results.len() > ef {
-                                results.pop();
-                            }
+                        results.push(FurthestCandidate {
+                            id: neighbor,
+                            distance: dist,
+                        });
+                        if results.len() > ef {
+                            results.pop();
                         }
                     }
                 }

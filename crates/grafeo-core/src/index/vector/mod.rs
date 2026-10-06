@@ -88,6 +88,8 @@ pub mod zone_map;
 
 #[cfg(feature = "vector-index")]
 mod config;
+#[cfg(all(test, feature = "vector-index"))]
+mod filtered_search_tests;
 #[cfg(feature = "vector-index")]
 mod hnsw;
 #[cfg(feature = "vector-index")]
@@ -115,7 +117,7 @@ pub use zone_map::VectorZoneMap;
 #[cfg(feature = "vector-index")]
 pub use config::HnswConfig;
 #[cfg(feature = "vector-index")]
-pub use hnsw::HnswIndex;
+pub use hnsw::{FILTERED_EXACT_SCAN_THRESHOLD, HnswIndex};
 #[cfg(feature = "vector-index")]
 pub use quantized_hnsw::QuantizedHnswIndex;
 #[cfg(feature = "vector-index")]

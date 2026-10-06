@@ -36,6 +36,7 @@
 //! ```
 
 use super::VectorAccessor;
+use super::hnsw::{FilteredScanReason, use_filtered_exact_scan};
 use super::quantization::{BinaryQuantizer, ProductQuantizer, QuantizationType, ScalarQuantizer};
 use super::{HnswConfig, HnswIndex, compute_distance};
 use grafeo_common::types::NodeId;
@@ -382,29 +383,50 @@ impl QuantizedHnswIndex {
         ef: usize,
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
+        self.search_pipeline(query, k, accessor, |n| {
+            self.hnsw.search_with_ef(query, n, ef, accessor)
+        })
+    }
+
+    /// Runs the quantization-specific search: `fetch(n)` returns up to `n`
+    /// HNSW candidates (unfiltered or filtered during traversal), which are
+    /// then scored and rescored the same way for every caller.
+    fn search_pipeline<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        accessor: &impl VectorAccessor,
+        fetch: F,
+    ) -> Vec<(NodeId, f32)>
+    where
+        F: Fn(usize) -> Vec<(NodeId, f32)>,
+    {
         match self.quantization_type {
-            QuantizationType::None => self.hnsw.search_with_ef(query, k, ef, accessor),
-            QuantizationType::Scalar => self.search_scalar_quantized(query, k, ef, accessor),
-            QuantizationType::Binary => self.search_binary_quantized(query, k, ef, accessor),
+            QuantizationType::None => fetch(k),
+            QuantizationType::Scalar => self.search_scalar_quantized(query, k, accessor, fetch),
+            QuantizationType::Binary => self.search_binary_quantized(query, k, accessor, fetch),
             QuantizationType::Product { .. } => {
-                self.search_product_quantized(query, k, ef, accessor)
+                self.search_product_quantized(query, k, accessor, fetch)
             }
         }
     }
 
     /// Search with scalar quantization.
-    fn search_scalar_quantized(
+    fn search_scalar_quantized<F>(
         &self,
         query: &[f32],
         k: usize,
-        ef: usize,
         accessor: &impl VectorAccessor,
-    ) -> Vec<(NodeId, f32)> {
+        fetch: F,
+    ) -> Vec<(NodeId, f32)>
+    where
+        F: Fn(usize) -> Vec<(NodeId, f32)>,
+    {
         let trained = *self.quantizer_trained.read();
 
         if !trained {
             // Quantizer not ready, fall back to exact search
-            return self.hnsw.search_with_ef(query, k, ef, accessor);
+            return fetch(k);
         }
 
         // Get candidates using HNSW (with full precision distances for now)
@@ -415,9 +437,7 @@ impl QuantizedHnswIndex {
             k
         };
 
-        let candidates = self
-            .hnsw
-            .search_with_ef(query, num_candidates, ef, accessor);
+        let candidates = fetch(num_candidates);
 
         if !self.rescore {
             return candidates.into_iter().take(k).collect();
@@ -428,17 +448,20 @@ impl QuantizedHnswIndex {
     }
 
     /// Search with binary quantization.
-    fn search_binary_quantized(
+    fn search_binary_quantized<F>(
         &self,
         query: &[f32],
         k: usize,
-        ef: usize,
         accessor: &impl VectorAccessor,
-    ) -> Vec<(NodeId, f32)> {
+        fetch: F,
+    ) -> Vec<(NodeId, f32)>
+    where
+        F: Fn(usize) -> Vec<(NodeId, f32)>,
+    {
         let binary_vecs = self.binary_vectors.read();
 
         if binary_vecs.is_empty() {
-            return self.hnsw.search_with_ef(query, k, ef, accessor);
+            return fetch(k);
         }
 
         // Quantize the query
@@ -453,9 +476,7 @@ impl QuantizedHnswIndex {
         };
 
         // Use HNSW to get initial candidates, then filter by hamming distance
-        let hnsw_candidates = self
-            .hnsw
-            .search_with_ef(query, num_candidates, ef, accessor);
+        let hnsw_candidates = fetch(num_candidates);
 
         // Compute hamming distances for candidates
         let mut scored: Vec<(NodeId, f32)> = hnsw_candidates
@@ -481,18 +502,21 @@ impl QuantizedHnswIndex {
     }
 
     /// Search with product quantization.
-    fn search_product_quantized(
+    fn search_product_quantized<F>(
         &self,
         query: &[f32],
         k: usize,
-        ef: usize,
         accessor: &impl VectorAccessor,
-    ) -> Vec<(NodeId, f32)> {
+        fetch: F,
+    ) -> Vec<(NodeId, f32)>
+    where
+        F: Fn(usize) -> Vec<(NodeId, f32)>,
+    {
         let trained = *self.quantizer_trained.read();
 
         if !trained {
             // Quantizer not ready, fall back to exact search
-            return self.hnsw.search_with_ef(query, k, ef, accessor);
+            return fetch(k);
         }
 
         // Get candidates using HNSW
@@ -502,9 +526,7 @@ impl QuantizedHnswIndex {
             k
         };
 
-        let candidates = self
-            .hnsw
-            .search_with_ef(query, num_candidates, ef, accessor);
+        let candidates = fetch(num_candidates);
 
         if !self.rescore {
             return candidates.into_iter().take(k).collect();
@@ -641,9 +663,13 @@ impl QuantizedHnswIndex {
 
     /// Searches with an allowlist filter.
     ///
-    /// Only nodes in the `allowlist` can appear in results. The candidate
-    /// count `k` is auto-scaled to `max(k, allowlist.len())` so the
-    /// underlying search retrieves enough candidates before filtering.
+    /// Only nodes in the `allowlist` can appear in results. The filter is
+    /// applied during the HNSW traversal (as in
+    /// [`HnswIndex::search_with_filter`]), and the candidates are then
+    /// scored and rescored exactly as in [`search`](Self::search). Small
+    /// allowlists, and traversals that come back short, are answered by an
+    /// exact scan of the allowlisted ids; see
+    /// [`FILTERED_EXACT_SCAN_THRESHOLD`](super::FILTERED_EXACT_SCAN_THRESHOLD).
     #[must_use]
     pub fn search_with_filter(
         &self,
@@ -652,15 +678,13 @@ impl QuantizedHnswIndex {
         allowlist: &std::collections::HashSet<NodeId>,
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
-        let results = self.search(query, k.max(allowlist.len()), accessor);
-        results
-            .into_iter()
-            .filter(|(id, _)| allowlist.contains(id))
-            .take(k)
-            .collect()
+        self.filtered_search(query, k, self.config().ef, allowlist, accessor)
     }
 
     /// Searches with a custom ef and an allowlist filter.
+    ///
+    /// Same as [`search_with_filter`](Self::search_with_filter), with `ef` as
+    /// the traversal beam width (raised to the candidate count if smaller).
     #[must_use]
     pub fn search_with_ef_and_filter(
         &self,
@@ -670,12 +694,76 @@ impl QuantizedHnswIndex {
         allowlist: &std::collections::HashSet<NodeId>,
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
-        let results = self.search_with_ef(query, k.max(allowlist.len()), ef, accessor);
+        self.filtered_search(query, k, ef, allowlist, accessor)
+    }
+
+    /// Filtered search shared by the filtered entry points.
+    fn filtered_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        allowlist: &std::collections::HashSet<NodeId>,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        if allowlist.is_empty() || k == 0 {
+            return Vec::new();
+        }
+
+        let visit_estimate = self.hnsw.filtered_visit_estimate(ef, k, allowlist.len());
+        if use_filtered_exact_scan(allowlist.len(), visit_estimate) {
+            return self.filtered_exact_scan(
+                query,
+                k,
+                allowlist,
+                accessor,
+                FilteredScanReason::SmallAllowlist,
+            );
+        }
+
+        // The pipeline asks for `k * rescore_factor` (or more) candidates;
+        // the filtered traversal returns that many allowlisted nodes.
+        let results = self.search_pipeline(query, k, accessor, |n| {
+            self.hnsw
+                .filtered_traversal(query, n, ef.max(n), allowlist, accessor)
+        });
+
+        if self
+            .hnsw
+            .filtered_traversal_is_short(results.len(), k, allowlist)
+        {
+            return self.filtered_exact_scan(
+                query,
+                k,
+                allowlist,
+                accessor,
+                FilteredScanReason::Shortfall,
+            );
+        }
         results
-            .into_iter()
-            .filter(|(id, _)| allowlist.contains(id))
-            .take(k)
-            .collect()
+    }
+
+    /// Exact scan of the allowlisted ids, reading full-precision vectors in
+    /// the same order as [`rescore_candidates`](Self::rescore_candidates):
+    /// the internal map first, then `accessor`. The distances therefore match
+    /// what rescoring returns.
+    fn filtered_exact_scan(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowlist: &std::collections::HashSet<NodeId>,
+        accessor: &impl VectorAccessor,
+        reason: FilteredScanReason,
+    ) -> Vec<(NodeId, f32)> {
+        let internal = self.vectors.read();
+        let lookup = |id: NodeId| -> Option<Arc<[f32]>> {
+            internal
+                .get(&id)
+                .cloned()
+                .or_else(|| accessor.get_vector(id))
+        };
+        self.hnsw
+            .filtered_exact_scan(query, k, allowlist, &lookup, reason)
     }
 
     /// Batch search with custom ef for multiple queries.
@@ -1284,13 +1372,12 @@ mod tests {
     }
 
     /// Filtered search must return `min(k, |allowlist|)` results when that many
-    /// allowlisted vectors exist. `search_with_filter` and
-    /// `search_with_ef_and_filter` post-filter the global top
-    /// `max(k, |allowlist|)`, so an allowlist that is not near the query comes
-    /// back empty. Plain `HnswIndex` filters during traversal and returns all
-    /// five here.
+    /// allowlisted vectors exist, even when they are the furthest from the
+    /// query. Before filtering moved into the traversal, `search_with_filter`
+    /// and `search_with_ef_and_filter` post-filtered the global top
+    /// `max(k, |allowlist|)` and returned nothing here. Every quantization type
+    /// and every filtered entry point is covered in `filtered_search_tests`.
     #[test]
-    #[ignore = "reproduces quantized filtered-search post-filter returning empty; engine fix pending owner decision"]
     fn test_filtered_search_returns_min_k_allowed_when_allowlist_is_far() {
         let config = HnswConfig::new(4, DistanceMetric::Euclidean);
         let vectors = create_test_vectors(30, 4);
