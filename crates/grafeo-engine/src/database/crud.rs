@@ -571,7 +571,7 @@ impl super::GrafeoDB {
         if self.refuse_write_if_wal_poisoned("add_node_label") {
             return false;
         }
-        let result = self.lpg_store().add_label(id, label);
+        let result = self.node_write_store().add_label(id, label);
 
         #[cfg(feature = "wal")]
         if result {
@@ -590,7 +590,7 @@ impl super::GrafeoDB {
             let prefix = format!("{label}:");
             for (key, index) in self.lpg_store().vector_index_entries() {
                 if let Some(property) = key.strip_prefix(&prefix)
-                    && let Some(node) = self.lpg_store().get_node(id)
+                    && let Some(node) = self.get_node(id)
                 {
                     let prop_key = grafeo_common::types::PropertyKey::new(property);
                     if let Some(grafeo_common::types::Value::Vector(v)) =
@@ -608,7 +608,7 @@ impl super::GrafeoDB {
 
         // Auto-insert into text indexes for the newly-added label
         #[cfg(feature = "text-index")]
-        if result && let Some(node) = self.lpg_store().get_node(id) {
+        if result && let Some(node) = self.get_node(id) {
             for (prop_key, prop_val) in &node.properties {
                 if let grafeo_common::types::Value::String(text) = prop_val
                     && let Some(index) = self.lpg_store().get_text_index(label, prop_key.as_ref())
@@ -660,7 +660,7 @@ impl super::GrafeoDB {
                 .collect()
         };
 
-        let result = self.lpg_store().remove_label(id, label);
+        let result = self.node_write_store().remove_label(id, label);
 
         #[cfg(feature = "wal")]
         if result {
@@ -702,8 +702,7 @@ impl super::GrafeoDB {
     /// ```
     #[must_use]
     pub fn get_node_labels(&self, id: grafeo_common::types::NodeId) -> Option<Vec<String>> {
-        self.lpg_store()
-            .get_node(id)
+        self.get_node(id)
             .map(|node| node.labels.iter().map(|s| s.to_string()).collect())
     }
 
@@ -1066,7 +1065,10 @@ impl super::GrafeoDB {
         if self.refuse_write_if_wal_poisoned("remove_node_property") {
             return false;
         }
-        let removed = self.lpg_store().remove_node_property(id, key).is_some();
+        let removed = self
+            .node_write_store()
+            .remove_node_property(id, key)
+            .is_some();
 
         #[cfg(feature = "wal")]
         if removed
@@ -1080,7 +1082,7 @@ impl super::GrafeoDB {
 
         // Remove from matching text indexes
         #[cfg(feature = "text-index")]
-        if removed && let Some(node) = self.lpg_store().get_node(id) {
+        if removed && let Some(node) = self.get_node(id) {
             for label in &node.labels {
                 if let Some(index) = self.lpg_store().get_text_index(label.as_str(), key) {
                     index.write().remove(id);
@@ -1460,6 +1462,17 @@ impl super::GrafeoDB {
         self.lpg_store()
             .bulk_create_nodes_with_props_unindexed(label, rows)
             .map_err(|message| grafeo_common::utils::error::Error::Internal(message.to_owned()))
+    }
+
+    /// The store direct node label and property-removal writes go to: on a
+    /// layered database the layered store, which edits a base node through
+    /// its overlay diff row (D10), elsewhere the LPG store.
+    fn node_write_store(&self) -> &dyn grafeo_core::graph::GraphStoreMut {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.as_ref();
+        }
+        self.lpg_store().as_ref()
     }
 }
 

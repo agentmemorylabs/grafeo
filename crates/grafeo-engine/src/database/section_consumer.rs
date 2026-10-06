@@ -262,6 +262,11 @@ impl MemoryConsumer for SectionConsumer {
 ))]
 pub struct VectorIndexConsumer {
     store: Weak<grafeo_core::graph::lpg::LpgStore>,
+    /// The layered store `store` is the overlay of, if any. A vector on a
+    /// diff row of a base node (D10) is never spilled: merged reads would
+    /// fall back to the stale base vector for a drained key.
+    #[cfg(feature = "compact-store")]
+    layered: Option<Weak<grafeo_core::graph::compact::layered::LayeredStore>>,
     /// Directory for spill files. `None` disables spilling.
     spill_path: Option<PathBuf>,
     /// Map of "label:property" -> MmapStorage for spilled indexes.
@@ -286,9 +291,36 @@ impl VectorIndexConsumer {
     ) -> Self {
         Self {
             store: Arc::downgrade(store),
+            #[cfg(feature = "compact-store")]
+            layered: None,
             spill_path,
             spilled: Arc::new(RwLock::new(HashMap::new())),
             stale_files: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Binds the layered store whose overlay `store` is (see `layered`).
+    #[cfg(feature = "compact-store")]
+    #[must_use]
+    pub fn with_layered(
+        mut self,
+        layered: Option<&Arc<grafeo_core::graph::compact::layered::LayeredStore>>,
+    ) -> Self {
+        self.layered = layered.map(Arc::downgrade);
+        self
+    }
+
+    /// Whether a node is a base node's diff row (never spilled, see
+    /// `layered`).
+    fn base_row_filter(&self) -> impl Fn(&NodeId) -> bool {
+        #[cfg(feature = "compact-store")]
+        {
+            let layered = self.layered.as_ref().and_then(Weak::upgrade);
+            move |id: &NodeId| layered.as_ref().is_some_and(|l| l.base_contains_node(*id))
+        }
+        #[cfg(not(feature = "compact-store"))]
+        {
+            |_: &NodeId| false
         }
     }
 
@@ -306,6 +338,8 @@ impl VectorIndexConsumer {
     ) -> Self {
         Self {
             store: Arc::downgrade(store),
+            #[cfg(feature = "compact-store")]
+            layered: None,
             spill_path,
             spilled,
             stale_files: parking_lot::Mutex::new(Vec::new()),
@@ -422,6 +456,7 @@ impl MemoryConsumer for VectorIndexConsumer {
         // (vector search) are not blocked.
         let mut registry = self.spilled.upgradable_read();
         let already_spilled: HashSet<String> = registry.keys().cloned().collect();
+        let is_base_row = self.base_row_filter();
         let mut indexes_by_property: HashMap<String, Vec<(String, usize, HashSet<NodeId>)>> =
             HashMap::new();
         for (key, index) in store.vector_index_entries() {
@@ -437,7 +472,11 @@ impl MemoryConsumer for VectorIndexConsumer {
             indexes_by_property.entry(property).or_default().push((
                 key,
                 index.config().dimensions,
-                store.nodes_by_label(&label).into_iter().collect(),
+                store
+                    .nodes_by_label(&label)
+                    .into_iter()
+                    .filter(|id| !is_base_row(id))
+                    .collect(),
             ));
         }
 

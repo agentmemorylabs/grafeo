@@ -146,10 +146,14 @@ mod imp {
             // `label` belong in the `label:property`-keyed spill file; every
             // other value (foreign label or non-vector) is restored so other
             // labels' columns are never stolen by this call.
+            // A vector on a diff row of a base node (D10) stays in the
+            // overlay: a merged read of a drained key would fall back to the
+            // stale base vector instead of the spill.
             let label_nodes: std::collections::HashSet<NodeId> = self
                 .graph_store()
                 .nodes_by_label(label)
                 .into_iter()
+                .filter(|id| !self.is_layered_base_node(*id))
                 .collect();
 
             // Partition exhaustively (every drained value lands in exactly
@@ -297,6 +301,8 @@ mod imp {
                 Some(spill_dir),
                 registry,
             );
+            #[cfg(feature = "compact-store")]
+            let consumer = consumer.with_layered(self.layered_store.as_ref());
             self.buffer_manager().register_consumer(Arc::new(consumer));
 
             grafeo_info!(

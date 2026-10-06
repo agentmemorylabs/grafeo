@@ -3465,6 +3465,17 @@ impl GrafeoDB {
         &**self.lpg_store()
     }
 
+    /// Whether the layered base has a row for `id`, i.e. an overlay row at
+    /// `id` is a diff row (D10). `false` without a layered store.
+    #[allow(unused_variables)]
+    pub(crate) fn is_layered_base_node(&self, id: grafeo_common::types::NodeId) -> bool {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.base_contains_node(id);
+        }
+        false
+    }
+
     /// Returns whether a `LayeredStore` (compact base + overlay) is installed.
     #[cfg(feature = "lpg")]
     fn is_layered(&self) -> bool {
@@ -4037,9 +4048,10 @@ impl GrafeoDB {
         ))]
         if let Some(store) = store_ref {
             let spill_path = self.buffer_manager.config().spill_path.clone();
-            let consumer = Arc::new(section_consumer::VectorIndexConsumer::new(
-                store, spill_path,
-            ));
+            let consumer = section_consumer::VectorIndexConsumer::new(store, spill_path);
+            #[cfg(feature = "compact-store")]
+            let consumer = consumer.with_layered(self.layered_store.as_ref());
+            let consumer = Arc::new(consumer);
             // Share the spill registry with the search path
             self.vector_spill_storages = Some(Arc::clone(consumer.spilled_storages()));
             self.buffer_manager.register_consumer(consumer);

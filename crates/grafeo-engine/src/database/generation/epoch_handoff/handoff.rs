@@ -571,7 +571,9 @@ impl GrafeoDB {
             node_ids.sort_unstable();
             for raw in node_ids {
                 if let Some(n) = overlay.get_node(NodeId::new(raw)) {
-                    nodes.push(node_to_generation(&n));
+                    // A diff row of a base node is captured as its whole
+                    // merged row (D10): the build skips the base row.
+                    nodes.push(node_to_generation(&layered.materialize_overlay_node(n)));
                 }
             }
             let mut edges = Vec::with_capacity(overlay_edge_ids.len());

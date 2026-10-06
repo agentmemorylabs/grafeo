@@ -631,7 +631,7 @@ impl GraphStoreSearch for CompactStore {
     }
 }
 
-fn value_in_range(
+pub(super) fn value_in_range(
     value: &Value,
     min: Option<&Value>,
     max: Option<&Value>,

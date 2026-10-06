@@ -208,6 +208,11 @@ path = "tests/generation_root_overlay_delete_crash.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
 
 [[test]]
+name = "generation_root_overlay_diff"
+path = "tests/generation_root_overlay_diff.rs"
+required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
+
+[[test]]
 name = "epoch_handoff_wal_boundary"
 path = "tests/epoch_handoff_wal_boundary.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
