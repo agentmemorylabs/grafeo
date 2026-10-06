@@ -162,10 +162,10 @@ impl<R: WalEntry> TypedWal<R> {
     /// records written while the snapshot was being taken are not skipped
     /// even if the WAL rotated meanwhile.
     ///
-    /// Pass `current_sequence().saturating_sub(1)`, not
-    /// [`current_sequence`](Self::current_sequence) itself: rotation bumps
-    /// the sequence before it swaps in the new log file, so the value read
-    /// can be one ahead of the file that is still receiving writes.
+    /// Callers pass `current_sequence().saturating_sub(1)`: one file of
+    /// margin before the sequence read. Rotation now swaps files under the
+    /// append lock, so [`current_sequence`](Self::current_sequence) names
+    /// the active file; the margin costs at most one extra replayed file.
     ///
     /// Call this only after the snapshot is durable.
     ///

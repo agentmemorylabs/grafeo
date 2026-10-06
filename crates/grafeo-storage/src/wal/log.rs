@@ -778,10 +778,9 @@ impl WalManager {
     /// Returns the current WAL log sequence number.
     ///
     /// Each log file has a sequence number embedded in its name
-    /// (`wal_XXXXXXXX.log`). This returns the sequence of the active log file,
-    /// except while [`rotate`](Self::rotate) is in progress: the sequence is
-    /// bumped before the new file is swapped in, so it can be one ahead of
-    /// the file still receiving writes.
+    /// (`wal_XXXXXXXX.log`). This returns the sequence of the active log file:
+    /// [`rotate`](Self::rotate) changes it and swaps the file under the same
+    /// append lock.
     #[must_use]
     pub fn current_sequence(&self) -> u64 {
         self.current_sequence.load(Ordering::Relaxed)
