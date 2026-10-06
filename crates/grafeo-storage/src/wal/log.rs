@@ -1357,4 +1357,114 @@ mod tests {
         assert_eq!(len2, 0);
         assert_eq!(seq2, wal.current_sequence());
     }
+
+    /// Decodes every frame of `wal_*.log` files in sequence order as
+    /// `(sequence, record)`.
+    fn read_all_frames(dir: &Path) -> Vec<(u64, WalRecord)> {
+        let mut files: Vec<(u64, PathBuf)> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                Some((WalManager::sequence_from_path(&path)?, path))
+            })
+            .collect();
+        files.sort_by_key(|(seq, _)| *seq);
+        let mut out = Vec::new();
+        for (seq, path) in files {
+            let bytes = fs::read(&path).unwrap();
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                let body = &bytes[at + 4..at + 4 + len];
+                let (record, _): (WalRecord, _) =
+                    bincode::serde::decode_from_slice(body, bincode::config::standard()).unwrap();
+                out.push((seq, record));
+                at += 4 + len + 4;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn concurrent_size_rotations_keep_files_in_append_order() {
+        // Many writers cross max_log_size at once, so several of them see the
+        // same full file and ask for a rotation. The active file must only
+        // ever move to a higher sequence: reading files in sequence order
+        // must give every writer's records in the order it appended them,
+        // and the newest file must be the one still being written.
+        const WRITERS: u64 = 8;
+        const RECORDS: u64 = 400;
+        for _round in 0..5 {
+            let dir = tempdir().unwrap();
+            let wal = WalManager::with_config(
+                dir.path(),
+                WalConfig {
+                    durability: DurabilityMode::NoSync,
+                    max_log_size: 96,
+                    ..WalConfig::default()
+                },
+            )
+            .unwrap();
+            let barrier = std::sync::Barrier::new(WRITERS as usize);
+            std::thread::scope(|scope| {
+                for writer in 0..WRITERS {
+                    let (wal, barrier) = (&wal, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for i in 0..RECORDS {
+                            wal.log(&WalRecord::CreateNode {
+                                id: NodeId::new(writer * 1_000_000 + i),
+                                labels: vec![],
+                            })
+                            .unwrap();
+                        }
+                    });
+                }
+            });
+            // A last record lands in the active file, which must be the newest.
+            wal.log(&WalRecord::CreateNode {
+                id: NodeId::new(u64::MAX - 1),
+                labels: vec![],
+            })
+            .unwrap();
+            wal.flush().unwrap();
+            let max_file_seq = wal
+                .log_files()
+                .unwrap()
+                .iter()
+                .filter_map(|p| WalManager::sequence_from_path(p))
+                .max()
+                .unwrap();
+            assert_eq!(
+                wal.current_sequence(),
+                max_file_seq,
+                "current_sequence names the newest file"
+            );
+
+            let frames = read_all_frames(dir.path());
+            assert_eq!(frames.len() as u64, WRITERS * RECORDS + 1);
+            let (last_seq, last) = frames.last().unwrap();
+            assert!(
+                matches!(last, WalRecord::CreateNode { id, .. } if id.as_u64() == u64::MAX - 1),
+                "the record written last is read last"
+            );
+            // Nothing was written to a file newer than the one that took the
+            // last record (a file after it, if any, is the fresh one its
+            // own size rotation opened).
+            let newest_written = frames.iter().map(|(seq, _)| *seq).max().unwrap();
+            assert_eq!(*last_seq, newest_written, "the active file is the newest");
+            let mut next = vec![0u64; WRITERS as usize];
+            for (seq, record) in &frames[..frames.len() - 1] {
+                let WalRecord::CreateNode { id, .. } = record else {
+                    panic!("unexpected record {record:?}");
+                };
+                let (writer, i) = (id.as_u64() / 1_000_000, id.as_u64() % 1_000_000);
+                assert_eq!(
+                    i, next[writer as usize],
+                    "writer {writer} out of order in file {seq}"
+                );
+                next[writer as usize] += 1;
+            }
+        }
+    }
 }
