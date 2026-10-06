@@ -39,6 +39,35 @@ use grafeo_common::types::Value;
 use grafeo_engine::{GrafeoDB, generation_build_request};
 use tempfile::tempdir;
 
+/// Serializes child spawns against root-lock cycles (acquire after release)
+/// across the parallel test threads of this binary.
+///
+/// The root ownership lock is a `flock`, which belongs to the *open file
+/// description*, not to the process or the fd number. Spawning a child forks,
+/// and between fork and exec the child holds a copy of every fd this process
+/// has open, including another test thread's locked root file (O_CLOEXEC only
+/// closes them at exec). If that thread drops its database (unlock by close)
+/// and immediately reopens the root in that window, the child's copy still
+/// holds the lock and the reopen fails with "root already locked by another
+/// process". So child starts and parent-side lock acquisitions take turns:
+/// `std`'s `spawn` returns only once the child has exec'd, so an acquisition
+/// that takes this mutex starts after every earlier fork has dropped its
+/// inherited copies. Keep the critical sections short and never hold this
+/// across a wait on a child. Same fix as `compact_store_generation_retirement`.
+static LOCK_CYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take one turn of the lock-cycle mutex (poison-tolerant: a panicking test
+/// must not cascade into every other test in the binary).
+fn lock_cycle() -> std::sync::MutexGuard<'static, ()> {
+    LOCK_CYCLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `GrafeoDB::open_generation_root` taken as one turn of the lock-cycle mutex.
+fn open_root(root: &std::path::Path) -> Result<GrafeoDB, grafeo_common::utils::error::Error> {
+    let _cycle = lock_cycle();
+    GrafeoDB::open_generation_root(root, false)
+}
+
 /// Number of committed auto-commit transactions the SIGKILL child makes.
 const SIGKILL_COMMITTED: usize = 30;
 /// Committed nodes written before the repeated-reopen loop.
@@ -99,6 +128,7 @@ fn read_mem_detail_kb() -> (u64, u64) {
 
 /// Publish a small non-empty base generation (two nodes + one edge) at `root`.
 fn publish_base(root: &std::path::Path, generation_id: &str) {
+    let _cycle = lock_cycle();
     let source = GrafeoDB::new_in_memory();
     let ada = source
         .create_node_with_props(&["Person"], [("name", Value::from("Ada"))])
@@ -172,7 +202,7 @@ fn explicit_transaction_write_is_not_wal_logged_before_commit() {
     std::fs::create_dir_all(&root).expect("create generation root");
     publish_base(&root, "explicit-tx-probe-g1");
 
-    let db = GrafeoDB::open_generation_root(&root, false).expect("open generation root writable");
+    let db = open_root(&root).expect("open generation root writable");
     let session = db.session();
     session
         .execute("START TRANSACTION")
@@ -282,7 +312,8 @@ fn sigkill_reopen_retains_committed() {
     publish_base(&root, "sigkill-g1");
 
     let exe = std::env::current_exe().expect("current exe");
-    let mut child = Command::new(exe)
+    let mut child = Command::new(exe);
+    child
         .arg("--exact")
         .arg("sigkill_reopen_retains_committed")
         .arg("--nocapture")
@@ -290,9 +321,12 @@ fn sigkill_reopen_retains_committed() {
         .arg("--sigkill-child")
         .arg(root.to_str().expect("root utf8"))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn SIGKILL child");
+        .stderr(Stdio::piped());
+    // Spawn (fork through exec) under the lock-cycle mutex; wait outside it.
+    let mut child = {
+        let _cycle = lock_cycle();
+        child.spawn().expect("spawn SIGKILL child")
+    };
 
     // Read child stdout on a helper thread so the ~60s readiness deadline is
     // enforced even if the child blocks.
@@ -355,8 +389,7 @@ fn sigkill_reopen_retains_committed() {
 
     // Reopen: the constructor replays the committed tail. All N committed
     // writes must be present; the uncommitted (N+1)th must be absent.
-    let reopened =
-        GrafeoDB::open_generation_root(&root, false).expect("reopen generation root after SIGKILL");
+    let reopened = open_root(&root).expect("reopen generation root after SIGKILL");
     let (names, node_count, edge_count) = observable_state(&reopened);
 
     let mut expected: Vec<String> = vec!["Ada".to_string(), "Grace".to_string()];
@@ -393,8 +426,7 @@ fn repeated_reopen_identical() {
 
     // Commit K nodes through a writable session, then close cleanly.
     {
-        let db =
-            GrafeoDB::open_generation_root(&root, false).expect("open generation root writable");
+        let db = open_root(&root).expect("open generation root writable");
         let session = db.session();
         for i in 0..REOPEN_COMMITTED {
             session
@@ -405,8 +437,7 @@ fn repeated_reopen_identical() {
 
     let mut reference: Option<(Vec<String>, usize, usize)> = None;
     for cycle in 0..REOPEN_CYCLES {
-        let db = GrafeoDB::open_generation_root(&root, false)
-            .unwrap_or_else(|e| panic!("reopen cycle {cycle} failed: {e}"));
+        let db = open_root(&root).unwrap_or_else(|e| panic!("reopen cycle {cycle} failed: {e}"));
         let state = observable_state(&db);
         match &reference {
             None => reference = Some(state),
@@ -433,15 +464,23 @@ fn repeated_reopen_identical() {
 /// constructor replays the WAL tail) and prints `RSS_ANON_KB=<n>`.
 fn spawn_replay_child(root: &std::path::Path) -> String {
     let exe = std::env::current_exe().expect("current exe");
-    let output = Command::new(exe)
-        .arg("--exact")
+    let mut cmd = Command::new(exe);
+    cmd.arg("--exact")
         .arg("replay_rss_bounded")
         .arg("--nocapture")
         .arg("--")
         .arg("--replay-child")
         .arg(root.to_str().expect("root utf8"))
-        .output()
-        .expect("spawn replay child");
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // `Command::output()` forks and then waits for the child; split it so only
+    // the spawn (fork through exec) is under the lock-cycle mutex.
+    let child = {
+        let _cycle = lock_cycle();
+        cmd.spawn().expect("spawn replay child")
+    };
+    let output = child.wait_with_output().expect("wait for replay child");
     assert!(
         output.status.success(),
         "replay child must exit 0: stdout={}, stderr={}",
@@ -492,8 +531,7 @@ fn replay_rss_bounded() {
     publish_base(&large_root, "replay-large-g1");
     let build_started = Instant::now();
     {
-        let db =
-            GrafeoDB::open_generation_root(&large_root, false).expect("open large root writable");
+        let db = open_root(&large_root).expect("open large root writable");
         let session = db.session();
         for i in 0..REPLAY_TAIL_RECORDS {
             session
