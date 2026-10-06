@@ -133,7 +133,6 @@ pub struct SpilledVectorSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct SpilledVectorColumn {
     pub(crate) key: String,
-    pub(crate) label: String,
     pub(crate) property: grafeo_common::types::PropertyKey,
     /// Width of the registered vector index at the freeze (falls back to the
     /// storage's width when the index is no longer registered).
@@ -153,9 +152,13 @@ impl SpilledVectorSnapshot {
 
     /// Fills `node`'s missing spilled vectors.
     ///
-    /// An inline value wins (it was written after the spill, as on the read
-    /// path). An id with no spill entry is fine: vectorless nodes are
-    /// legitimate. An entry that exists but cannot be read, or whose width
+    /// Matching is by node id and property, **not** by the node's current
+    /// labels: removing the label a column was spilled under does not remove
+    /// the property (a reload would restore it too), so its vector must still
+    /// reach the new base. An inline value wins (it was written after the
+    /// spill, as on the read path). An id with no spill entry is fine:
+    /// vectorless nodes are legitimate. Cold entries are read without
+    /// populating the storage's shared cache. An entry that exists but cannot be read, or whose width
     /// does not match the registered index, fails the build, so the
     /// handoff is cancelled before publication instead of publishing a base
     /// without the vector.
@@ -169,13 +172,11 @@ impl SpilledVectorSnapshot {
     ) -> std::result::Result<(), grafeo_core::graph::compact::generation::GenerationError> {
         #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
         for col in &self.columns {
-            if node.properties.contains_key(&col.property)
-                || !node.labels.iter().any(|l| *l == col.label)
-            {
+            if node.properties.contains_key(&col.property) {
                 continue;
             }
             let id = grafeo_common::types::NodeId::new(node.id.as_u64());
-            let vector = col.storage.try_get(id).map_err(|e| {
+            let vector = col.storage.try_get_uncached(id).map_err(|e| {
                 grafeo_core::graph::compact::generation::GenerationError::Io(format!(
                     "spilled vector {} for node {} exists but cannot be read: {e}",
                     col.key,

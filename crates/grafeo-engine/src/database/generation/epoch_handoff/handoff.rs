@@ -512,7 +512,6 @@ impl GrafeoDB {
                     .map_or_else(|| storage.dimensions(), |index| index.config().dimensions);
                 Some(super::types::SpilledVectorColumn {
                     key: key.clone(),
-                    label: label.to_string(),
                     property: grafeo_common::types::PropertyKey::new(property),
                     dimensions,
                     storage: Arc::clone(storage),
@@ -700,6 +699,17 @@ impl GrafeoDB {
         #[cfg(not(feature = "generation-streaming"))]
         let (section, node_count, edge_count) = {
             use grafeo_core::graph::compact::generation::generate_compact_store;
+
+            // AMH #167 review: the eager fallback collects every node (and so
+            // every recovered spilled vector) outside the build budget. Refuse
+            // before allocating rather than hold them all in RAM.
+            if handle.spilled_vectors.column_count() > 0 {
+                return Err(Error::Internal(format!(
+                    "spill-bearing handoff requires generation-streaming (DESIGN R1): \
+                     {} spilled vector column(s) would be collected in RAM by the eager build",
+                    handle.spilled_vectors.column_count()
+                )));
+            }
             use grafeo_storage::file::generation_writer::CompactStoreSectionSource;
 
             let mut nodes = FrozenNodeSource {

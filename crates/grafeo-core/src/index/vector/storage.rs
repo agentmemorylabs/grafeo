@@ -275,15 +275,35 @@ impl MmapStorage {
     ///
     /// Returns `Err` if the file cannot be created or the header cannot be written.
     pub fn create<P: AsRef<Path>>(path: P, dimensions: usize) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)?;
+            .open(path.as_ref())?;
+        Self::init(path.as_ref().to_path_buf(), file, dimensions)
+    }
 
+    /// Creates a storage file that must not already exist (`create_new`).
+    ///
+    /// Spill files use this: an open [`MmapStorage`] (e.g. one retained by an
+    /// epoch-handoff snapshot) keeps reading its own inode, so a path must
+    /// never be truncated and reused while such a reader may exist (AMH #167).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` (`AlreadyExists`) if `path` exists, or if the file or
+    /// its header cannot be written.
+    pub fn create_new<P: AsRef<Path>>(path: P, dimensions: usize) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path.as_ref())?;
+        Self::init(path.as_ref().to_path_buf(), file, dimensions)
+    }
+
+    fn init(path: std::path::PathBuf, mut file: File, dimensions: usize) -> io::Result<Self> {
         // Write header
         let mut header = [0u8; MMAP_HEADER_SIZE];
         header[0..8].copy_from_slice(&MMAP_MAGIC);
@@ -399,6 +419,37 @@ impl MmapStorage {
     ///
     /// Returns the I/O error when the indexed entry cannot be read.
     pub fn try_get(&self, id: NodeId) -> io::Result<Option<Arc<[f32]>>> {
+        self.read_entry(id, true)
+    }
+
+    /// Like [`Self::try_get`], but a cold entry is read without being added
+    /// to the cache, so a bulk reader (e.g. a generation build) does not grow
+    /// the shared cache outside its own budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the indexed entry cannot be read.
+    pub fn try_get_uncached(&self, id: NodeId) -> io::Result<Option<Arc<[f32]>>> {
+        self.read_entry(id, false)
+    }
+
+    /// Every stored vector, failing if any indexed entry cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first I/O error; nothing is returned partially.
+    pub fn try_export_all(&self) -> io::Result<Vec<(NodeId, Arc<[f32]>)>> {
+        let ids: Vec<NodeId> = self.index.read().keys().copied().collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(vector) = self.read_entry(id, false)? {
+                out.push((id, vector));
+            }
+        }
+        Ok(out)
+    }
+
+    fn read_entry(&self, id: NodeId, populate_cache: bool) -> io::Result<Option<Arc<[f32]>>> {
         if let Some(vec) = self.cache.read().get(&id) {
             return Ok(Some(Arc::clone(vec)));
         }
@@ -426,10 +477,11 @@ impl MmapStorage {
 
         let arc: Arc<[f32]> = vector.into();
 
-        // Update cache
-        let mut cache = self.cache.write();
-        if cache.len() < self.cache_limit {
-            cache.insert(id, Arc::clone(&arc));
+        if populate_cache {
+            let mut cache = self.cache.write();
+            if cache.len() < self.cache_limit {
+                cache.insert(id, Arc::clone(&arc));
+            }
         }
 
         Ok(Some(arc))
@@ -714,6 +766,42 @@ mod tests {
         assert!(storage.get(NodeId::new(2)).is_none());
         // Still absent, not an error, for an id that was never stored.
         assert_eq!(storage.try_get(NodeId::new(9)).unwrap(), None);
+        // A bulk export fails whole instead of dropping the unreadable entry.
+        assert!(storage.try_export_all().is_err());
+    }
+
+    /// AMH #167 review r2: spill files are never reused, and a bulk reader
+    /// does not grow the shared cache.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn test_mmap_storage_create_new_and_uncached_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spill.bin");
+        let storage = MmapStorage::create_new(&path, 2).unwrap();
+        let err = MmapStorage::create_new(&path, 2).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        storage.insert(NodeId::new(1), &[1.0, 2.0]).unwrap();
+        storage.flush().unwrap();
+        storage.clear_cache();
+        let before = storage.memory_usage();
+        assert_eq!(
+            storage.try_get_uncached(NodeId::new(1)).unwrap().as_deref(),
+            Some(&[1.0, 2.0][..])
+        );
+        assert_eq!(
+            storage.memory_usage(),
+            before,
+            "uncached read left the cache alone"
+        );
+        assert_eq!(storage.try_export_all().unwrap().len(), 1);
+        assert_eq!(
+            storage.memory_usage(),
+            before,
+            "export left the cache alone"
+        );
+        storage.try_get(NodeId::new(1)).unwrap();
+        assert!(storage.memory_usage() > before, "try_get still caches");
     }
 
     #[cfg(feature = "mmap")]

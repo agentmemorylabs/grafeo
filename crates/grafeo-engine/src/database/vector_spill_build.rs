@@ -111,8 +111,8 @@ mod imp {
             // freeze (which takes the same upgradable read) never sees this
             // column drained but not yet registered (AMH #167 review).
             let lifecycle = registry.upgradable_read();
-            if lifecycle.contains_key(&key) {
-                let spill_file = spill_file_for_key(&spill_dir, &key);
+            if let Some(existing) = lifecycle.get(&key) {
+                let spill_file = existing.path().to_path_buf();
                 return Ok(SpillVectorColumnReport {
                     label: label.to_string(),
                     property: property.to_string(),
@@ -229,8 +229,8 @@ mod imp {
                 )));
             }
 
-            let spill_file = spill_file_for_key(&spill_dir, &key);
-            let mmap_storage = match MmapStorage::create(&spill_file, dims) {
+            let spill_file = super::super::section_consumer::unique_spill_file(&spill_dir, &key);
+            let mmap_storage = match MmapStorage::create_new(&spill_file, dims) {
                 Ok(storage) => storage,
                 Err(e) => {
                     // Unlink any truncated file the failed create left behind.

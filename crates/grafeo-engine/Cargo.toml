@@ -158,6 +158,11 @@ path = "tests/compact_store_source_true_outer/main.rs"
 required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
 
 [[test]]
+name = "generation_root_forcedisk_spill_lifecycle"
+path = "tests/generation_root_forcedisk_spill_lifecycle.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index"]
+
+[[test]]
 name = "generation_root_forcedisk_handoff_vectors"
 path = "tests/generation_root_forcedisk_handoff_vectors.rs"
 required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index"]

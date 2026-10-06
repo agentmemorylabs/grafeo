@@ -328,12 +328,10 @@ impl VectorIndexConsumer {
             .ok_or(SpillError::NoSpillDirectory)?;
         std::fs::create_dir_all(spill_dir).map_err(|e| SpillError::IoError(e.to_string()))?;
 
-        // Sanitize key for filename ("Label:property" -> "Label%3Aproperty")
-        // while preserving label case and underscores.
-        let safe_key = key.replace('%', "%25").replace(':', "%3A");
-        let spill_file = spill_dir.join(format!("vectors_{safe_key}.bin"));
-        let mmap_storage = grafeo_core::index::vector::MmapStorage::create(&spill_file, dimensions)
-            .map_err(|e| SpillError::IoError(e.to_string()))?;
+        let spill_file = unique_spill_file(spill_dir, key);
+        let mmap_storage =
+            grafeo_core::index::vector::MmapStorage::create_new(&spill_file, dimensions)
+                .map_err(|e| SpillError::IoError(e.to_string()))?;
 
         for (id, vector) in vectors {
             mmap_storage
@@ -495,30 +493,77 @@ impl MemoryConsumer for VectorIndexConsumer {
             .ok_or(SpillError::IoError("store dropped".to_string()))?;
 
         let mut spilled = self.spilled.write();
-        for (key, mmap_storage) in spilled.drain() {
+
+        // AMH #167 review: read every spilled vector fallibly BEFORE touching
+        // the registry. An unreadable entry fails the reload with the
+        // registry and files intact, instead of being dropped as if the node
+        // were vectorless.
+        let mut exported = Vec::with_capacity(spilled.len());
+        for (key, mmap_storage) in spilled.iter() {
             let property = key
                 .split(':')
                 .nth(1)
                 .ok_or_else(|| SpillError::IoError(format!("invalid index key: {key}")))?;
-            let prop_key = PropertyKey::new(property);
+            let vectors = mmap_storage.try_export_all().map_err(|e| {
+                SpillError::IoError(format!("reload {key}: spilled vector unreadable: {e}"))
+            })?;
+            exported.push((key.clone(), PropertyKey::new(property), vectors));
+        }
 
-            // Export vectors from mmap, restore to property store
-            let vectors = mmap_storage.export_all();
+        let mut unlink_failures = Vec::new();
+        for (key, prop_key, vectors) in exported {
             store.restore_node_property_column(
                 &prop_key,
                 vectors
                     .into_iter()
                     .map(|(id, vec_data)| (id, Value::Vector(vec_data))),
             );
-
-            // Delete spill file
-            if let Ok(path) = std::fs::canonicalize(mmap_storage.path()) {
-                let _ = std::fs::remove_file(path);
+            // The values are inline again. Drop the registry entry only once
+            // its file is gone. Spill files are never reused (unique names,
+            // `create_new`), and a kept entry is harmless: inline values win
+            // on every read path.
+            let path = spilled.get(&key).map(|s| s.path().to_path_buf());
+            match path.map(std::fs::remove_file) {
+                Some(Ok(())) | None => {
+                    spilled.remove(&key);
+                }
+                Some(Err(e)) => unlink_failures.push(format!("{key}: {e}")),
             }
         }
-
+        if !unlink_failures.is_empty() {
+            return Err(SpillError::IoError(format!(
+                "reload restored the vectors but could not remove spill file(s): {}",
+                unlink_failures.join("; ")
+            )));
+        }
         Ok(())
     }
+}
+
+/// A fresh spill file path for `key` ("Label:property"), never reused.
+///
+/// A frozen epoch-handoff snapshot may still read an earlier spill file
+/// through its open descriptor, so a re-spill must not truncate that inode
+/// (AMH #167 review). Callers open the path with
+/// [`MmapStorage::create_new`](grafeo_core::index::vector::MmapStorage::create_new).
+#[cfg(all(
+    feature = "lpg",
+    feature = "vector-index",
+    feature = "mmap",
+    not(feature = "temporal")
+))]
+pub(crate) fn unique_spill_file(spill_dir: &std::path::Path, key: &str) -> PathBuf {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    // "Label:property" -> "Label%3Aproperty", preserving case and underscores.
+    let safe_key = key.replace('%', "%25").replace(':', "%3A");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    spill_dir.join(format!(
+        "vectors_{safe_key}.{}-{nanos}-{seq}.bin",
+        std::process::id()
+    ))
 }
 
 /// Dynamic memory consumer for text indexes.
