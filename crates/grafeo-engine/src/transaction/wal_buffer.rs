@@ -365,8 +365,9 @@ impl WalBuffer {
             ));
             // Keep the error's kind (#27 keeps the cap retryable), but say
             // that nothing succeeds before a reopen.
-            const REOPEN: &str = " The write is applied in memory but not logged; the WAL \
-                                  refuses writes until the database is reopened.";
+            const REOPEN: &str = " The write is applied in memory but not logged: the WAL \
+                                  refuses writes until the database is reopened, and the \
+                                  reopened database does not have the write.";
             return Err(match error {
                 Error::AdmissionRetryable(message) => {
                     Error::AdmissionRetryable(format!("{message}.{REOPEN}"))

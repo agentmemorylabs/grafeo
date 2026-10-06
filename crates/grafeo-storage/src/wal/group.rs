@@ -145,6 +145,9 @@ pub struct GroupBuffer {
     failure: Option<Failure>,
     /// Reused encoding buffer.
     scratch: Vec<u8>,
+    /// Capacity of the encoding buffer while [`push`](Self::push) has it out
+    /// of `scratch`, for the RAM counter.
+    scratch_in_use: usize,
     /// Highest [`ram_bytes`](Self::ram_bytes) seen.
     peak_ram: usize,
 }
@@ -198,8 +201,9 @@ impl SpillFile {
         position.bytes + position.frames * self.extra_per_frame()
     }
 
-    /// Appends one frame to the write buffer.
-    fn push_frame(&mut self, payload: &[u8]) -> Result<()> {
+    /// Appends one frame to the write buffer. Returns the bytes of the
+    /// temporary sealed copy it held while appending (0 without encryption).
+    fn push_frame(&mut self, payload: &[u8]) -> Result<usize> {
         #[cfg(feature = "encryption")]
         if let Some(cipher) = self.cipher.as_mut() {
             let nonce = grafeo_common::encryption::build_nonce(0, cipher.next_nonce);
@@ -208,14 +212,14 @@ impl SpillFile {
             self.pending
                 .extend_from_slice(&frame_len(sealed.len())?.to_le_bytes());
             self.pending.extend_from_slice(&sealed);
-            return Ok(());
+            return Ok(sealed.len());
         }
         self.pending
             .extend_from_slice(&frame_len(payload.len())?.to_le_bytes());
         self.pending.extend_from_slice(payload);
         self.pending
             .extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
-        Ok(())
+        Ok(0)
     }
 
     /// Writes the buffered frames to the file; afterwards everything before
@@ -302,6 +306,16 @@ impl SpillFile {
     }
 }
 
+/// Creates `dir` (and missing parents) with owner-only access for the
+/// directories it creates.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
 /// A frame's length prefix.
 fn frame_len(len: usize) -> Result<u32> {
     u32::try_from(len)
@@ -333,6 +347,7 @@ impl GroupBuffer {
             requires_sync: false,
             failure: None,
             scratch: Vec::new(),
+            scratch_in_use: 0,
             peak_ram: 0,
         }
     }
@@ -365,17 +380,12 @@ impl GroupBuffer {
             bincode::config::standard(),
         ) {
             Ok(_) => {
-                // The encoded record (and, when spilling encrypted, its sealed
-                // copy) sits in RAM beside the group while it is appended.
-                let sealed = if self.encrypt && self.spill.is_some() {
-                    scratch.len() + 28
-                } else {
-                    0
-                };
+                // The encoded record sits in RAM beside the group while it is
+                // appended (push_encoded counts it while it appends).
+                self.scratch_in_use = scratch.capacity();
                 let result = self.push_encoded(&scratch);
-                self.peak_ram = self
-                    .peak_ram
-                    .max(self.ram_bytes() + scratch.capacity() + sealed);
+                self.scratch_in_use = 0;
+                self.peak_ram = self.peak_ram.max(self.ram_bytes() + scratch.capacity());
                 result
             }
             Err(e) => Err(self.fail(
@@ -472,13 +482,20 @@ impl GroupBuffer {
         }
 
         let spill = self.spill.as_mut().expect("spilled above");
-        let result = spill.push_frame(payload).and_then(|()| {
+        let scratch_in_use = self.scratch_in_use;
+        let mut transient_peak = 0;
+        let result = spill.push_frame(payload).and_then(|sealed| {
+            // Right after appending: the encoded record, its sealed copy (just
+            // dropped) and the grown write buffer were all in RAM at once,
+            // before the write below may shrink the buffer.
+            transient_peak = spill.pending.capacity() + sealed + scratch_in_use;
             if spill.pending.len() >= IO_CHUNK {
                 spill.write_pending(new_end)
             } else {
                 Ok(())
             }
         });
+        self.peak_ram = self.peak_ram.max(self.ram.capacity() + transient_peak);
         self.note_ram();
         let end = self.end;
         let spill = self.spill.as_mut().expect("spilled above");
@@ -511,18 +528,20 @@ impl GroupBuffer {
     /// Moves the RAM frames to a new spill file.
     fn start_spill(&mut self) -> Result<()> {
         maybe_fail_io("wal_spill_create")?;
-        fs::create_dir_all(&self.spill_dir)?;
+        create_private_dir(&self.spill_dir)?;
         let name = format!(
             "txn_{}_{}.{SPILL_EXTENSION}",
             std::process::id(),
             SPILL_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let path = self.spill_dir.join(name);
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        // Owner-only from the first byte: a spill file holds records that may
+        // never be committed (or later rolled back).
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(&path)?;
         let mut spill = SpillFile {
             path,
             file,
@@ -548,6 +567,9 @@ impl GroupBuffer {
             ) as usize;
             let payload = &self.ram[offset + 4..offset + 4 + len];
             spill.push_frame(payload)?;
+            self.peak_ram = self
+                .peak_ram
+                .max(self.ram.capacity() + spill.pending.capacity());
             offset += 4 + len;
             position.frames += 1;
             position.bytes += RAM_FRAME_HEADER + len as u64;
@@ -1048,9 +1070,10 @@ mod tests {
         assert!(g.is_spilled());
         assert_eq!(decode_all(&mut g).len(), 2);
         let peak = g.peak_ram_bytes();
-        // The encoded record, its sealed copy, the write buffer holding it,
-        // and at commit the payload read back and its decrypted copy.
-        assert!(peak >= 2 << 20, "peak {peak} misses the record's copies");
+        // While pushing: the encoded record, its sealed copy and the write
+        // buffer holding it, all at once (later the read-back payload and
+        // its decrypted copy, fewer).
+        assert!(peak >= 3 << 20, "peak {peak} misses the record's copies");
         assert!(peak <= 1024 + 4 * IO_CHUNK + 5 * (1 << 20), "peak {peak}");
     }
 
@@ -1192,6 +1215,25 @@ mod tests {
         let mut expected: Vec<u64> = (0..next).collect();
         expected.push(99_999);
         assert_eq!(ids(&decode_all(&mut g)), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = group(dir.path(), 0, false);
+        g.push(&node(1)).unwrap();
+        let file_mode = fs::metadata(g.spill_path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        let dir_mode = fs::metadata(dir.path().join(SPILL_DIR))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(file_mode & 0o777, 0o600, "file mode {file_mode:o}");
+        assert_eq!(dir_mode & 0o777, 0o700, "dir mode {dir_mode:o}");
     }
 
     #[test]

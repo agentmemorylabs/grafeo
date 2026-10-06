@@ -3599,6 +3599,9 @@ impl GrafeoDB {
     /// # Errors
     ///
     /// Returns an error if the WAL can't be flushed (check disk space/permissions).
+    /// Also when the WAL was poisoned (a write could not be logged): the
+    /// database then closes without checkpointing memory, so a write that
+    /// never reached the WAL is not kept, and the next open replays the WAL.
     pub fn close(&self) -> Result<()> {
         let mut is_open = self.is_open.write();
         if !*is_open {
@@ -3622,6 +3625,29 @@ impl GrafeoDB {
             }
             *is_open = false;
             return Ok(());
+        }
+
+        // A poisoned WAL: some write applied in memory may never have reached
+        // it, and was reported as failed. Neither snapshot memory into the
+        // container nor write a close-time commit marker (either would make
+        // that write durable, or settle a partial group). Keep the WAL as it
+        // is: the next open replays it, so the database comes back as the WAL
+        // left it. The close itself fails, after releasing the files.
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
+            && let Some(reason) = wal.poisoned_reason()
+        {
+            wal.close_active_log();
+            #[cfg(feature = "grafeo-file")]
+            if let Some(ref fm) = self.file_manager {
+                fm.close()?;
+            }
+            *is_open = false;
+            return Err(Error::Internal(format!(
+                "database closed without a checkpoint: the WAL was poisoned ({reason}); \
+                 changes after the failure that never reached the WAL are not kept, and \
+                 the next open replays the WAL"
+            )));
         }
 
         // For single-file format: checkpoint to .grafeo file, then clean up sidecar WAL.

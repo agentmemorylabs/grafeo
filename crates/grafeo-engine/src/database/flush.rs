@@ -102,6 +102,21 @@ pub(super) fn flush(
 ) -> Result<FlushResult> {
     use grafeo_common::testing::crash::maybe_crash;
 
+    // A poisoned WAL means some write applied in memory may never have
+    // reached it (a refused record, a failed append). Snapshotting memory now
+    // would make that write durable behind the caller's back, after it was
+    // reported as failed (and possibly retried). Refuse: the next open
+    // replays the WAL instead, so such a write is gone, as reported.
+    #[cfg(feature = "wal")]
+    if let Some(wal) = wal
+        && let Some(reason) = wal.poisoned_reason()
+    {
+        return Err(grafeo_common::utils::error::Error::Internal(format!(
+            "refusing to checkpoint in-memory state while the WAL is poisoned ({reason}); \
+             the next open replays the WAL instead"
+        )));
+    }
+
     maybe_crash("flush:before_serialize");
 
     // Collect sections to write based on flush reason

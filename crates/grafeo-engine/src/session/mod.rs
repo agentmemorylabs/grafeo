@@ -532,16 +532,18 @@ impl Session {
     /// Finishes a write's result for the WAL: inside a transaction a record
     /// the buffer refused (over the cap) fails the statement; outside one the
     /// write's records are written as an implicit group, and a failure to
-    /// write them fails the call. The first error wins.
+    /// write them fails the call. A flush error wins over the statement's.
     fn finish_write<T>(&self, result: Result<T>) -> Result<T> {
         let result = result.and_then(|value| self.check_wal_buffer().map(|()| value));
         #[cfg(feature = "wal")]
         let flushed = self.flush_wal_outside_transaction();
         #[cfg(not(feature = "wal"))]
         let flushed: Result<()> = Ok(());
-        let value = result?;
+        // When the flush failed too, its error describes the state better
+        // (the write is applied in memory, the WAL refuses writes until a
+        // reopen); it keeps the refusal's kind.
         flushed?;
-        Ok(value)
+        result
     }
 
     /// Records a direct write's WAL record, after the store write took

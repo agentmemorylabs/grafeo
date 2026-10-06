@@ -220,9 +220,15 @@ fn crash_child() {
     };
     let path = PathBuf::from(std::env::var_os(PATH_VAR).unwrap());
     let kind = Kind::from_name(&std::env::var(KIND_VAR).unwrap());
-    let db = kind.open(&path);
+    let db = open_for_session_case(kind, &path, &scenario);
     let mut session = db.session();
     insert_rows(&session, "Kept", 0, 3);
+    if let Some(case) = scenario.strip_prefix("session_") {
+        let err = failing_session_write(&session, case);
+        assert!(is_buffer_full(&err), "{kind:?} {case}: {err}");
+        // Crash: no close(), no destructors.
+        std::process::exit(0);
+    }
     match scenario.as_str() {
         // A spilled transaction that never commits.
         "mid_transaction" => {
@@ -252,6 +258,53 @@ fn crash_child() {
     }
     // Crash: no close(), no destructors.
     std::process::exit(0);
+}
+
+/// Cap for the `session_cap` case: over one 8 KiB write, over the 1 KiB
+/// `Kept` rows.
+const SESSION_CAP: usize = 4096;
+
+/// Opens the database for `scenario`: with [`SESSION_CAP`] for the cap case.
+fn open_for_session_case(kind: Kind, path: &Path, scenario: &str) -> GrafeoDB {
+    if scenario.ends_with("cap") {
+        kind.open_with(
+            kind.config(path)
+                .with_wal_transaction_buffer_cap(SESSION_CAP),
+        )
+    } else {
+        kind.open(path)
+    }
+}
+
+/// A session write outside a transaction (`Lost`, one node) whose records
+/// cannot be buffered, after the store applied it: the spill file cannot be
+/// created (`spill_create`), a spill write fails (`spill_write`), or the
+/// write is over the cap (`cap`). Returns the write's error.
+fn failing_session_write(session: &Session, case: &str) -> Error {
+    use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
+    let payload = match case {
+        // Over the spill threshold: the first push past it creates the file.
+        "spill_create" | "cap" => 2 * THRESHOLD,
+        // Over one write-buffer chunk: the frame itself is written out.
+        "spill_write" => 100 * 1024,
+        other => panic!("unknown session case {other}"),
+    };
+    // I/O calls of this write: creating the spill file (1), writing the
+    // frames moved from RAM (2), writing the large frame (3).
+    match case {
+        "spill_create" => enable_io_failure_at(1),
+        "spill_write" => enable_io_failure_at(3),
+        _ => {}
+    }
+    let result = session.create_node_with_props(
+        &["Lost"],
+        [
+            ("seq", Value::Int64(0)),
+            ("payload", Value::from("x".repeat(payload))),
+        ],
+    );
+    disable_io_failure();
+    result.expect_err("the write's records cannot be buffered")
 }
 
 fn crash_after(scenario: &str, path: &Path, kind: Kind) {
@@ -545,22 +598,25 @@ fn batch_props(
 }
 
 /// Reopens after the WAL was poisoned: the writes before it (`Kept`) are
-/// there, the poisoning write (label `Lost`, `lost_rows` nodes) is all there
-/// or not at all ("durability unconfirmed": a single file's close may still
-/// snapshot it from memory), and the database writes again.
+/// there, the poisoning write (label `Lost`, `lost_rows` nodes) never reached
+/// the WAL and is gone (close does not snapshot memory over a poisoned WAL),
+/// and the database writes again.
 fn check_reopen_after_poison(kind: Kind, path: &Path, db: GrafeoDB, lost_rows: usize) {
     assert!(
         db.session().execute("INSERT (:After {seq: 0})").is_err(),
         "{kind:?}: the WAL refuses writes once poisoned"
     );
+    // No checkpoint of memory over a poisoned WAL: the close fails, and the
+    // reopen replays the WAL as it is.
+    assert!(db.close().is_err(), "{kind:?}: close over a poisoned WAL");
     drop(db);
     let db = kind.open(path);
     let session = db.session();
     assert_eq!(seqs(&session, "Kept"), vec![0, 1, 2], "{kind:?}");
     let lost = count(&session, "Lost");
-    assert!(
-        lost == 0 || lost == lost_rows,
-        "{kind:?}: {lost} of {lost_rows} unconfirmed nodes survived"
+    assert_eq!(
+        lost, 0,
+        "{kind:?}: {lost} of {lost_rows} never-logged nodes came back"
     );
     assert!(
         spill_files(&kind.wal_dir(path)).is_empty(),
@@ -638,6 +694,48 @@ fn implicit_session_write_copy_failure_is_reported() {
         );
         drop(session);
         check_reopen_after_poison(kind, &path, db, 1);
+    }
+}
+
+/// A session write outside a transaction whose records cannot be buffered
+/// (spill create, spill write, over the cap): the call fails with a
+/// retryable error that says a reopen is needed, the next write is refused,
+/// close does not checkpoint memory, and after close + reopen or crash +
+/// reopen the write is gone, so a retry after reopen does not duplicate it.
+#[cfg(feature = "testing-crash-injection")]
+#[test]
+fn session_write_outside_a_transaction_refused_records_are_gone_after_reopen() {
+    let _serial = serial();
+    for kind in kinds() {
+        for case in ["spill_create", "spill_write", "cap"] {
+            // Close + reopen.
+            let dir = tempfile::tempdir().unwrap();
+            let path = kind.create(dir.path());
+            let scenario = format!("session_{case}");
+            let db = open_for_session_case(kind, &path, &scenario);
+            insert_rows(&db.session(), "Kept", 0, 3);
+            let err = failing_session_write(&db.session(), case);
+            assert!(is_buffer_full(&err), "{kind:?} {case}: {err}");
+            assert!(
+                err.to_string().contains("does not have the write"),
+                "{kind:?} {case}: {err}"
+            );
+            assert_eq!(
+                count(&db.session(), "Lost"),
+                1,
+                "{kind:?} {case}: applied in memory"
+            );
+            check_reopen_after_poison(kind, &path, db, 1);
+
+            // Crash + reopen.
+            let dir = tempfile::tempdir().unwrap();
+            let path = kind.create(dir.path());
+            crash_after(&scenario, &path, kind);
+            let db = kind.open(&path);
+            let session = db.session();
+            assert_eq!(seqs(&session, "Kept"), vec![0, 1, 2], "{kind:?} {case}");
+            assert_eq!(count(&session, "Lost"), 0, "{kind:?} {case}: after a crash");
+        }
     }
 }
 
