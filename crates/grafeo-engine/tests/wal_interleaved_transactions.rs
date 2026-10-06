@@ -477,6 +477,7 @@ fn run_scenario(scenario: &str, db: &GrafeoDB) -> Vec<String> {
             use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
             insert(&db.session(), "alix");
             let session = db.session();
+            session.execute("CREATE SCHEMA kept_schema").unwrap();
             enable_io_failure_at(1);
             let r = session.execute("CREATE SCHEMA lost_schema");
             disable_io_failure();
@@ -576,6 +577,26 @@ fn assert_schema_refused(db: &GrafeoDB, session: &Session) {
         !graphs.iter().any(|g| g.starts_with("refused")),
         "nothing was created: {graphs:?}"
     );
+    let schemas = schema_names(session);
+    assert!(
+        !schemas.iter().any(|s| s.contains("refused")),
+        "no schema was created: {schemas:?}"
+    );
+}
+
+/// Every value `SHOW SCHEMAS` returns, as text.
+fn schema_names(session: &Session) -> Vec<String> {
+    session
+        .execute("SHOW SCHEMAS")
+        .unwrap()
+        .rows()
+        .iter()
+        .flatten()
+        .map(|v| match v {
+            Value::String(s) => s.to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect()
 }
 
 /// A small transaction WAL buffer cap for the scenarios that test it.
@@ -819,6 +840,19 @@ fn check_schema_crash_reopen(scenario: &str) {
                 .any(|g| g.starts_with("lost") || g.starts_with("refused")),
             "{kind:?} {scenario}: after a crash: {graphs:?}"
         );
+        let schemas = schema_names(&db.session());
+        assert!(
+            !schemas
+                .iter()
+                .any(|s| s.contains("lost") || s.contains("refused")),
+            "{kind:?} {scenario}: after a crash: {schemas:?}"
+        );
+        if scenario == "schema_ddl_failure" {
+            assert!(
+                schemas.iter().any(|s| s == "kept_schema"),
+                "{kind:?} {scenario}: the schema created before the failure survives: {schemas:?}"
+            );
+        }
     }
 }
 

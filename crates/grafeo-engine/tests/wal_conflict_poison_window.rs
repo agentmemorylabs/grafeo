@@ -33,6 +33,19 @@ use grafeo_common::testing::crash::{disable_io_failure, enable_io_failure_at};
 use grafeo_common::utils::error::Error;
 use grafeo_engine::{COMMIT_STALL_BEFORE_VALIDATION, COMMIT_STALL_PARKED, GrafeoDB};
 
+/// Releases a parked commit and disarms the seam when dropped, so a failing
+/// assertion in the test thread cannot leave the loser parked forever (the
+/// scope would then never join it).
+struct ReleaseOnDrop;
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        COMMIT_STALL_BEFORE_VALIDATION.store(false, Ordering::Release);
+        COMMIT_STALL_PARKED.store(false, Ordering::Release);
+        disable_io_failure();
+    }
+}
+
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
@@ -55,6 +68,8 @@ fn run(db: &GrafeoDB) -> Error {
     let begun = Barrier::new(2);
     let winner_done = Barrier::new(2);
     std::thread::scope(|scope| {
+        // Dropped on unwinding too, before the scope joins the loser.
+        let _release = ReleaseOnDrop;
         let loser = scope.spawn(|| {
             let mut loser = db.session();
             loser.begin_transaction().unwrap();
