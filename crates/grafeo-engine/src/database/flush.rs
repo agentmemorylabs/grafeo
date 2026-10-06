@@ -114,8 +114,9 @@ pub(super) fn flush(
     if let Some(wal) = wal
         && let Some(reason) = wal.poisoned_reason()
     {
+        use grafeo_common::utils::write_outcome::WAL_IS_POISONED;
         return Err(grafeo_common::utils::error::Error::Internal(format!(
-            "refusing to checkpoint in-memory state while the WAL is poisoned ({reason}); \
+            "refusing to checkpoint in-memory state while {WAL_IS_POISONED} ({reason}); \
              the next open replays the WAL instead"
         )));
     }

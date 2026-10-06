@@ -382,17 +382,16 @@ impl WalBuffer {
 /// snapshot of memory may still persist it; a failed append may have reached
 /// the WAL. Either way a blind retry could apply the write twice.
 pub(crate) fn unconfirmed_write_error(error: Error) -> Error {
+    use grafeo_common::utils::write_outcome::{DURABILITY_UNCONFIRMED, UNTIL_REOPENED};
     match error {
         Error::AdmissionRetryable(refusal) => Error::Internal(format!(
-            "write applied in memory; durability unconfirmed: its WAL records were refused \
+            "write applied in memory; {DURABILITY_UNCONFIRMED}: its WAL records were refused \
              and never reached the WAL ({refusal}), but a snapshot may still persist it, so \
-             do not retry it blindly; the WAL refuses further writes until the database is \
-             reopened"
+             do not retry it blindly; the WAL refuses further writes {UNTIL_REOPENED}"
         )),
         other => Error::Internal(format!(
-            "write applied in memory; durability unconfirmed (it may have been written): \
-             its WAL group failed ({other}); the WAL refuses further writes until the \
-             database is reopened"
+            "write applied in memory; {DURABILITY_UNCONFIRMED} (it may have been written): \
+             its WAL group failed ({other}); the WAL refuses further writes {UNTIL_REOPENED}"
         )),
     }
 }
