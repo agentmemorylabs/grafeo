@@ -10,32 +10,48 @@ impl super::GrafeoDB {
     // =========================================================================
 
     /// Returns the number of nodes in the database.
+    ///
+    /// Reads the same store queries read: on a layered database (compacted,
+    /// or a generation root) the base plus the overlay, and the tier chain
+    /// while a mid-build drain has tiers installed.
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.lpg_store().node_count()
+        self.graph_store().node_count()
     }
 
     /// Returns the number of edges in the database.
     #[must_use]
     pub fn edge_count(&self) -> usize {
-        self.lpg_store().edge_count()
+        self.graph_store().edge_count()
     }
 
     /// Returns the number of distinct labels in the database.
     #[must_use]
     pub fn label_count(&self) -> usize {
+        #[cfg(feature = "compact-store")]
+        if self.layered_store.is_some() {
+            return self.graph_store().all_labels().len();
+        }
         self.lpg_store().label_count()
     }
 
     /// Returns the number of distinct property keys in the database.
     #[must_use]
     pub fn property_key_count(&self) -> usize {
+        #[cfg(feature = "compact-store")]
+        if self.layered_store.is_some() {
+            return self.graph_store().all_property_keys().len();
+        }
         self.lpg_store().property_key_count()
     }
 
     /// Returns the number of distinct edge types in the database.
     #[must_use]
     pub fn edge_type_count(&self) -> usize {
+        #[cfg(feature = "compact-store")]
+        if self.layered_store.is_some() {
+            return self.graph_store().all_edge_types().len();
+        }
         self.lpg_store().edge_type_count()
     }
 
@@ -66,8 +82,8 @@ impl super::GrafeoDB {
     pub fn info(&self) -> crate::admin::DatabaseInfo {
         crate::admin::DatabaseInfo {
             mode: crate::admin::DatabaseMode::Lpg,
-            node_count: self.lpg_store().node_count(),
-            edge_count: self.lpg_store().edge_count(),
+            node_count: self.node_count(),
+            edge_count: self.edge_count(),
             is_persistent: self.is_persistent(),
             path: self.config.path.clone(),
             wal_enabled: self.config.wal_enabled,
@@ -218,11 +234,11 @@ impl super::GrafeoDB {
         let disk_bytes: Option<usize> = None;
 
         crate::admin::DatabaseStats {
-            node_count: self.lpg_store().node_count(),
-            edge_count: self.lpg_store().edge_count(),
-            label_count: self.lpg_store().label_count(),
-            edge_type_count: self.lpg_store().edge_type_count(),
-            property_key_count: self.lpg_store().property_key_count(),
+            node_count: self.node_count(),
+            edge_count: self.edge_count(),
+            label_count: self.label_count(),
+            edge_type_count: self.edge_type_count(),
+            property_key_count: self.property_key_count(),
             index_count: self.catalog.index_count(),
             memory_bytes: self.memory_usage().total_bytes,
             disk_bytes,
@@ -348,7 +364,7 @@ impl super::GrafeoDB {
         }
 
         // Add warnings for potential issues
-        if self.lpg_store().node_count() > 0 && self.lpg_store().edge_count() == 0 {
+        if self.node_count() > 0 && self.edge_count() == 0 {
             result.warnings.push(crate::admin::ValidationWarning {
                 code: "NO_EDGES".to_string(),
                 message: "Database has nodes but no edges".to_string(),
