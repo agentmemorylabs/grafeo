@@ -4323,13 +4323,19 @@ impl Session {
                 drop(commit_order);
                 // Conflict detected: abort the transaction completely so its
                 // entities are released and its versions discarded (#409).
-                // The caller gets the conflict error, unless the layered undo
-                // could not restore every base change: a caller that retries
-                // conflicts would then commit on top of them, so it gets the
-                // "rollback incomplete" error instead. A lost abort marker has
-                // poisoned a layered WAL (later writes fail with its reason).
+                // The abort writes nothing to the WAL. The caller gets the
+                // conflict error, unless a retry could not succeed:
+                // - the layered undo could not restore every base change (a
+                //   retry would commit on top of them): "rollback incomplete";
+                // - another session poisoned the WAL after this commit's
+                //   writability check: the WAL's refusal, never a retryable
+                //   conflict.
                 #[cfg_attr(not(feature = "compact-store"), allow(unused_variables))]
                 let outcome = self.abort_transaction(transaction_id, &touched);
+                let e = match self.check_wal_writable() {
+                    Err(poisoned) => poisoned,
+                    Ok(()) => e,
+                };
                 #[cfg(all(feature = "compact-store", feature = "lpg"))]
                 let e = if outcome.unrestored > 0 {
                     Self::incomplete_rollback_error(transaction_id, outcome.unrestored, false)
