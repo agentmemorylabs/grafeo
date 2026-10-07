@@ -4,7 +4,7 @@
 //! snapshot write/read, and sidecar WAL lifecycle management.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -844,8 +844,9 @@ impl GrafeoFileManager {
     /// | Zero-length section | no — `DirectMmapUnavailable` |
     /// | Compressed payload (none shipped today) | would need a separate design |
     ///
-    /// CRC validation may fault every page into the OS file cache; it must not
-    /// copy the section into an anonymous `Vec`. Callers must not fall back to
+    /// CRC validation streams through a bounded buffer before mapping. It
+    /// warms the file cache without making every section page resident in this
+    /// process. Callers must not fall back to
     /// `read_section_data` while still reporting a mapped backing diagnostic.
     #[allow(unsafe_code)]
     pub fn mmap_section(
@@ -876,14 +877,36 @@ impl GrafeoFileManager {
             )));
         }
 
-        let file = self.file.lock();
+        let mut file = self.file.lock();
+
+        // Published section bytes are immutable: checkpoints publish a new
+        // inode rather than modifying this locked file. Validate those bytes
+        // before mmap so integrity checking does not populate the process's
+        // entire mapped working set on every generation open.
+        file.seek(SeekFrom::Start(entry.offset))?;
+        let mut crc = crc32fast::Hasher::new();
+        let mut remaining = entry.length;
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining != 0 {
+            let len = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..len])?;
+            crc.update(&buffer[..len]);
+            remaining -= len as u64;
+        }
+        let actual_crc = crc.finalize();
+        if actual_crc != entry.checksum {
+            return Err(Error::Internal(format!(
+                "section {:?} CRC mismatch: expected {:#010X}, got {actual_crc:#010X}",
+                entry.section_type, entry.checksum
+            )));
+        }
 
         // SAFETY: We hold a lock on the `.grafeo` file, preventing
         // concurrent modification by other processes, and checkpoints never
         // write a published file in place (they rename a new image over the
         // path), so the mapped bytes do not change. The mapping is read-only.
         // The section region [offset .. offset+length] was written by
-        // write_sections() and its CRC is verified below before the mmap
+        // write_sections() and its CRC is verified above before the mmap
         // is exposed to callers.
         // reason: section length is bounded by file size, fits in usize on 64-bit targets
         #[allow(clippy::cast_possible_truncation)]
@@ -897,17 +920,6 @@ impl GrafeoFileManager {
         .map_err(Error::Io)?;
 
         drop(file);
-
-        // Verify CRC on the mmap'd bytes. This reads through the mapping,
-        // which triggers page faults and warms the OS page cache: a free
-        // prefetch disguised as an integrity check.
-        let actual_crc = crc32fast::hash(&mmap);
-        if actual_crc != entry.checksum {
-            return Err(Error::Internal(format!(
-                "section {:?} CRC mismatch: expected {:#010X}, got {actual_crc:#010X}",
-                entry.section_type, entry.checksum
-            )));
-        }
 
         Ok(crate::container::MmapSection::new(
             mmap,
