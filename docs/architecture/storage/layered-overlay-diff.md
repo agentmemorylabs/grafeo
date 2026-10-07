@@ -9,7 +9,7 @@ tags:
 
 # Layered overlay as a diff for base entities (D10)
 
-**Status:** design; slices 1–3 implemented (fork PRs #40, #42, and the slice-3 PR); slice 4 open. **Grounded in:** fork trunk `83710123` plus fork PR #38 (overlay-only deletes).
+**Status:** slices 1–3 implemented together in fork PR #40 (the separate slice-2/3 PRs #42 and #43 were folded in); slice 4 open. **Grounded in:** fork trunk `9b423f72`, which includes fork PR #38 (overlay-only deletes) and #37 (ForceDisk handoff).
 **Decision source:** AMH `docs/planning/disk-backed-memory-graph/DESIGN.md` D10, §4.3, §11.2 (gap G6).
 
 ## 1. Problem
@@ -165,6 +165,13 @@ on the diff row.
 - Unchanged properties were (re)indexed by the copy. They need no work now: their documents were indexed when the
   index was built over the layered view.
 - A tombstone (`Null`) removes the document, as a removal did.
+- **Rollback is the exception.** The overlay undo of a `SET` on an *inherited* text property has no old value (the
+  diff row never held it), so it removes the replacement document and has nothing to reinsert. After every
+  rollback and savepoint rollback, the session therefore re-syncs the text documents of the base nodes the undone
+  entries touched against the merged row (`LayeredStore::reconcile_text_documents`, node ids from
+  `LpgStore::undo_log_node_ids`, read before the undo runs). Nothing is copied back into the overlay, embeddings
+  included. Pinned by `rollback_of_an_inherited_text_property_restores_its_document` (full rollback, savepoint
+  rollback, rollback onto a committed diff, exact `text_search` results).
 
 ### 5.5 Vector search
 - **Vector reads that go through the layered view are unaffected:** the accessor and `read_indexed_node_vector`
@@ -183,7 +190,22 @@ on the diff row.
   - A merged read of a drained key on a diff row would fall back to the **stale base vector**.
   - Slice 1 therefore never spills a diff row's vector: only changed embeddings of base nodes stay on the heap,
     bounded by the overlay budget, while new nodes' vectors still spill.
-  - Pinned by `force_disk_reopen_keeps_a_diff_row_vector`.
+  - The consumer learns which rows are diff rows from the layered store, so it must be bound **after** the layered
+    wiring. A generation-root open always did that; a compact-file open (`GrafeoDB::with_config`) registered its
+    consumers first, so the spill took a diff row's new vector and the read served the base vector (review r2,
+    P1). `with_config` now registers consumers after `wire_layered_after_load`.
+  - Pinned by `force_disk_reopen_keeps_a_diff_row_vector` (generation root) and
+    `force_disk_open_keeps_a_diff_row_vector` (compact file; an overlay-only node spills, the diff row stays),
+    both with exact indexed reads and ANN.
+- **Batch-create HNSW inserts (interim, with slice 4).** `GrafeoDB::batch_create_nodes` and
+  `batch_create_nodes_with_props` (`crud.rs`) build their insert accessor over the overlay `LpgStore`, so a new
+  node's neighbour candidates among base nodes have no readable vector. That was already true of clean base nodes;
+  D10 extends it to base nodes with a non-vector write. `add_node_label` reads through the merged view since this
+  PR. Routing the batch paths the same way belongs with the planner merge (slice 4) and AMH #174 (lane 3).
+  Non-worsening check: `batch_creates_after_base_writes_search_like_a_clean_base` (with every base node touched,
+  both batch paths give exactly the clean-base search results: nearest hit and reachable set per query). It does
+  not measure recall at scale. **Pre-existing, not D10:** over a clean base, a base node's query reaches only the 6
+  base nodes, not the 6 batch-created ones, because the inserts could not read any base neighbour (AMH #174 class).
 
 ### 5.6 Visibility and history
 `is_*_visible_*` and `filter_visible_*` are unchanged, since visibility comes from the diff row.
@@ -205,6 +227,7 @@ Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1
 | Vector spill consumers | skip diff rows (§5.5) |
 | `GrafeoDB::get_{node,edge}_at_epoch`, `get_{node,edge}_history`; `Session::get_{node,edge}_history` | read through the layered view (§5.6) |
 | `GrafeoDB::get_{node,edge}_property_at_epoch` / property history (`temporal`-only) | still read overlay entries: a diff row's per-property history lacks the base's epoch-0 values. Not in AMH's feature set; **slice 4** |
+| `GrafeoDB::batch_create_nodes`, `batch_create_nodes_with_props` HNSW insert accessors | **interim, with slice 4**: overlay-only neighbour reads (§5.5) |
 | `LayeredStore::vector_search` (planner / `GraphStoreSearch` path) | **interim gap, slice 4**: forwards to the overlay `LpgStore` with an overlay-only accessor. A base node with a diff row is now invisible there, as a clean base node already was. DB-level `vector_search` and `read_indexed_node_vector` use the merged accessor and are unaffected (§5.5) |
 | `export_snapshot`, `iter_nodes`, `save` (`persistence.rs`) | already miss base rows entirely on a layered DB (pre-existing). Unchanged; listed so nobody relies on them. |
 | `LpgStore::find_nodes_by_property` on a mapped index, `property_index_snapshot_entries` | keep diff rows only if the overlay value matches. `LayeredStore` never relies on them (it verifies mapped candidates itself), and generation writers rebuild postings from the layered graph. Direct overlay callers should not use them on a layered store. |
@@ -248,6 +271,8 @@ Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1
 
 - **Property writes on a diff row** are overlay property writes, undone by the overlay's property undo log as today.
   This includes tombstones (§2.1).
+- **Secondary text documents** of the touched base nodes are re-synced against the merged row afterwards, because the
+  undo of an inherited property has no old value to restore (§5.4).
 - **The diff row itself** is a copy-up journal entry: rollback of its only owner purges it, as today. Because it
   carries no base data, a purge that races a reader's "miss on dirty id" re-check falls back to the identical base row.
 - **Base tombstones, overlay deletes, label writes:** unchanged (fork #14, #38).
@@ -277,7 +302,7 @@ Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1
 
 ## 9. Slices
 
-Each slice is one fork PR with tests, against `fix/root-mount-covers-nested`.
+Slices 1–3 ship together as fork PR #40, against `fix/root-mount-covers-nested`; slice 4 is its own PR.
 
 1. **Node property diffs.**
    - `ensure_diff_row` for nodes; merged node point reads; tombstones; property-index verification.
@@ -296,20 +321,35 @@ Each slice is one fork PR with tests, against `fix/root-mount-covers-nested`.
    - **Applies to** the live creates, batch creates, WAL replay and edge copy-up.
    - **Unchanged:** already-dirty endpoints keep their journal touch and post-freeze record.
    - **Also:** `GrafeoDB::validate` checks overlay edge endpoints through the merged view.
-4. **Vector search merge:** the explicit overlay flat scan of §5.5, shared with the per-tier vector work (DESIGN §5).
+4. **Vector search merge:** the explicit overlay flat scan of §5.5, shared with the per-tier vector work (DESIGN §5),
+   plus the batch-create insert accessors (§5.5) and merged per-property `temporal` history (§5.7). After lane 3's
+   AMH #174 fix, rebased on it.
 
 ## 10. Test plan
 
-**Slice 1 (this PR)**
-- **New `tests/generation_root_overlay_diff.rs`** (8 tests):
-  - SET keeps unchanged base properties, across reopen and a handoff;
-  - REMOVE is a tombstone, across reopen and a handoff;
-  - rollback restores the base view;
-  - property lookups with and without an index, including multi-key with one key changed, and range;
-  - a relation create keeps both base endpoints whole (no embedding copy);
-  - the DB-level label and removal APIs;
+**Slices 1–3 (fork PR #40)**
+- **`tests/generation_root_overlay_diff.rs`** (20 tests), each with exact-state oracles (whole property maps and
+  labels through `get_node`, `get_node_property`, the epoch read, and DB and session history: present exactly
+  when the row is dirty, in epoch order, tombstone-free, latest entry exact; edges also check identity, endpoints,
+  type and both edge-history APIs):
+  - SET keeps unchanged base properties, across reopen and a handoff; REMOVE is a tombstone, likewise;
+  - rollback restores the base view; rollback to an already-committed non-empty diff;
+  - property lookups with and without an index, including multi-key with one key changed, and range; a removed
+    property never matches (`Null` equality, open range);
+  - a relation create keeps both base endpoints whole; exact adjacency and degrees with no endpoint rows through
+    rollback, commit, a refused plain `DELETE`, `DETACH DELETE`, reopen and a handoff;
+  - the DB-level label and removal APIs, for nodes and edges;
+  - edge SET/REMOVE across reopen and a handoff; edge rollback;
+  - post-freeze SET/REMOVE (install refuses; reopen replays);
+  - the freeze holds diffs (one record per touched entity, < 1 KiB each), and every entity of the new base is whole;
+  - the tier drain refuses a non-empty base;
   - a ForceDisk reopen keeps a diff row's new vector;
-  - the cost measurement.
+  - rollback of an inherited text property restores its document (full, savepoint, onto a committed diff);
+  - batch creates after base writes search exactly like over a clean base (interim non-worsening check);
+  - the cost measurements (property update, relation).
+- **`tests/layered_overlay_diff_compact_file.rs`** (3 tests + 1 ignored): the pre-D10 fixture, the same scenario
+  written by this binary, and a compact-file ForceDisk open; the ignored one pins the pre-existing `compact()`
+  limit (AMH #183, fixed separately in fork #47).
 - **Existing suites must stay green unchanged**, except tests that inspect overlay contents directly to assert a
   copy was made (listed in the PR with the reason for each rewrite):
   - `layered_session_direct_api`, `layered_rollback_base_mutations`, `layered_dirty_node_adjacency`,
@@ -325,5 +365,4 @@ Each slice is one fork PR with tests, against `fix/root-mount-covers-nested`.
 - The SIGKILL replay tests (`generation_root_wal_replay.rs`): killing mid-write after a base-entity SET must reopen to
   the merged view.
 
-**Later slices** add edge diffs (2), endpoint rows (3) and the vector merge (4), each with its own targets, and
-re-run the above.
+**Slice 4** adds the vector merge with its own targets, and re-runs the above.

@@ -157,13 +157,18 @@ fn props_map(props: &grafeo_common::types::PropertyMap) -> BTreeMap<String, Valu
 
 /// `e{i}` as published.
 fn published_entity(i: usize) -> BTreeMap<String, Value> {
+    published_entity_of(i, DIMS)
+}
+
+/// `e{i}` as published with a `dims`-wide embedding.
+fn published_entity_of(i: usize, dims: usize) -> BTreeMap<String, Value> {
     [
         ("name", Value::from(format!("e{i}"))),
         ("account_id", Value::from("acct")),
         ("observations_json", Value::from("[\"o0\"]")),
         ("embedding_provider", Value::from("voyage")),
         ("updated_at_ms", Value::Int64(1_000 + i as i64)),
-        ("embedding", vector(i, DIMS)),
+        ("embedding", vector(i, dims)),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -209,11 +214,43 @@ fn assert_entity(
         want,
         "[{stage}] get_node_at_epoch"
     );
+    // History: the overlay's versions of a dirty row, merged with the base.
+    // A clean base node, or one whose row an install absorbed, has none
+    // (base rows carry no versions); a dirty one has at least one.
+    let has_row = db
+        .layered_store()
+        .expect("layered")
+        .snapshot_dirty_node_ids()
+        .contains(&id);
     for (what, history) in [
         ("db", db.get_node_history(id)),
         ("session", db.session().get_node_history(id)),
     ] {
-        if let Some((_, _, latest)) = history.last() {
+        assert_eq!(
+            !history.is_empty(),
+            has_row,
+            "[{stage}] {what} history exists exactly when the row is dirty: {history:?}"
+        );
+        assert!(
+            history.windows(2).all(|w| w[0].0 <= w[1].0),
+            "[{stage}] {what} history out of epoch order"
+        );
+        for (epoch, _, entry) in &history {
+            assert_eq!(entry.id, id, "[{stage}] {what} history entry id");
+            let mut labels: Vec<String> = entry.labels.iter().map(ToString::to_string).collect();
+            labels.sort();
+            assert_eq!(
+                labels,
+                vec!["MemoryEntity".to_string()],
+                "[{stage}] {what} history labels at {epoch:?}"
+            );
+            assert!(
+                entry.properties.iter().all(|(_, v)| !v.is_null()),
+                "[{stage}] {what} history at {epoch:?} shows a tombstone"
+            );
+        }
+        if let Some((_, deleted, latest)) = history.last() {
+            assert_eq!(*deleted, None, "[{stage}] {what} latest entry is live");
             assert_eq!(
                 props_map(&latest.properties),
                 want,
@@ -478,6 +515,139 @@ fn relation_create_between_base_entities_keeps_both() {
     assert_entity(&db, e2, 2, &[], "handoff dst");
 }
 
+/// Adjacency of the three published entities, exactly: per node, sorted
+/// `(neighbour name, relation name)` lists for both directions, and both
+/// degrees.
+type Adjacency = BTreeMap<String, (Vec<(String, String)>, Vec<(String, String)>, usize, usize)>;
+
+fn adjacency(db: &GrafeoDB) -> Adjacency {
+    use grafeo_core::graph::Direction;
+    let store = db.graph_store();
+    let name = |id: NodeId| match prop(db, id, "name") {
+        Some(Value::String(n)) => n.to_string(),
+        other => panic!("{id:?} name: {other:?}"),
+    };
+    let rel = |id: grafeo_common::types::EdgeId| match store
+        .get_edge_property(id, &PropertyKey::new("rel_type"))
+    {
+        Some(Value::String(t)) => t.to_string(),
+        other => panic!("{id:?} rel_type: {other:?}"),
+    };
+    let mut out = BTreeMap::new();
+    for n in ["e0", "e1", "e2"] {
+        let r = db
+            .execute_cypher(&format!(
+                "MATCH (m:MemoryEntity {{name: '{n}'}}) RETURN id(m)"
+            ))
+            .expect("lookup");
+        let Some(Value::Int64(raw)) = r.rows().first().map(|row| row[0].clone()) else {
+            continue; // deleted
+        };
+        let id = NodeId::new(raw as u64);
+        let side = |direction| {
+            let mut v: Vec<(String, String)> = store
+                .edges_from(id, direction)
+                .into_iter()
+                .map(|(other, e)| (name(other), rel(e)))
+                .collect();
+            v.sort();
+            v
+        };
+        out.insert(
+            n.to_string(),
+            (
+                side(Direction::Outgoing),
+                side(Direction::Incoming),
+                store.out_degree(id),
+                store.in_degree(id),
+            ),
+        );
+    }
+    out
+}
+
+fn adj(entries: &[(&str, &[(&str, &str)], &[(&str, &str)])]) -> Adjacency {
+    let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
+            .collect()
+    };
+    entries
+        .iter()
+        .map(|(n, o, i)| ((*n).to_string(), (pairs(o), pairs(i), o.len(), i.len())))
+        .collect()
+}
+
+/// Slice 3 with no endpoint rows: a relation between base entities is
+/// served by adjacency alone. Exact adjacency and degrees through rollback,
+/// commit, a refused plain DELETE, DETACH DELETE, reopen and a handoff.
+#[test]
+fn relation_without_endpoint_rows_adjacency_and_deletes() {
+    const RELATE: &str = "MATCH (a:MemoryEntity {name: 'e1'}), (b:MemoryEntity {name: 'e2'}) \
+                          CREATE (a)-[:MemoryEntityRelation {rel_type: 'x'}]->(b)";
+    let (_dir, root) = fresh_root(3, DIMS);
+    let published = adj(&[
+        ("e0", &[("e1", "base")], &[]),
+        ("e1", &[], &[("e0", "base")]),
+        ("e2", &[], &[]),
+    ]);
+    let related = adj(&[
+        ("e0", &[("e1", "base")], &[]),
+        ("e1", &[("e2", "x")], &[("e0", "base")]),
+        ("e2", &[], &[("e1", "x")]),
+    ]);
+    let detached = adj(&[
+        ("e0", &[("e1", "base")], &[]),
+        ("e1", &[], &[("e0", "base")]),
+    ]);
+    {
+        let db = open(&root);
+        assert_eq!(adjacency(&db), published, "published");
+        let mut session = db.session();
+        session.begin_transaction().expect("begin");
+        session.execute_cypher(RELATE).expect("relate");
+        assert_eq!(adjacency(&db), related, "inside the transaction");
+        session.rollback().expect("rollback");
+        assert_eq!(adjacency(&db), published, "rollback");
+        drop(session);
+
+        db.execute_cypher(RELATE).expect("relate");
+        assert_eq!(adjacency(&db), related, "committed");
+        let overlay = db.layered_store().expect("layered").overlay_store();
+        for n in ["e1", "e2"] {
+            assert!(
+                overlay.get_node(id_of(&db, n)).is_none(),
+                "{n} has an overlay row"
+            );
+        }
+        db.execute_cypher("MATCH (m:MemoryEntity {name: 'e2'}) DELETE m")
+            .expect_err("a plain DELETE of a node with a relation is refused");
+        assert_eq!(adjacency(&db), related, "refused DELETE");
+        assert_entity(&db, id_of(&db, "e2"), 2, &[], "refused DELETE");
+        db.close().expect("close");
+    }
+    let db = open(&root);
+    assert_eq!(adjacency(&db), related, "reopen");
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e2'}) DETACH DELETE m")
+        .expect("DETACH DELETE");
+    assert_eq!(adjacency(&db), detached, "DETACH DELETE");
+    assert_eq!(
+        count(&db, "MATCH ()-[r:MemoryEntityRelation]->() RETURN count(r)"),
+        1,
+        "relations after DETACH DELETE"
+    );
+    db.close().expect("close");
+    drop(db);
+    let db = open(&root);
+    assert_eq!(adjacency(&db), detached, "reopen after DETACH DELETE");
+    handoff(&db, &root, "g2");
+    assert_eq!(adjacency(&db), detached, "handoff");
+    assert_entity(&db, id_of(&db, "e1"), 1, &[], "handoff e1");
+    db.close().expect("close");
+    drop(db);
+    assert_eq!(adjacency(&open(&root)), detached, "reopen after handoff");
+}
+
 /// The DB-level label and property-removal APIs edit a base node through
 /// its diff row.
 #[test]
@@ -702,14 +872,61 @@ fn assert_base_rel(db: &GrafeoDB, overrides: &[(&str, Option<Value>)], stage: &s
             "[{stage}] get_edge_property {key}"
         );
     }
+    let (e0, e1) = (id_of(db, "e0"), id_of(db, "e1"));
+    let identity = |edge: &grafeo_core::graph::lpg::Edge, what: &str| {
+        assert_eq!(
+            (edge.id, edge.src, edge.dst, edge.edge_type.as_str()),
+            (id, e0, e1, "MemoryEntityRelation"),
+            "[{stage}] {what}: identity, endpoints and type"
+        );
+    };
+    identity(&edge, "get_edge");
     let at_epoch = db
         .get_edge_at_epoch(id, db.current_epoch())
         .unwrap_or_else(|| panic!("[{stage}] get_edge_at_epoch"));
+    identity(&at_epoch, "get_edge_at_epoch");
     assert_eq!(
         props_map(&at_epoch.properties),
         want,
         "[{stage}] get_edge_at_epoch"
     );
+    // History, as for nodes (`assert_entity`): present exactly when the
+    // edge is dirty, in epoch order, no tombstones, the
+    // latest entry exact.
+    let has_row = db
+        .layered_store()
+        .expect("layered")
+        .snapshot_dirty_edge_ids()
+        .contains(&id);
+    for (what, history) in [
+        ("db", db.get_edge_history(id)),
+        ("session", db.session().get_edge_history(id)),
+    ] {
+        assert_eq!(
+            !history.is_empty(),
+            has_row,
+            "[{stage}] {what} edge history exists exactly when the row is dirty: {history:?}"
+        );
+        assert!(
+            history.windows(2).all(|w| w[0].0 <= w[1].0),
+            "[{stage}] {what} edge history out of epoch order"
+        );
+        for (epoch, _, entry) in &history {
+            identity(entry, &format!("{what} edge history at {epoch:?}"));
+            assert!(
+                entry.properties.iter().all(|(_, v)| !v.is_null()),
+                "[{stage}] {what} edge history at {epoch:?} shows a tombstone"
+            );
+        }
+        if let Some((_, deleted, latest)) = history.last() {
+            assert_eq!(*deleted, None, "[{stage}] {what} latest edge entry is live");
+            assert_eq!(
+                props_map(&latest.properties),
+                want,
+                "[{stage}] {what} edge history"
+            );
+        }
+    }
 }
 
 /// SET and REMOVE on a base relation keep its other properties, never copy
@@ -952,6 +1169,11 @@ fn freeze_captures_diffs_not_inherited_embeddings() {
         .expect("touch");
     }
     let handle = db.freeze_epoch_for_handoff(&root).expect("freeze");
+    assert_eq!(
+        handle.frozen_nodes.len(),
+        N,
+        "the freeze captured one diff row per touched entity"
+    );
     let captured: usize = handle
         .frozen_nodes
         .iter()
@@ -985,14 +1207,22 @@ fn freeze_captures_diffs_not_inherited_embeddings() {
     db.publish_and_install_handoff(report).expect("install");
     db.close().expect("close");
     drop(db);
+    // Every entity of the new base is whole: its written value plus every
+    // inherited property, the embedding included.
     let db = open(&root);
-    let e7 = id_of(&db, "e7");
-    assert_eq!(prop(&db, e7, "observations_json"), Some(Value::from("x7")));
     assert_eq!(
-        prop(&db, e7, "embedding"),
-        Some(vector(7, WIDE)),
-        "embedding carried into the new base"
+        count(&db, "MATCH (m:MemoryEntity) RETURN count(m)"),
+        N as i64,
+        "entity count"
     );
+    for i in 0..N {
+        let mut want = published_entity_of(i, WIDE);
+        want.insert("observations_json".into(), Value::from(format!("x{i}")));
+        let node = db.get_node(id_of(&db, &format!("e{i}"))).expect("node");
+        let labels: Vec<String> = node.labels.iter().map(ToString::to_string).collect();
+        assert_eq!(labels, vec!["MemoryEntity".to_string()], "e{i} labels");
+        assert_eq!(props_map(&node.properties), want, "e{i} after the build");
+    }
 }
 
 /// A tier drain needs an empty base: the final tier-chain build carries no
@@ -1020,4 +1250,179 @@ fn tier_drain_refuses_a_non_empty_base() {
         &[("observations_json", Some(Value::from("d")))],
         "after refusal",
     );
+}
+
+/// Exact text-search result: the names of every hit, sorted.
+#[cfg(feature = "text-index")]
+fn text_hits(db: &GrafeoDB, query: &str) -> Vec<String> {
+    let mut names: Vec<String> = db
+        .text_search("MemoryEntity", "observations_json", query, 10)
+        .expect("text search")
+        .into_iter()
+        .map(|(id, _)| match prop(db, id, "name") {
+            Some(Value::String(name)) => name.to_string(),
+            other => panic!("hit {id:?} has name {other:?}"),
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The text index serves exactly `inherited` for the base text and
+/// `written` for the replacement text.
+#[cfg(feature = "text-index")]
+fn assert_text(db: &GrafeoDB, inherited: &[&str], written: &[&str], stage: &str) {
+    assert_eq!(text_hits(db, "o0"), inherited, "[{stage}] base text");
+    assert_eq!(
+        text_hits(db, "replacementterm"),
+        written,
+        "[{stage}] replacement text"
+    );
+}
+
+/// A rolled-back SET of an inherited text property gives the node its base
+/// document back. The diff row has no old value for it, so the overlay undo
+/// only drops the replacement document; the rollback rebuilds the document
+/// from the merged row. Full rollback, savepoint rollback, and a rollback
+/// onto an already-committed non-empty diff.
+#[cfg(feature = "text-index")]
+#[test]
+fn rollback_of_an_inherited_text_property_restores_its_document() {
+    const ALL: [&str; 3] = ["e0", "e1", "e2"];
+    const SET_E0: &str =
+        "MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'replacementterm'";
+    let (_dir, root) = fresh_root(3, DIMS);
+    let db = open(&root);
+    db.create_text_index("MemoryEntity", "observations_json")
+        .expect("text index");
+    assert_text(&db, &ALL, &[], "indexed");
+    let e0 = id_of(&db, "e0");
+    let mut session = db.session();
+
+    // Full rollback of a SET on a clean base node.
+    session.begin_transaction().expect("begin");
+    session.execute_cypher(SET_E0).expect("SET");
+    assert_text(&db, &["e1", "e2"], &["e0"], "inside the transaction");
+    session.rollback().expect("rollback");
+    assert_text(&db, &ALL, &[], "rollback");
+    assert_entity(&db, e0, 0, &[], "rollback");
+
+    // Savepoint rollback, then the rest of the transaction commits.
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e1'}) SET m.updated_at_ms = 7")
+        .expect("write before the savepoint");
+    session.savepoint("s").expect("savepoint");
+    session.execute_cypher(SET_E0).expect("SET");
+    session
+        .rollback_to_savepoint("s")
+        .expect("rollback to savepoint");
+    assert_text(&db, &ALL, &[], "savepoint rollback");
+    session.commit().expect("commit");
+    assert_text(&db, &ALL, &[], "commit after savepoint rollback");
+    assert_entity(&db, e0, 0, &[], "savepoint rollback");
+
+    // A committed non-text diff on e0, then a rolled-back text SET on it.
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.updated_at_ms = 5")
+        .expect("committed diff");
+    let committed = [("updated_at_ms", Some(Value::Int64(5)))];
+    session.begin_transaction().expect("begin");
+    session.execute_cypher(SET_E0).expect("SET");
+    session.rollback().expect("rollback");
+    assert_text(&db, &ALL, &[], "rollback onto a committed diff");
+    assert_entity(&db, e0, 0, &committed, "rollback onto a committed diff");
+
+    // A committed text SET survives a rolled-back REMOVE of it.
+    db.execute_cypher(SET_E0).expect("committed text SET");
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) REMOVE m.observations_json")
+        .expect("REMOVE");
+    assert_text(&db, &["e1", "e2"], &[], "inside the REMOVE transaction");
+    session.rollback().expect("rollback");
+    assert_text(&db, &["e1", "e2"], &["e0"], "rollback of the REMOVE");
+}
+
+/// Interim (slice 4 / AMH #174): the batch-create HNSW inserts
+/// (`GrafeoDB::batch_create_nodes`, `batch_create_nodes_with_props`) read
+/// neighbour vectors through the overlay alone. A clean base node's vector
+/// was never readable there; D10 adds base nodes with a non-vector write,
+/// whose diff rows no longer carry the embedding.
+///
+/// Non-worsening check: with every base node touched, both batch paths give
+/// exactly the search results they give over a clean base: per query, the
+/// nearest hit and the set of reachable nodes. Not asserted, because it
+/// already fails over a clean base (pre-existing, AMH #174 class): that a
+/// batch-created node is found at all. The insert cannot read any base
+/// neighbour's vector, so the new node is never linked into the graph.
+#[cfg(feature = "vector-index")]
+#[test]
+fn batch_creates_after_base_writes_search_like_a_clean_base() {
+    const BASE: usize = 6;
+    let as_f32 = |v: Value| match v {
+        Value::Vector(v) => v.to_vec(),
+        other => panic!("{other:?}"),
+    };
+    let run = |touched: bool| {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("batch.grafeo.d");
+        publish_with(&root, BASE, DIMS, true);
+        let db = open(&root);
+        if touched {
+            db.execute_cypher("MATCH (m:MemoryEntity) SET m.observations_json = 'touched'")
+                .expect("touch every base node");
+        }
+        let mut nodes: Vec<(String, Vec<f32>)> = (0..BASE)
+            .map(|i| (format!("e{i}"), as_f32(vector(i, DIMS))))
+            .collect();
+        let plain: Vec<Vec<f32>> = (0..3).map(|i| as_f32(vector(40 + 7 * i, DIMS))).collect();
+        let ids = db.batch_create_nodes("MemoryEntity", "embedding", plain.clone());
+        assert_eq!(ids.len(), 3, "batch_create_nodes");
+        nodes.extend((0..3).map(|i| (format!("b{i}"), plain[i].clone())));
+        let named = |id: NodeId| {
+            if let Some(Value::String(n)) = prop(&db, id, "name") {
+                n.to_string()
+            } else {
+                let i = ids.iter().position(|b| *b == id).expect("a batch node");
+                format!("b{i}")
+            }
+        };
+        let with_props: Vec<Vec<f32>> = (0..3).map(|i| as_f32(vector(80 + 7 * i, DIMS))).collect();
+        let created = db.batch_create_nodes_with_props(
+            "MemoryEntity",
+            with_props
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    [
+                        (PropertyKey::new("name"), Value::from(format!("p{i}"))),
+                        (
+                            PropertyKey::new("embedding"),
+                            Value::Vector(v.clone().into()),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect()
+                })
+                .collect(),
+        );
+        assert_eq!(created.len(), 3, "batch_create_nodes_with_props");
+        nodes.extend((0..3).map(|i| (format!("p{i}"), with_props[i].clone())));
+        nodes
+            .iter()
+            .map(|(name, v)| {
+                let hits = db
+                    .vector_search("MemoryEntity", "embedding", v, nodes.len(), Some(64), None)
+                    .expect("vector search");
+                let mut reachable: Vec<String> = hits.iter().map(|(id, _)| named(*id)).collect();
+                let nearest = reachable.first().cloned();
+                reachable.sort();
+                (name.clone(), nearest, reachable)
+            })
+            .collect::<Vec<_>>()
+    };
+    let clean = run(false);
+    let touched = run(true);
+    eprintln!("batch creates over a clean base, per query (name, nearest, reachable): {clean:?}");
+    assert_eq!(touched, clean, "a touched base searches like a clean one");
 }

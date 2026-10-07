@@ -934,9 +934,6 @@ impl GrafeoDB {
             mid_build_drain_seq: 0,
         };
 
-        // Register storage sections as memory consumers for pressure tracking
-        db.register_section_consumers();
-
         // Phase 5e: if the loaded file has a CompactStore section, the
         // database was previously compacted. Reconstruct the LayeredStore
         // wiring (base + overlay + tier wrapper + consumers) so the
@@ -947,6 +944,12 @@ impl GrafeoDB {
             db.compact_backing = Some(loaded.backing);
             db.wire_layered_after_load(loaded.store, loaded_overlay_deletions)?;
         }
+
+        // Register storage sections as memory consumers for pressure
+        // tracking. After the layered wiring, as on a generation root: the
+        // vector consumer binds the layered store there, so its spill keeps
+        // the vectors of base nodes' diff rows in the overlay (D10).
+        db.register_section_consumers();
 
         // After Catalog shells + VectorStore topology + WAL + layered wiring,
         // rehydrate Quantized payloads from LPG embeddings via graph_store().

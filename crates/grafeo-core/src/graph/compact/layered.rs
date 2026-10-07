@@ -1244,6 +1244,47 @@ impl LayeredStore {
         forgotten
     }
 
+    /// Re-syncs the overlay's text documents of `nodes` against the merged
+    /// view, after a rollback or savepoint rollback has undone their writes.
+    ///
+    /// A diff row (D10) does not carry the base properties it inherits, so
+    /// the overlay undo of a `SET` on an inherited text property records no
+    /// old value: it removes the replacement document and has nothing to
+    /// reinsert. The row then reads back the base text again, so the
+    /// document is rebuilt from that merged read. Nodes the base lacks are
+    /// whole overlay rows, which the overlay undo already restores exactly.
+    #[cfg(feature = "text-index")]
+    pub fn reconcile_text_documents(&self, nodes: &[NodeId]) {
+        let overlay = self.overlay.load();
+        let entries = overlay.text_index_entries();
+        if entries.is_empty() {
+            return;
+        }
+        for &id in nodes {
+            if !self.base_contains_node(id) {
+                continue;
+            }
+            let node = GraphStore::get_node(self, id);
+            for (key, index) in &entries {
+                let Some((label, property)) = key.split_once(':') else {
+                    continue;
+                };
+                let text = node
+                    .as_ref()
+                    .filter(|n| n.labels.iter().any(|l| l.as_str() == label))
+                    .and_then(|n| match n.properties.get(&PropertyKey::new(property)) {
+                        Some(Value::String(text)) => Some(text.clone()),
+                        _ => None,
+                    });
+                let mut index = index.write();
+                index.remove(id);
+                if let Some(text) = text {
+                    index.insert(id, &text);
+                }
+            }
+        }
+    }
+
     /// Total journal entries dropped by overlay resets / merges while their
     /// transaction was still open. Each such entry is a change a later
     /// rollback can no longer undo (it was baked into the new base or

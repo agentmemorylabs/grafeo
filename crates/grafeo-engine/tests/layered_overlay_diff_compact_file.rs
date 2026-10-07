@@ -177,3 +177,129 @@ fn compact_after_a_removal_keeps_it_removed() {
     db.compact().expect("compact");
     assert_state(&db, "after compact");
 }
+
+/// A compact file's diff-row vector survives a `ForceDisk` open. The open
+/// wires the layered store before it registers the vector consumer, so the
+/// consumer knows which rows are base nodes' diff rows and keeps their
+/// vectors in the overlay. Spilled, the diff row would lose its vector key
+/// and the merged read would serve the stale base vector instead. Checked
+/// through the exact indexed read and ANN, not only the inline property.
+#[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+#[test]
+fn force_disk_open_keeps_a_diff_row_vector() {
+    use grafeo_common::storage::{SectionType, TierOverride};
+    use grafeo_engine::{Config, IndexedVectorRead};
+
+    const DIMS: usize = 16;
+    let vector =
+        |seed: usize| -> Vec<f32> { (0..DIMS).map(|d| (seed * 31 + d) as f32 * 0.001).collect() };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("fd.grafeo");
+    let spill = dir.path().join("spill");
+    let v1 = vector(99);
+    {
+        let mut db = GrafeoDB::open(&path).expect("open");
+        for i in 0..3 {
+            db.create_node_with_props(
+                &["Doc"],
+                [
+                    ("name", Value::from(format!("d{i}"))),
+                    ("embedding", Value::Vector(vector(i).into())),
+                ],
+            )
+            .expect("create");
+        }
+        db.create_vector_index(
+            "Doc",
+            "embedding",
+            Some(DIMS),
+            Some("cosine"),
+            None,
+            None,
+            None,
+        )
+        .expect("vector index");
+        db.compact().expect("compact");
+        let d0 = node_id(&db, "d0");
+        db.session()
+            .set_node_property(d0, "embedding", Value::Vector(v1.clone().into()))
+            .expect("new vector");
+        // An overlay-only node: its vector is the one the spill takes.
+        db.create_node_with_props(
+            &["Doc"],
+            [
+                ("name", Value::from("d3")),
+                ("embedding", Value::Vector(vector(50).into())),
+            ],
+        )
+        .expect("create d3");
+        db.close().expect("close");
+    }
+    let db = GrafeoDB::with_config(
+        Config::persistent(&path)
+            .with_section_tier(SectionType::VectorStore, TierOverride::ForceDisk)
+            .with_spill_path(&spill),
+    )
+    .expect("ForceDisk open");
+    let d0 = node_id(&db, "d0");
+    let d1 = node_id(&db, "d1");
+    let d3 = node_id(&db, "d3");
+    // The spill ran: d3's vector left the overlay for the spill file, while
+    // d0's diff-row vector stayed in the overlay.
+    assert!(
+        std::fs::read_dir(&spill).is_ok_and(|mut d| d.next().is_some()),
+        "the ForceDisk open spilled the vector column"
+    );
+    let overlay = db.layered_store().expect("layered").overlay_store();
+    let key = grafeo_common::types::PropertyKey::new("embedding");
+    assert_eq!(overlay.get_node_property(d3, &key), None, "d3 spilled");
+    assert_eq!(
+        overlay.get_node_property(d0, &key),
+        Some(Value::Vector(v1.clone().into())),
+        "d0's diff row keeps its vector"
+    );
+    let embedding = |id: NodeId| {
+        db.get_node(id)
+            .expect("node")
+            .properties
+            .get(&grafeo_common::types::PropertyKey::new("embedding"))
+            .cloned()
+    };
+    assert_eq!(
+        embedding(d0),
+        Some(Value::Vector(v1.clone().into())),
+        "d0 row"
+    );
+    match db
+        .read_indexed_node_vector("Doc", "embedding", d0)
+        .expect("indexed read")
+    {
+        IndexedVectorRead::Found(got) => assert_eq!(&got[..], &v1[..], "indexed read of d0"),
+        other => panic!("indexed read of d0: {other:?}"),
+    }
+    for (id, want, what) in [
+        (d1, vector(1), "d1 (base)"),
+        (d3, vector(50), "d3 (spilled)"),
+    ] {
+        match db
+            .read_indexed_node_vector("Doc", "embedding", id)
+            .expect("indexed read")
+        {
+            IndexedVectorRead::Found(got) => {
+                assert_eq!(&got[..], &want[..], "indexed read of {what}");
+            }
+            other => panic!("indexed read of {what}: {other:?}"),
+        }
+    }
+    // Served the stale base vector, d0 would lose the V1 query to d2.
+    for (id, query) in [(d0, v1.clone()), (d1, vector(1)), (d3, vector(50))] {
+        let hits = db
+            .vector_search("Doc", "embedding", &query, 4, Some(64), None)
+            .expect("vector search");
+        assert_eq!(
+            hits.first().map(|(hit, _)| *hit),
+            Some(id),
+            "{id:?} is the nearest neighbour of its own vector: {hits:?}"
+        );
+    }
+}
