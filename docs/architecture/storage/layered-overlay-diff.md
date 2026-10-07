@@ -290,9 +290,8 @@ Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1
   - **Why not read old rows as diffs:** a full copy with a physically removed key would resurrect that key
     (review r1, must-fix 1). The fixture `tests/fixtures/legacy_layered_overlay.grafeo`, written by fork trunk
     `850e69f3`, pins this; without the conversion, `a.q` comes back.
-  - **Pre-existing, not D10:** `compact()` after a property removal brings the key back as its column's type
-    default (`""`, zeros). The in-memory CompactStore builder encodes absent string/vector values that way when
-    other rows of the label carry the key. Same on trunk; pinned as an ignored test.
+  - `compact()` after a property removal keeps the key removed: the CompactStore builder records absent cells as
+    absent (AMH #183, fork #47). Before that it wrote the column's type default (`""`, zeros), on trunk too.
 - **Downgrade:** a pre-D10 binary reading a D10 compact file sees whole rows, so it reads it correctly.
   Generation roots never persist the overlay (their WAL replays through the mutators), so they are safe in both
   directions.
@@ -343,9 +342,8 @@ Slices 1–3 ship together as fork PR #40, against `fix/root-mount-covers-nested
   - rollback of an inherited text property restores its document (full, savepoint, onto a committed diff);
   - batch creates over base diff rows are searchable (every node its own nearest neighbour, all reachable);
   - the cost measurements (property update, relation).
-- **`tests/layered_overlay_diff_compact_file.rs`** (3 tests + 1 ignored): the pre-D10 fixture, the same scenario
-  written by this binary, and a compact-file ForceDisk open; the ignored one pins the pre-existing `compact()`
-  limit (AMH #183, fixed separately in fork #47).
+- **`tests/layered_overlay_diff_compact_file.rs`** (4 tests): the pre-D10 fixture, the same scenario written by this
+  binary, a compact-file ForceDisk open, and `compact()` after removals (AMH #183, fork #47).
 - **Existing suites must stay green unchanged**, except tests that inspect overlay contents directly to assert a
   copy was made (listed in the PR with the reason for each rewrite):
   - `layered_session_direct_api`, `layered_rollback_base_mutations`, `layered_dirty_node_adjacency`,

@@ -158,13 +158,10 @@ fn diff_rows_round_trip_through_a_compact_file() {
     check_cycles(&path);
 }
 
-/// Not D10: `compact()` after a property removal brings the removed key back
-/// as its column's type default (`""`, a zero vector). The in-memory
-/// CompactStore builder encodes `Null` / absent values that way when other
-/// rows of the label have the key (`compact/builder.rs`, `Value::Null =>
-/// String::new()`). Fails the same on fork trunk `850e69f3`, without D10.
+/// `compact()` over the layered file keeps every removal: the rebuilt
+/// CompactStore marks absent cells absent (AMH #183) instead of filling them
+/// with the column's type default (`""`, a zero vector).
 #[test]
-#[ignore = "pre-existing CompactStore builder limit: absent string/vector values become type defaults after compact(); see the D10 PR"]
 fn compact_after_a_removal_keeps_it_removed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("compact.grafeo");
