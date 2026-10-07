@@ -156,6 +156,25 @@ pub trait WriteTracker: Send + Sync {
 /// Type alias for a shared write tracker.
 pub type SharedWriteTracker = Arc<dyn WriteTracker>;
 
+/// Records node mutations made by query-language operators that can change
+/// a vector index (AMH #187), so the engine maintains HNSW for them as it
+/// does for its direct write APIs. Lives in `grafeo-core` for the same
+/// reason as [`WriteTracker`]: the operators can't depend on the engine.
+pub trait VectorIndexRecorder: Send + Sync {
+    /// `property` of node `id` was set to a vector, or removed / nulled.
+    fn property_changed(&self, id: NodeId, property: &str);
+    /// Node `id` was created with a vector property or gained a label: any
+    /// of its indexed properties may now belong in an index.
+    fn node_reindex(&self, id: NodeId);
+    /// Node `id` lost `label`: it leaves that label's vector indexes.
+    fn label_removed(&self, id: NodeId, label: &str);
+    /// Node `id` was deleted.
+    fn node_deleted(&self, id: NodeId);
+}
+
+/// Type alias for a shared vector index recorder.
+pub type SharedVectorIndexRecorder = Arc<dyn VectorIndexRecorder>;
+
 /// Result of executing an operator.
 pub type OperatorResult = Result<Option<DataChunk>, OperatorError>;
 

@@ -70,6 +70,9 @@ impl super::Planner {
         if let Some(ref tracker) = self.write_tracker {
             op = op.with_write_tracker(Arc::clone(tracker));
         }
+        if let Some(ref recorder) = self.vector_recorder {
+            op = op.with_vector_recorder(Arc::clone(recorder));
+        }
         if let Some(ref validator) = self.validator {
             op = op.with_validator(Arc::clone(validator));
         }
@@ -199,6 +202,9 @@ impl super::Planner {
             .with_transaction_context(self.viewing_epoch, self.transaction_id);
             if let Some(ref tracker) = self.write_tracker {
                 op = op.with_write_tracker(Arc::clone(tracker));
+            }
+            if let Some(ref recorder) = self.vector_recorder {
+                op = op.with_vector_recorder(Arc::clone(recorder));
             }
             Ok((Box::new(op), output_columns))
         }
@@ -537,6 +543,9 @@ impl super::Planner {
 
         if let Some(ref validator) = self.validator {
             merge_op = merge_op.with_validator(Arc::clone(validator));
+        }
+        if let Some(ref recorder) = self.vector_recorder {
+            merge_op = merge_op.with_vector_recorder(Arc::clone(recorder));
         }
 
         let operator: Box<dyn Operator> = Box::new(merge_op);
@@ -960,6 +969,9 @@ impl super::Planner {
         if let Some(ref tracker) = self.write_tracker {
             op = op.with_write_tracker(Arc::clone(tracker));
         }
+        if let Some(ref recorder) = self.vector_recorder {
+            op = op.with_vector_recorder(Arc::clone(recorder));
+        }
 
         Ok((Box::new(op), output_columns))
     }
@@ -998,6 +1010,9 @@ impl super::Planner {
         .with_transaction_context(self.viewing_epoch, self.transaction_id);
         if let Some(ref tracker) = self.write_tracker {
             op = op.with_write_tracker(Arc::clone(tracker));
+        }
+        if let Some(ref recorder) = self.vector_recorder {
+            op = op.with_vector_recorder(Arc::clone(recorder));
         }
 
         Ok((Box::new(op), output_columns))
@@ -1128,6 +1143,9 @@ impl super::Planner {
             .with_transaction_context(self.viewing_epoch, self.transaction_id);
             if let Some(ref tracker) = self.write_tracker {
                 op = op.with_write_tracker(Arc::clone(tracker));
+            }
+            if let Some(ref recorder) = self.vector_recorder {
+                op = op.with_vector_recorder(Arc::clone(recorder));
             }
             if let Some(ref validator) = self.validator {
                 op = op.with_validator(Arc::clone(validator));

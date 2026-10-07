@@ -201,6 +201,9 @@ pub struct Session {
     /// synchronization until commit has made graph changes visible.
     #[cfg(all(feature = "lpg", feature = "vector-index"))]
     vector_index_intents: parking_lot::Mutex<Vec<VectorIndexIntent>>,
+    /// Query-language node mutations awaiting vector-index intents (AMH #187).
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    vector_recorder: Arc<VectorIntentRecorder>,
     /// Current graph name (for multi-graph USE GRAPH support). None = default graph.
     current_graph: parking_lot::Mutex<Option<String>>,
     /// Current schema name (ISO/IEC 39075 Section 4.7.3: independent from session graph).
@@ -277,6 +280,59 @@ enum VectorIndexIntent {
         graph_name: Option<String>,
         node_id: NodeId,
     },
+    /// Every indexed property of the node's labels (created with a vector,
+    /// gained a label, or had its properties replaced): AMH #187.
+    Reindex {
+        graph_name: Option<String>,
+        node_id: NodeId,
+    },
+    /// The node lost `label`: it leaves that label's vector indexes.
+    RemoveLabel {
+        graph_name: Option<String>,
+        node_id: NodeId,
+        label: String,
+    },
+}
+
+/// Node mutations reported by query-language operators that can change a
+/// vector index (AMH #187). The session drains them into
+/// [`VectorIndexIntent`]s after each statement, so Cypher/GQL writes get the
+/// same HNSW maintenance as the direct write APIs.
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+#[derive(Default)]
+pub(crate) struct VectorIntentRecorder {
+    changes: parking_lot::Mutex<Vec<RecordedVectorChange>>,
+}
+
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+enum RecordedVectorChange {
+    Property(NodeId, String),
+    Reindex(NodeId),
+    LabelRemoved(NodeId, String),
+    Deleted(NodeId),
+}
+
+#[cfg(all(feature = "lpg", feature = "vector-index"))]
+impl grafeo_core::execution::operators::VectorIndexRecorder for VectorIntentRecorder {
+    fn property_changed(&self, id: NodeId, property: &str) {
+        self.changes
+            .lock()
+            .push(RecordedVectorChange::Property(id, property.to_string()));
+    }
+
+    fn node_reindex(&self, id: NodeId) {
+        self.changes.lock().push(RecordedVectorChange::Reindex(id));
+    }
+
+    fn label_removed(&self, id: NodeId, label: &str) {
+        self.changes
+            .lock()
+            .push(RecordedVectorChange::LabelRemoved(id, label.to_string()));
+    }
+
+    fn node_deleted(&self, id: NodeId) {
+        self.changes.lock().push(RecordedVectorChange::Deleted(id));
+    }
 }
 
 /// Savepoint state: name + per-graph snapshots + the graph that was active.
@@ -380,6 +436,8 @@ impl Session {
             cdc_pending_events: None,
             #[cfg(all(feature = "lpg", feature = "vector-index"))]
             vector_index_intents: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(all(feature = "lpg", feature = "vector-index"))]
+            vector_recorder: Arc::new(VectorIntentRecorder::default()),
             current_graph: parking_lot::Mutex::new(None),
             current_schema: parking_lot::Mutex::new(None),
             time_zone: parking_lot::Mutex::new(None),
@@ -674,6 +732,8 @@ impl Session {
             cdc_pending_events: None,
             #[cfg(all(feature = "lpg", feature = "vector-index"))]
             vector_index_intents: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(all(feature = "lpg", feature = "vector-index"))]
+            vector_recorder: Arc::new(VectorIntentRecorder::default()),
             current_graph: parking_lot::Mutex::new(None),
             current_schema: parking_lot::Mutex::new(None),
             time_zone: parking_lot::Mutex::new(None),
@@ -3469,6 +3529,8 @@ impl Session {
                 self.active_write_store(),
                 Arc::clone(&self.transaction_manager),
             )?;
+            #[cfg(all(feature = "lpg", feature = "vector-index"))]
+            let processor = processor.with_vector_recorder(self.shared_vector_recorder());
 
             // Apply transaction context if in a transaction
             let processor = if let Some(transaction_id) = transaction_id {
@@ -4076,6 +4138,8 @@ impl Session {
                 self.active_write_store(),
                 Arc::clone(&self.transaction_manager),
             )?;
+            #[cfg(all(feature = "lpg", feature = "vector-index"))]
+            let processor = processor.with_vector_recorder(self.shared_vector_recorder());
             let processor = if let Some(transaction_id) = transaction_id {
                 processor.with_transaction_context(viewing_epoch, transaction_id)
             } else {
@@ -4151,6 +4215,9 @@ impl Session {
                             self.active_write_store(),
                             Arc::clone(&self.transaction_manager),
                         )?;
+                        #[cfg(all(feature = "lpg", feature = "vector-index"))]
+                        let processor =
+                            processor.with_vector_recorder(self.shared_vector_recorder());
                         let (viewing_epoch, transaction_id) = self.get_transaction_context();
                         let processor = if let Some(transaction_id) = transaction_id {
                             processor.with_transaction_context(viewing_epoch, transaction_id)
@@ -5021,9 +5088,18 @@ impl Session {
         if has_mutations {
             self.check_wal_writable()?;
         }
+        // Query-language node mutations become vector-index intents before
+        // the commit that applies them (AMH #187).
+        let run = || {
+            let result = body().and_then(|r| self.flush_recorded_vector_changes().map(|()| r));
+            if result.is_err() {
+                self.clear_recorded_vector_changes();
+            }
+            result
+        };
         if self.needs_auto_commit(has_mutations) {
             self.begin_transaction_inner(false, None)?;
-            match body() {
+            match run() {
                 Ok(result) => {
                     self.commit_inner()?;
                     Ok(result)
@@ -5037,7 +5113,7 @@ impl Session {
             // Inside a transaction a refused WAL record fails the statement
             // (the transaction can still be rolled back); outside one the
             // statement's group is written, or its failure reported.
-            self.finish_write(body())
+            self.finish_write(run())
         }
     }
 
@@ -5379,6 +5455,12 @@ impl Session {
                 let store = self.resolve_store(graph_name);
                 let read = self.vector_read_view(&store);
                 for (key, index) in store.vector_index_entries() {
+                    // Query-language deletes record every deleted node
+                    // (AMH #187): skip indexes that never held it, without
+                    // taking the topology write lock.
+                    if !index.contains(*node_id) {
+                        continue;
+                    }
                     let Some((label, property)) = key.split_once(':') else {
                         continue;
                     };
@@ -5386,8 +5468,110 @@ impl Session {
                     index.remove_with_accessor(*node_id, &accessor);
                 }
             }
+            VectorIndexIntent::Reindex {
+                graph_name,
+                node_id,
+            } => {
+                let store = self.resolve_store(graph_name);
+                let read = self.vector_read_view(&store);
+                let Some(node) = read.get_node(*node_id) else {
+                    return Ok(());
+                };
+                let mut properties: Vec<String> = Vec::new();
+                for (key, _) in store.vector_index_entries() {
+                    if let Some((label, property)) = key.split_once(':')
+                        && node.labels.iter().any(|l| l.as_str() == label)
+                        && !properties.iter().any(|p| p == property)
+                    {
+                        properties.push(property.to_string());
+                    }
+                }
+                for property in properties {
+                    self.apply_vector_intent(&VectorIndexIntent::Upsert {
+                        graph_name: graph_name.clone(),
+                        node_id: *node_id,
+                        property,
+                    })?;
+                }
+            }
+            VectorIndexIntent::RemoveLabel {
+                graph_name,
+                node_id,
+                label,
+            } => {
+                let store = self.resolve_store(graph_name);
+                let read = self.vector_read_view(&store);
+                let prefix = format!("{label}:");
+                for (key, index) in store.vector_index_entries() {
+                    if let Some(property) = key.strip_prefix(&prefix)
+                        && index.contains(*node_id)
+                    {
+                        let accessor = self.intent_vector_accessor(&store, read, label, property);
+                        index.remove_with_accessor(*node_id, &accessor);
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Turns the operators' recorded node mutations into vector-index
+    /// intents (AMH #187): applied now outside a transaction, at commit
+    /// inside one, dropped on rollback.
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    fn flush_recorded_vector_changes(&self) -> Result<()> {
+        let changes = std::mem::take(&mut *self.vector_recorder.changes.lock());
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let graph_name = self.active_graph_storage_key();
+        for change in changes {
+            let graph_name = graph_name.clone();
+            let intent = match change {
+                RecordedVectorChange::Property(node_id, property) => VectorIndexIntent::Upsert {
+                    graph_name,
+                    node_id,
+                    property,
+                },
+                RecordedVectorChange::Reindex(node_id) => VectorIndexIntent::Reindex {
+                    graph_name,
+                    node_id,
+                },
+                RecordedVectorChange::LabelRemoved(node_id, label) => {
+                    VectorIndexIntent::RemoveLabel {
+                        graph_name,
+                        node_id,
+                        label,
+                    }
+                }
+                RecordedVectorChange::Deleted(node_id) => VectorIndexIntent::Delete {
+                    graph_name,
+                    node_id,
+                },
+            };
+            self.push_vector_intent(intent)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "lpg", feature = "vector-index")))]
+    fn flush_recorded_vector_changes(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Drops recorded node mutations of a failed statement (AMH #187).
+    fn clear_recorded_vector_changes(&self) {
+        #[cfg(all(feature = "lpg", feature = "vector-index"))]
+        self.vector_recorder.changes.lock().clear();
+    }
+
+    /// The recorder handed to planners and query processors (AMH #187).
+    #[cfg(all(feature = "lpg", feature = "vector-index"))]
+    fn shared_vector_recorder(
+        &self,
+    ) -> grafeo_core::execution::operators::SharedVectorIndexRecorder {
+        Arc::clone(&self.vector_recorder)
+            as grafeo_core::execution::operators::SharedVectorIndexRecorder
     }
 
     /// Accessor for vector-intent maintenance: `read` (the merged view)
@@ -5467,6 +5651,11 @@ impl Session {
         .with_catalog(Arc::clone(&self.catalog))
         .with_session_context(session_context)
         .with_read_only(read_only);
+
+        #[cfg(all(feature = "lpg", feature = "vector-index"))]
+        {
+            planner = planner.with_vector_recorder(self.shared_vector_recorder());
+        }
 
         // Attach the LPG store so CALL grafeo.search.* procedures can reach
         // HNSW / BM25 indexes. Skip when the session is backed by an external
@@ -5795,6 +5984,44 @@ impl Session {
             })?;
 
             Ok(())
+        })
+    }
+
+    /// Removes a node property within the active transaction context,
+    /// keeping vector indexes in step. Returns whether a value was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write is refused (poisoned WAL, conflict).
+    #[cfg(feature = "lpg")]
+    pub fn remove_node_property(&self, id: NodeId, key: &str) -> Result<bool> {
+        let store = self.direct_store();
+        self.with_direct_write(&store, || {
+            let (_, transaction_id) = self.get_transaction_context();
+            #[cfg(feature = "vector-index")]
+            let vector_intent = self.active_graph_storage_key();
+            if let Some(tid) = transaction_id {
+                self.transaction_manager.record_write(tid, id)?;
+            }
+            let removed = store
+                .remove_node_property(id, key, transaction_id)
+                .is_some();
+            #[cfg(feature = "wal")]
+            if removed {
+                self.log_direct_wal_record(&grafeo_storage::wal::WalRecord::RemoveNodeProperty {
+                    id,
+                    key: key.to_string(),
+                });
+            }
+            #[cfg(feature = "vector-index")]
+            if removed {
+                self.push_vector_intent(VectorIndexIntent::Upsert {
+                    graph_name: vector_intent,
+                    node_id: id,
+                    property: key.to_string(),
+                })?;
+            }
+            Ok(removed)
         })
     }
 

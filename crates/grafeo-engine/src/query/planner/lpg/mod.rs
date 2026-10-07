@@ -199,6 +199,9 @@ pub struct Planner {
     profile_entries: std::cell::RefCell<Vec<crate::query::profile::ProfileEntry>>,
     /// Optional write tracker for recording writes during mutations.
     write_tracker: Option<grafeo_core::execution::operators::SharedWriteTracker>,
+    /// Optional recorder of vector-index-relevant node mutations (AMH #187).
+    pub(super) vector_recorder:
+        Option<grafeo_core::execution::operators::SharedVectorIndexRecorder>,
     /// Session context for introspection functions (info, schema, current_schema, etc.).
     pub(super) session_context: grafeo_core::execution::operators::SessionContext,
     /// When true, expand operators use epoch-only visibility (no MVCC version
@@ -245,6 +248,7 @@ impl Planner {
             profiling: std::cell::Cell::new(false),
             profile_entries: std::cell::RefCell::new(Vec::new()),
             write_tracker: None,
+            vector_recorder: None,
             session_context: grafeo_core::execution::operators::SessionContext::default(),
             read_only: false,
             limit_hint: std::cell::Cell::new(None),
@@ -291,10 +295,22 @@ impl Planner {
             profiling: std::cell::Cell::new(false),
             profile_entries: std::cell::RefCell::new(Vec::new()),
             write_tracker,
+            vector_recorder: None,
             session_context: grafeo_core::execution::operators::SessionContext::default(),
             read_only: false,
             limit_hint: std::cell::Cell::new(None),
         }
+    }
+
+    /// Attaches the recorder that lets the session maintain vector indexes
+    /// after query-language node mutations (AMH #187).
+    #[must_use]
+    pub fn with_vector_recorder(
+        mut self,
+        recorder: grafeo_core::execution::operators::SharedVectorIndexRecorder,
+    ) -> Self {
+        self.vector_recorder = Some(recorder);
+        self
     }
 
     /// Marks this planner as planning a read-only query (no mutations),

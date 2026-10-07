@@ -154,6 +154,8 @@ pub struct CreateNodeOperator {
     validator: Option<Arc<dyn ConstraintValidator>>,
     /// Optional write tracker for conflict detection.
     write_tracker: Option<SharedWriteTracker>,
+    /// Optional vector index recorder (AMH #187).
+    vector_recorder: Option<super::SharedVectorIndexRecorder>,
 }
 
 /// Source for a property value.
@@ -265,6 +267,7 @@ impl CreateNodeOperator {
             transaction_id: None,
             validator: None,
             write_tracker: None,
+            vector_recorder: None,
         }
     }
 
@@ -288,6 +291,12 @@ impl CreateNodeOperator {
     /// Sets the write tracker for conflict detection.
     pub fn with_write_tracker(mut self, tracker: SharedWriteTracker) -> Self {
         self.write_tracker = Some(tracker);
+        self
+    }
+
+    /// Records vector-index-relevant mutations (AMH #187).
+    pub fn with_vector_recorder(mut self, recorder: super::SharedVectorIndexRecorder) -> Self {
+        self.vector_recorder = Some(recorder);
         self
     }
 }
@@ -371,6 +380,13 @@ impl Operator for CreateNodeOperator {
 
                     // Validate and set properties
                     self.validate_and_set_properties(node_id, &mut resolved_props)?;
+                    if let Some(recorder) = &self.vector_recorder
+                        && resolved_props
+                            .iter()
+                            .any(|(_, v)| matches!(v, Value::Vector(_)))
+                    {
+                        recorder.node_reindex(node_id);
+                    }
 
                     // Copy input columns to output
                     for col_idx in 0..chunk.column_count() {
@@ -432,6 +448,13 @@ impl Operator for CreateNodeOperator {
 
             // Validate and set properties
             self.validate_and_set_properties(node_id, &mut resolved_props)?;
+            if let Some(recorder) = &self.vector_recorder
+                && resolved_props
+                    .iter()
+                    .any(|(_, v)| matches!(v, Value::Vector(_)))
+            {
+                recorder.node_reindex(node_id);
+            }
 
             // Build output chunk with just the node ID
             let mut builder = DataChunkBuilder::with_capacity(&self.output_schema, 1);
@@ -738,6 +761,8 @@ pub struct DeleteNodeOperator {
     transaction_id: Option<TransactionId>,
     /// Optional write tracker for conflict detection.
     write_tracker: Option<SharedWriteTracker>,
+    /// Optional vector index recorder (AMH #187).
+    vector_recorder: Option<super::SharedVectorIndexRecorder>,
 }
 
 /// Fails a DELETE whose store call removed nothing although the node is
@@ -807,6 +832,7 @@ impl DeleteNodeOperator {
             viewing_epoch: None,
             transaction_id: None,
             write_tracker: None,
+            vector_recorder: None,
         }
     }
 
@@ -824,6 +850,12 @@ impl DeleteNodeOperator {
     /// Sets the write tracker for conflict detection.
     pub fn with_write_tracker(mut self, tracker: SharedWriteTracker) -> Self {
         self.write_tracker = Some(tracker);
+        self
+    }
+
+    /// Records vector-index-relevant mutations (AMH #187).
+    pub fn with_vector_recorder(mut self, recorder: super::SharedVectorIndexRecorder) -> Self {
+        self.vector_recorder = Some(recorder);
         self
     }
 }
@@ -893,6 +925,9 @@ impl Operator for DeleteNodeOperator {
 
                 // Delete the node with MVCC versioning
                 let deleted = self.store.delete_node_versioned(node_id, epoch, tx);
+                if deleted && let Some(recorder) = &self.vector_recorder {
+                    recorder.node_deleted(node_id);
+                }
 
                 // Record write for conflict detection
                 if let (Some(tracker), Some(tid)) = (&self.write_tracker, self.transaction_id) {
@@ -1087,6 +1122,8 @@ pub struct AddLabelOperator {
     transaction_id: Option<TransactionId>,
     /// Optional write tracker for conflict detection.
     write_tracker: Option<SharedWriteTracker>,
+    /// Optional vector index recorder (AMH #187).
+    vector_recorder: Option<super::SharedVectorIndexRecorder>,
 }
 
 impl AddLabelOperator {
@@ -1109,6 +1146,7 @@ impl AddLabelOperator {
             viewing_epoch: None,
             transaction_id: None,
             write_tracker: None,
+            vector_recorder: None,
         }
     }
 
@@ -1126,6 +1164,12 @@ impl AddLabelOperator {
     /// Sets the write tracker for conflict detection.
     pub fn with_write_tracker(mut self, tracker: SharedWriteTracker) -> Self {
         self.write_tracker = Some(tracker);
+        self
+    }
+
+    /// Records vector-index-relevant mutations (AMH #187).
+    pub fn with_vector_recorder(mut self, recorder: super::SharedVectorIndexRecorder) -> Self {
+        self.vector_recorder = Some(recorder);
         self
     }
 }
@@ -1171,6 +1215,9 @@ impl Operator for AddLabelOperator {
                     };
                     if added {
                         row_count += 1;
+                        if let Some(recorder) = &self.vector_recorder {
+                            recorder.node_reindex(node_id);
+                        }
                     }
                 }
 
@@ -1232,6 +1279,8 @@ pub struct RemoveLabelOperator {
     transaction_id: Option<TransactionId>,
     /// Optional write tracker for conflict detection.
     write_tracker: Option<SharedWriteTracker>,
+    /// Optional vector index recorder (AMH #187).
+    vector_recorder: Option<super::SharedVectorIndexRecorder>,
 }
 
 impl RemoveLabelOperator {
@@ -1254,6 +1303,7 @@ impl RemoveLabelOperator {
             viewing_epoch: None,
             transaction_id: None,
             write_tracker: None,
+            vector_recorder: None,
         }
     }
 
@@ -1271,6 +1321,12 @@ impl RemoveLabelOperator {
     /// Sets the write tracker for conflict detection.
     pub fn with_write_tracker(mut self, tracker: SharedWriteTracker) -> Self {
         self.write_tracker = Some(tracker);
+        self
+    }
+
+    /// Records vector-index-relevant mutations (AMH #187).
+    pub fn with_vector_recorder(mut self, recorder: super::SharedVectorIndexRecorder) -> Self {
+        self.vector_recorder = Some(recorder);
         self
     }
 }
@@ -1316,6 +1372,9 @@ impl Operator for RemoveLabelOperator {
                     };
                     if removed {
                         row_count += 1;
+                        if let Some(recorder) = &self.vector_recorder {
+                            recorder.label_removed(node_id, label);
+                        }
                     }
                 }
 
@@ -1388,6 +1447,8 @@ pub struct SetPropertyOperator {
     transaction_id: Option<TransactionId>,
     /// Optional write tracker for conflict detection.
     write_tracker: Option<SharedWriteTracker>,
+    /// Optional vector index recorder (AMH #187).
+    vector_recorder: Option<super::SharedVectorIndexRecorder>,
 }
 
 impl SetPropertyOperator {
@@ -1413,6 +1474,7 @@ impl SetPropertyOperator {
             viewing_epoch: None,
             transaction_id: None,
             write_tracker: None,
+            vector_recorder: None,
         }
     }
 
@@ -1438,6 +1500,7 @@ impl SetPropertyOperator {
             viewing_epoch: None,
             transaction_id: None,
             write_tracker: None,
+            vector_recorder: None,
         }
     }
 
@@ -1482,6 +1545,12 @@ impl SetPropertyOperator {
     /// Sets the write tracker for conflict detection.
     pub fn with_write_tracker(mut self, tracker: SharedWriteTracker) -> Self {
         self.write_tracker = Some(tracker);
+        self
+    }
+
+    /// Records vector-index-relevant mutations (AMH #187).
+    pub fn with_vector_recorder(mut self, recorder: super::SharedVectorIndexRecorder) -> Self {
+        self.vector_recorder = Some(recorder);
         self
     }
 }
@@ -1550,6 +1619,22 @@ impl Operator for SetPropertyOperator {
                         }
                     }
                 }
+
+                // Vector-index-relevant node writes (AMH #187): a map
+                // assignment may touch any indexed property; a single
+                // property matters when it becomes a vector or is removed.
+                let vector_events: Option<(bool, Vec<String>)> =
+                    (!self.is_edge && self.vector_recorder.is_some()).then(|| {
+                        let whole = resolved_props.iter().any(|(name, _)| name == "*");
+                        let props = resolved_props
+                            .iter()
+                            .filter(|(name, v)| {
+                                name != "*" && (matches!(v, Value::Vector(_)) || v.is_null())
+                            })
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        (whole, props)
+                    });
 
                 // Write all properties (use versioned methods when inside a transaction)
                 let tx_id = self.transaction_id;
@@ -1679,6 +1764,17 @@ impl Operator for SetPropertyOperator {
                     } else {
                         self.store
                             .set_node_property(NodeId(entity_id), &prop_name, value);
+                    }
+                }
+                if let (Some((whole, props)), Some(recorder)) =
+                    (vector_events, &self.vector_recorder)
+                {
+                    let id = NodeId(entity_id);
+                    if whole {
+                        recorder.node_reindex(id);
+                    }
+                    for property in &props {
+                        recorder.property_changed(id, property);
                     }
                 }
 
