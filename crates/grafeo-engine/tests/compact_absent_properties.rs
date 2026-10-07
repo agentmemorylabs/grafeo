@@ -466,7 +466,7 @@ fn compact_refuses_list_and_map_values() {
     }
 }
 
-/// Review r1 must-fix 2: the lazy range reader of a CompactStore rechecks
+/// Review r1 must-fix 2: the lazy range reader of a `CompactStore` rechecks
 /// each candidate on its stored value, as the eager one does: an absent row
 /// and a present-null row hold a placeholder body (`0`, `""`, `false`) and
 /// must not match; a genuinely stored `0`/`""`/`false` must.
@@ -560,7 +560,7 @@ mod range_parity {
         }
     }
 
-    /// v5: a compacted single file, after compact() and after reopen.
+    /// v5: a compacted single file, after `compact()` and after reopen.
     #[cfg(feature = "grafeo-file")]
     #[test]
     fn eager_and_lazy_ranges_agree_on_a_compact_file() {
@@ -688,7 +688,7 @@ fn audit_reports_stored_defaults_and_edge_drift() {
 
     // A swapped target, and swapped properties, against the baseline.
     for wrong in [baseline(real, real, 1), baseline(real, zero, 2)] {
-        let audit = db.audit_fabricated_defaults(&["Unit"], &[], &[wrong.clone()]);
+        let audit = db.audit_fabricated_defaults(&["Unit"], &[], std::slice::from_ref(&wrong));
         assert!(audit.empty_strings.is_empty(), "no audited string keys");
         assert_eq!(audit.edge_mismatches.len(), 1, "{wrong:?}");
         assert_eq!(audit.edge_mismatches[0].expected, wrong);
@@ -726,7 +726,7 @@ fn edge(
 /// Review r1 coverage: edge identity across several edge types and label
 /// pairs, a self loop and parallel edges with different properties, and
 /// explicit `Null`s in every supported column family (nodes and edges),
-/// through compact(), overlay writes and a second compact() (base plus
+/// through `compact()`, overlay writes and a second `compact()` (base plus
 /// overlay), then a generation build from that base.
 #[test]
 fn identity_and_nulls_survive_compact_recompact_and_generation() {

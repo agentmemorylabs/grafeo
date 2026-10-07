@@ -757,7 +757,8 @@ impl CompactStore {
     /// The one row reader for node rows: point reads and every generation
     /// row source go through it. `NodeTable::get_all_properties` decodes the
     /// placeholder body of an absent cell (`""`, `0`, a zero vector) as if it
-    /// were stored, so it must not feed a row.
+    /// were stored and skips a null cell without a body value, so it must not
+    /// feed a row.
     pub(crate) fn node_row_properties(
         &self,
         nt: &NodeTable,
@@ -767,10 +768,13 @@ impl CompactStore {
         let Ok(row_u32) = u32::try_from(row) else {
             return props;
         };
-        for (key, raw) in nt.get_all_properties(row) {
-            if let Some(value) = self.get_property_filtered(nt.table_id(), row_u32, &key, Some(raw))
-            {
-                props.insert(key, value);
+        // Every column, not only those whose body decodes a value here: a
+        // present-null cell may have no body value, and its null companion
+        // says it is there.
+        for key in nt.columns().keys() {
+            let raw = nt.get_property(row, key);
+            if let Some(value) = self.get_property_filtered(nt.table_id(), row_u32, key, raw) {
+                props.insert(key.clone(), value);
             }
         }
         props
@@ -790,9 +794,10 @@ impl CompactStore {
             return props;
         };
         let column_table = graph_store_impl::rel_column_table_id(rel_table_id);
-        for (key, raw) in rt.get_all_edge_properties(pos) {
-            if let Some(value) = self.get_property_filtered(column_table, pos_u32, &key, Some(raw))
-            {
+        // Every column, as for nodes.
+        for key in rt.property_keys() {
+            let raw = rt.get_edge_property(pos, &key);
+            if let Some(value) = self.get_property_filtered(column_table, pos_u32, &key, raw) {
                 props.insert(key, value);
             }
         }
