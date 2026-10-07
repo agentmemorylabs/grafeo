@@ -233,8 +233,12 @@ mod imp {
             let mmap_storage = match MmapStorage::create_new(&spill_file, dims) {
                 Ok(storage) => storage,
                 Err(e) => {
-                    // Unlink any truncated file the failed create left behind.
-                    let _ = std::fs::remove_file(&spill_file);
+                    // Unlink a partial file the failed create left behind,
+                    // but never a file that already existed: `create_new`
+                    // refused it, so it belongs to someone else.
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        let _ = std::fs::remove_file(&spill_file);
+                    }
                     restore(store, &vectors, &restored);
                     return Err(Error::Internal(format!(
                         "spill_vector_column_to_disk {key}: create {}: {e}",

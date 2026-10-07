@@ -267,6 +267,9 @@ pub struct VectorIndexConsumer {
     /// Map of "label:property" -> MmapStorage for spilled indexes.
     /// Shared with the search path so `SpillableVectorAccessor` can read.
     pub(crate) spilled: Arc<RwLock<HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>>>,
+    /// Spill files whose vectors were restored inline but which could not be
+    /// unlinked. Cleanup-only: never consulted for reads (AMH #167 review).
+    stale_files: parking_lot::Mutex<Vec<PathBuf>>,
 }
 
 #[cfg(all(
@@ -285,6 +288,7 @@ impl VectorIndexConsumer {
             store: Arc::downgrade(store),
             spill_path,
             spilled: Arc::new(RwLock::new(HashMap::new())),
+            stale_files: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -304,6 +308,7 @@ impl VectorIndexConsumer {
             store: Arc::downgrade(store),
             spill_path,
             spilled,
+            stale_files: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -510,7 +515,6 @@ impl MemoryConsumer for VectorIndexConsumer {
             exported.push((key.clone(), PropertyKey::new(property), vectors));
         }
 
-        let mut unlink_failures = Vec::new();
         for (key, prop_key, vectors) in exported {
             store.restore_node_property_column(
                 &prop_key,
@@ -518,24 +522,26 @@ impl MemoryConsumer for VectorIndexConsumer {
                     .into_iter()
                     .map(|(id, vec_data)| (id, Value::Vector(vec_data))),
             );
-            // The values are inline again. Drop the registry entry only once
-            // its file is gone. Spill files are never reused (unique names,
-            // `create_new`), and a kept entry is harmless: inline values win
-            // on every read path.
-            let path = spilled.get(&key).map(|s| s.path().to_path_buf());
-            match path.map(std::fs::remove_file) {
-                Some(Ok(())) | None => {
-                    spilled.remove(&key);
+            // The values are inline again, so the spill entry stops being an
+            // authority NOW, whether or not its file can be unlinked: a kept
+            // entry would let readers (and a later reload or handoff fill)
+            // resurrect a vector that a WAL-logged removal deleted inline.
+            // A file that can't be unlinked goes on a cleanup-only list.
+            if let Some(storage) = spilled.remove(&key) {
+                let path = storage.path().to_path_buf();
+                if let Err(e) = std::fs::remove_file(&path) {
+                    grafeo_common::grafeo_warn!(
+                        "vector spill reload {key}: could not remove {}: {e}; kept for cleanup",
+                        path.display()
+                    );
+                    self.stale_files.lock().push(path);
                 }
-                Some(Err(e)) => unlink_failures.push(format!("{key}: {e}")),
             }
         }
-        if !unlink_failures.is_empty() {
-            return Err(SpillError::IoError(format!(
-                "reload restored the vectors but could not remove spill file(s): {}",
-                unlink_failures.join("; ")
-            )));
-        }
+        // Retry earlier failed unlinks (cleanup only; never read).
+        self.stale_files
+            .lock()
+            .retain(|path| std::fs::remove_file(path).is_err() && path.exists());
         Ok(())
     }
 }

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use grafeo_common::storage::{SectionType, TierOverride};
 use grafeo_common::types::{NodeId, PropertyKey, Value};
-use grafeo_core::graph::traits::GraphStore as _;
+use grafeo_core::graph::traits::GraphStore;
 use grafeo_engine::{Config, GrafeoDB, IndexedVectorRead, generation_build_request};
 use tempfile::tempdir;
 
@@ -229,14 +229,15 @@ fn respill_after_freeze_does_not_reuse_the_frozen_file() {
     assert_inline(&db, &expected, "after re-spill during the build");
 }
 
-/// Must-fix 3, failed unlink: the reload restores inline values, keeps the
-/// registry entry and reports the error; the handoff still publishes the
-/// right vectors (inline wins), and no file is reused.
+/// Round 3: a reload whose unlink fails still drops the spill entry (the
+/// file goes on a cleanup-only list), so a WAL-logged removal after it is not
+/// resurrected by reads, by a retried reload, or by the handoff fill.
 #[cfg(unix)]
 #[test]
-fn reload_with_failed_unlink_keeps_the_registry_and_publishes_correctly() {
+fn removal_after_a_failed_unlink_reload_stays_removed() {
     use std::os::unix::fs::PermissionsExt;
     let (r, expected) = root_with_overlay(5, &["Doc"]);
+    let (removed, _) = expected[0].clone();
     {
         let db = GrafeoDB::open_generation_root_with_config(force_disk(&r.root, &r.spill)).unwrap();
         let files = spill_files(&r.spill);
@@ -244,22 +245,44 @@ fn reload_with_failed_unlink_keeps_the_registry_and_publishes_correctly() {
         std::fs::set_permissions(&r.spill, std::fs::Permissions::from_mode(0o555)).unwrap();
         let reload = db.prepare_vector_mutation();
         std::fs::set_permissions(&r.spill, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if reload.is_ok() {
+        reload.expect("reload restores inline even when the unlink fails");
+        if spill_files(&r.spill).is_empty() {
             // Running as root ignores directory permissions; nothing to test.
             eprintln!("skipping: unlink was not refused (running as root?)");
             return;
         }
-        assert_eq!(
-            spill_files(&r.spill),
-            files,
-            "file kept after failed unlink"
+        assert_eq!(spill_files(&r.spill), files, "file kept for cleanup only");
+
+        assert!(
+            db.remove_node_property(removed, "embedding"),
+            "inline value removed"
         );
+        let gone = |db: &GrafeoDB, what: &str| {
+            assert!(
+                matches!(
+                    db.read_indexed_node_vector("Doc", "embedding", removed),
+                    Ok(IndexedVectorRead::Absent)
+                ),
+                "{what}: removed vector came back"
+            );
+        };
+        gone(&db, "after removal");
+        db.prepare_vector_mutation().expect("retried reload");
+        gone(&db, "after a retried reload");
+
         let report = db
             .run_epoch_handoff(generation_build_request(&r.root, "g2"))
             .unwrap();
         db.publish_and_install_handoff(report).unwrap();
+        gone(&db, "after handoff install");
         db.close().unwrap();
     }
     let db = GrafeoDB::open_generation_root(&r.root, false).unwrap();
-    assert_inline(&db, &expected, "after failed unlink + handoff");
+    assert!(
+        db.graph_store()
+            .get_node_property(removed, &PropertyKey::new("embedding"))
+            .is_none(),
+        "reopened base must be vectorless for the removed node"
+    );
+    assert_inline(&db, &expected[1..], "other vectors kept");
 }
