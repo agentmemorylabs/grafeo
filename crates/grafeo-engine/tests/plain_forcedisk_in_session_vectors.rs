@@ -217,6 +217,13 @@ fn run(quantization: Option<&str>) {
 
     let db = GrafeoDB::with_config(force_disk(&path, &spill)).unwrap();
     assert_all_found(&db, &nodes, "after ForceDisk reopen");
+    // Repair path for graphs damaged before the fix: a rebuild under
+    // ForceDisk (spilled column) keeps the index's quantization and finds
+    // every node.
+    let mode = db.vector_index_quantization("Doc", "embedding");
+    db.rebuild_vector_index("Doc", "embedding").unwrap();
+    assert_eq!(db.vector_index_quantization("Doc", "embedding"), mode);
+    assert_all_found(&db, &nodes, "after ForceDisk rebuild");
     db.close().unwrap();
     drop(db);
 
