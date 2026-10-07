@@ -675,9 +675,7 @@ impl CompactStore {
     /// The installed presence and null companion segment bodies, for writers
     /// that persist the store (they use this store's column numbering).
     #[must_use]
-    pub(crate) fn column_companion_bodies(
-        &self,
-    ) -> (Option<&bytes::Bytes>, Option<&bytes::Bytes>) {
+    pub(crate) fn column_companion_bodies(&self) -> (Option<&bytes::Bytes>, Option<&bytes::Bytes>) {
         (self.presence_body.as_ref(), self.null_body.as_ref())
     }
 
@@ -793,7 +791,8 @@ impl CompactStore {
         };
         let column_table = graph_store_impl::rel_column_table_id(rel_table_id);
         for (key, raw) in rt.get_all_edge_properties(pos) {
-            if let Some(value) = self.get_property_filtered(column_table, pos_u32, &key, Some(raw)) {
+            if let Some(value) = self.get_property_filtered(column_table, pos_u32, &key, Some(raw))
+            {
                 props.insert(key, value);
             }
         }
