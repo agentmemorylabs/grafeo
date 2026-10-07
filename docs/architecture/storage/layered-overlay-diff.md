@@ -197,15 +197,12 @@ on the diff row.
   - Pinned by `force_disk_reopen_keeps_a_diff_row_vector` (generation root) and
     `force_disk_open_keeps_a_diff_row_vector` (compact file; an overlay-only node spills, the diff row stays),
     both with exact indexed reads and ANN.
-- **Batch-create HNSW inserts (interim, with slice 4).** `GrafeoDB::batch_create_nodes` and
-  `batch_create_nodes_with_props` (`crud.rs`) build their insert accessor over the overlay `LpgStore`, so a new
-  node's neighbour candidates among base nodes have no readable vector. That was already true of clean base nodes;
-  D10 extends it to base nodes with a non-vector write. `add_node_label` reads through the merged view since this
-  PR. Routing the batch paths the same way belongs with the planner merge (slice 4) and AMH #174 (lane 3).
-  Non-worsening check: `batch_creates_after_base_writes_search_like_a_clean_base` (with every base node touched,
-  both batch paths give exactly the clean-base search results: nearest hit and reachable set per query). It does
-  not measure recall at scale. **Pre-existing, not D10:** over a clean base, a base node's query reaches only the 6
-  base nodes, not the 6 batch-created ones, because the inserts could not read any base neighbour (AMH #174 class).
+- **Batch-create HNSW inserts.** `GrafeoDB::batch_create_nodes` and `batch_create_nodes_with_props` (`crud.rs`), like
+  every write-side insert since fork #45 (AMH #175), read neighbour vectors through the merged view plus the spill
+  registry (`build_vector_accessor`), so a base node's inherited embedding is readable with or without a diff row.
+  Before #45 they read the overlay alone, and on a generation root a batch-created node was never found by vector
+  search. Pinned by `batch_creates_over_base_diff_rows_are_searchable` (clean and touched base; every node its own
+  nearest neighbour and reachable from every query).
 
 ### 5.6 Visibility and history
 `is_*_visible_*` and `filter_visible_*` are unchanged, since visibility comes from the diff row.
@@ -227,7 +224,7 @@ Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1
 | Vector spill consumers | skip diff rows (§5.5) |
 | `GrafeoDB::get_{node,edge}_at_epoch`, `get_{node,edge}_history`; `Session::get_{node,edge}_history` | read through the layered view (§5.6) |
 | `GrafeoDB::get_{node,edge}_property_at_epoch` / property history (`temporal`-only) | still read overlay entries: a diff row's per-property history lacks the base's epoch-0 values. Not in AMH's feature set; **slice 4** |
-| `GrafeoDB::batch_create_nodes`, `batch_create_nodes_with_props` HNSW insert accessors | **interim, with slice 4**: overlay-only neighbour reads (§5.5) |
+| `GrafeoDB::batch_create_nodes`, `batch_create_nodes_with_props` HNSW insert accessors | merged view plus spill since fork #45 (§5.5) |
 | `LayeredStore::vector_search` (planner / `GraphStoreSearch` path) | **interim gap, slice 4**: forwards to the overlay `LpgStore` with an overlay-only accessor. A base node with a diff row is now invisible there, as a clean base node already was. DB-level `vector_search` and `read_indexed_node_vector` use the merged accessor and are unaffected (§5.5) |
 | `export_snapshot`, `iter_nodes`, `save` (`persistence.rs`) | already miss base rows entirely on a layered DB (pre-existing). Unchanged; listed so nobody relies on them. |
 | `LpgStore::find_nodes_by_property` on a mapped index, `property_index_snapshot_entries` | keep diff rows only if the overlay value matches. `LayeredStore` never relies on them (it verifies mapped candidates itself), and generation writers rebuild postings from the layered graph. Direct overlay callers should not use them on a layered store. |
@@ -322,8 +319,7 @@ Slices 1–3 ship together as fork PR #40, against `fix/root-mount-covers-nested
    - **Unchanged:** already-dirty endpoints keep their journal touch and post-freeze record.
    - **Also:** `GrafeoDB::validate` checks overlay edge endpoints through the merged view.
 4. **Vector search merge:** the explicit overlay flat scan of §5.5, shared with the per-tier vector work (DESIGN §5),
-   plus the batch-create insert accessors (§5.5) and merged per-property `temporal` history (§5.7). After lane 3's
-   AMH #174 fix, rebased on it.
+   plus merged per-property `temporal` history (§5.7). After lane 3's AMH #174 fix, rebased on it.
 
 ## 10. Test plan
 
@@ -345,7 +341,7 @@ Slices 1–3 ship together as fork PR #40, against `fix/root-mount-covers-nested
   - the tier drain refuses a non-empty base;
   - a ForceDisk reopen keeps a diff row's new vector;
   - rollback of an inherited text property restores its document (full, savepoint, onto a committed diff);
-  - batch creates after base writes search exactly like over a clean base (interim non-worsening check);
+  - batch creates over base diff rows are searchable (every node its own nearest neighbour, all reachable);
   - the cost measurements (property update, relation).
 - **`tests/layered_overlay_diff_compact_file.rs`** (3 tests + 1 ignored): the pre-D10 fixture, the same scenario
   written by this binary, and a compact-file ForceDisk open; the ignored one pins the pre-existing `compact()`

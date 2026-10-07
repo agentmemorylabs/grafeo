@@ -1343,27 +1343,25 @@ fn rollback_of_an_inherited_text_property_restores_its_document() {
     assert_text(&db, &["e1", "e2"], &["e0"], "rollback of the REMOVE");
 }
 
-/// Interim (slice 4 / AMH #174): the batch-create HNSW inserts
-/// (`GrafeoDB::batch_create_nodes`, `batch_create_nodes_with_props`) read
-/// neighbour vectors through the overlay alone. A clean base node's vector
-/// was never readable there; D10 adds base nodes with a non-vector write,
-/// whose diff rows no longer carry the embedding.
-///
-/// Non-worsening check: with every base node touched, both batch paths give
-/// exactly the search results they give over a clean base: per query, the
-/// nearest hit and the set of reachable nodes. Not asserted, because it
-/// already fails over a clean base (pre-existing, AMH #174 class): that a
-/// batch-created node is found at all. The insert cannot read any base
-/// neighbour's vector, so the new node is never linked into the graph.
+/// Batch creates on a generation root whose base nodes have diff rows. The
+/// batch HNSW inserts (`GrafeoDB::batch_create_nodes`,
+/// `batch_create_nodes_with_props`) read neighbour vectors through the merged
+/// view (fork #45), so a base node's inherited embedding is readable whether
+/// or not it has a diff row. Over a clean and over a touched base, every
+/// node, base or batch-created, is the nearest neighbour of its own vector
+/// and reachable from every query. (Before #45 the inserts read the overlay
+/// alone and batch-created nodes were never found.) The batch vectors are
+/// orthogonal, so no two nodes tie for nearest under cosine.
 #[cfg(feature = "vector-index")]
 #[test]
-fn batch_creates_after_base_writes_search_like_a_clean_base() {
+fn batch_creates_over_base_diff_rows_are_searchable() {
     const BASE: usize = 6;
     let as_f32 = |v: Value| match v {
         Value::Vector(v) => v.to_vec(),
         other => panic!("{other:?}"),
     };
-    let run = |touched: bool| {
+    let axis = |k: usize| -> Vec<f32> { (0..DIMS).map(|d| f32::from(u8::from(d == k))).collect() };
+    for touched in [false, true] {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("batch.grafeo.d");
         publish_with(&root, BASE, DIMS, true);
@@ -1372,57 +1370,47 @@ fn batch_creates_after_base_writes_search_like_a_clean_base() {
             db.execute_cypher("MATCH (m:MemoryEntity) SET m.observations_json = 'touched'")
                 .expect("touch every base node");
         }
-        let mut nodes: Vec<(String, Vec<f32>)> = (0..BASE)
-            .map(|i| (format!("e{i}"), as_f32(vector(i, DIMS))))
+        let mut nodes: Vec<(NodeId, Vec<f32>)> = (0..BASE)
+            .map(|i| (id_of(&db, &format!("e{i}")), as_f32(vector(i, DIMS))))
             .collect();
-        let plain: Vec<Vec<f32>> = (0..3).map(|i| as_f32(vector(40 + 7 * i, DIMS))).collect();
+        let plain: Vec<Vec<f32>> = (0..3).map(axis).collect();
         let ids = db.batch_create_nodes("MemoryEntity", "embedding", plain.clone());
         assert_eq!(ids.len(), 3, "batch_create_nodes");
-        nodes.extend((0..3).map(|i| (format!("b{i}"), plain[i].clone())));
-        let named = |id: NodeId| {
-            if let Some(Value::String(n)) = prop(&db, id, "name") {
-                n.to_string()
-            } else {
-                let i = ids.iter().position(|b| *b == id).expect("a batch node");
-                format!("b{i}")
-            }
-        };
-        let with_props: Vec<Vec<f32>> = (0..3).map(|i| as_f32(vector(80 + 7 * i, DIMS))).collect();
-        let created = db.batch_create_nodes_with_props(
+        nodes.extend(ids.into_iter().zip(plain));
+        let with_props: Vec<Vec<f32>> = (3..6).map(axis).collect();
+        let ids = db.batch_create_nodes_with_props(
             "MemoryEntity",
             with_props
                 .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    [
-                        (PropertyKey::new("name"), Value::from(format!("p{i}"))),
-                        (
-                            PropertyKey::new("embedding"),
-                            Value::Vector(v.clone().into()),
-                        ),
-                    ]
+                .map(|v| {
+                    [(
+                        PropertyKey::new("embedding"),
+                        Value::Vector(v.clone().into()),
+                    )]
                     .into_iter()
                     .collect()
                 })
                 .collect(),
         );
-        assert_eq!(created.len(), 3, "batch_create_nodes_with_props");
-        nodes.extend((0..3).map(|i| (format!("p{i}"), with_props[i].clone())));
-        nodes
-            .iter()
-            .map(|(name, v)| {
-                let hits = db
-                    .vector_search("MemoryEntity", "embedding", v, nodes.len(), Some(64), None)
-                    .expect("vector search");
-                let mut reachable: Vec<String> = hits.iter().map(|(id, _)| named(*id)).collect();
-                let nearest = reachable.first().cloned();
-                reachable.sort();
-                (name.clone(), nearest, reachable)
-            })
-            .collect::<Vec<_>>()
-    };
-    let clean = run(false);
-    let touched = run(true);
-    eprintln!("batch creates over a clean base, per query (name, nearest, reachable): {clean:?}");
-    assert_eq!(touched, clean, "a touched base searches like a clean one");
+        assert_eq!(ids.len(), 3, "batch_create_nodes_with_props");
+        nodes.extend(ids.into_iter().zip(with_props));
+        let mut all: Vec<NodeId> = nodes.iter().map(|(id, _)| *id).collect();
+        all.sort();
+        for (id, v) in &nodes {
+            let hits = db
+                .vector_search("MemoryEntity", "embedding", v, nodes.len(), Some(64), None)
+                .expect("vector search");
+            assert_eq!(
+                hits.first().map(|(hit, _)| *hit),
+                Some(*id),
+                "touched={touched}: {id:?} is the nearest neighbour of its own vector: {hits:?}"
+            );
+            let mut reachable: Vec<NodeId> = hits.iter().map(|(hit, _)| *hit).collect();
+            reachable.sort();
+            assert_eq!(
+                reachable, all,
+                "touched={touched}: every node is reachable from {id:?}'s query"
+            );
+        }
+    }
 }
