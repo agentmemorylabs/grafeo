@@ -71,7 +71,7 @@ pub(crate) mod section_consumer;
 ))]
 pub(crate) mod tier_chain_sources;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
-mod vector_access;
+pub(crate) mod vector_access;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 mod vector_read;
 #[cfg(all(
@@ -276,13 +276,7 @@ pub struct GrafeoDB {
     /// Shared registry of spilled vector storages.
     /// Used by the search path to create `SpillableVectorAccessor` instances.
     #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
-    vector_spill_storages: Option<
-        Arc<
-            parking_lot::RwLock<
-                std::collections::HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>,
-            >,
-        >,
-    >,
+    vector_spill_storages: Option<vector_access::VectorSpillRegistry>,
     /// External read-only graph store (when using with_store() or with_read_store()).
     /// When set, sessions route queries through this store instead of the built-in LpgStore.
     pub(super) external_read_store: Option<Arc<dyn GraphStoreSearch>>,
@@ -2922,6 +2916,8 @@ impl GrafeoDB {
             let write_store: Arc<dyn GraphStoreMut> = layered_arc as Arc<dyn GraphStoreMut>;
             session.override_stores(read_store, Some(write_store));
             session.set_layered_store(Arc::clone(layered));
+            #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+            session.set_vector_spill_storages(self.vector_spill_registry());
             // Attach the WAL for TransactionCommit/EpochAdvance logging without
             // re-wrapping the store (the write store above is already wrapped).
             #[cfg(feature = "wal")]
@@ -2957,6 +2953,14 @@ impl GrafeoDB {
         if let Some(ref wal) = self.wal {
             session.set_wal(Arc::clone(wal), Arc::clone(&self.wal_graph_context));
         }
+
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        session.set_vector_spill_storages(self.vector_spill_registry());
 
         #[cfg(feature = "cdc")]
         {
