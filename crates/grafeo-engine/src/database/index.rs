@@ -199,6 +199,7 @@ impl super::GrafeoDB {
         // count zero vectors and silently create an empty index (the
         // skip-every-node trap). The accessor sees overlay/tier/base vectors
         // plus the spilled mmap fallback.
+        #[cfg(not(feature = "vector-index"))]
         let prop_key = PropertyKey::new(property);
         let mut found_dims: Option<usize> = dimensions;
         let mut vector_count = 0usize;
@@ -285,26 +286,6 @@ impl super::GrafeoDB {
         {
             use grafeo_core::index::vector::VectorIndexKind;
 
-            // G-VECBUILD.1 E2 fail-closed guard: the Quantized build branch
-            // still reads through the heap-property guard (untouched per the
-            // packet's A1 hard rule), so a column drained to disk by E1 would
-            // pass the accessor-based dim scan but insert ZERO vectors here.
-            // The builder path passes `quantization=None`; anything else on a
-            // spilled column is a wiring bug — fail closed, never build an
-            // empty quantized index.
-            #[cfg(all(feature = "mmap", not(feature = "temporal")))]
-            if !matches!(
-                quantization_type,
-                grafeo_core::index::vector::QuantizationType::None
-            ) && self.vector_column_is_spilled(label, property)
-            {
-                return Err(Error::Internal(format!(
-                    "create_vector_index :{label}({property}): quantized construction over a \
-                     spilled vector column is unsupported (the build branch reads the heap \
-                     property guard and would insert nothing)"
-                )));
-            }
-
             let index = Self::build_vector_index(
                 dims,
                 metric,
@@ -352,9 +333,12 @@ impl super::GrafeoDB {
                     }
                 }
                 VectorIndexKind::Quantized(q_idx) => {
+                    use grafeo_core::index::vector::VectorAccessor as _;
                     let graph = self.graph_store();
-                    let accessor =
-                        grafeo_core::index::vector::PropertyVectorAccessor::new(&*graph, property);
+                    // Same spill-aware build accessor as the HNSW branch, so a
+                    // quantized index can be built (or rebuilt, AMH #175) over
+                    // a column a ForceDisk open drained to a spill file.
+                    let accessor = self.build_vector_accessor(&graph, label, property);
                     let mut inserted: u64 = 0;
                     for (iteration, node_id) in graph.nodes_by_label(label).into_iter().enumerate()
                     {
@@ -368,12 +352,17 @@ impl super::GrafeoDB {
                             }
                             control.maybe_progress(iteration as u64, inserted, vector_count as u64);
                         }
-                        if let Some(Value::Vector(vector)) =
-                            graph.get_node_property(node_id, &prop_key)
-                        {
+                        if let Some(vector) = accessor.get_vector(node_id) {
                             q_idx.insert(node_id, &vector, &accessor);
                             inserted += 1;
                         }
+                    }
+                    if inserted != vector_count as u64 {
+                        return Err(Error::Internal(format!(
+                            "create_vector_index build :{label}({property}): inserted \
+                             {inserted} of {vector_count} vectors (skip-every-node trap: \
+                             the build accessor lost sight of the vector sources)"
+                        )));
                     }
                     // Scalar search currently uses LPG accessor distances, not the
                     // u8 code map. Dropping codes after build avoids pure RSS cost
