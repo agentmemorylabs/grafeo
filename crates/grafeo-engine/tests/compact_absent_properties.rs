@@ -370,6 +370,71 @@ mod generation {
         }
     }
 
+    /// Lane 3's reproduction (review r1 must-fix 1, handoff path): a sparse
+    /// string column on a mapped generation base. `extra` is written on B0
+    /// only; the first handoff carries it as an overlay row, but every later
+    /// handoff with no writes rebuilds B1..B4 through the base row cursors,
+    /// which read the column body's placeholder (on trunk, the dictionary
+    /// string `"B"`) as a stored value. Exact whole-graph oracle at every
+    /// generation and after reopen; also with `extra` removed again between
+    /// handoffs.
+    #[test]
+    fn repeated_handoffs_over_a_mapped_base_keep_a_sparse_column_sparse() {
+        for remove in [false, true] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().join("sparse.grafeo.d");
+            std::fs::create_dir_all(&root).expect("root");
+            let source = GrafeoDB::new_in_memory();
+            let ids: Vec<_> = (0..5_i64)
+                .map(|i| {
+                    source
+                        .create_node_with_props(
+                            &["B"],
+                            [
+                                ("name", Value::from(format!("B{i}"))),
+                                ("k", Value::Int64(i)),
+                                ("tag", Value::from("base")),
+                            ],
+                        )
+                        .expect("node")
+                })
+                .collect();
+            source
+                .build_and_publish_generation(generation_build_request(&root, "g1"))
+                .expect("publish g1");
+            drop(source);
+            let db = GrafeoDB::open_generation_root(&root, false).expect("open");
+            db.set_node_property(ids[0], "extra", Value::from("pre"))
+                .expect("extra on B0");
+            let mut want = snapshot(&db);
+            let stage = |g: &str| format!("remove={remove}, {g}");
+            for (n, generation) in ["g2", "g3", "g4"].into_iter().enumerate() {
+                if remove && n == 1 {
+                    assert!(db.remove_node_property(ids[0], "extra"), "remove extra");
+                    want = snapshot(&db);
+                }
+                let report = db
+                    .run_epoch_handoff(generation_build_request(&root, generation))
+                    .expect("handoff");
+                db.publish_and_install_handoff(report).expect("install");
+                assert_eq!(snapshot(&db), want, "[{}]", stage(generation));
+                for id in &ids[1..] {
+                    assert_eq!(
+                        db.graph_store()
+                            .get_node_property(*id, &PropertyKey::new("extra")),
+                        None,
+                        "[{}] {id:?} has no extra",
+                        stage(generation)
+                    );
+                }
+            }
+            db.close().expect("close");
+            drop(db);
+            let db = GrafeoDB::open_generation_root(&root, true).expect("reopen");
+            assert_eq!(snapshot(&db), want, "[{}]", stage("reopen"));
+        }
+    }
+
     /// AMH's code-index sidecar path: an empty compacted builder DB, a
     /// mid-build drain to a tier, then the final tier-chain build.
     #[test]
