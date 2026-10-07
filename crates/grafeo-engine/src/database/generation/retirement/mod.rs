@@ -187,7 +187,9 @@ impl From<RetirementError> for grafeo_common::utils::error::Error {
 ///
 /// GC runs in the owner process under the exclusive root lock, and every
 /// publication needs that same lock — so no build is in flight while GC
-/// plans or collects. Under that model an unreferenced generation or a
+/// plans or collects. Once the owning database is closed and releases the
+/// lock (AMH #176), the authority is marked released and collection refuses:
+/// another owner may hold the root. Under that model an unreferenced generation or a
 /// `.unpublished-*` directory observed by GC is, by construction, a crash
 /// leftover (a pre-commit build that aborted before this owner acquired the
 /// lock), never a live build. Eligibility is therefore a fresh read of the
@@ -205,6 +207,9 @@ pub struct RetirementAuthority {
     /// The in-process lease registry (weak-probe observability only).
     #[cfg(feature = "mmap")]
     lease_registry: Option<std::sync::Arc<super::lease::GenerationLeaseRegistry>>,
+    /// Set when the owning database released the root lock: collection
+    /// refuses from then on.
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl RetirementAuthority {
@@ -217,7 +222,22 @@ impl RetirementAuthority {
             retired: Mutex::new(Vec::new()),
             #[cfg(feature = "mmap")]
             lease_registry: None,
+            released: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Marks the owning database's root lock released (AMH #176): from now
+    /// on [`collect_retirement`](super::collect_retirement) refuses, even
+    /// through a reference taken before.
+    pub(crate) fn mark_released(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the owning database released the root lock.
+    #[must_use]
+    pub fn is_released(&self) -> bool {
+        self.released.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Attach the in-process lease registry so GC honors live read leases

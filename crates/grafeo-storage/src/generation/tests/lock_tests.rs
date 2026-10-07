@@ -88,11 +88,14 @@ fn lock_acquire_and_release() {
 }
 
 /// `release` frees the root without dropping the lock value (AMH #176): it
-/// waits for a hold taken on another thread, a later hold fails with
-/// `Released`, a second release is a no-op, and a fresh acquire succeeds
-/// while the released value is still alive.
+/// refuses new holds at once, waits for the hold in flight on another
+/// thread, then releases; a hold asked for during or after the release
+/// fails without waiting; a second release is a no-op; and a fresh acquire
+/// succeeds while the released value is still alive. Every wait is bounded.
 #[test]
 fn lock_release_waits_for_holds_then_frees_the_root() {
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
     if std::env::var(HELPER_ENV).is_ok() {
         child_main();
         return;
@@ -106,37 +109,68 @@ fn lock_release_waits_for_holds_then_frees_the_root() {
     let root = dir.path().to_path_buf();
     let lock = try_acquire_root(&root).expect("acquire");
     assert!(lock.is_held());
+    const BOUND: Duration = Duration::from_secs(20);
 
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    let released = std::sync::atomic::AtomicBool::new(false);
-    let (lock, released, dir) = (&lock, &released, &dir);
+    let (held_tx, held_rx) = channel();
+    let (go_tx, go_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel();
+    let (lock, dir) = (&lock, &dir);
     std::thread::scope(|scope| {
         scope.spawn(move || {
             let hold = lock.hold().expect("hold while held");
             assert_eq!(hold.lock().canonical_root(), dir.path());
             held_tx.send(()).unwrap();
-            go_rx.recv().unwrap();
-            assert!(
-                !released.load(std::sync::atomic::Ordering::SeqCst),
-                "release returned while a hold was alive"
-            );
+            go_rx.recv_timeout(BOUND).expect("go");
             drop(hold);
         });
-        held_rx.recv().unwrap();
-        scope.spawn(|| {
-            assert!(lock.release(), "the first release releases");
-            released.store(true, std::sync::atomic::Ordering::SeqCst);
+        held_rx.recv_timeout(BOUND).expect("the hold was taken");
+        scope.spawn(move || {
+            done_tx.send(lock.release()).unwrap();
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // The release has started (new holds refused) but cannot finish
+        // while the hold is alive.
+        let started = Instant::now();
+        while !lock.is_releasing() {
+            assert!(started.elapsed() < BOUND, "release never started");
+            std::thread::yield_now();
+        }
+        assert!(!lock.is_held());
+        let refused = Instant::now();
+        assert!(matches!(lock.hold(), Err(RootLockError::Released)));
+        assert!(
+            refused.elapsed() < BOUND,
+            "a hold during the release waited instead of failing"
+        );
+        assert!(
+            done_rx.try_recv().is_err(),
+            "release returned while a hold was alive"
+        );
         go_tx.send(()).unwrap();
+        assert!(
+            done_rx.recv_timeout(BOUND).expect("release returned"),
+            "the first release releases"
+        );
     });
-    assert!(released.load(std::sync::atomic::Ordering::SeqCst));
     assert!(!lock.is_held());
     assert!(matches!(lock.hold(), Err(RootLockError::Released)));
     assert!(!lock.release(), "a second release is a no-op");
     let again = try_acquire_root(&root).expect("acquire after release, before drop");
-    drop((lock, again));
+    drop(again);
+}
+
+/// The released-lock refusals carry the `DATABASE_CLOSED` marker, so they
+/// classify as `WriteOutcome::DatabaseClosed` wherever they surface.
+#[test]
+fn released_errors_carry_the_database_closed_marker() {
+    use grafeo_common::utils::write_outcome::DATABASE_CLOSED;
+    for text in [
+        RootLockError::Released.to_string(),
+        crate::generation::publication::PublicationError::Released(RootLockError::Released)
+            .to_string(),
+        crate::generation::snapshot::SnapshotError::Released(RootLockError::Released).to_string(),
+    ] {
+        assert!(text.contains(DATABASE_CLOSED), "{text}");
+    }
 }
 
 #[test]

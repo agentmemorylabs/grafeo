@@ -184,7 +184,9 @@ impl From<PublicationPhaseError> for grafeo_common::utils::error::Error {
 ///   falsely claiming the commit point was reached.
 fn phase_for_error(err: &PublicationError) -> PublicationPhase {
     match err {
-        PublicationError::NoLock => PublicationPhase::WalBoundaryCut,
+        PublicationError::NoLock | PublicationError::Released(_) => {
+            PublicationPhase::WalBoundaryCut
+        }
         PublicationError::WalCut(_) => PublicationPhase::WalBoundaryCut,
         PublicationError::ValidationFailed(_) => PublicationPhase::ReopenValidate,
         PublicationError::TargetExists(_) => PublicationPhase::RenameImmutable,

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -154,7 +155,7 @@ pub struct WalManager {
     /// Set by [`seal`](Self::seal): the owning database was closed. Every
     /// later append, log file creation and rotation is refused. Written
     /// under the active-log lock.
-    sealed: AtomicBool,
+    sealed: Arc<AtomicBool>,
     /// Encryptor for WAL records (None = unencrypted).
     #[cfg(feature = "encryption")]
     encryptor: Option<grafeo_common::encryption::PageEncryptor>,
@@ -212,7 +213,7 @@ impl WalManager {
             current_sequence: AtomicU64::new(max_sequence),
             checkpoint_epoch: Mutex::new(None),
             poisoned: Mutex::new(None),
-            sealed: AtomicBool::new(false),
+            sealed: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "encryption")]
             encryptor: None,
             #[cfg(test)]
@@ -334,8 +335,9 @@ impl WalManager {
         Error::Internal(format!("WAL refuses appends {UNTIL_REOPENED}: {reason}"))
     }
 
-    /// The error of an append to a [`seal`](Self::seal)ed WAL.
-    fn sealed_error() -> Error {
+    /// The error of an append (or a group spill) to a
+    /// [`seal`](Self::seal)ed WAL.
+    pub(crate) fn sealed_error() -> Error {
         use grafeo_common::utils::write_outcome::DATABASE_CLOSED;
         Error::Internal(format!("WAL refuses appends: {DATABASE_CLOSED}"))
     }
@@ -357,6 +359,11 @@ impl WalManager {
     #[must_use]
     pub fn is_sealed(&self) -> bool {
         self.sealed.load(Ordering::SeqCst)
+    }
+
+    /// The seal flag, for the groups of this WAL (no spill file after it).
+    pub(crate) fn seal_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.sealed)
     }
 
     fn write_frames_inner(

@@ -75,6 +75,9 @@ pub enum PublicationError {
     /// The root lock is not held (unreachable by API shape; reserved).
     #[error("root lock not held")]
     NoLock,
+    /// The root lock was released: the owning database was closed.
+    #[error("{0}")]
+    Released(crate::generation::lock::RootLockError),
     /// The immutable generation target already exists.
     #[error("generation target already exists: {0}")]
     TargetExists(String),
@@ -132,7 +135,7 @@ pub fn publish_generation(
 
     // The whole publication runs under the root lock; a released lock
     // (the owning database was closed) refuses before anything is written.
-    let _held = lock.hold().map_err(|_| PublicationError::NoLock)?;
+    let _held = lock.hold().map_err(PublicationError::Released)?;
 
     // Step 0: cut the WAL generation boundary (sync + rotate), unless the
     // caller already froze boundary B at epoch-handoff freeze time (G-EM0.5c).

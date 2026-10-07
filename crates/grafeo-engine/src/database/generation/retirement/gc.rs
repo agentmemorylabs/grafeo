@@ -88,6 +88,13 @@ pub fn collect_retirement(
     auth: &RetirementAuthority,
     plan: &RetirementPlan,
 ) -> Result<Vec<ClassifiedGeneration>, RetirementError> {
+    // The database owning this authority was closed and released the root
+    // lock: another owner may hold the root, so delete nothing (AMH #176).
+    if auth.is_released() {
+        return Err(RetirementError::Lock(
+            grafeo_storage::generation::lock::RootLockError::Released,
+        ));
+    }
     let root = auth.root();
 
     // Re-evaluate protection with completely fresh state (TOCTOU rail).

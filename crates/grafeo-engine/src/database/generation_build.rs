@@ -263,6 +263,10 @@ impl GrafeoDB {
     /// assembles the extended [`PublishedGeneration`] from the result.
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
     fn build_generation_inner(&self, request: GenerationBuildRequest) -> Result<BuildPublication> {
+        // A closed generation root no longer owns its root; without this the
+        // lock below could be acquired again on a fresh descriptor and the
+        // closed handle's graph published (AMH #176).
+        self.check_root_open("build a generation")?;
         #[cfg(feature = "wal")]
         self.check_snapshot_source("build a generation")?;
         let root = request.generation_root.as_path();

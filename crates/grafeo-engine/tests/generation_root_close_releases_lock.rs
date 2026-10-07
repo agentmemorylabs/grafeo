@@ -165,7 +165,10 @@ fn poisoned_close_still_releases_the_lock() {
 fn a_closed_handle_is_fenced_off_the_root() {
     let (dir, root) = fresh_root();
     let closed = open(&root);
+    // A retirement authority taken before the close.
+    let authority = closed.retirement_authority().expect("authority");
     closed.close().expect("close");
+    assert!(closed.retirement_authority().is_none());
     let owner = open(&root);
     create(&owner, "owner");
     let before = tree(&root);
@@ -212,15 +215,64 @@ fn a_closed_handle_is_fenced_off_the_root() {
         Some(WriteOutcome::DatabaseClosed),
         "{err}"
     );
-    closed
-        .run_epoch_handoff(generation_build_request(&root, "g-late"))
-        .expect_err("a handoff on a closed database");
-    closed
-        .freeze_epoch_for_handoff(&root)
-        .expect_err("a freeze on a closed database");
-    closed
-        .backup_generation_root(dir.path().join("backups"), "late")
-        .expect_err("a backup of a closed database");
+    let other_root = dir.path().join("elsewhere.grafeo.d");
+    std::fs::create_dir_all(&other_root).expect("other root");
+    let refusals: Vec<(&str, grafeo_common::utils::error::Error)> = vec![
+        (
+            "handoff",
+            closed
+                .run_epoch_handoff(generation_build_request(&root, "g-late"))
+                .expect_err("a handoff on a closed database"),
+        ),
+        (
+            "freeze",
+            closed
+                .freeze_epoch_for_handoff(&root)
+                .expect_err("a freeze on a closed database"),
+        ),
+        (
+            "backup",
+            closed
+                .backup_generation_root(dir.path().join("backups"), "late")
+                .expect_err("a backup of a closed database")
+                .into(),
+        ),
+        (
+            "build into its root",
+            closed
+                .build_and_publish_generation(generation_build_request(&root, "g-late"))
+                .expect_err("a generation build from a closed database"),
+        ),
+        (
+            "build elsewhere",
+            closed
+                .build_and_publish_generation(generation_build_request(&other_root, "g-late"))
+                .expect_err("a generation build from a closed database"),
+        ),
+        (
+            "retirement through an authority taken before close",
+            grafeo_engine::collect_retirement(
+                authority,
+                &grafeo_engine::plan_retirement(authority).expect("plan"),
+            )
+            .expect_err("GC through a released authority")
+            .into(),
+        ),
+    ];
+    for (what, err) in refusals {
+        assert_eq!(
+            err.write_outcome(),
+            Some(WriteOutcome::DatabaseClosed),
+            "{what}: {err}"
+        );
+    }
+    assert!(
+        std::fs::read_dir(&other_root)
+            .expect("read")
+            .next()
+            .is_none(),
+        "nothing built elsewhere"
+    );
     assert_eq!(tree(&root), before, "the closed handle changed the root");
 
     owner.close().expect("close owner");
@@ -242,4 +294,61 @@ fn second_close_is_a_no_op() {
     assert_eq!(tree(&root), before);
     create(&owner, "owner");
     drop((rw, owner));
+}
+
+/// A close while a handoff is in flight on another thread (parked inside the
+/// freeze, through the debug test seam) completes promptly and releases the
+/// lock; the handoff, resumed, is refused before it builds or publishes.
+/// Every wait is bounded.
+#[cfg(debug_assertions)]
+#[test]
+fn close_during_an_in_flight_handoff_is_bounded() {
+    use grafeo_engine::{FREEZE_STALL_BEFORE_CAPTURE, FREEZE_STALL_ENTERED};
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+    const BOUND: Duration = Duration::from_secs(30);
+
+    let (_dir, root) = fresh_root();
+    let db = open(&root);
+    create(&db, "written");
+    FREEZE_STALL_BEFORE_CAPTURE.store(true, Ordering::Release);
+    let (db, root) = (&db, &root);
+    std::thread::scope(|scope| {
+        let (frozen_tx, frozen_rx) = channel();
+        let freezer = scope.spawn(move || {
+            let handle = db.freeze_epoch_for_handoff(root);
+            frozen_tx.send(()).ok();
+            handle
+        });
+        let started = Instant::now();
+        while !FREEZE_STALL_ENTERED.load(Ordering::Acquire) {
+            assert!(started.elapsed() < BOUND, "the freeze never parked");
+            std::thread::yield_now();
+        }
+        let (closed_tx, closed_rx) = channel();
+        scope.spawn(move || closed_tx.send(db.close()).ok());
+        let closed = closed_rx.recv_timeout(BOUND);
+        // Unpark before asserting, so a failure cannot leave the freezer
+        // parked.
+        FREEZE_STALL_BEFORE_CAPTURE.store(false, Ordering::Release);
+        closed
+            .expect("close() returned while the handoff was in flight")
+            .expect("close");
+        let reopened = GrafeoDB::open_generation_root(root, true)
+            .expect("the root reopens while the handoff is still in flight");
+        assert_eq!(names(&reopened), ["base", "written"]);
+        frozen_rx.recv_timeout(BOUND).expect("the freeze resumed");
+        if let Ok(handle) = freezer.join().expect("freezer thread") {
+            let err = db
+                .complete_epoch_handoff(handle, generation_build_request(root, "g2"))
+                .expect_err("completing a handoff of a closed database");
+            assert_eq!(
+                err.write_outcome(),
+                Some(WriteOutcome::DatabaseClosed),
+                "{err}"
+            );
+        }
+        drop(reopened);
+    });
 }

@@ -3646,9 +3646,17 @@ impl GrafeoDB {
     /// `GrafeoDB` is dropped. It first fences this handle off the root: the
     /// WAL is sealed, so a later write is refused before it is applied (a
     /// [`DATABASE_CLOSED`](grafeo_common::utils::write_outcome::DATABASE_CLOSED)
-    /// error), and handoff, publication and backup refuse. The release waits
-    /// for a root operation in flight on another thread. Reads keep working
-    /// on the state at close. A close over a poisoned WAL releases the lock
+    /// error), and handoff, publication, generation builds, backup and
+    /// retirement refuse, all with that error. The release refuses new root
+    /// operations at once and waits only for those already in flight on
+    /// other threads (a handoff's WAL cut, an install, a backup copy, a
+    /// publication), so its wait is bounded by the longest of them. Reads
+    /// keep working on the state at close.
+    ///
+    /// A write already past its refusal check on another thread when the WAL
+    /// is sealed can still apply in memory and then fail at its WAL append
+    /// with `DATABASE_CLOSED`: the closed handle then reads it, the root
+    /// never has it. Stop writers before closing. A close over a poisoned WAL releases the lock
     /// too. If the close-time commit marker cannot be written, `close()`
     /// returns that error and keeps the lock (and the database open), so it
     /// can be retried; the lock is then released at drop.
@@ -3838,6 +3846,7 @@ impl GrafeoDB {
             if let Some(ref wal) = self.wal {
                 wal.seal();
             }
+            root.retirement().mark_released();
             root.release_lock();
         }
     }

@@ -18,6 +18,7 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fs2::FileExt;
 use parking_lot::{RwLock, RwLockReadGuard};
@@ -45,9 +46,10 @@ pub enum RootLockError {
     /// Underlying I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// The lock was released ([`RootLock::release`]): this handle no longer
-    /// owns the root.
-    #[error("root lock released: this handle no longer owns the root")]
+    /// The lock was released, or is being released ([`RootLock::release`]):
+    /// this handle no longer owns the root. The text carries
+    /// [`DATABASE_CLOSED`](grafeo_common::utils::write_outcome::DATABASE_CLOSED).
+    #[error("root lock released, the database is closed: this handle no longer owns the root")]
     Released,
 }
 
@@ -71,14 +73,17 @@ pub struct MountEntry {
 /// No PID file, no lease timeout, no timestamp fencing.
 ///
 /// Work that relies on the ownership takes a [`hold`](Self::hold) for its
-/// duration: `release` waits for every hold to end, and a hold taken after
-/// it fails with [`RootLockError::Released`].
+/// duration: `release` waits for the holds in flight to end, and a hold asked
+/// for once `release` has started fails at once with
+/// [`RootLockError::Released`], so `release` is never starved by new holds.
 #[derive(Debug)]
 pub struct RootLock {
     canonical_root: PathBuf,
     lock_path: PathBuf,
     /// Held open while the lock is held; `None` once released.
     file: RwLock<Option<File>>,
+    /// Set when [`release`](Self::release) starts: new holds are refused.
+    releasing: AtomicBool,
 }
 
 /// Proof that a [`RootLock`] is held, for as long as this value lives
@@ -142,17 +147,22 @@ impl RootLock {
             canonical_root: canonical,
             lock_path,
             file: RwLock::new(Some(file)),
+            releasing: AtomicBool::new(false),
         })
     }
 
     /// Holds the lock for the duration of the returned value, so that a
     /// concurrent [`release`](Self::release) waits for it. Re-entrant within
-    /// a thread.
+    /// a thread. Never waits behind a release: once one has started, this
+    /// fails at once.
     ///
     /// # Errors
     ///
-    /// Returns [`RootLockError::Released`] once the lock was released.
+    /// Returns [`RootLockError::Released`] once a release has started.
     pub fn hold(&self) -> std::result::Result<RootLockHold<'_>, RootLockError> {
+        if self.releasing.load(Ordering::SeqCst) {
+            return Err(RootLockError::Released);
+        }
         let held = self.file.read_recursive();
         if held.is_none() {
             return Err(RootLockError::Released);
@@ -163,19 +173,29 @@ impl RootLock {
         })
     }
 
-    /// Whether the lock is still held (not [`release`](Self::release)d).
+    /// Whether the lock is still held: no [`release`](Self::release) has
+    /// started.
     #[must_use]
     pub fn is_held(&self) -> bool {
-        self.file.read_recursive().is_some()
+        !self.releasing.load(Ordering::SeqCst) && self.file.read_recursive().is_some()
     }
 
-    /// Releases the lock now, after every [`hold`](Self::hold) has ended:
-    /// closes the lock file, so another opener (in this process or another)
-    /// can acquire the root. Returns whether this call released it (`false`
-    /// if it was already released). Must not be called while this thread
-    /// has a hold.
+    /// Releases the lock: refuses new [`hold`](Self::hold)s from now on,
+    /// waits for the holds in flight to end (only those: the wait is bounded
+    /// by the longest operation already holding the lock), then closes the
+    /// lock file, so another opener (in this process or another) can acquire
+    /// the root. Returns whether this call released it (`false` if it was
+    /// already released). Must not be called while this thread has a hold.
     pub fn release(&self) -> bool {
+        self.releasing.store(true, Ordering::SeqCst);
         self.file.write().take().is_some()
+    }
+
+    /// Whether a [`release`](Self::release) has started (new holds are
+    /// refused), whether or not it has finished.
+    #[must_use]
+    pub fn is_releasing(&self) -> bool {
+        self.releasing.load(Ordering::SeqCst)
     }
 
     /// The canonical root path this lock is bound to.

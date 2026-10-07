@@ -45,9 +45,9 @@ pub enum SnapshotError {
     /// Underlying I/O error.
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    /// The root lock is no longer held (the owning database was closed).
-    #[error("root lock not held")]
-    NoLock,
+    /// The root lock was released: the owning database was closed.
+    #[error("{0}")]
+    Released(crate::generation::lock::RootLockError),
 }
 
 /// Copy buffer size for snapshot streaming (bounded memory).
@@ -89,7 +89,7 @@ pub fn publish_snapshot(
 
     // The snapshot runs under the root lock, so the source generation
     // cannot be retired under it.
-    let _held = lock.hold().map_err(|_| SnapshotError::NoLock)?;
+    let _held = lock.hold().map_err(SnapshotError::Released)?;
 
     // Step 1: revalidate the source capability.
     let root = lock.canonical_root();

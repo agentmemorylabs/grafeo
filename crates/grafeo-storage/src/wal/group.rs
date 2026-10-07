@@ -32,7 +32,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::WalEntry;
 use grafeo_common::testing::crash::{maybe_crash, maybe_fail_io};
@@ -131,6 +132,9 @@ struct Failure {
 /// The encoded frames of one WAL group, in RAM or spilled to a file.
 pub struct GroupBuffer {
     spill_dir: PathBuf,
+    /// The seal of the WAL this group is for (see `WalManager::seal`): once
+    /// set, no spill file is created (the directory may have a new owner).
+    sealed: Option<Arc<AtomicBool>>,
     limits: GroupLimits,
     /// Encrypt the spill file (the WAL is encrypted).
     encrypt: bool,
@@ -351,6 +355,7 @@ impl GroupBuffer {
     pub fn new(spill_dir: PathBuf, limits: GroupLimits, encrypt: bool) -> Self {
         Self {
             spill_dir,
+            sealed: None,
             limits,
             encrypt,
             ram: Vec::new(),
@@ -481,6 +486,15 @@ impl GroupBuffer {
                 return Ok(());
             }
             if let Err(e) = self.start_spill() {
+                // Refused by the seal: the database is closed, not out of
+                // disk space, so not retryable.
+                if self.is_sealed() {
+                    return Err(self.fail(
+                        format!("{e}; nothing of the transaction was written to the WAL"),
+                        self.end,
+                        false,
+                    ));
+                }
                 return Err(self.fail(
                     format!(
                         "could not spill the transaction's WAL records to disk ({e}); \
@@ -537,8 +551,25 @@ impl GroupBuffer {
         }
     }
 
+    /// Ties this group to its WAL's seal (see `WalManager::seal`).
+    #[must_use]
+    pub(crate) fn with_seal(mut self, sealed: Arc<AtomicBool>) -> Self {
+        self.sealed = Some(sealed);
+        self
+    }
+
+    /// Whether this group's WAL was sealed (see `WalManager::seal`).
+    fn is_sealed(&self) -> bool {
+        self.sealed
+            .as_ref()
+            .is_some_and(|sealed| sealed.load(Ordering::SeqCst))
+    }
+
     /// Moves the RAM frames to a new spill file.
     fn start_spill(&mut self) -> Result<()> {
+        if self.is_sealed() {
+            return Err(super::log::WalManager::sealed_error());
+        }
         maybe_fail_io("wal_spill_create")?;
         create_private_dir(&self.spill_dir)?;
         let name = format!(
@@ -887,6 +918,24 @@ mod tests {
 
     fn group(dir: &Path, spill_threshold: usize, encrypt: bool) -> GroupBuffer {
         GroupBuffer::new(dir.join(SPILL_DIR), limits(spill_threshold), encrypt)
+    }
+
+    /// A group of a sealed WAL creates no spill file (AMH #176): the WAL
+    /// directory may have a new owner once its database closed.
+    #[test]
+    fn sealed_wal_group_does_not_spill() {
+        use grafeo_common::utils::write_outcome::WriteOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = Arc::new(AtomicBool::new(true));
+        let mut g = group(dir.path(), 0, false).with_seal(sealed);
+        let err = g.push(&node(1)).unwrap_err();
+        assert_eq!(
+            err.write_outcome(),
+            Some(WriteOutcome::DatabaseClosed),
+            "{err}"
+        );
+        assert!(!g.is_spilled());
+        assert!(!dir.path().join(SPILL_DIR).exists(), "no spill directory");
     }
 
     #[test]

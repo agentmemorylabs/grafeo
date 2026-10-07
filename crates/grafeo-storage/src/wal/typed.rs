@@ -222,6 +222,7 @@ impl<R: WalEntry> TypedWal<R> {
             false
         };
         GroupBuffer::new(self.manager.dir().join(SPILL_DIR), limits, encrypt)
+            .with_seal(self.manager.seal_flag())
     }
 
     /// Writes `group`'s records followed by `trailer` (its commit markers) as
