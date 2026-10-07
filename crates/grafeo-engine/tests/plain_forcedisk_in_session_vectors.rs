@@ -29,7 +29,6 @@ use std::path::Path;
 
 use grafeo_common::storage::{SectionType, TierOverride};
 use grafeo_common::types::{NodeId, PropertyKey, Value};
-use grafeo_core::graph::traits::GraphStore;
 use grafeo_engine::{Config, GrafeoDB};
 use tempfile::tempdir;
 

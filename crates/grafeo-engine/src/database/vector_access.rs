@@ -99,22 +99,11 @@ impl super::GrafeoDB {
         label: &str,
         property: &str,
     ) -> grafeo_core::index::vector::VectorAccessorKind<'a> {
-        let key = format!("{label}:{property}");
-        if let Some(ref spill_map) = self.vector_spill_storages {
-            let map = spill_map.read();
-            if let Some(storage) = map.get(&key) {
-                return grafeo_core::index::vector::VectorAccessorKind::Spilled(
-                    grafeo_core::index::vector::SpillableVectorAccessor::new(
-                        &**graph,
-                        property,
-                        std::sync::Arc::clone(storage)
-                            as std::sync::Arc<dyn grafeo_core::index::vector::VectorStorage>,
-                    ),
-                );
-            }
-        }
-        grafeo_core::index::vector::VectorAccessorKind::Property(
-            grafeo_core::index::vector::PropertyVectorAccessor::new(&**graph, property),
+        spill_aware_accessor(
+            &**graph,
+            self.vector_spill_storages.as_ref(),
+            label,
+            property,
         )
     }
 
