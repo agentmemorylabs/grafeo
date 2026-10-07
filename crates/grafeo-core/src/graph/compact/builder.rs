@@ -78,6 +78,8 @@ pub enum CompactStoreError {
 pub struct NodeTableBuilder {
     label: ArcStr,
     columns: Vec<(PropertyKey, ColumnCodec)>,
+    /// Per-column row presence/null bits (see [`Self::column_presence`]).
+    presence: ColumnBits,
     zone_maps: Vec<(PropertyKey, ZoneMap)>,
     len: Option<usize>,
     length_mismatch: Option<(usize, usize)>,
@@ -89,11 +91,22 @@ impl NodeTableBuilder {
         Self {
             label: label.into(),
             columns: Vec::new(),
+            presence: Vec::new(),
             zone_maps: Vec::new(),
             len: None,
             length_mismatch: None,
             value_overflow: None,
         }
+    }
+
+    /// Records which rows of column `key` carry the property (`present`) and
+    /// which of those carry `Value::Null` (`null`), one bit per row. Only
+    /// needed when some row lacks the key or stores a null: the column body
+    /// holds a placeholder (a type default) for such rows, which readers must
+    /// not serve as a value (AMH #183).
+    pub fn column_presence(&mut self, key: &str, present: Vec<bool>, null: Vec<bool>) -> &mut Self {
+        self.presence.push((PropertyKey::new(key), present, null));
+        self
     }
 
     /// Adds a bit-packed integer column.
@@ -214,7 +227,13 @@ pub struct RelTableBuilder {
     edges: Vec<(u32, u32)>,
     backward: bool,
     properties: Vec<(PropertyKey, ColumnCodec)>,
+    /// Per-column row presence/null bits, rows in `edges` order (which the
+    /// forward CSR keeps: its sort by source is stable).
+    presence: ColumnBits,
 }
+
+/// `(column key, present bits, null bits)` per column that needs them.
+type ColumnBits = Vec<(PropertyKey, Vec<bool>, Vec<bool>)>;
 
 impl RelTableBuilder {
     fn new(
@@ -229,7 +248,14 @@ impl RelTableBuilder {
             edges: Vec::new(),
             backward: false,
             properties: Vec::new(),
+            presence: Vec::new(),
         }
+    }
+
+    /// Edge counterpart of [`NodeTableBuilder::column_presence`].
+    pub fn column_presence(&mut self, key: &str, present: Vec<bool>, null: Vec<bool>) -> &mut Self {
+        self.presence.push((PropertyKey::new(key), present, null));
+        self
     }
 
     /// Sets the `(src_offset, dst_offset)` edge pairs.
@@ -396,7 +422,8 @@ impl CompactStoreBuilder {
         let mut node_tables_by_id: Vec<NodeTable> =
             Vec::with_capacity(self.node_table_builders.len());
 
-        for (idx, ntb) in self.node_table_builders.into_iter().enumerate() {
+        let mut node_presence: Vec<ColumnBits> = Vec::with_capacity(self.node_table_builders.len());
+        for (idx, mut ntb) in self.node_table_builders.into_iter().enumerate() {
             // Validated in Step 2c: count <= MAX_TABLE_ID + 1, so idx fits u16.
             let table_id =
                 u16::try_from(idx).map_err(|_| CompactStoreError::TableCountOverflow {
@@ -404,6 +431,7 @@ impl CompactStoreBuilder {
                     count: idx,
                     max: MAX_TABLE_ID,
                 })?;
+            node_presence.push(std::mem::take(&mut ntb.presence));
             let row_count = ntb.len.unwrap_or(0);
 
             // Build column definitions for the schema.
@@ -445,7 +473,9 @@ impl CompactStoreBuilder {
         let mut edge_type_to_rel_id: FxHashMap<ArcStr, Vec<u16>> = FxHashMap::default();
         let mut rel_table_id_to_type: Vec<ArcStr> = Vec::new();
 
-        for (idx, rtb) in self.rel_table_builders.into_iter().enumerate() {
+        let mut rel_presence: Vec<ColumnBits> = Vec::with_capacity(self.rel_table_builders.len());
+        for (idx, mut rtb) in self.rel_table_builders.into_iter().enumerate() {
+            rel_presence.push(std::mem::take(&mut rtb.presence));
             // Validated in Step 2c: count <= MAX_TABLE_ID + 1, so idx fits u16.
             let rel_table_id =
                 u16::try_from(idx).map_err(|_| CompactStoreError::TableCountOverflow {
@@ -565,7 +595,7 @@ impl CompactStoreBuilder {
         stats.total_edges = total_edges;
 
         // Step 7: Construct the CompactStore.
-        Ok(CompactStore::new(
+        let mut store = CompactStore::new(
             node_tables_by_id,
             label_to_table_id,
             rel_tables_by_id,
@@ -573,8 +603,138 @@ impl CompactStoreBuilder {
             table_id_to_label,
             rel_table_id_to_type,
             stats,
-        ))
+        );
+        // Step 8: Absent / null rows (AMH #183).
+        install_column_presence(&mut store, &node_presence, &rel_presence)
+            .map_err(CompactStoreError::InconsistentEdgeData)?;
+        Ok(store)
     }
+}
+
+/// Hands a column's presence/null bits to `record` when the column needs
+/// them: some row lacks the key, or a present row stores `Value::Null`.
+fn record_presence(
+    key: &PropertyKey,
+    values: &[Value],
+    present: &[bool],
+    record: impl FnOnce(&str, Vec<bool>, Vec<bool>),
+) {
+    let null: Vec<bool> = present
+        .iter()
+        .zip(values)
+        .map(|(p, v)| *p && matches!(v, Value::Null))
+        .collect();
+    if present.iter().any(|p| !p) || null.iter().any(|n| *n) {
+        record(key.as_str(), present.to_vec(), null);
+    }
+}
+
+/// Installs the builder's per-column presence/null bits as the store's
+/// `ColumnRowPresence` / `ColumnRowNull` companions (AMH #183), the same
+/// views a mapped v5 payload installs, so every reader that honours them
+/// serves an absent row as absent and a null row as `Value::Null` instead of
+/// the column body's placeholder.
+///
+/// Column indices follow the v5 reader's numbering: node tables in id order,
+/// then rel tables, each table's columns sorted by key.
+fn install_column_presence(
+    store: &mut CompactStore,
+    node_presence: &[ColumnBits],
+    rel_presence: &[ColumnBits],
+) -> Result<(), String> {
+    use super::mapped::{
+        RowBitmapView, SegmentKind, presence::write_null_segment, presence::write_presence_segment,
+    };
+
+    if node_presence.iter().chain(rel_presence).all(Vec::is_empty) {
+        return Ok(());
+    }
+    let mut index_map: FxHashMap<(u16, PropertyKey), u32> = FxHashMap::default();
+    let mut present_records: Vec<(u32, u32, Vec<bool>)> = Vec::new();
+    let mut null_records: Vec<(u32, u32, Vec<bool>)> = Vec::new();
+    let mut column_index: u32 = 0;
+    let mut add_table = |table_id: u16,
+                         mut keys: Vec<PropertyKey>,
+                         row_count: usize,
+                         bits: Option<&ColumnBits>|
+     -> Result<(), String> {
+        keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for key in keys {
+            index_map.insert((table_id, key.clone()), column_index);
+            if let Some((_, present, null)) =
+                bits.and_then(|b| b.iter().find(|(k, _, _)| *k == key))
+            {
+                let rows = u32::try_from(row_count).map_err(|_| "row count exceeds u32")?;
+                if present.len() != row_count || null.len() != row_count {
+                    return Err(format!(
+                        "presence bits for column {key} have {} / {} rows, table has {row_count}",
+                        present.len(),
+                        null.len()
+                    ));
+                }
+                if present.iter().any(|p| !p) {
+                    present_records.push((column_index, rows, present.clone()));
+                }
+                if null.iter().any(|n| *n) {
+                    null_records.push((column_index, rows, null.clone()));
+                }
+            }
+            column_index += 1;
+        }
+        Ok(())
+    };
+    for (tid, nt) in store.node_tables_by_id.iter().enumerate() {
+        let tid = u16::try_from(tid).map_err(|_| "node table id exceeds u16")?;
+        let keys: Vec<PropertyKey> = nt.columns().keys().cloned().collect();
+        add_table(tid, keys, nt.len(), node_presence.get(usize::from(tid)))?;
+    }
+    for (rid, rt) in store.rel_tables_by_id.iter().enumerate() {
+        let rid = u16::try_from(rid).map_err(|_| "rel table id exceeds u16")?;
+        let keys: Vec<PropertyKey> = rt.properties().keys().cloned().collect();
+        add_table(
+            super::graph_store_impl::rel_column_table_id(rid),
+            keys,
+            rt.num_edges(),
+            rel_presence.get(usize::from(rid)),
+        )?;
+    }
+    if present_records.is_empty() && null_records.is_empty() {
+        return Ok(());
+    }
+    let segment = |records: &[(u32, u32, Vec<bool>)],
+                   kind: SegmentKind|
+     -> Result<Option<(bytes::Bytes, RowBitmapView)>, String> {
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let mut body = Vec::new();
+        let mut sink = |b: &[u8]| -> Result<(), String> {
+            body.extend_from_slice(b);
+            Ok(())
+        };
+        match kind {
+            SegmentKind::ColumnRowNull => write_null_segment(&mut sink, records)?,
+            _ => write_presence_segment(&mut sink, records)?,
+        }
+        let body = bytes::Bytes::from(body);
+        let view = RowBitmapView::parse(&body, kind)?;
+        Ok(Some((body, view)))
+    };
+    let presence = segment(&present_records, SegmentKind::ColumnRowPresence)?;
+    let null = segment(&null_records, SegmentKind::ColumnRowNull)?;
+    let (presence_view, presence_body) = presence.map_or((None, None), |(b, v)| (Some(v), Some(b)));
+    let (null_view, null_body) = null.map_or((None, None), |(b, v)| (Some(v), Some(b)));
+    store.set_source_true_companions(
+        None,
+        presence_view,
+        null_view,
+        bytes::Bytes::new(),
+        presence_body,
+        null_body,
+        None,
+    );
+    store.set_column_index_map(index_map);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -737,10 +897,14 @@ pub fn from_graph_store(
 
     // label_key -> (ordered node IDs, property_key -> Vec<Value>)
     // We use Vec<Value> to collect per-column values in row order.
+    // The fourth element marks, per column and row, whether the row carries
+    // the key at all: a padded `Value::Null` is absent, a stored one is a
+    // present null (AMH #183).
     let mut label_data: Vec<(
         ArcStr,
         Vec<grafeo_common::types::NodeId>,
         FxHashMap<PropertyKey, Vec<Value>>,
+        FxHashMap<PropertyKey, Vec<bool>>,
     )> = Vec::new();
 
     // Collect all node IDs per label. Nodes with multiple labels use a
@@ -774,11 +938,17 @@ pub fn from_graph_store(
             } else {
                 let idx = label_data.len();
                 label_key_index.insert(label_key.clone(), idx);
-                label_data.push((label_key.clone(), Vec::new(), FxHashMap::default()));
+                label_data.push((
+                    label_key.clone(),
+                    Vec::new(),
+                    FxHashMap::default(),
+                    FxHashMap::default(),
+                ));
                 idx
             };
 
-            let (_, ref mut node_ids_vec, ref mut props_map) = label_data[entry_idx];
+            let (_, ref mut node_ids_vec, ref mut props_map, ref mut present_map) =
+                label_data[entry_idx];
             // reason: node offset within a table fits u32
             #[allow(clippy::cast_possible_truncation)]
             let offset = node_ids_vec.len() as u32;
@@ -795,6 +965,11 @@ pub fn from_graph_store(
                     col.push(Value::Null);
                 }
                 col.push(value.clone());
+                let present = present_map
+                    .entry(key.clone())
+                    .or_insert_with(|| vec![false; offset as usize]);
+                present.resize(offset as usize, false);
+                present.push(true);
             }
 
             // Pad all existing columns that this node didn't have.
@@ -804,18 +979,26 @@ pub fn from_graph_store(
                     col.push(Value::Null);
                 }
             }
+            for present in present_map.values_mut() {
+                present.resize(expected_len, false);
+            }
         }
     }
 
     // Step 2: Infer column types and build CompactStoreBuilder.
     let mut builder = CompactStoreBuilder::new();
 
-    for (label_key, node_ids_for_label, props_map) in &label_data {
+    for (label_key, node_ids_for_label, props_map, present_map) in &label_data {
         let node_count = node_ids_for_label.len();
         builder = builder.node_table(label_key.as_str(), |t| {
             // Ensure row count is set even when there are no properties.
             t.record_len(node_count);
             for (key, values) in props_map {
+                if let Some(present) = present_map.get(key) {
+                    record_presence(key, values, present, |k, p, n| {
+                        t.column_presence(k, p, n);
+                    });
+                }
                 let inferred = infer_type_from_values(values);
                 match inferred {
                     InferredType::BitPacked => {
@@ -922,9 +1105,12 @@ pub fn from_graph_store(
     let mut edge_groups: FxHashMap<EdgeGroupKey, Vec<(u32, u32)>> = FxHashMap::default();
     let mut edge_props_groups: FxHashMap<EdgeGroupKey, FxHashMap<PropertyKey, Vec<Value>>> =
         FxHashMap::default();
+    // Per group and column: which edges carry the key (see `label_data`).
+    let mut edge_present_groups: FxHashMap<EdgeGroupKey, FxHashMap<PropertyKey, Vec<bool>>> =
+        FxHashMap::default();
 
     // Iterate all nodes and their outgoing edges.
-    for (_label_key, node_ids, _) in &label_data {
+    for (_label_key, node_ids, _, _) in &label_data {
         for &nid in node_ids {
             let outgoing = store.edges_from(nid, crate::graph::Direction::Outgoing);
             for (_target_nid, edge_id) in outgoing {
@@ -948,6 +1134,7 @@ pub fn from_graph_store(
 
                 // Collect edge properties.
                 if !edge.properties.is_empty() {
+                    let present_cols = edge_present_groups.entry(group_key.clone()).or_default();
                     let props = edge_props_groups.entry(group_key).or_default();
                     for (key, value) in edge.properties.iter() {
                         let col = props
@@ -957,6 +1144,11 @@ pub fn from_graph_store(
                             col.push(Value::Null);
                         }
                         col.push(value.clone());
+                        let present = present_cols
+                            .entry(key.clone())
+                            .or_insert_with(|| vec![false; edge_idx]);
+                        present.resize(edge_idx, false);
+                        present.push(true);
                     }
                     let expected_len = edge_idx + 1;
                     for col in props.values_mut() {
@@ -971,8 +1163,31 @@ pub fn from_graph_store(
 
     // Step 4: Add relationship tables to the builder.
     for ((edge_type, src_label, dst_label), edges) in &edge_groups {
-        let edge_props =
-            edge_props_groups.get(&(edge_type.clone(), src_label.clone(), dst_label.clone()));
+        let group = (edge_type.clone(), src_label.clone(), dst_label.clone());
+        // Rows in (src, dst) order, stable for equal pairs: the forward CSR
+        // keeps the given order within a source, and
+        // `from_graph_store_preserving_ids` maps edge ids in (src, dst)
+        // order. Insertion order alone left a source's edges to several
+        // targets out of step with their ids (wrong target and properties).
+        let mut order: Vec<usize> = (0..edges.len()).collect();
+        order.sort_by_key(|&i| edges[i]);
+        let edges: Vec<(u32, u32)> = order.iter().map(|&i| edges[i]).collect();
+        // Every column gets one row per edge (edges after the last one that
+        // carries any property were never padded), in that order.
+        if let Some(props) = edge_props_groups.get_mut(&group) {
+            for col in props.values_mut() {
+                col.resize(edges.len(), Value::Null);
+                *col = order.iter().map(|&i| col[i].clone()).collect();
+            }
+        }
+        if let Some(present_cols) = edge_present_groups.get_mut(&group) {
+            for present in present_cols.values_mut() {
+                present.resize(edges.len(), false);
+                *present = order.iter().map(|&i| present[i]).collect();
+            }
+        }
+        let edge_props = edge_props_groups.get(&group);
+        let edge_present = edge_present_groups.get(&group);
 
         builder = builder.rel_table(
             edge_type.as_str(),
@@ -984,6 +1199,11 @@ pub fn from_graph_store(
                 // Add edge property columns.
                 if let Some(props) = edge_props {
                     for (key, values) in props {
+                        if let Some(present) = edge_present.and_then(|p| p.get(key)) {
+                            record_presence(key, values, present, |k, p, n| {
+                                r.column_presence(k, p, n);
+                            });
+                        }
                         let inferred = infer_type_from_values(values);
                         match inferred {
                             InferredType::BitPacked => {
