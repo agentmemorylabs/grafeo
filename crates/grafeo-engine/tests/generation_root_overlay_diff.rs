@@ -1556,8 +1556,8 @@ fn delete_rollback_restores_inherited_secondaries() {
 /// absorbed the row (none again).
 #[test]
 fn history_records_are_exact_for_a_controlled_sequence() {
-    let (_dir, root) = fresh_root(3, DIMS);
     type Record = (u64, Option<u64>, Vec<String>, BTreeMap<String, Value>);
+    let (_dir, root) = fresh_root(3, DIMS);
     let records = |db: &GrafeoDB, id: NodeId| -> [Vec<Record>; 2] {
         let as_records = |h: Vec<(
             grafeo_common::types::EpochId,
@@ -1599,11 +1599,11 @@ fn history_records_are_exact_for_a_controlled_sequence() {
         )];
         [record.clone(), record]
     };
-    let none: [Vec<Record>; 2] = [Vec::new(), Vec::new()];
+    let no_history: [Vec<Record>; 2] = [Vec::new(), Vec::new()];
 
     let db = open(&root);
     let e0 = id_of(&db, "e0");
-    assert_eq!(records(&db, e0), none, "clean");
+    assert_eq!(records(&db, e0), no_history, "clean");
     db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'one'")
         .expect("SET");
     let mut o = vec![("observations_json", Some(Value::from("one")))];
@@ -1631,13 +1631,13 @@ fn history_records_are_exact_for_a_controlled_sequence() {
     let e0 = id_of(&db, "e0");
     assert_eq!(records(&db, e0), one(&labels, &o), "reopen");
     handoff(&db, &root, "g2");
-    assert_eq!(records(&db, e0), none, "absorbed by the install");
-    let node = db.get_node(e0).expect("e0");
+    assert_eq!(records(&db, e0), no_history, "absorbed by the install");
+    let absorbed = db.get_node(e0).expect("e0");
     let mut want = published_entity(0);
     want.insert("observations_json".into(), Value::from("one"));
     want.remove("embedding_provider");
     want.insert("updated_at_ms".into(), Value::Int64(5));
-    assert_eq!(props_map(&node.properties), want, "absorbed row");
+    assert_eq!(props_map(&absorbed.properties), want, "absorbed row");
 }
 
 /// #190 R3-F3: nested savepoints over an inherited text property. Each
