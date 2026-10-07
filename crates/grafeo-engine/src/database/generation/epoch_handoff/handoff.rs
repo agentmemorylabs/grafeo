@@ -467,24 +467,27 @@ impl GrafeoDB {
 
     // ── internals ──────────────────────────────────────────────────
 
-    /// Refuses (retryable) a handoff step while a write transaction is open
-    /// (DESIGN G2: the freeze capture and the install repair read committed
-    /// state only). Call with the handoff gate and the commit-order lock
-    /// held, so no transaction starts writing or commits meanwhile.
+    /// Refuses (retryable) a handoff step while an open transaction holds a
+    /// change the step would read as committed (DESIGN G2): an in-place
+    /// property or label write or a delete (the overlay's undo log), or a
+    /// layered base tombstone or copy-up (the layered undo journal). Call
+    /// with the handoff gate and the commit-order lock held, so no
+    /// transaction commits meanwhile; a transaction mid-mutation is held off
+    /// by the merge guard the step takes.
     ///
-    /// Checks the layered undo journal too: a transaction's delete journals
-    /// its base tombstone before the write set records it.
+    /// An open transaction's creates are versioned, invisible to the freeze
+    /// capture and the repair, and do not defer either.
     pub(super) fn refuse_open_write_transactions(&self, step: &str) -> Result<()> {
-        let open_writers = self.transaction_manager.active_writers();
+        let pending_undo = self.store.as_ref().is_some_and(|s| s.has_pending_undo());
         let pending_layer_changes = self
             .layered_store
             .as_ref()
             .is_some_and(|layered| layered.has_pending_layer_changes());
-        if open_writers > 0 || pending_layer_changes {
+        if pending_undo || pending_layer_changes {
             return Err(Error::AdmissionRetryable(format!(
-                "epoch handoff {step} deferred: {open_writers} open write transaction(s) \
-                 (pending layered changes: {pending_layer_changes}); retry when they \
-                 commit or roll back"
+                "epoch handoff {step} deferred: an open transaction has uncommitted \
+                 in-place writes (undo log: {pending_undo}, layered changes: \
+                 {pending_layer_changes}); retry when it commits or rolls back"
             )));
         }
         Ok(())

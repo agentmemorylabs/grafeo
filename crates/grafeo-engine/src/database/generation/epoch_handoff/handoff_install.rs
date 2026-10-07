@@ -172,12 +172,14 @@ impl GrafeoDB {
             .ok_or(HandoffInstallError::NoLayeredStore)?;
 
         // Brief writer stop (DESIGN G2): the gate holds direct writes, the
-        // commit-order lock holds commits, and the swap below takes the
-        // merge guard. The repair reads committed state only, so an open
-        // write transaction defers the install (retryable).
+        // commit-order lock holds commits, and the merge guard holds store
+        // mutations, from the checks below through the swap. The repair
+        // reads committed state only, so an open transaction with in-place
+        // writes defers the install (retryable). Lock order as the freeze.
         let _gate = self.handoff_gate.write();
         #[cfg(feature = "wal")]
         let _commit_order = self.wal_commit_order.lock();
+        let barrier = layered.freeze_write_barrier();
         self.refuse_open_write_transactions("install")?;
         if !layered.handoff_live().is_some_and(|live| live.retired) {
             return Err(HandoffInstallError::NothingToInstall.into());
@@ -221,7 +223,7 @@ impl GrafeoDB {
         // ── (c) Base swap + repair (N+1 wins over the new base) ───────────
         let new_base = lease.store();
         let (_old_base, _live) = layered
-            .install_handoff_base(Arc::clone(&new_base), &|_, key| {
+            .install_handoff_base(&barrier, Arc::clone(&new_base), &|_, key| {
                 spilled_properties.contains(key)
             })
             .map_err(Error::Internal)?;

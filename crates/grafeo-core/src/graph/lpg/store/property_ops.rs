@@ -740,6 +740,40 @@ impl LpgStore {
         self.property_undo_log.write().remove(&transaction_id);
     }
 
+    /// True while an open transaction holds an in-place change (a property
+    /// or label write, or a delete) to an entity other transactions can
+    /// see, which its rollback would undo. Its creates, and its writes to
+    /// entities it created, are invisible to others and do not count.
+    #[must_use]
+    pub fn has_pending_undo(&self) -> bool {
+        use PropertyUndoEntry as U;
+        self.property_undo_log.read().values().any(|entries| {
+            let mut created_nodes: FxHashSet<NodeId> = FxHashSet::default();
+            let mut created_edges: FxHashSet<EdgeId> = FxHashSet::default();
+            for entry in entries {
+                match entry {
+                    U::NodeCreated { node_id, .. } => {
+                        created_nodes.insert(*node_id);
+                    }
+                    U::EdgeCreated { edge_id, .. } => {
+                        created_edges.insert(*edge_id);
+                    }
+                    _ => {}
+                }
+            }
+            entries.iter().any(|entry| match entry {
+                U::NodeCreated { .. } | U::EdgeCreated { .. } => false,
+                U::NodeProperty { node_id, .. }
+                | U::LabelAdded { node_id, .. }
+                | U::LabelRemoved { node_id, .. }
+                | U::NodeDeleted { node_id, .. } => !created_nodes.contains(node_id),
+                U::EdgeProperty { edge_id, .. } | U::EdgeDeleted { edge_id, .. } => {
+                    !created_edges.contains(edge_id)
+                }
+            })
+        })
+    }
+
     /// Returns the current number of undo log entries for a transaction.
     ///
     /// Used by savepoints to record the position so that partial rollback

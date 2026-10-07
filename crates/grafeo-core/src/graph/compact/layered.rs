@@ -692,10 +692,12 @@ impl LayeredStore {
     /// N+1-epoch entity. It does not order WAL records against the cut: a
     /// WAL-backed store appends its record after the store mutation has
     /// released the guard, and transaction commit markers are written
-    /// separately. Callers must drain writers before the freeze (see
-    /// `GrafeoDB::freeze_epoch_for_handoff`). The caller MUST drop the
-    /// returned guard before the freeze returns so N+1 writers proceed only
-    /// after the handoff is fully installed.
+    /// separately. The engine orders those with its own locks, taken first
+    /// (`GrafeoDB::freeze_epoch_for_handoff`, DESIGN G2). The caller MUST
+    /// drop the returned guard before the freeze returns so N+1 writers
+    /// proceed only after the handoff is fully installed. The handoff
+    /// install holds it the same way across its checks and
+    /// [`Self::install_handoff_base`].
     pub fn freeze_write_barrier(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
         self.merge_guard.write()
     }
@@ -1017,8 +1019,11 @@ impl LayeredStore {
     /// Installs a retired handoff's generation as the live base (DESIGN G2):
     /// takes the live handoff state, with every write recorded from the
     /// freeze up to now, and runs the repair swap of
-    /// [`Self::swap_base_and_repair_overlay`] on it, all under the writer
-    /// barrier, so no write falls between the two.
+    /// [`Self::swap_base_and_repair_overlay`] on it.
+    ///
+    /// The caller holds `barrier` (from [`Self::freeze_write_barrier`]) from
+    /// before its own checks through this call, so no write falls between
+    /// them and the swap.
     ///
     /// `spilled` says whether a node property is held outside the overlay
     /// row (a ForceDisk-spilled vector): the row lacking it says nothing
@@ -1030,10 +1035,11 @@ impl LayeredStore {
     #[cfg(feature = "lpg")]
     pub fn install_handoff_base(
         &self,
+        barrier: &parking_lot::RwLockWriteGuard<'_, ()>,
         new_base: Arc<CompactStore>,
         spilled: &dyn Fn(&Node, &PropertyKey) -> bool,
     ) -> Result<(Arc<CompactStore>, OverlayHandoffLive), String> {
-        let _barrier = self.merge_guard.write();
+        let _ = barrier;
         let state = {
             let mut slot = self.handoff.write();
             if !slot.as_ref().is_some_and(|h| h.retired) {

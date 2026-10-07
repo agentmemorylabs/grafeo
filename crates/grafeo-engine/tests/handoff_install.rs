@@ -1,8 +1,7 @@
 //! H-ADOPT.2 item 4 — combined production handoff install
 //! (`GrafeoDB::publish_and_install_handoff`).
 //!
-//! The production handoff runs inside a quiesced maintenance window: the
-//! caller opens a writable generation root (which holds the exclusive
+//! The caller opens a writable generation root (which holds the exclusive
 //! `root.lock` and the lease registry for the DB lifetime), drives the epoch
 //! handoff (freeze → build → publish → retire), then installs the published
 //! generation as the live base through the registry's `publish` + the layered
@@ -11,18 +10,10 @@
 //!
 //! 1. Happy path: publish+install redirects the registry, swaps the layered
 //!    base to the new generation container, and reads serve through it.
-//! 2. Fail-closed zero-writer assertion: a post-freeze write during the
-//!    handoff window — recorded in the report's `post_freeze_*` sets, which
-//!    `complete_epoch_handoff` snapshots from the live handoff state under
-//!    the handoff lock at retire — makes the install fail with the typed
-//!    writes-during-window error, and the registry is NOT redirected.
+//! 2. Writes during the handoff window (DESIGN G2): a post-freeze write
+//!    survives the install (N+1 wins over the new base), and the report
+//!    cannot be installed twice.
 //! 3. Fail-closed: a database without a generation root cannot install.
-//!
-//! Note on (2): the write that records `post_freeze_*` must land between
-//! freeze and retire (two-step handoff). A write AFTER `run_epoch_handoff`
-//! returns cannot record post-freeze identity — retire already cleared the
-//! live handoff slot — so the two-step shape is the only legitimate way to
-//! produce the writes-during-window evidence the install assertion reads.
 
 #![cfg(all(
     feature = "generation",
@@ -149,10 +140,10 @@ fn publish_and_install_handoff_happy_path() {
     );
 }
 
-// ── Fail-closed: writes during the handoff window ──────────────────
+// ── Writes during the handoff window (DESIGN G2) ───────────────────
 
 #[test]
-fn publish_and_install_fails_closed_on_writes_during_window() {
+fn publish_and_install_keeps_writes_during_window() {
     let dir = TempDir::new().expect("temp dir");
     let gen_root = dir.path().join("live.grafeo.d");
     fs::create_dir_all(&gen_root).expect("create generation root");
@@ -160,64 +151,54 @@ fn publish_and_install_fails_closed_on_writes_during_window() {
 
     let db =
         GrafeoDB::open_generation_root(&gen_root, false).expect("open writable generation root");
-    let old_base_nodes = db
-        .layered_store()
-        .expect("layered store")
-        .base_store_arc()
-        .total_nodes();
-    assert_eq!(old_base_nodes, 2, "registry base = Ada + Grace");
+    let layered = || db.layered_store().expect("layered store");
+    assert_eq!(layered().base_store_arc().total_nodes(), 2, "Ada + Grace");
 
-    // Epoch-N overlay write FIRST, so G(1) would absorb it: if the install
-    // wrongly published+swapped despite the assertion failure, the layered
-    // base node count would change from 2 to 3 and this test would catch the
-    // redirect.
-    let n0 = db
-        .layered_store()
-        .expect("layered store")
-        .create_node(&["Person"]);
-    db.layered_store()
-        .expect("layered store")
-        .set_node_property(n0, "name", Value::from("epoch-n-absorbed"));
+    // Epoch N: absorbed into G(1).
+    let n0 = layered().create_node(&["Person"]);
+    layered().set_node_property(n0, "name", Value::from("epoch-n-absorbed"));
 
-    // Two-step handoff with a REAL post-freeze write: freeze epoch N, then a
-    // layered write lands in epoch N+1 and records post-freeze identity under
-    // the handoff lock, then build/publish/retire captures it on the report.
+    // Two-step handoff with a post-freeze write (epoch N+1).
     let handle = db
         .freeze_epoch_for_handoff(&gen_root)
         .expect("freeze epoch N");
-    let n1 = db
-        .layered_store()
-        .expect("layered store")
-        .create_node(&["Person"]);
-    db.layered_store()
-        .expect("layered store")
-        .set_node_property(n1, "name", Value::from("post-freeze-write"));
+    let n1 = layered().create_node(&["Person"]);
+    layered().set_node_property(n1, "name", Value::from("post-freeze-write"));
+    // ...and a post-freeze write to the frozen N row.
+    layered().set_node_property(n0, "name", Value::from("rewritten-at-n+1"));
     let report = db
         .complete_epoch_handoff(handle, generation_build_request(&gen_root, "g-hand-1"))
         .expect("complete handoff");
     assert_eq!(report.phase, EpochHandoffPhase::EpochRetired);
     assert!(
         report.post_freeze_nodes.contains(&n1.as_u64()),
-        "the post-freeze write must be recorded on the report: {report:?}"
+        "the post-freeze write is recorded on the report: {report:?}"
     );
 
-    // The install MUST fail closed: zero-writer assertion violated.
+    db.publish_and_install_handoff(report.clone())
+        .expect("install keeps the post-freeze writes");
+    assert_eq!(
+        layered().base_store_arc().total_nodes(),
+        3,
+        "the new base holds Ada, Grace and the epoch-N node"
+    );
+    let name = |id| {
+        db.graph_store()
+            .get_node_property(id, &PropertyKey::new("name"))
+    };
+    assert_eq!(name(n0), Some(Value::from("rewritten-at-n+1")), "N+1 wins");
+    assert_eq!(name(n1), Some(Value::from("post-freeze-write")));
+    assert!(
+        layered().handoff_live().is_none(),
+        "the install consumed the handoff"
+    );
+
     let err = db
         .publish_and_install_handoff(report)
-        .expect_err("writes during the handoff window must fail closed");
-    let msg = err.to_string();
+        .expect_err("a report installs once");
     assert!(
-        msg.contains("writes occurred during the handoff window"),
-        "typed writes-during-window error expected, got: {msg}"
-    );
-
-    // Registry NOT redirected: the layered base still serves the OLD
-    // generation container (no partial application on assertion failure).
-    let base = db.layered_store().expect("layered store").base_store_arc();
-    assert_eq!(
-        base.total_nodes(),
-        old_base_nodes,
-        "base must be unchanged after failed install"
+        err.to_string().contains("no retired handoff"),
+        "typed nothing-to-install error expected, got: {err}"
     );
 }
 
