@@ -208,6 +208,11 @@ path = "tests/generation_root_overlay_delete_crash.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
 
 [[test]]
+name = "generation_root_close_releases_lock"
+path = "tests/generation_root_close_releases_lock.rs"
+required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
+
+[[test]]
 name = "generation_root_overlay_diff"
 path = "tests/generation_root_overlay_diff.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]

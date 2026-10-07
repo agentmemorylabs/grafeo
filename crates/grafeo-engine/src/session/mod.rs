@@ -987,6 +987,12 @@ impl Session {
     fn check_wal_writable(&self) -> Result<()> {
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal
+            && wal.wal().is_sealed()
+        {
+            return Err(crate::database::GrafeoDB::database_closed_error());
+        }
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
             && let Some(reason) = wal.wal().poisoned_reason()
         {
             use grafeo_common::utils::write_outcome::UNTIL_REOPENED;

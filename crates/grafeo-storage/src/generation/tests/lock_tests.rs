@@ -87,6 +87,58 @@ fn lock_acquire_and_release() {
     try_acquire_root(&root).expect("acquire after drop must succeed");
 }
 
+/// `release` frees the root without dropping the lock value (AMH #176): it
+/// waits for a hold taken on another thread, a later hold fails with
+/// `Released`, a second release is a no-op, and a fresh acquire succeeds
+/// while the released value is still alive.
+#[test]
+fn lock_release_waits_for_holds_then_frees_the_root() {
+    if std::env::var(HELPER_ENV).is_ok() {
+        child_main();
+        return;
+    }
+    if super::super::tests::support::in_any_child() {
+        return;
+    }
+    let Some(dir) = supported_tempdir() else {
+        return;
+    };
+    let root = dir.path().to_path_buf();
+    let lock = try_acquire_root(&root).expect("acquire");
+    assert!(lock.is_held());
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::atomic::AtomicBool::new(false);
+    let (lock, released, dir) = (&lock, &released, &dir);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let hold = lock.hold().expect("hold while held");
+            assert_eq!(hold.lock().canonical_root(), dir.path());
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            assert!(
+                !released.load(std::sync::atomic::Ordering::SeqCst),
+                "release returned while a hold was alive"
+            );
+            drop(hold);
+        });
+        held_rx.recv().unwrap();
+        scope.spawn(|| {
+            assert!(lock.release(), "the first release releases");
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        go_tx.send(()).unwrap();
+    });
+    assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!lock.is_held());
+    assert!(matches!(lock.hold(), Err(RootLockError::Released)));
+    assert!(!lock.release(), "a second release is a no-op");
+    let again = try_acquire_root(&root).expect("acquire after release, before drop");
+    drop((lock, again));
+}
+
 #[test]
 fn lock_second_process_rejected() {
     if std::env::var(HELPER_ENV).is_ok() {

@@ -100,6 +100,9 @@ impl GrafeoDB {
             .generation_root
             .as_ref()
             .ok_or(RetirementError::NotGenerationRoot)?;
+        // Held through the backup, so `close()` waits for it; refused once
+        // the database was closed (AMH #176).
+        let _held = root.ownership().lock().hold()?;
         let _gate = self
             .epoch_handoff
             .begin_backup()
@@ -124,10 +127,15 @@ impl GrafeoDB {
     }
 
     /// The retirement authority of the open generation root, or `None` when
-    /// the database is not a generation root. Run live-root GC through this
-    /// so backups taken by the database keep their generation pinned.
+    /// the database is not a generation root or was closed (its root lock is
+    /// released, so it no longer owns the root; AMH #176). Run live-root GC
+    /// through this so backups taken by the database keep their generation
+    /// pinned.
     #[must_use]
     pub fn retirement_authority(&self) -> Option<&RetirementAuthority> {
-        self.generation_root.as_ref().map(|r| r.retirement())
+        self.generation_root
+            .as_ref()
+            .filter(|r| r.ownership().lock().is_held())
+            .map(|r| r.retirement())
     }
 }

@@ -157,6 +157,14 @@ impl GrafeoDB {
             .generation_root
             .as_ref()
             .ok_or(HandoffInstallError::NotGenerationRoot)?;
+        // Held through the install, so `close()` waits for it; refused once
+        // the database was closed (AMH #176).
+        let _held = ownership.ownership().lock().hold().map_err(|e| {
+            use grafeo_common::utils::write_outcome::DATABASE_CLOSED;
+            grafeo_common::utils::error::Error::Internal(format!(
+                "refusing to install an epoch handoff: {DATABASE_CLOSED} ({e})"
+            ))
+        })?;
         if self.epoch_handoff_phase() != EpochHandoffPhase::EpochRetired {
             return Err(HandoffInstallError::NotRetired {
                 phase: self.epoch_handoff_phase(),

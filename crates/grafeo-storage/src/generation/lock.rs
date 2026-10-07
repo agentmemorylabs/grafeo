@@ -3,8 +3,8 @@
 //! [`RootLock`] provides Option-S process ownership of a writable generation
 //! root: exactly one OS process may hold the lock for one canonical root.
 //! The lock is an exclusive kernel lock on `<root>/root.lock`, released by
-//! handle close (drop or process exit). There is no PID file, no lease
-//! timeout, and no timestamp fencing.
+//! handle close: [`RootLock::release`], drop, or process exit. There is no PID
+//! file, no lease timeout, and no timestamp fencing.
 //!
 //! Fail-closed guarantees:
 //!
@@ -20,6 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use parking_lot::{RwLock, RwLockReadGuard};
 
 /// Errors from root lock acquisition.
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +45,10 @@ pub enum RootLockError {
     /// Underlying I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The lock was released ([`RootLock::release`]): this handle no longer
+    /// owns the root.
+    #[error("root lock released: this handle no longer owns the root")]
+    Released,
 }
 
 /// Filesystem types accepted for a durable generation root on Linux.
@@ -61,14 +66,35 @@ pub struct MountEntry {
 /// Exclusive process ownership of a writable generation root.
 ///
 /// Acquires an exclusive kernel lock on `<root>/root.lock`.
-/// The lock is released when this value is dropped (handle close).
+/// The lock is released by [`release`](Self::release), or when this value is
+/// dropped (handle close).
 /// No PID file, no lease timeout, no timestamp fencing.
+///
+/// Work that relies on the ownership takes a [`hold`](Self::hold) for its
+/// duration: `release` waits for every hold to end, and a hold taken after
+/// it fails with [`RootLockError::Released`].
 #[derive(Debug)]
 pub struct RootLock {
     canonical_root: PathBuf,
     lock_path: PathBuf,
-    /// Held open for the lifetime of the lock; close = release.
-    _file: File,
+    /// Held open while the lock is held; `None` once released.
+    file: RwLock<Option<File>>,
+}
+
+/// Proof that a [`RootLock`] is held, for as long as this value lives
+/// ([`RootLock::hold`]).
+#[derive(Debug)]
+pub struct RootLockHold<'a> {
+    lock: &'a RootLock,
+    _held: RwLockReadGuard<'a, Option<File>>,
+}
+
+impl<'a> RootLockHold<'a> {
+    /// The held lock.
+    #[must_use]
+    pub fn lock(&self) -> &'a RootLock {
+        self.lock
+    }
 }
 
 impl RootLock {
@@ -115,8 +141,41 @@ impl RootLock {
         Ok(Self {
             canonical_root: canonical,
             lock_path,
-            _file: file,
+            file: RwLock::new(Some(file)),
         })
+    }
+
+    /// Holds the lock for the duration of the returned value, so that a
+    /// concurrent [`release`](Self::release) waits for it. Re-entrant within
+    /// a thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RootLockError::Released`] once the lock was released.
+    pub fn hold(&self) -> std::result::Result<RootLockHold<'_>, RootLockError> {
+        let held = self.file.read_recursive();
+        if held.is_none() {
+            return Err(RootLockError::Released);
+        }
+        Ok(RootLockHold {
+            lock: self,
+            _held: held,
+        })
+    }
+
+    /// Whether the lock is still held (not [`release`](Self::release)d).
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.file.read_recursive().is_some()
+    }
+
+    /// Releases the lock now, after every [`hold`](Self::hold) has ended:
+    /// closes the lock file, so another opener (in this process or another)
+    /// can acquire the root. Returns whether this call released it (`false`
+    /// if it was already released). Must not be called while this thread
+    /// has a hold.
+    pub fn release(&self) -> bool {
+        self.file.write().take().is_some()
     }
 
     /// The canonical root path this lock is bound to.

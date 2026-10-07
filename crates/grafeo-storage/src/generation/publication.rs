@@ -130,6 +130,10 @@ pub fn publish_generation(
     #[cfg(not(test))]
     let hook = |_name: &str| {};
 
+    // The whole publication runs under the root lock; a released lock
+    // (the owning database was closed) refuses before anything is written.
+    let _held = lock.hold().map_err(|_| PublicationError::NoLock)?;
+
     // Step 0: cut the WAL generation boundary (sync + rotate), unless the
     // caller already froze boundary B at epoch-handoff freeze time (G-EM0.5c).
     // A pre-cut cursor must remain replayable against the live WAL directory.

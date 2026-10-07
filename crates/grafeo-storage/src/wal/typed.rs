@@ -92,6 +92,18 @@ impl<R: WalEntry> TypedWal<R> {
         self.manager.poison(reason);
     }
 
+    /// Seals this WAL for good: its database was closed. See
+    /// [`WalManager::seal`].
+    pub fn seal(&self) {
+        self.manager.seal();
+    }
+
+    /// Whether this WAL was sealed. See [`WalManager::seal`].
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.manager.is_sealed()
+    }
+
     /// Why appends are refused, if the WAL was poisoned.
     #[must_use]
     pub fn poisoned_reason(&self) -> Option<String> {

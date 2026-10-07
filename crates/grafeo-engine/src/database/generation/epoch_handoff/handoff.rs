@@ -23,7 +23,7 @@ use grafeo_core::graph::compact::overlay_budget::RetainedCategory;
 use grafeo_storage::file::generation_writer::{
     ExactSectionSource, GenerationContainerHeader, OsGenerationFileOps,
 };
-use grafeo_storage::generation::lock::RootLock;
+use grafeo_storage::generation::lock::{RootLock, RootLockHold};
 use grafeo_storage::generation::publication::{PublicationInput, publish_generation};
 use grafeo_storage::generation::wal_cursor::cut_generation_boundary;
 use grafeo_storage::wal::WalManager;
@@ -82,8 +82,9 @@ fn maybe_stall_before_capture() {}
 /// is per open-file-description, so the same process cannot lock the same
 /// file twice through independent descriptors).
 enum HandoffRootLock<'a> {
-    /// The DB-lifetime lock already held by the generation-root ownership.
-    Owned(&'a RootLock),
+    /// The DB-lifetime lock held by the generation-root ownership, held for
+    /// the handoff so that `close()` waits for it (AMH #176).
+    Owned(RootLockHold<'a>),
     /// A freshly acquired short-lived lock (non-generation-root databases).
     Acquired(RootLock),
 }
@@ -93,7 +94,7 @@ impl HandoffRootLock<'_> {
     /// it; the exclusion itself is already in force in both variants).
     fn as_ref(&self) -> &RootLock {
         match self {
-            Self::Owned(lock) => lock,
+            Self::Owned(hold) => hold.lock(),
             Self::Acquired(lock) => lock,
         }
     }
@@ -124,6 +125,7 @@ impl GrafeoDB {
     /// handoff is already active, or the live graph cannot be snapshotted.
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
     pub fn freeze_epoch_for_handoff(&self, generation_root: &Path) -> Result<FrozenEpochHandle> {
+        self.check_root_open("start an epoch handoff")?;
         #[cfg(feature = "wal")]
         self.check_snapshot_source("start an epoch handoff")?;
         let mut slot = self.epoch_handoff.slot.lock();
@@ -329,6 +331,7 @@ impl GrafeoDB {
         handle: FrozenEpochHandle,
         request: GenerationBuildRequest,
     ) -> Result<EpochHandoffReport> {
+        self.check_root_open("complete an epoch handoff")?;
         {
             let mut slot = self.epoch_handoff.slot.lock();
             if slot.phase != EpochHandoffPhase::FreezeCaptured {
@@ -481,7 +484,11 @@ impl GrafeoDB {
             if let Some(ownership) = self.generation_root.as_ref()
                 && ownership.ownership().canonical_root() == root
             {
-                return Ok(HandoffRootLock::Owned(ownership.ownership().lock()));
+                let hold = ownership.ownership().lock().hold().map_err(|e| {
+                    use grafeo_common::utils::write_outcome::DATABASE_CLOSED;
+                    Error::Internal(format!("generation root lock: {DATABASE_CLOSED} ({e})"))
+                })?;
+                return Ok(HandoffRootLock::Owned(hold));
             }
         }
         Ok(HandoffRootLock::Acquired(

@@ -330,6 +330,13 @@ impl GenerationRootOwnership {
         &self.ownership
     }
 
+    /// Releases the root lock now (see [`RootLock::release`]), after every
+    /// hold on it has ended. The lease registry and the base mapping stay
+    /// until drop. Returns whether this call released it.
+    pub fn release_lock(&self) -> bool {
+        self.ownership.lock().release()
+    }
+
     /// The in-process lease registry holding the selected base.
     #[must_use]
     pub fn registry(&self) -> &std::sync::Arc<super::lease::GenerationLeaseRegistry> {

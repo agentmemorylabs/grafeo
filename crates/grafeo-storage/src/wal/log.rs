@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Checkpoint metadata stored in a separate file.
@@ -151,6 +151,10 @@ pub struct WalManager {
     checkpoint_epoch: Mutex<Option<EpochId>>,
     /// Set by [`poison`](Self::poison): every later append is refused.
     poisoned: Mutex<Option<String>>,
+    /// Set by [`seal`](Self::seal): the owning database was closed. Every
+    /// later append, log file creation and rotation is refused. Written
+    /// under the active-log lock.
+    sealed: AtomicBool,
     /// Encryptor for WAL records (None = unencrypted).
     #[cfg(feature = "encryption")]
     encryptor: Option<grafeo_common::encryption::PageEncryptor>,
@@ -208,6 +212,7 @@ impl WalManager {
             current_sequence: AtomicU64::new(max_sequence),
             checkpoint_epoch: Mutex::new(None),
             poisoned: Mutex::new(None),
+            sealed: AtomicBool::new(false),
             #[cfg(feature = "encryption")]
             encryptor: None,
             #[cfg(test)]
@@ -326,9 +331,32 @@ impl WalManager {
 
     fn poisoned_error(reason: &str) -> Error {
         use grafeo_common::utils::write_outcome::UNTIL_REOPENED;
-        Error::Internal(format!(
-            "WAL refuses appends {UNTIL_REOPENED}: {reason}"
-        ))
+        Error::Internal(format!("WAL refuses appends {UNTIL_REOPENED}: {reason}"))
+    }
+
+    /// The error of an append to a [`seal`](Self::seal)ed WAL.
+    fn sealed_error() -> Error {
+        use grafeo_common::utils::write_outcome::DATABASE_CLOSED;
+        Error::Internal(format!("WAL refuses appends: {DATABASE_CLOSED}"))
+    }
+
+    /// Seals this WAL for good: the database that owns it was closed (and,
+    /// for a generation root, is about to release the root lock, after which
+    /// another owner may append to this directory). Closes the active log;
+    /// every later append, log file creation and rotation is refused with a
+    /// [`DATABASE_CLOSED`](grafeo_common::utils::write_outcome::DATABASE_CLOSED)
+    /// error. Taken in the same order as an append, so an append either
+    /// completes before this or is refused.
+    pub fn seal(&self) {
+        let mut active = self.active_log.lock();
+        self.sealed.store(true, Ordering::SeqCst);
+        *active = None;
+    }
+
+    /// Whether [`seal`](Self::seal) was called.
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(Ordering::SeqCst)
     }
 
     fn write_frames_inner(
@@ -339,8 +367,12 @@ impl WalManager {
     ) -> Result<()> {
         use grafeo_common::testing::crash::maybe_crash;
 
+        // A sealed WAL refuses without poisoning: nothing was attempted.
+        if self.is_sealed() {
+            return Err(Self::sealed_error());
+        }
         if let Err(e) = self.ensure_active_log() {
-            if poison_on_error {
+            if poison_on_error && !self.is_sealed() {
                 self.poison(format!("WAL could not be opened for a commit marker: {e}"));
             }
             return Err(e);
@@ -353,6 +385,9 @@ impl WalManager {
         // after a writer poisoned the log.
         let (needs_rotation, sync_file, synced_records, written_sequence) = {
             let mut guard = self.active_log.lock();
+            if self.sealed.load(Ordering::SeqCst) {
+                return Err(Self::sealed_error());
+            }
             if let Some(reason) = self.poisoned.lock().as_ref() {
                 return Err(Self::poisoned_error(reason));
             }
@@ -712,6 +747,9 @@ impl WalManager {
     /// Returns an error if rotation fails.
     pub fn rotate(&self) -> Result<()> {
         let mut guard = self.active_log.lock();
+        if self.sealed.load(Ordering::SeqCst) {
+            return Err(Self::sealed_error());
+        }
         self.rotate_locked(&mut guard)
     }
 
@@ -956,6 +994,9 @@ impl WalManager {
     fn ensure_active_log(&self) -> Result<()> {
         let mut guard = self.active_log.lock();
         if guard.is_none() {
+            if self.sealed.load(Ordering::SeqCst) {
+                return Err(Self::sealed_error());
+            }
             let sequence = self.current_sequence.load(Ordering::Relaxed);
             let path = self.log_path(sequence);
 
@@ -1152,6 +1193,58 @@ mod tests {
         assert!(failed.is_err());
         assert!(wal.poisoned_reason().is_none());
         assert!(wal.write_frames(&[b"data".as_slice()], false).is_ok());
+    }
+
+    /// A sealed WAL (its database was closed, AMH #176) refuses appends and
+    /// rotation with a `DATABASE_CLOSED` error and creates no file: another
+    /// owner may own the directory by then.
+    #[test]
+    fn test_sealed_wal_refuses_appends_and_creates_nothing() {
+        use grafeo_common::utils::write_outcome::WriteOutcome;
+        let dir = tempdir().unwrap();
+        let wal = WalManager::open(dir.path()).unwrap();
+        let record = WalRecord::CreateNode {
+            id: NodeId::new(1),
+            labels: vec!["Person".to_string()],
+        };
+        wal.log(&record).unwrap();
+        wal.sync().unwrap();
+        let listing = || {
+            let mut files: Vec<(String, u64)> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata().unwrap().len(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = listing();
+
+        wal.seal();
+        assert!(wal.is_sealed());
+        for err in [
+            wal.log(&record).unwrap_err(),
+            wal.write_frames_or_poison(&[b"commit".as_slice()], true)
+                .unwrap_err(),
+            wal.rotate().unwrap_err(),
+        ] {
+            assert_eq!(
+                err.write_outcome(),
+                Some(WriteOutcome::DatabaseClosed),
+                "{err}"
+            );
+        }
+        assert!(
+            wal.poisoned_reason().is_none(),
+            "a sealed WAL is not poisoned"
+        );
+        assert_eq!(listing(), before, "the sealed WAL wrote or created a file");
+        assert_eq!(wal.record_count(), 1);
     }
 
     #[test]

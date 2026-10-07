@@ -36,6 +36,10 @@ pub const WAL_WAS_POISONED: &str = "the WAL was poisoned";
 /// Every "the WAL is poisoned, reopen the database" marker.
 pub const WAL_POISONED_MARKERS: [&str; 3] = [UNTIL_REOPENED, WAL_IS_POISONED, WAL_WAS_POISONED];
 
+/// A write or root operation refused because the database was closed: its
+/// WAL is sealed and, for a generation root, the root lock was released.
+pub const DATABASE_CLOSED: &str = "the database is closed";
+
 /// Prefix of a rollback that could not restore every change.
 pub const ROLLBACK_INCOMPLETE: &str = "rollback incomplete:";
 
@@ -54,6 +58,9 @@ pub enum WriteOutcome {
     RollbackIncomplete,
     /// Refused before anything was applied (rolled back cleanly); retryable.
     AdmissionRetryable,
+    /// Refused before anything was applied because the database was closed.
+    /// Write through a database opened again.
+    DatabaseClosed,
 }
 
 impl WriteOutcome {
@@ -72,6 +79,9 @@ impl Error {
     pub fn write_outcome(&self) -> Option<WriteOutcome> {
         match self {
             Error::AdmissionRetryable(_) => Some(WriteOutcome::AdmissionRetryable),
+            Error::Internal(message) if message.contains(DATABASE_CLOSED) => {
+                Some(WriteOutcome::DatabaseClosed)
+            }
             Error::Internal(message) if message.contains(DURABILITY_UNCONFIRMED) => {
                 Some(WriteOutcome::DurabilityUnconfirmed)
             }
@@ -128,6 +138,11 @@ mod tests {
             Error::AdmissionRetryable("cap".into()).write_outcome(),
             Some(WriteOutcome::AdmissionRetryable)
         );
+        assert_eq!(
+            internal(&format!("WAL refuses appends: {DATABASE_CLOSED}")).write_outcome(),
+            Some(WriteOutcome::DatabaseClosed)
+        );
+        assert!(WriteOutcome::DatabaseClosed.requires_reopen());
     }
 
     #[test]

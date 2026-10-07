@@ -3636,9 +3636,22 @@ impl GrafeoDB {
     /// A write reported as "durability unconfirmed" may or may not be there
     /// afterwards (another snapshot path may have persisted it).
     ///
-    /// After such a close, **drop** this `GrafeoDB` before reopening the same
-    /// database: a generation root keeps its root lock until drop, and
-    /// retrying `close()` returns `Ok` without confirming anything.
+    /// Retrying `close()` after such a close returns `Ok` without confirming
+    /// anything.
+    ///
+    /// # Generation roots
+    ///
+    /// `close()` releases the root lock (AMH #176), so the root can be opened
+    /// again, read-only or writable, in this process or another, before this
+    /// `GrafeoDB` is dropped. It first fences this handle off the root: the
+    /// WAL is sealed, so a later write is refused before it is applied (a
+    /// [`DATABASE_CLOSED`](grafeo_common::utils::write_outcome::DATABASE_CLOSED)
+    /// error), and handoff, publication and backup refuse. The release waits
+    /// for a root operation in flight on another thread. Reads keep working
+    /// on the state at close. A close over a poisoned WAL releases the lock
+    /// too. If the close-time commit marker cannot be written, `close()`
+    /// returns that error and keeps the lock (and the database open), so it
+    /// can be retried; the lock is then released at drop.
     pub fn close(&self) -> Result<()> {
         let mut is_open = self.is_open.write();
         if !*is_open {
@@ -3660,6 +3673,7 @@ impl GrafeoDB {
             if let Some(ref fm) = self.file_manager {
                 fm.close()?;
             }
+            self.release_generation_root();
             *is_open = false;
             return Ok(());
         }
@@ -3671,8 +3685,8 @@ impl GrafeoDB {
         // The WAL handle is closed without appending anything (bytes already
         // encoded in its write buffer may still be flushed by the drop); the
         // next writable open replays the WAL. The close itself fails, after
-        // releasing the files it can (a generation root's lock is released
-        // when the database is dropped).
+        // releasing the files and locks it can (a generation root's lock
+        // too).
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.poisoned_reason()
@@ -3689,12 +3703,12 @@ impl GrafeoDB {
             {
                 file_error = format!(" (closing the database file also failed: {e})");
             }
+            self.release_generation_root();
             *is_open = false;
             return Err(Error::Internal(format!(
                 "database closed without a checkpoint: {WAL_WAS_POISONED} ({reason}); the \
                  next writable open replays the WAL, and a write whose durability was \
-                 reported unconfirmed may or may not be there. Drop this database before \
-                 reopening it{file_error}"
+                 reported unconfirmed may or may not be there{file_error}"
             )));
         }
 
@@ -3803,8 +3817,64 @@ impl GrafeoDB {
             wal.sync()?;
         }
 
+        self.release_generation_root();
         *is_open = false;
         Ok(())
+    }
+
+    /// Fences a closing generation root off its root and releases the root
+    /// lock (AMH #176): seals the WAL (later appends refused, nothing more
+    /// written to the root's WAL directory), then releases the lock once no
+    /// root operation holds it. A no-op for other databases.
+    fn release_generation_root(&self) {
+        #[cfg(all(
+            feature = "generation",
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "mmap"
+        ))]
+        if let Some(ref root) = self.generation_root {
+            #[cfg(feature = "wal")]
+            if let Some(ref wal) = self.wal {
+                wal.seal();
+            }
+            root.release_lock();
+        }
+    }
+
+    /// Refuses a root operation (`what`: handoff, publication, backup) on a
+    /// generation root that was closed: its root lock is released, so this
+    /// handle no longer owns the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DATABASE_CLOSED`](grafeo_common::utils::write_outcome::DATABASE_CLOSED)
+    /// error.
+    pub(super) fn check_root_open(&self, what: &str) -> Result<()> {
+        #[cfg(all(
+            feature = "generation",
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "mmap"
+        ))]
+        if let Some(ref root) = self.generation_root
+            && !root.ownership().lock().is_held()
+        {
+            use grafeo_common::utils::write_outcome::DATABASE_CLOSED;
+            return Err(Error::Internal(format!(
+                "refusing to {what}: {DATABASE_CLOSED} (its root lock was released)"
+            )));
+        }
+        let _ = what;
+        Ok(())
+    }
+
+    /// The error of a write refused because the database was closed (its WAL
+    /// is sealed).
+    #[cfg(feature = "wal")]
+    pub(crate) fn database_closed_error() -> Error {
+        use grafeo_common::utils::write_outcome::DATABASE_CLOSED;
+        Error::Internal(format!("write refused: {DATABASE_CLOSED}"))
     }
 
     /// Returns the typed WAL if available.
@@ -3817,6 +3887,14 @@ impl GrafeoDB {
     /// Returns `true` (after a warning) when the WAL is poisoned, so a write
     /// API that cannot return an error refuses before mutating anything.
     pub(super) fn refuse_write_if_wal_poisoned(&self, api: &str) -> bool {
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = self.wal
+            && wal.is_sealed()
+        {
+            use grafeo_common::utils::write_outcome::DATABASE_CLOSED;
+            grafeo_warn!("{api} refused: {DATABASE_CLOSED}");
+            return true;
+        }
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.poisoned_reason()
@@ -3836,6 +3914,11 @@ impl GrafeoDB {
     /// Returns the poison's "WAL refuses writes" error.
     #[cfg(feature = "wal")]
     pub(super) fn check_wal_writable(&self) -> Result<()> {
+        if let Some(ref wal) = self.wal
+            && wal.is_sealed()
+        {
+            return Err(Self::database_closed_error());
+        }
         if let Some(ref wal) = self.wal
             && let Some(reason) = wal.poisoned_reason()
         {
