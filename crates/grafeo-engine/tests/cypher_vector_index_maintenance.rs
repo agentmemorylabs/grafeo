@@ -409,3 +409,74 @@ fn cypher_reembed_relinks_the_hnsw() {
         "after a Cypher re-embed of every node: recall@10 {recall:.3}, {not_self} not their own top hit"
     );
 }
+
+/// AMH #189: on a writable generation root, nodes created by
+/// `batch_create_nodes` / `batch_create_nodes_with_props` must be linked
+/// into the HNSW (their neighbours are base nodes, readable only through the
+/// merged view), and stay findable after a reopen. Fixed by fork #45
+/// (`build_vector_accessor`); this pins it.
+#[cfg(all(
+    feature = "generation",
+    feature = "generation-streaming",
+    feature = "compact-store"
+))]
+#[test]
+fn generation_root_batch_created_vectors_are_searchable() {
+    use grafeo_engine::generation_build_request;
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("g.grafeo.d");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = GrafeoDB::new_in_memory();
+    seed_graph(&source);
+    source
+        .build_and_publish_generation(generation_build_request(&root, "g1"))
+        .unwrap();
+
+    let batch: Vec<u64> = (3000..3012).collect();
+    let props: Vec<u64> = (4000..4012).collect();
+    let check = |db: &GrafeoDB, what: &str| {
+        let missing: Vec<u64> = batch
+            .iter()
+            .chain(&props)
+            .copied()
+            .filter(|seed| exact_hit(db, *seed).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{what}: batch-created seeds not found: {missing:?}"
+        );
+        assert_base_intact(db, &[], what);
+    };
+    {
+        let db = GrafeoDB::open_generation_root(&root, false).unwrap();
+        let ids = db.batch_create_nodes(
+            "Doc",
+            "embedding",
+            batch.iter().map(|s| vector(*s)).collect(),
+        );
+        assert_eq!(ids.len(), batch.len());
+        let rows = props
+            .iter()
+            .map(|s| {
+                HashMap::from([
+                    (
+                        grafeo_common::types::PropertyKey::new("key"),
+                        Value::Int64(*s as i64),
+                    ),
+                    (
+                        grafeo_common::types::PropertyKey::new("embedding"),
+                        vval(*s),
+                    ),
+                ])
+            })
+            .collect();
+        assert_eq!(
+            db.batch_create_nodes_with_props("Doc", rows).len(),
+            props.len()
+        );
+        check(&db, "root, in-session");
+        db.close().unwrap();
+    }
+    let db = GrafeoDB::open_generation_root(&root, false).unwrap();
+    check(&db, "root, after reopen");
+}
