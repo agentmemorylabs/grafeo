@@ -144,7 +144,7 @@ pub struct Session {
         feature = "mmap",
         not(feature = "temporal")
     ))]
-    vector_spill_storages: Option<crate::database::vector_access::VectorSpillRegistry>,
+    vector_spill_storages: Option<crate::database::VectorSpillRegistry>,
     /// Schema and metadata catalog shared across sessions.
     catalog: Arc<Catalog>,
     /// RDF triple store (if RDF feature is enabled).
@@ -412,10 +412,6 @@ impl Session {
         self.graph_store_mut = write_store;
     }
 
-    /// Hands the session the raw layered store, so the direct node/edge APIs
-    /// reach base elements (see [`direct_store`](Self::direct_store)), and so
-    /// commit, rollback and savepoint rollback drive its transaction-scoped
-    /// bookkeeping.
     /// Hands the session the database's spilled-vector registry (AMH #175).
     #[cfg(all(
         feature = "lpg",
@@ -425,11 +421,15 @@ impl Session {
     ))]
     pub(crate) fn set_vector_spill_storages(
         &mut self,
-        registry: Option<crate::database::vector_access::VectorSpillRegistry>,
+        registry: Option<crate::database::VectorSpillRegistry>,
     ) {
         self.vector_spill_storages = registry;
     }
 
+    /// Hands the session the raw layered store, so the direct node/edge APIs
+    /// reach base elements (see [`direct_store`](Self::direct_store)), and so
+    /// commit, rollback and savepoint rollback drive its transaction-scoped
+    /// bookkeeping.
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
     pub(crate) fn set_layered_store(
         &mut self,

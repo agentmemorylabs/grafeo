@@ -9,14 +9,8 @@
 //! property-only accessor sees every existing node as vectorless, so the new
 //! node is never linked and pruning drops edges of existing nodes.
 
-/// Spilled vector storages by `label:property`, shared by the database and
-/// its sessions.
 #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
-pub(crate) type VectorSpillRegistry = std::sync::Arc<
-    parking_lot::RwLock<
-        std::collections::HashMap<String, std::sync::Arc<grafeo_core::index::vector::MmapStorage>>,
-    >,
->;
+pub(crate) use super::VectorSpillRegistry;
 
 /// Accessor over `store` that falls back to the spill registered for
 /// `label:property` (inline values win: written after the spill).
