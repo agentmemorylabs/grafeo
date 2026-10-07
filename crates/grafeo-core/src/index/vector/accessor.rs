@@ -96,11 +96,16 @@ impl<'a> SpillableVectorAccessor<'a> {
 
 impl VectorAccessor for SpillableVectorAccessor<'_> {
     fn get_vector(&self, id: NodeId) -> Option<Arc<[f32]>> {
-        // Mutable post-spill writes are authoritative over the mmap snapshot.
-        if let Some(Value::Vector(vector)) = self.store.get_node_property(id, &self.property) {
-            return Some(vector);
+        // Mutable post-spill writes are authoritative over the mmap snapshot,
+        // including a non-vector value (e.g. the `Null` a Cypher `REMOVE`
+        // writes): only an ABSENT property falls back to the spill. The spill
+        // only ever drains vectors, so a present non-vector was written after
+        // it (AMH #174).
+        match self.store.get_node_property(id, &self.property) {
+            Some(Value::Vector(vector)) => Some(vector),
+            Some(_) => None,
+            None => self.spill_storage.get(id),
         }
-        self.spill_storage.get(id)
     }
 }
 
