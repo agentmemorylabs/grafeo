@@ -1087,15 +1087,76 @@ impl super::GrafeoDB {
     ///
     /// If WAL is enabled, the operation is logged as its own WAL group; see
     /// [Durability of direct writes](Self#durability-of-direct-writes).
+    /// Removes `id`'s spilled `key` vector from every matching spill storage
+    /// (one per `label:key` index). Returns whether any held it.
+    #[cfg(feature = "vector-index")]
+    fn remove_spilled_vector(
+        &self,
+        id: grafeo_common::types::NodeId,
+        key: &str,
+        labels: &[String],
+    ) -> bool {
+        #[cfg(all(feature = "mmap", not(feature = "temporal")))]
+        {
+            use grafeo_core::index::vector::VectorStorage as _;
+            let Some(registry) = self.vector_spill_storages.as_ref() else {
+                return false;
+            };
+            let registry = registry.read();
+            let mut removed = false;
+            for label in labels {
+                if let Some(storage) = registry.get(&format!("{label}:{key}")) {
+                    removed |= storage.remove(id);
+                }
+            }
+            removed
+        }
+        #[cfg(not(all(feature = "mmap", not(feature = "temporal"))))]
+        {
+            let _ = (id, key, labels);
+            false
+        }
+    }
+
     pub fn remove_node_property(&self, id: grafeo_common::types::NodeId, key: &str) -> bool {
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("remove_node_property") {
             return false;
         }
-        let removed = self
+        // Labels before the removal, for the vector index / spill lookups.
+        #[cfg(feature = "vector-index")]
+        let labels: Vec<String> = self
+            .graph_store()
+            .get_node(id)
+            .map(|node| node.labels.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
+
+        let removed_inline = self
             .direct_write_store()
             .remove_node_property(id, key)
             .is_some();
+        // AMH #174: under ForceDisk an indexed vector may live only in the
+        // spill. Removing it there too makes the removal real (and WAL-logged)
+        // instead of a silent no-op that readers, a reload and the next
+        // handoff would undo.
+        #[cfg(feature = "vector-index")]
+        let removed_spilled = self.remove_spilled_vector(id, key, &labels);
+        #[cfg(not(feature = "vector-index"))]
+        let removed_spilled = false;
+        let removed = removed_inline || removed_spilled;
+
+        // The node no longer has this vector: drop it from the matching
+        // vector indexes, reconnecting its former neighbours.
+        #[cfg(feature = "vector-index")]
+        if removed {
+            let graph = self.graph_store();
+            for label in &labels {
+                if let Some(index) = self.lpg_store().get_vector_index(label, key) {
+                    let accessor = self.build_vector_accessor(&graph, label, key);
+                    index.remove_with_accessor(id, &accessor);
+                }
+            }
+        }
 
         #[cfg(feature = "wal")]
         if removed
