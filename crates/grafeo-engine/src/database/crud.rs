@@ -485,8 +485,11 @@ impl super::GrafeoDB {
         {
             for label in &node.labels {
                 if let Some(index) = self.lpg_store().get_vector_index(label.as_str(), key) {
-                    // Spill-aware (AMH #175): neighbours may be spill-only.
-                    let accessor = self.make_vector_accessor(label.as_str(), key);
+                    // Neighbour vectors through the merged view with the
+                    // spill fallback: under ForceDisk they may be spill-only
+                    // (AMH #175), on a layered database base-only (#174).
+                    let graph = self.graph_store();
+                    let accessor = self.build_vector_accessor(&graph, label.as_str(), key);
                     index.insert(id, &vec, &accessor);
                 }
             }
@@ -571,8 +574,9 @@ impl super::GrafeoDB {
                     if let Some(grafeo_common::types::Value::Vector(v)) =
                         node.properties.get(&prop_key)
                     {
-                        // Spill-aware (AMH #175): neighbours may be spill-only.
-                        let accessor = self.make_vector_accessor(label, property);
+                        // Merged view + spill fallback (AMH #175, #174).
+                        let graph = self.graph_store();
+                        let accessor = self.build_vector_accessor(&graph, label, property);
                         index.insert(id, v, &accessor);
                     }
                 }
@@ -1119,8 +1123,9 @@ impl super::GrafeoDB {
         // Auto-insert into matching vector index if one exists
         #[cfg(feature = "vector-index")]
         if let Some(index) = self.lpg_store().get_vector_index(label, property) {
-            // Spill-aware (AMH #175): neighbours may be spill-only.
-            let accessor = self.make_vector_accessor(label, property);
+            // Merged view + spill fallback (AMH #175, #174).
+            let graph = self.graph_store();
+            let accessor = self.build_vector_accessor(&graph, label, property);
             for &id in &ids {
                 if let Some(node) = self.lpg_store().get_node(id) {
                     let pk = grafeo_common::types::PropertyKey::new(property);
@@ -1250,8 +1255,9 @@ impl super::GrafeoDB {
                     continue;
                 }
                 let property = &key[label.len() + 1..];
-                // Spill-aware (AMH #175): neighbours may be spill-only.
-                let accessor = self.make_vector_accessor(label, property);
+                // Merged view + spill fallback (AMH #175, #174).
+                let graph = self.graph_store();
+                let accessor = self.build_vector_accessor(&graph, label, property);
                 let pk = grafeo_common::types::PropertyKey::new(property);
                 for &id in &ids {
                     if let Some(node) = self.lpg_store().get_node(id) {
