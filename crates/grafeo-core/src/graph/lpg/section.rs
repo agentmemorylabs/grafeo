@@ -13,23 +13,55 @@ use grafeo_common::types::{EpochId, Value};
 use grafeo_common::utils::error::Result;
 
 use super::block::{self, BlockEdge, BlockNamedGraph, BlockNode};
-use crate::graph::lpg::LpgStore;
+use crate::graph::lpg::{Edge, LpgStore, Node};
+
+/// Turns a stored row into the row to persist (see
+/// [`LpgStoreSection::with_row_materializer`]).
+pub type NodeRowMaterializer = Arc<dyn Fn(Node) -> Node + Send + Sync>;
+/// Edge counterpart of [`NodeRowMaterializer`].
+pub type EdgeRowMaterializer = Arc<dyn Fn(Edge) -> Edge + Send + Sync>;
+
+/// Adds the materialized row's properties the stored row lacks as epoch-0
+/// entries (`temporal`: the stored history is the diff's history; the base
+/// values are its epoch-0 state).
+#[cfg(feature = "temporal")]
+fn add_inherited(
+    properties: &mut Vec<(String, Vec<(EpochId, Value)>)>,
+    materialized: &grafeo_common::types::PropertyMap,
+) {
+    for (key, value) in materialized.iter() {
+        if !properties.iter().any(|(k, _)| k == key.as_str()) {
+            properties.push((key.to_string(), vec![(EpochId::new(0), value.clone())]));
+        }
+    }
+}
 
 /// Current LPG section format version (v2 = block-based).
 const LPG_SECTION_VERSION: u8 = 2;
 
 // ── Collection helpers ──────────────────────────────────────────────
 
-fn collect_block_nodes(store: &LpgStore) -> Vec<BlockNode> {
+fn collect_block_nodes(
+    store: &LpgStore,
+    materialize: Option<&NodeRowMaterializer>,
+) -> Vec<BlockNode> {
     let mut nodes: Vec<BlockNode> = store
         .all_nodes()
         .map(|n| {
+            let n = match materialize {
+                Some(f) => f(n),
+                None => n,
+            };
             #[cfg(feature = "temporal")]
             let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = store
                 .committed_node_property_history(n.id)
                 .into_iter()
                 .map(|(k, entries)| (k.to_string(), entries))
                 .collect();
+            #[cfg(feature = "temporal")]
+            if materialize.is_some() {
+                add_inherited(&mut properties, &n.properties);
+            }
 
             #[cfg(not(feature = "temporal"))]
             let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = n
@@ -54,16 +86,27 @@ fn collect_block_nodes(store: &LpgStore) -> Vec<BlockNode> {
     nodes
 }
 
-fn collect_block_edges(store: &LpgStore) -> Vec<BlockEdge> {
+fn collect_block_edges(
+    store: &LpgStore,
+    materialize: Option<&EdgeRowMaterializer>,
+) -> Vec<BlockEdge> {
     let mut edges: Vec<BlockEdge> = store
         .all_edges()
         .map(|e| {
+            let e = match materialize {
+                Some(f) => f(e),
+                None => e,
+            };
             #[cfg(feature = "temporal")]
             let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = store
                 .committed_edge_property_history(e.id)
                 .into_iter()
                 .map(|(k, entries)| (k.to_string(), entries))
                 .collect();
+            #[cfg(feature = "temporal")]
+            if materialize.is_some() {
+                add_inherited(&mut properties, &e.properties);
+            }
 
             #[cfg(not(feature = "temporal"))]
             let mut properties: Vec<(String, Vec<(EpochId, Value)>)> = e
@@ -128,6 +171,8 @@ fn populate_store(store: &LpgStore, nodes: &[BlockNode], edges: &[BlockEdge]) ->
 pub struct LpgStoreSection {
     store: Arc<LpgStore>,
     dirty: AtomicBool,
+    /// Applied to the default graph's rows before they are written.
+    materialize: Option<(NodeRowMaterializer, EdgeRowMaterializer)>,
 }
 
 impl LpgStoreSection {
@@ -136,7 +181,26 @@ impl LpgStoreSection {
         Self {
             store,
             dirty: AtomicBool::new(false),
+            materialize: None,
         }
+    }
+
+    /// Persists every default-graph row as `node(row)` / `edge(row)`.
+    ///
+    /// A layered store's overlay holds *diff* rows for base entities (D10);
+    /// its section persists them as whole rows (base merged in, removed
+    /// properties absent), which is also what binaries before D10 wrote. So
+    /// a persisted overlay row of a base entity always means "the whole
+    /// row", and the load path turns it back into a diff
+    /// (`LayeredStore::adopt_persisted_full_rows`).
+    #[must_use]
+    pub fn with_row_materializer(
+        mut self,
+        node: NodeRowMaterializer,
+        edge: EdgeRowMaterializer,
+    ) -> Self {
+        self.materialize = Some((node, edge));
+        self
     }
 
     /// Mark this section as dirty (has unsaved changes).
@@ -161,8 +225,8 @@ impl Section for LpgStoreSection {
     }
 
     fn serialize(&self) -> Result<Vec<u8>> {
-        let nodes = collect_block_nodes(&self.store);
-        let edges = collect_block_edges(&self.store);
+        let nodes = collect_block_nodes(&self.store, self.materialize.as_ref().map(|(n, _)| n));
+        let edges = collect_block_edges(&self.store, self.materialize.as_ref().map(|(_, e)| e));
 
         let named_graphs: Vec<BlockNamedGraph> = self
             .store
@@ -171,8 +235,8 @@ impl Section for LpgStoreSection {
             .filter_map(|name| {
                 self.store.graph(&name).map(|graph_store| BlockNamedGraph {
                     name,
-                    nodes: collect_block_nodes(&graph_store),
-                    edges: collect_block_edges(&graph_store),
+                    nodes: collect_block_nodes(&graph_store, None),
+                    edges: collect_block_edges(&graph_store, None),
                 })
             })
             .collect();

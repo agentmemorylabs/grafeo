@@ -448,6 +448,32 @@ impl Session {
         })
     }
 
+    /// Nodes whose properties or labels the layered overlay will undo for
+    /// `transaction_id` from undo log position `since`. Read before the
+    /// undo replays, for [`Self::reconcile_layered_text`].
+    #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+    fn layered_undo_nodes(&self, transaction_id: TransactionId, since: usize) -> Vec<NodeId> {
+        self.layered_store
+            .as_ref()
+            .map_or_else(Vec::new, |layered| {
+                layered
+                    .overlay_store()
+                    .undo_log_node_ids(transaction_id, since)
+            })
+    }
+
+    /// After a rollback, re-syncs the text documents of the base nodes it
+    /// touched against the merged view (an undone `SET` of an inherited text
+    /// property has no old value in the overlay to restore; D10).
+    #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+    fn reconcile_layered_text(&self, nodes: &[NodeId]) {
+        if let Some(layered) = &self.layered_store
+            && !nodes.is_empty()
+        {
+            layered.reconcile_text_documents(nodes);
+        }
+    }
+
     /// The error a rollback returns, after completing everything else, when
     /// `unrestored` layered base changes could not be undone. It is an
     /// error rather than only a log line so embedders that compile out
@@ -1085,6 +1111,11 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[must_use]
     pub fn get_node_history(&self, id: NodeId) -> Vec<(EpochId, Option<EpochId>, Node)> {
+        // The layered target merges a base node's diff rows (D10).
+        #[cfg(feature = "compact-store")]
+        if let direct_store::DirectStore::Layered { read, .. } = self.direct_store() {
+            return read.get_node_history(id);
+        }
         self.active_lpg_store().get_node_history(id)
     }
 
@@ -1094,6 +1125,11 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[must_use]
     pub fn get_edge_history(&self, id: EdgeId) -> Vec<(EpochId, Option<EpochId>, Edge)> {
+        // See `get_node_history`.
+        #[cfg(feature = "compact-store")]
+        if let direct_store::DirectStore::Layered { read, .. } = self.direct_store() {
+            return read.get_edge_history(id);
+        }
         self.active_lpg_store().get_edge_history(id)
     }
 
@@ -4700,6 +4736,9 @@ impl Session {
     ) -> AbortOutcome {
         *self.read_only_tx.lock() = self.db_read_only;
 
+        #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+        let undone_nodes = self.layered_undo_nodes(transaction_id, 0);
+
         // Discard uncommitted versions in ALL touched LPG stores (cross-graph atomicity).
         for graph_name in touched {
             let store = self.resolve_store(graph_name);
@@ -4712,6 +4751,8 @@ impl Session {
         let unrestored = self.rollback_layered_bookkeeping(transaction_id);
         #[cfg(not(all(feature = "compact-store", feature = "lpg")))]
         let unrestored = 0;
+        #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+        self.reconcile_layered_text(&undone_nodes);
 
         #[cfg(feature = "triple-store")]
         self.rollback_rdf_transaction(transaction_id);
@@ -4838,6 +4879,21 @@ impl Session {
         savepoints.truncate(pos);
         drop(savepoints);
 
+        // The layered overlay's undo range: from its captured position, or
+        // all of it when it was first touched after the savepoint.
+        #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+        let undone_nodes = {
+            let since = self.layered_store.as_ref().and_then(|layered| {
+                let overlay = layered.overlay_store();
+                sp_state
+                    .graph_snapshots
+                    .iter()
+                    .find(|gs| Arc::ptr_eq(&self.resolve_store(&gs.graph_name), &overlay))
+                    .map(|gs| gs.undo_log_position)
+            });
+            self.layered_undo_nodes(transaction_id, since.unwrap_or(0))
+        };
+
         // Roll back each graph that was captured in the savepoint.
         for gs in &sp_state.graph_snapshots {
             let store = self.resolve_store(&gs.graph_name);
@@ -4866,6 +4922,8 @@ impl Session {
         let unrestored = self.layered_store.as_ref().map_or(0, |layered| {
             layered.rollback_transaction_layers_to(transaction_id, sp_state.layered_position)
         });
+        #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+        self.reconcile_layered_text(&undone_nodes);
 
         // Truncate CDC event buffer to the savepoint position.
         #[cfg(feature = "cdc")]

@@ -340,8 +340,10 @@ impl super::GrafeoDB {
         let mut result = crate::admin::ValidationResult::default();
 
         // Check for dangling edge references
+        // Endpoints through the merged view: on a layered database an
+        // overlay edge's endpoint can be a base node with no overlay row.
         for edge in self.lpg_store().all_edges() {
-            if self.lpg_store().get_node(edge.src).is_none() {
+            if self.get_node(edge.src).is_none() {
                 result.errors.push(crate::admin::ValidationError {
                     code: "DANGLING_SRC".to_string(),
                     message: format!(
@@ -351,7 +353,7 @@ impl super::GrafeoDB {
                     context: Some(format!("edge:{}", edge.id.0)),
                 });
             }
-            if self.lpg_store().get_node(edge.dst).is_none() {
+            if self.get_node(edge.dst).is_none() {
                 result.errors.push(crate::admin::ValidationError {
                     code: "DANGLING_DST".to_string(),
                     message: format!(

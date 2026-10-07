@@ -140,6 +140,21 @@ impl GrafeoDB {
                 "drain_overlay_to_tier: epoch handoff already active".into(),
             ));
         }
+        // Builder-only contract: tiers chain over an EMPTY base. The final
+        // tier-chain build walks tiers + overlay only, so original base rows
+        // would be left out, and an overlay row of a base node is a diff
+        // (D10) that a tier cannot hold whole. Refused before any state
+        // changes.
+        let base = layered.base_store_arc();
+        if base.total_nodes() > 0 || base.total_edges() > 0 {
+            return Err(Error::Internal(format!(
+                "drain_overlay_to_tier requires an empty base (it has {} node(s), {} edge(s)): \
+                 a tier chain carries no original base rows",
+                base.total_nodes(),
+                base.total_edges()
+            )));
+        }
+        drop(base);
 
         let anon_before = layered.overlay_memory_bytes() as u64;
 
@@ -206,7 +221,8 @@ impl GrafeoDB {
         let overlay_arc = layered.overlay_store();
         let window_store = {
             // Use the overlay LpgStore directly as the GraphStore source.
-            // This is O(window) by construction.
+            // This is O(window) by construction. The base is empty (checked
+            // above), so every overlay row is whole.
             let src: &dyn grafeo_core::graph::traits::GraphStore = overlay_arc.as_ref();
             grafeo_core::graph::compact::from_graph_store_preserving_ids(src)
                 .map_err(|e| Error::Internal(format!("window CompactStore build: {e}")))?
