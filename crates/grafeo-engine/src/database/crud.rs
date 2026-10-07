@@ -1123,6 +1123,13 @@ impl super::GrafeoDB {
         if self.refuse_write_if_wal_poisoned("remove_node_property") {
             return false;
         }
+        // A layered database (generation root) writes through the session so
+        // a base-only node is copied up and its removal reaches the vector
+        // index (AMH #187).
+        #[cfg(feature = "compact-store")]
+        if self.layered_store.is_some() {
+            return self.layered_remove_node_property(id, key);
+        }
         // Labels before the removal, for the vector index / spill lookups.
         #[cfg(feature = "vector-index")]
         let labels: Vec<String> = self
@@ -1608,6 +1615,64 @@ impl super::GrafeoDB {
             self.reindex_text_property(id, key, &node);
         }
         Ok(())
+    }
+
+    /// [`Self::remove_node_property`] on a layered database (AMH #187): the
+    /// session removes the value (copying a base-only node up) and queues
+    /// the vector-index removal; a ForceDisk-spilled value is removed from
+    /// the spill too, and from the index directly when it lived only there.
+    #[cfg(feature = "compact-store")]
+    fn layered_remove_node_property(&self, id: grafeo_common::types::NodeId, key: &str) -> bool {
+        #[cfg(feature = "vector-index")]
+        let labels: Vec<String> = self
+            .graph_store()
+            .get_node(id)
+            .map(|node| node.labels.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
+
+        let removed_inline = match self.session().remove_node_property(id, key) {
+            Ok(removed) => removed,
+            Err(e) => {
+                grafeo_warn!("remove_node_property on a layered database failed: {e}");
+                return false;
+            }
+        };
+        #[cfg(feature = "vector-index")]
+        let removed_spilled = self.remove_spilled_vector(id, key, &labels);
+        #[cfg(not(feature = "vector-index"))]
+        let removed_spilled = false;
+
+        #[cfg(feature = "vector-index")]
+        if removed_spilled && !removed_inline {
+            let graph = self.graph_store();
+            for label in &labels {
+                if let Some(index) = self.lpg_store().get_vector_index(label, key) {
+                    let accessor = self.build_vector_accessor(&graph, label, key);
+                    index.remove_with_accessor(id, &accessor);
+                }
+            }
+        }
+        #[cfg(feature = "wal")]
+        if removed_spilled
+            && !removed_inline
+            && let Err(e) = self.log_wal(&WalRecord::RemoveNodeProperty {
+                id,
+                key: key.to_string(),
+            })
+        {
+            grafeo_warn!("WAL log for RemoveNodeProperty failed: {e}");
+        }
+
+        let removed = removed_inline || removed_spilled;
+        #[cfg(feature = "text-index")]
+        if removed && let Some(node) = self.get_node(id) {
+            for label in &node.labels {
+                if let Some(index) = self.lpg_store().get_text_index(label.as_str(), key) {
+                    index.write().remove(id);
+                }
+            }
+        }
+        removed
     }
 
     fn layered_delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {

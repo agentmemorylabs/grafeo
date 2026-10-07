@@ -116,6 +116,25 @@ impl DirectStore {
         }
     }
 
+    pub(super) fn remove_node_property(
+        &self,
+        id: NodeId,
+        key: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        use grafeo_core::graph::GraphStoreMut as _;
+        match (self, transaction_id) {
+            (Self::Lpg(store), Some(tid)) => store.remove_node_property_versioned(id, key, tid),
+            (Self::Lpg(store), None) => store.remove_node_property(id, key),
+            #[cfg(feature = "compact-store")]
+            (Self::Layered { write, .. }, Some(tid)) => {
+                write.remove_node_property_versioned(id, key, tid)
+            }
+            #[cfg(feature = "compact-store")]
+            (Self::Layered { write, .. }, None) => write.remove_node_property(id, key),
+        }
+    }
+
     pub(super) fn set_edge_property(
         &self,
         id: EdgeId,

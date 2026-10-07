@@ -115,6 +115,8 @@ pub struct QueryProcessor {
     optimizer: Optimizer,
     /// Current transaction context (if any).
     transaction_context: Option<(EpochId, TransactionId)>,
+    /// Recorder for vector-index-relevant node mutations (AMH #187).
+    vector_recorder: Option<grafeo_core::execution::operators::SharedVectorIndexRecorder>,
     /// RDF store for triple pattern queries (optional).
     #[cfg(feature = "triple-store")]
     rdf_store: Option<Arc<grafeo_core::graph::rdf::RdfStore>>,
@@ -136,6 +138,7 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            vector_recorder: None,
             #[cfg(feature = "triple-store")]
             rdf_store: None,
         }
@@ -159,6 +162,7 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            vector_recorder: None,
             #[cfg(feature = "triple-store")]
             rdf_store: None,
         }
@@ -184,6 +188,7 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            vector_recorder: None,
             #[cfg(feature = "triple-store")]
             rdf_store: None,
         })
@@ -209,6 +214,7 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            vector_recorder: None,
             #[cfg(feature = "triple-store")]
             rdf_store: None,
         })
@@ -224,6 +230,16 @@ impl QueryProcessor {
         transaction_id: TransactionId,
     ) -> Self {
         self.transaction_context = Some((viewing_epoch, transaction_id));
+        self
+    }
+
+    /// Attaches the session's vector index recorder (AMH #187).
+    #[must_use]
+    pub fn with_vector_recorder(
+        mut self,
+        recorder: grafeo_core::execution::operators::SharedVectorIndexRecorder,
+    ) -> Self {
+        self.vector_recorder = Some(recorder);
         self
     }
 
@@ -347,6 +363,10 @@ impl QueryProcessor {
             )
         }
         .with_read_only(is_read_only);
+        let planner = match &self.vector_recorder {
+            Some(recorder) => planner.with_vector_recorder(Arc::clone(recorder)),
+            None => planner,
+        };
         let mut physical_plan = planner.plan(&optimized_plan)?;
 
         // 6. Execute and collect results
@@ -454,6 +474,7 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            vector_recorder: None,
             rdf_store: Some(rdf_store),
         }
     }

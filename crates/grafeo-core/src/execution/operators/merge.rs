@@ -66,6 +66,8 @@ pub struct MergeOperator {
     search_store: Option<Arc<dyn GraphStoreSearch>>,
     /// Session context for expression evaluation (info, schema, etc.).
     session_context: SessionContext,
+    /// Optional vector index recorder (AMH #187).
+    vector_recorder: Option<super::SharedVectorIndexRecorder>,
 }
 
 impl MergeOperator {
@@ -85,6 +87,7 @@ impl MergeOperator {
             validator: None,
             search_store: None,
             session_context: SessionContext::default(),
+            vector_recorder: None,
         }
     }
 
@@ -103,6 +106,21 @@ impl MergeOperator {
         self.viewing_epoch = Some(epoch);
         self.transaction_id = transaction_id;
         self
+    }
+
+    /// Records vector-index-relevant mutations (AMH #187).
+    pub fn with_vector_recorder(mut self, recorder: super::SharedVectorIndexRecorder) -> Self {
+        self.vector_recorder = Some(recorder);
+        self
+    }
+
+    /// Reports a node write that set a vector (AMH #187).
+    fn record_vector_write<'a>(&self, id: NodeId, mut values: impl Iterator<Item = &'a Value>) {
+        if let Some(recorder) = &self.vector_recorder
+            && values.any(|v| matches!(v, Value::Vector(_)) || v.is_null())
+        {
+            recorder.node_reindex(id);
+        }
     }
 
     /// Sets the constraint validator for schema enforcement.
@@ -339,6 +357,7 @@ impl MergeOperator {
                     .set_node_property(id, key.as_str(), value.clone());
             }
         }
+        self.record_vector_write(id, props.iter().map(|(_, v)| v));
     }
 
     /// Creates a node through the versioned API so the create itself is
@@ -511,6 +530,7 @@ impl MergeOperator {
                     .set_node_property(node_id, key.as_str(), value.clone());
             }
         }
+        self.record_vector_write(node_id, resolved_on_match.iter().map(|(_, v)| v));
         Ok(())
     }
 }
