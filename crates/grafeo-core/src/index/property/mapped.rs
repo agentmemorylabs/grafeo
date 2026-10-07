@@ -19,6 +19,7 @@
 // the resident section length; they cannot truncate on the 64-bit targets
 // this engine supports.
 #![allow(clippy::cast_possible_truncation)]
+use std::io::Write;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -183,84 +184,159 @@ pub struct PropertyIndexSnapshot {
 
 /// Encode a PropertyIndex section from live heap snapshots.
 ///
+/// Builds the whole section in memory. Callers that publish large indexes
+/// should stream each index through [`PropertyIndexBlobEncoder`] and
+/// [`encode_property_index_section_prefix`] instead, so only one index's
+/// postings are resident at a time.
+///
 /// # Errors
 ///
-/// Returns an error if a property value fails to serialize.
-///
-/// # Panics
-///
-/// Panics if internal offset arithmetic overflows `u32` (cannot occur for
-/// sections within the format's size limits).
+/// Returns an error if a property value fails to serialize or the section
+/// exceeds the format's `u32` offsets.
 pub fn encode_property_index_section(indexes: &[PropertyIndexSnapshot]) -> Result<Vec<u8>> {
-    let mut names = Vec::new();
-    let mut name_spans: Vec<(u32, u32)> = Vec::with_capacity(indexes.len());
-    let mut entry_blobs: Vec<Vec<u8>> = Vec::with_capacity(indexes.len());
-    let mut entry_counts: Vec<u32> = Vec::with_capacity(indexes.len());
-
+    let mut blobs = Vec::new();
+    let mut directory = Vec::with_capacity(indexes.len());
     for idx in indexes {
-        let name_off = names.len() as u32;
-        names.extend_from_slice(idx.name.as_bytes());
-        name_spans.push((name_off, idx.name.len() as u32));
-
-        let mut entries = idx.entries.clone();
-        // Sort by encoded value then node id for binary search.
-        let mut encoded: Vec<(Vec<u8>, NodeId)> = entries
-            .drain(..)
-            .map(|(v, id)| Ok((encode_value(&v)?, id)))
-            .collect::<Result<Vec<_>>>()?;
-        encoded.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_u64().cmp(&b.1.as_u64())));
-
-        // Fixed-width offset table + variable entries.
-        let mut offsets: Vec<u32> = Vec::with_capacity(encoded.len());
-        let mut body = Vec::new();
-        for (vb, id) in &encoded {
-            offsets.push(body.len() as u32);
-            body.extend_from_slice(&(vb.len() as u32).to_le_bytes());
-            body.extend_from_slice(vb);
-            body.extend_from_slice(&id.as_u64().to_le_bytes());
+        let mut encoder = PropertyIndexBlobEncoder::new();
+        for (value, node_id) in &idx.entries {
+            encoder.push(value, *node_id)?;
         }
-        let mut blob = Vec::with_capacity(offsets.len() * 4 + body.len());
-        for off in offsets {
-            blob.extend_from_slice(&off.to_le_bytes());
-        }
-        blob.extend_from_slice(&body);
-        entry_counts.push(encoded.len() as u32);
-        entry_blobs.push(blob);
+        let blob = encoder.write_to(&mut blobs)?;
+        directory.push((idx.name.as_str(), blob));
+    }
+    let mut out = encode_property_index_section_prefix(&directory)?;
+    out.extend_from_slice(&blobs);
+    Ok(out)
+}
+
+/// Shape of one encoded index blob, needed to build the section directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropertyIndexBlob {
+    /// Number of (value, node_id) postings in the blob.
+    pub entry_count: u32,
+    /// Encoded blob length in bytes (offset table plus entries).
+    pub byte_len: u64,
+}
+
+/// Encodes one property index's postings blob without holding decoded
+/// values.
+///
+/// Each pushed value is bincode-encoded straight into a shared arena, so
+/// the resident cost is the encoded bytes plus one fixed-size row per
+/// posting. [`write_to`](Self::write_to) sorts the rows by encoded value
+/// then node id and writes the blob in the section's wire format.
+#[derive(Debug, Default)]
+pub struct PropertyIndexBlobEncoder {
+    arena: Vec<u8>,
+    rows: Vec<(usize, u32, NodeId)>,
+}
+
+impl PropertyIndexBlobEncoder {
+    /// Creates an empty encoder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    let dir_len = indexes.len() * DIR_ENTRY_LEN;
-    let names_off = HEADER_LEN + dir_len;
-    let mut entries_region = Vec::new();
-    let mut dir = Vec::with_capacity(dir_len);
-    for i in 0..indexes.len() {
-        let (name_off, name_len) = name_spans[i];
-        let entry_off = (names_off + names.len() + entries_region.len()) as u32;
-        dir.extend_from_slice(&name_off.to_le_bytes());
-        dir.extend_from_slice(&name_len.to_le_bytes());
-        dir.extend_from_slice(&entry_off.to_le_bytes());
-        dir.extend_from_slice(&entry_counts[i].to_le_bytes());
-        entries_region.extend_from_slice(&entry_blobs[i]);
+    /// Adds one posting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value fails to serialize.
+    pub fn push(&mut self, value: &Value, node_id: NodeId) -> Result<()> {
+        let start = self.arena.len();
+        bincode::serde::encode_into_std_write(value, &mut self.arena, bincode::config::standard())
+            .map_err(|e| Error::Internal(format!("PropertyIndex value encode failed: {e}")))?;
+        let len = u32::try_from(self.arena.len() - start)
+            .map_err(|_| Error::Internal("PropertyIndex value exceeds u32 length".into()))?;
+        self.rows.push((start, len, node_id));
+        Ok(())
     }
 
-    let mut out = Vec::with_capacity(names_off + names.len() + entries_region.len());
+    /// Number of postings pushed so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether no postings have been pushed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Sorts the postings and writes the blob: a `u32` offset table relative
+    /// to the body start, then `value_len u32 | value_bytes | node_id u64`
+    /// per posting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blob exceeds the format's `u32` offsets or
+    /// the sink fails.
+    pub fn write_to(mut self, sink: &mut dyn Write) -> Result<PropertyIndexBlob> {
+        let arena = &self.arena;
+        self.rows.sort_unstable_by(|a, b| {
+            arena[a.0..a.0 + a.1 as usize]
+                .cmp(&arena[b.0..b.0 + b.1 as usize])
+                .then_with(|| a.2.as_u64().cmp(&b.2.as_u64()))
+        });
+        let entry_count = u32::try_from(self.rows.len())
+            .map_err(|_| Error::Internal("PropertyIndex entry count exceeds u32".into()))?;
+
+        let mut body_len = 0u64;
+        for &(_, len, _) in &self.rows {
+            let offset = u32::try_from(body_len)
+                .map_err(|_| Error::Internal("PropertyIndex blob exceeds u32 offsets".into()))?;
+            sink.write_all(&offset.to_le_bytes()).map_err(Error::Io)?;
+            body_len += 4 + u64::from(len) + 8;
+        }
+        for &(start, len, node_id) in &self.rows {
+            sink.write_all(&len.to_le_bytes()).map_err(Error::Io)?;
+            sink.write_all(&arena[start..start + len as usize])
+                .map_err(Error::Io)?;
+            sink.write_all(&node_id.as_u64().to_le_bytes())
+                .map_err(Error::Io)?;
+        }
+        Ok(PropertyIndexBlob {
+            entry_count,
+            byte_len: u64::from(entry_count) * 4 + body_len,
+        })
+    }
+}
+
+/// Encodes the section header, directory and names for indexes whose blobs
+/// follow the returned bytes back to back, in the given order.
+///
+/// # Errors
+///
+/// Returns an error if the section exceeds the format's `u32` offsets.
+pub fn encode_property_index_section_prefix(
+    indexes: &[(&str, PropertyIndexBlob)],
+) -> Result<Vec<u8>> {
+    let too_large = || Error::Internal("PropertyIndex section exceeds u32 offsets".into());
+    let names_off = HEADER_LEN + indexes.len() * DIR_ENTRY_LEN;
+    let names_len: usize = indexes.iter().map(|(name, _)| name.len()).sum();
+    let mut out = Vec::with_capacity(names_off + names_len);
     out.extend_from_slice(PROPERTY_INDEX_MAGIC);
     out.push(PROPERTY_INDEX_VERSION);
     out.push(0); // flags
     out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(indexes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(indexes.len()).map_err(|_| too_large())?.to_le_bytes());
     debug_assert_eq!(out.len(), HEADER_LEN);
-    out.extend_from_slice(&dir);
-    // Fix name offsets to be absolute from section start
-    // name_off was relative to names region; rewrite directory name_off.
-    let names_abs = names_off as u32;
-    for i in 0..indexes.len() {
-        let dir_base = HEADER_LEN + i * DIR_ENTRY_LEN;
-        let rel = u32::from_le_bytes(out[dir_base..dir_base + 4].try_into().unwrap());
-        let abs = names_abs + rel;
-        out[dir_base..dir_base + 4].copy_from_slice(&abs.to_le_bytes());
+
+    let mut name_off = names_off as u64;
+    let mut entry_off = (names_off + names_len) as u64;
+    for (name, blob) in indexes {
+        out.extend_from_slice(&u32::try_from(name_off).map_err(|_| too_large())?.to_le_bytes());
+        out.extend_from_slice(&u32::try_from(name.len()).map_err(|_| too_large())?.to_le_bytes());
+        out.extend_from_slice(&u32::try_from(entry_off).map_err(|_| too_large())?.to_le_bytes());
+        out.extend_from_slice(&blob.entry_count.to_le_bytes());
+        name_off += name.len() as u64;
+        entry_off += blob.byte_len;
     }
-    out.extend_from_slice(&names);
-    out.extend_from_slice(&entries_region);
+    for (name, _) in indexes {
+        out.extend_from_slice(name.as_bytes());
+    }
     Ok(out)
 }
 
@@ -383,6 +459,117 @@ pub type SharedMappedPropertyIndex = Arc<MappedPropertyIndex>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-streaming encoder, kept verbatim as the wire-format oracle.
+    fn legacy_encode(indexes: &[PropertyIndexSnapshot]) -> Vec<u8> {
+        let mut names = Vec::new();
+        let mut name_spans: Vec<(u32, u32)> = Vec::new();
+        let mut entry_blobs: Vec<Vec<u8>> = Vec::new();
+        let mut entry_counts: Vec<u32> = Vec::new();
+        for idx in indexes {
+            let name_off = names.len() as u32;
+            names.extend_from_slice(idx.name.as_bytes());
+            name_spans.push((name_off, idx.name.len() as u32));
+            let mut encoded: Vec<(Vec<u8>, NodeId)> = idx
+                .entries
+                .iter()
+                .map(|(v, id)| (encode_value(v).unwrap(), *id))
+                .collect();
+            encoded.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_u64().cmp(&b.1.as_u64())));
+            let mut offsets: Vec<u32> = Vec::new();
+            let mut body = Vec::new();
+            for (vb, id) in &encoded {
+                offsets.push(body.len() as u32);
+                body.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+                body.extend_from_slice(vb);
+                body.extend_from_slice(&id.as_u64().to_le_bytes());
+            }
+            let mut blob = Vec::new();
+            for off in offsets {
+                blob.extend_from_slice(&off.to_le_bytes());
+            }
+            blob.extend_from_slice(&body);
+            entry_counts.push(encoded.len() as u32);
+            entry_blobs.push(blob);
+        }
+        let dir_len = indexes.len() * DIR_ENTRY_LEN;
+        let names_off = HEADER_LEN + dir_len;
+        let mut entries_region = Vec::new();
+        let mut dir = Vec::new();
+        for i in 0..indexes.len() {
+            let (name_off, name_len) = name_spans[i];
+            let entry_off = (names_off + names.len() + entries_region.len()) as u32;
+            dir.extend_from_slice(&(names_off as u32 + name_off).to_le_bytes());
+            dir.extend_from_slice(&name_len.to_le_bytes());
+            dir.extend_from_slice(&entry_off.to_le_bytes());
+            dir.extend_from_slice(&entry_counts[i].to_le_bytes());
+            entries_region.extend_from_slice(&entry_blobs[i]);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(PROPERTY_INDEX_MAGIC);
+        out.push(PROPERTY_INDEX_VERSION);
+        out.push(0);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(indexes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&dir);
+        out.extend_from_slice(&names);
+        out.extend_from_slice(&entries_region);
+        out
+    }
+
+    #[test]
+    fn streaming_encoder_matches_legacy_wire_format() {
+        let snaps = vec![
+            PropertyIndexSnapshot {
+                name: "document_id".into(),
+                entries: (0..500u64)
+                    .map(|i| (Value::from(format!("doc-{}", (i * 7919) % 97)), NodeId::new(i)))
+                    .collect(),
+            },
+            PropertyIndexSnapshot {
+                name: "empty".into(),
+                entries: Vec::new(),
+            },
+            PropertyIndexSnapshot {
+                name: "rank".into(),
+                entries: vec![
+                    (Value::Int64(3), NodeId::new(30)),
+                    (Value::Int64(1), NodeId::new(11)),
+                    (Value::Int64(1), NodeId::new(10)),
+                    (Value::Bool(true), NodeId::new(5)),
+                ],
+            },
+        ];
+        let streamed = encode_property_index_section(&snaps).expect("encode");
+        assert_eq!(streamed, legacy_encode(&snaps));
+        assert_eq!(
+            encode_property_index_section(&[]).expect("encode empty"),
+            legacy_encode(&[])
+        );
+
+        // Blobs written one at a time after the prefix give the same bytes.
+        let mut blobs = Vec::new();
+        let mut directory = Vec::new();
+        for snap in &snaps {
+            let mut encoder = PropertyIndexBlobEncoder::new();
+            for (value, id) in &snap.entries {
+                encoder.push(value, *id).expect("push");
+            }
+            let before = blobs.len() as u64;
+            let blob = encoder.write_to(&mut blobs).expect("write");
+            assert_eq!(blob.byte_len, blobs.len() as u64 - before);
+            directory.push((snap.name.as_str(), blob));
+        }
+        let mut pieced = encode_property_index_section_prefix(&directory).expect("prefix");
+        pieced.extend_from_slice(&blobs);
+        assert_eq!(pieced, streamed);
+
+        let set = parse_property_index_section(Bytes::from(streamed)).expect("parse");
+        let mut hits = set.get("document_id").unwrap().lookup(&Value::from("doc-0"));
+        hits.sort_by_key(|id| id.as_u64());
+        assert_eq!(hits.first(), Some(&NodeId::new(0)));
+        assert_eq!(set.get("empty").unwrap().len(), 0);
+    }
 
     #[test]
     fn property_index_round_trip_lookup() {

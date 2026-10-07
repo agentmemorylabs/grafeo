@@ -10,7 +10,8 @@ mod section;
 
 pub use mapped::{
     MappedPropertyIndex, MappedPropertyIndexSet, PROPERTY_INDEX_MAGIC, PROPERTY_INDEX_VERSION,
-    PropertyIndexMemoryAccounting, PropertyIndexSnapshot, encode_property_index_section,
+    PropertyIndexBlob, PropertyIndexBlobEncoder, PropertyIndexMemoryAccounting,
+    PropertyIndexSnapshot, encode_property_index_section, encode_property_index_section_prefix,
     parse_property_index_section,
 };
 pub use section::PropertyIndexSection;

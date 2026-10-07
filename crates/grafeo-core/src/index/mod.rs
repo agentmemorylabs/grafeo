@@ -31,8 +31,9 @@ pub mod zone_map;
 pub use adjacency::ChunkedAdjacency;
 pub use hash::HashIndex;
 pub use property::{
-    MappedPropertyIndex, MappedPropertyIndexSet, PropertyIndexMemoryAccounting,
-    PropertyIndexSection, PropertyIndexSnapshot, encode_property_index_section,
+    MappedPropertyIndex, MappedPropertyIndexSet, PropertyIndexBlob, PropertyIndexBlobEncoder,
+    PropertyIndexMemoryAccounting, PropertyIndexSection, PropertyIndexSnapshot,
+    encode_property_index_section, encode_property_index_section_prefix,
     parse_property_index_section,
 };
 // PropertyIndexSnapshot re-exported above.

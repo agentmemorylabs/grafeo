@@ -339,7 +339,7 @@ impl GrafeoDB {
         // SAME instant as the payload source — right after the live-graph
         // freeze above, inside the quiesced build window. Emission happens
         // before publication from this captured state.
-        let section_capture = self.capture_generation_sections()?;
+        let section_capture = self.capture_generation_sections(root)?;
 
         // ── Generation build + section source ─────────────────────────────
         // With `generation-streaming` the engine drives the bounded

@@ -224,7 +224,7 @@ impl GrafeoDB {
         // SAME instant as the payload source — inside the writer barrier,
         // immediately after the frozen payload capture above. The build emits
         // the generation's index sections from this captured state.
-        let section_capture = self.capture_generation_sections()?;
+        let section_capture = self.capture_generation_sections(&generation_root)?;
 
         // Snapshot frozen retained accounting (both frozen + next count later).
         // NOTE(5d closeout): `frozen_retained_bytes` is write-only — it is

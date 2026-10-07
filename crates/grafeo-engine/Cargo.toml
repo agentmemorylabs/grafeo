@@ -67,6 +67,9 @@ arc-swap = { workspace = true, optional = true }
 # Refcounted byte slices for mmap-backed column storage (Phase 3c)
 bytes.workspace = true
 
+# Unlinked spool files for generation sections too large to hold in RAM
+tempfile = { workspace = true, optional = true }
+
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
@@ -96,7 +99,7 @@ algos = ["grafeo-adapters/algos"]  # Graph algorithm plugin (SSSP, PageRank, etc
 wal = ["dep:grafeo-storage", "grafeo-storage/wal"]  # Write-ahead log storage
 async-storage = ["dep:grafeo-storage", "grafeo-storage/async-storage", "dep:tokio"]  # Async WAL and storage backend
 grafeo-file = ["dep:grafeo-storage", "grafeo-storage/grafeo-file", "dep:crc32fast"]  # Single-file .grafeo format
-generation = ["grafeo-file", "grafeo-storage/generation"]  # Streaming generation container writer
+generation = ["grafeo-file", "grafeo-storage/generation", "dep:tempfile"]  # Streaming generation container writer
 generation-streaming = ["generation", "grafeo-storage/generation-streaming", "grafeo-core/generation-streaming"]  # Bounded out-of-core generation (G-EM0.5b)
 encryption = ["dep:grafeo-storage", "grafeo-common/encryption", "grafeo-storage/encryption"]  # AES-256-GCM encryption at rest
 spill = ["grafeo-core/spill"]  # Disk spilling for out-of-core execution

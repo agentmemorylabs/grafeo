@@ -7,12 +7,17 @@
 //!   index state are captured at the same instant as the generation payload
 //!   source — the live-graph freeze for direct builds, the freeze handle's
 //!   capture (inside the writer barrier) for handoff builds.
-//! - **Emission** ([locked decision 2/4]): the three small sections are
-//!   serialized once at capture (catalog is always < 10 KB; property/text
-//!   postings mirror `build_sections`'s conditions) and emitted from the
-//!   captured bytes. The VectorStore section is **never materialized** — the
-//!   item 0B streaming encoder streams the v2 envelope straight to the
-//!   container sink, with `exact_len` from the arithmetic pass.
+//! - **Emission** ([locked decision 2/4]): the Catalog and TextIndex
+//!   sections are serialized once at capture (catalog is always < 10 KB;
+//!   text postings mirror `build_sections`'s conditions) and emitted from the
+//!   captured bytes. The PropertyIndex section is encoded one index at a
+//!   time into an unlinked spool file under the generation root, so its
+//!   postings are never all resident: on a code-index graph with twelve
+//!   high-cardinality keys the section is ~520 MiB, and building it in RAM
+//!   added ~2.6 GiB of anonymous memory to publication. The VectorStore
+//!   section is **never materialized** — the item 0B streaming encoder
+//!   streams the v2 envelope straight to the container sink, with
+//!   `exact_len` from the arithmetic pass.
 //!
 //! Section presence mirrors `build_sections` (engine `database/mod.rs`):
 //! emit when the DB has the corresponding indexes; omit otherwise. Absent
@@ -21,13 +26,17 @@
 //! [locked decision 2]: https://example.invalid (see packet H-ADOPT.6)
 
 use std::cell::Cell;
-use std::io::Write;
-use std::sync::Arc;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::utils::error::{Error, Result};
 use grafeo_core::graph::lpg::LpgStore;
-use grafeo_core::index::property::{PropertyIndexSection, PropertyIndexSnapshot};
+use grafeo_core::index::property::{
+    PropertyIndexBlobEncoder, PropertyIndexSection, encode_property_index_section_prefix,
+};
 use grafeo_storage::file::generation_writer::ExactSectionSource;
 
 use crate::database::GrafeoDB;
@@ -55,7 +64,7 @@ pub struct GenerationSectionCapture {
     /// Catalog section (always emitted).
     pub catalog: SerializedSection,
     /// PropertyIndex section, when the DB has registered property indexes.
-    pub property_index: Option<SerializedSection>,
+    pub property_index: Option<SpooledSection>,
     /// TextIndex section, when the DB has registered text indexes.
     #[cfg(feature = "text-index")]
     pub text_index: Option<SerializedSection>,
@@ -123,6 +132,117 @@ impl ExactSectionSource for SerializedSectionSource {
     }
 }
 
+/// A section whose small prefix is held in memory and whose body was
+/// streamed to an unlinked spool file at capture.
+///
+/// Cloning shares the spool; the file is removed by the OS when the last
+/// clone drops (or the process exits), so a failed or crashed build leaves
+/// nothing behind.
+#[derive(Clone)]
+pub struct SpooledSection {
+    inner: Arc<SpooledSectionInner>,
+}
+
+struct SpooledSectionInner {
+    version: u8,
+    prefix: Vec<u8>,
+    body: Mutex<File>,
+    body_len: u64,
+}
+
+impl SpooledSection {
+    /// Exact section length: prefix plus spooled body.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.inner.prefix.len() as u64 + self.inner.body_len
+    }
+
+    /// Whether the section has no bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Section directory version byte.
+    #[must_use]
+    pub fn version(&self) -> u8 {
+        self.inner.version
+    }
+
+    /// Writes the prefix, then copies the spooled body from its start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the spool cannot be read, is shorter than
+    /// recorded, or the sink fails.
+    pub fn copy_to(&self, sink: &mut dyn Write) -> Result<()> {
+        sink.write_all(&self.inner.prefix).map_err(Error::Io)?;
+        let mut body = self
+            .inner
+            .body
+            .lock()
+            .map_err(|_| Error::Internal("section spool lock poisoned".into()))?;
+        body.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+        let mut reader = BufReader::with_capacity(SPOOL_IO_BYTES, (&mut *body).take(self.inner.body_len));
+        let copied = std::io::copy(&mut reader, sink).map_err(Error::Io)?;
+        if copied != self.inner.body_len {
+            return Err(Error::Internal(format!(
+                "section spool truncated: copied {copied} of {} bytes",
+                self.inner.body_len
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SpooledSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpooledSection")
+            .field("version", &self.inner.version)
+            .field("prefix_len", &self.inner.prefix.len())
+            .field("body_len", &self.inner.body_len)
+            .finish()
+    }
+}
+
+/// Buffer size for spool writes and reads.
+const SPOOL_IO_BYTES: usize = 1024 * 1024;
+
+/// [`ExactSectionSource`] over a [`SpooledSection`].
+pub struct SpooledSectionSource {
+    section_type: SectionType,
+    section: SpooledSection,
+}
+
+impl SpooledSectionSource {
+    /// Wraps one spooled section.
+    #[must_use]
+    pub fn new(section_type: SectionType, section: SpooledSection) -> Self {
+        Self {
+            section_type,
+            section,
+        }
+    }
+}
+
+impl ExactSectionSource for SpooledSectionSource {
+    fn section_type(&self) -> SectionType {
+        self.section_type
+    }
+
+    fn directory_version(&self) -> u8 {
+        self.section.version()
+    }
+
+    fn exact_len(&self) -> u64 {
+        self.section.len()
+    }
+
+    fn copy_to(&mut self, sink: &mut dyn Write) -> Result<()> {
+        self.section.copy_to(sink)
+    }
+}
+
 /// [`ExactSectionSource`] backed by the item 0B streaming VectorStore encoder.
 ///
 /// `exact_len` runs the arithmetic pass ([`VectorStoreSection::stream_len`])
@@ -187,16 +307,23 @@ impl GrafeoDB {
     ///
     /// Mirrors `build_sections`'s emission conditions: property/text/vector
     /// sections are captured only when the DB has the corresponding indexes.
-    /// The catalog is serialized now (small, always in RAM); the VectorStore
-    /// keeps only its registered index Arcs — the topology bytes are streamed
-    /// at emission.
+    /// The catalog is serialized now (small, always in RAM); the
+    /// PropertyIndex is spooled to an unlinked file in `spool_dir`; the
+    /// VectorStore keeps only its registered index Arcs — the topology bytes
+    /// are streamed at emission.
+    ///
+    /// `spool_dir` should be the generation root: it is on the same disk as
+    /// the publication, never a RAM-backed `/tmp`.
     ///
     /// # Errors
     ///
-    /// Returns an error when no LPG store exists or a section serialization
-    /// fails.
+    /// Returns an error when no LPG store exists, the spool cannot be
+    /// written, or a section serialization fails.
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
-    pub(crate) fn capture_generation_sections(&self) -> Result<GenerationSectionCapture> {
+    pub(crate) fn capture_generation_sections(
+        &self,
+        spool_dir: &Path,
+    ) -> Result<GenerationSectionCapture> {
         let store = self
             .layered_store
             .as_ref()
@@ -220,7 +347,7 @@ impl GrafeoDB {
 
         // PropertyIndex: mirror build_sections (overlay snapshot + layered
         // rescan so base rows stay in the postings).
-        let property_index = capture_property_index(self, &store)?;
+        let property_index = capture_property_index(self, &store, spool_dir)?;
 
         #[cfg(feature = "text-index")]
         let text_index = {
@@ -265,10 +392,9 @@ pub fn generation_section_sources(
         capture.catalog.bytes,
     )));
     if let Some(property) = capture.property_index {
-        out.push(Box::new(SerializedSectionSource::new(
+        out.push(Box::new(SpooledSectionSource::new(
             SectionType::PropertyIndex,
-            property.version,
-            property.bytes,
+            property,
         )));
     }
     #[cfg(feature = "text-index")]
@@ -291,10 +417,15 @@ pub fn generation_section_sources(
 /// Mirror of `build_sections`'s PropertyIndex emission: registered keys are
 /// postings-rebuilt from the full layered graph so base rows are included,
 /// not just the overlay heap snapshot.
+///
+/// Byte-identical to `PropertyIndexSection::from_snapshots(..).serialize()`,
+/// but each key's postings are encoded and written to the spool before the
+/// next key is read, so at most one key's encoded postings are resident.
 fn capture_property_index(
     db: &GrafeoDB,
     store: &Arc<LpgStore>,
-) -> Result<Option<SerializedSection>> {
+    spool_dir: &Path,
+) -> Result<Option<SpooledSection>> {
     // Postings are rebuilt from the full layered graph for every registered
     // key, so base rows are included. The overlay's own postings are not read:
     // for a restored mapped index they would be a base-sized decode that is
@@ -305,28 +436,41 @@ fn capture_property_index(
     }
     let graph = db.graph_store();
     let node_ids = graph.node_ids();
-    let snaps: Vec<PropertyIndexSnapshot> = keys
-        .into_iter()
-        .map(|prop| {
-            let prop_key = grafeo_common::types::PropertyKey::new(&prop);
-            let entries = node_ids
-                .iter()
-                .filter_map(|&node_id| {
-                    graph
-                        .get_node_property(node_id, &prop_key)
-                        .map(|value| (value, node_id))
-                })
-                .collect();
-            PropertyIndexSnapshot {
-                name: prop,
-                entries,
+    let mut spool = tempfile::tempfile_in(spool_dir).map_err(|e| {
+        Error::Internal(format!(
+            "create PropertyIndex spool in {}: {e}",
+            spool_dir.display()
+        ))
+    })?;
+    let mut directory = Vec::with_capacity(keys.len());
+    {
+        let mut writer = BufWriter::with_capacity(SPOOL_IO_BYTES, &mut spool);
+        for prop in &keys {
+            let prop_key = grafeo_common::types::PropertyKey::new(prop);
+            let mut encoder = PropertyIndexBlobEncoder::new();
+            for &node_id in &node_ids {
+                if let Some(value) = graph.get_node_property(node_id, &prop_key) {
+                    encoder.push(&value, node_id)?;
+                }
             }
-        })
+            directory.push(encoder.write_to(&mut writer)?);
+        }
+        writer.flush().map_err(Error::Io)?;
+    }
+    let named: Vec<(&str, _)> = keys
+        .iter()
+        .map(String::as_str)
+        .zip(directory.iter().copied())
         .collect();
-    let section = PropertyIndexSection::from_snapshots(snaps);
-    Ok(Some(SerializedSection {
-        bytes: section.serialize()?,
-        version: section.version(),
+    let prefix = encode_property_index_section_prefix(&named)?;
+    let body_len = directory.iter().map(|blob| blob.byte_len).sum();
+    Ok(Some(SpooledSection {
+        inner: Arc::new(SpooledSectionInner {
+            version: PropertyIndexSection::empty().version(),
+            prefix,
+            body: Mutex::new(spool),
+            body_len,
+        }),
     }))
 }
 
