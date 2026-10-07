@@ -178,6 +178,11 @@ path = "tests/compact_store_v6_payload.rs"
 required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "cypher"]
 
 [[test]]
+name = "generation_root_vector_update_recall"
+path = "tests/generation_root_vector_update_recall.rs"
+required-features = ["generation", "generation-streaming", "compact-store", "lpg", "mmap", "wal", "vector-index"]
+
+[[test]]
 name = "compact_store_disk_parity"
 path = "tests/compact_store_disk_parity.rs"
 required-features = ["generation-streaming", "compact-store", "lpg", "mmap"]
