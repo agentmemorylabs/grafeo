@@ -2,10 +2,12 @@
 //! indexed vector of a base node must not drop other nodes from the ANN
 //! index.
 //!
-//! The layered write path upserts a vector by `index.remove(id)` followed by
-//! `index.insert(id, ..)`. The plain HNSW `remove` deletes the node and its
-//! incoming links without reconnecting its former neighbours, so nodes
-//! reachable only through it fall out of search (exact reads still work).
+//! Before the fix the layered write path upserted a vector by `index.remove(id)`
+//! then `index.insert(id, ..)`, and deleted with `index.remove(id)`. The plain
+//! HNSW `remove` deletes the node and its incoming links without reconnecting
+//! its former neighbours, so nodes reachable only through it fell out of
+//! search (exact reads still worked). Upserts and deletes now go through
+//! `remove_with_accessor`, which reconnects and prunes them.
 //!
 //! ```text
 //! cargo test -p grafeo-engine --features generation,generation-streaming,compact-store,lpg,mmap,wal,vector-index \

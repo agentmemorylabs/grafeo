@@ -867,9 +867,16 @@ impl HnswIndex {
             return false;
         };
 
-        for node in nodes_map.values_mut() {
-            for neighbors in &mut node.neighbors {
+        // Strip every link to `id`, remembering per level who had one: a
+        // one-way link (`id` pruned it from its own list) is repaired too.
+        let mut incoming: Vec<Vec<NodeId>> = vec![Vec::new(); removed.neighbors.len()];
+        for (&node_id, node) in nodes_map.iter_mut() {
+            for (level, neighbors) in node.neighbors.iter_mut().enumerate() {
+                let before = neighbors.len();
                 neighbors.retain(|&neighbor| neighbor != id);
+                if neighbors.len() != before && level < incoming.len() {
+                    incoming[level].push(node_id);
+                }
             }
         }
 
@@ -877,17 +884,25 @@ impl HnswIndex {
         // its former neighborhoods disconnected. Connect those neighborhoods
         // at each shared level, then prune them back to the configured degree.
         for (level, former_neighbors) in removed.neighbors.iter().enumerate() {
+            let has_level = |nodes_map: &HashMap<NodeId, HnswNode>, neighbor: &NodeId| {
+                nodes_map
+                    .get(neighbor)
+                    .is_some_and(|node| node.neighbors.len() > level)
+            };
             let existing: Vec<NodeId> = former_neighbors
                 .iter()
                 .copied()
-                .filter(|neighbor| {
-                    nodes_map
-                        .get(neighbor)
-                        .is_some_and(|node| node.neighbors.len() > level)
-                })
+                .filter(|neighbor| has_level(nodes_map, neighbor))
+                .collect();
+            // Nodes that linked to `id` without `id` linking back: link each
+            // to `id`'s former neighbours, its path through `id`.
+            let one_way: Vec<NodeId> = incoming[level]
+                .iter()
+                .copied()
+                .filter(|node| !existing.contains(node) && has_level(nodes_map, node))
                 .collect();
 
-            for &left in &existing {
+            for &left in existing.iter().chain(&one_way) {
                 if let Some(node) = nodes_map.get_mut(&left) {
                     for &right in &existing {
                         if left != right && !node.neighbors[level].contains(&right) {
@@ -902,8 +917,12 @@ impl HnswIndex {
             } else {
                 self.config.m
             };
-            let mut prune_data: Vec<(NodeId, Vec<(NodeId, f32)>)> = Vec::new();
-            for &neighbor_id in &existing {
+            // Over-degree neighbours are pruned with the same diversity
+            // heuristic insert uses to pick neighbours, not by nearest-m: a
+            // full list (normal at m_max) would otherwise evict the one far
+            // neighbour bridging to another region, the #174 symptom again.
+            let mut pruned: Vec<(NodeId, Vec<NodeId>)> = Vec::new();
+            for &neighbor_id in existing.iter().chain(&one_way) {
                 let Some(node) = nodes_map.get(&neighbor_id) else {
                     continue;
                 };
@@ -913,38 +932,51 @@ impl HnswIndex {
                 let Some(base_vector) = accessor.get_vector(neighbor_id) else {
                     continue;
                 };
-                let distances: Vec<(NodeId, f32)> = node.neighbors[level]
+                let mut candidates: Vec<Neighbor> = node.neighbors[level]
                     .iter()
-                    .map(|&candidate| {
-                        let distance = accessor.get_vector(candidate).map_or(f32::MAX, |vector| {
+                    .map(|&candidate| Neighbor {
+                        id: candidate,
+                        distance: accessor.get_vector(candidate).map_or(f32::MAX, |vector| {
                             self.vector_distance(&base_vector, &vector)
-                        });
-                        (candidate, distance)
+                        }),
                     })
                     .collect();
-                prune_data.push((neighbor_id, distances));
+                candidates.sort_by_key(|c| OrderedFloat(c.distance));
+                pruned.push((
+                    neighbor_id,
+                    self.select_neighbors_heuristic(accessor, &candidates, max_neighbors),
+                ));
             }
 
-            for (neighbor_id, distances) in prune_data {
+            for (neighbor_id, kept) in pruned {
                 if let Some(node) = nodes_map.get_mut(&neighbor_id) {
-                    Self::prune_neighbors_with_distances(
-                        &mut node.neighbors[level],
-                        &distances,
-                        max_neighbors,
-                    );
+                    node.neighbors[level] = kept;
                 }
             }
         }
 
         if *entry_point == Some(id) {
-            *entry_point = removed
+            // The entry point must sit on the top remaining layer: prefer a
+            // former neighbour at the removed node's top layer, else scan.
+            let top = removed.neighbors.len().saturating_sub(1);
+            let on_top =
+                |node: &NodeId| nodes_map.get(node).is_some_and(|n| n.neighbors.len() > top);
+            let next = removed
                 .neighbors
-                .iter()
-                .rev()
-                .flatten()
-                .find(|neighbor| nodes_map.contains_key(neighbor))
-                .copied()
-                .or_else(|| nodes_map.keys().next().copied());
+                .last()
+                .and_then(|layer| layer.iter().copied().find(|n| on_top(n)))
+                .or_else(|| {
+                    nodes_map
+                        .iter()
+                        .max_by_key(|(node_id, node)| {
+                            (node.neighbors.len(), std::cmp::Reverse(**node_id))
+                        })
+                        .map(|(node_id, _)| *node_id)
+                });
+            *entry_point = next;
+            *self.max_level.write() = next
+                .and_then(|n| nodes_map.get(&n))
+                .map_or(0, |node| node.neighbors.len().saturating_sub(1));
         }
         true
     }
@@ -2427,6 +2459,166 @@ mod tests {
         // Removed node should not appear
         assert!(results.iter().all(|(id, _)| *id != NodeId::new(1)));
         assert_eq!(results.len(), 2);
+    }
+
+    /// AMH #174 review: when the reconnection after a remove pushes a node
+    /// past `m_max`, the prune keeps a diverse neighbour set. Nearest-m kept
+    /// three near cluster nodes and evicted `far`, whose only inbound path
+    /// was through `x`, so `far` was unreachable.
+    #[test]
+    fn remove_prune_keeps_the_far_bridge() {
+        let mut config = HnswConfig::new(2, DistanceMetric::Euclidean);
+        config.m = 3;
+        config.m_max = 3;
+        config.alpha = 1.0;
+        let index = HnswIndex::with_seed(config, 7);
+        let points: [(u64, [f32; 2]); 6] = [
+            (0, [0.0, 0.0]),   // x
+            (1, [0.5, 0.0]),   // removed bridge into the cluster
+            (2, [1.0, 0.0]),   // cluster
+            (3, [1.0, 0.1]),   // cluster
+            (4, [1.0, -0.1]),  // cluster
+            (5, [-10.0, 0.0]), // far
+        ];
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for (id, v) in &points {
+            map.insert(NodeId::new(*id), v.to_vec().into());
+        }
+        let accessor = make_accessor(&map);
+        for (id, v) in &points {
+            index.insert(NodeId::new(*id), v, &accessor);
+        }
+        // Pin a single-layer topology: x -> {removed, far}; the removed bridge
+        // links x and all three cluster nodes, so reconnecting gives x four
+        // neighbours (over m_max); far links only x.
+        let n = NodeId::new;
+        let adjacency: [(u64, &[u64]); 6] = [
+            (0, &[1, 5]),
+            (1, &[0, 2, 3, 4]),
+            (2, &[1, 3, 4]),
+            (3, &[1, 2, 4]),
+            (4, &[2, 3]),
+            (5, &[0]),
+        ];
+        {
+            let mut nodes = index.nodes.write();
+            let nodes_map = nodes.as_heap_mut();
+            for (id, neighbors) in adjacency {
+                nodes_map.get_mut(&n(id)).expect("node").neighbors =
+                    vec![neighbors.iter().map(|&i| n(i)).collect()];
+            }
+        }
+        *index.max_level.write() = 0;
+        *index.entry_point.write() = Some(n(2));
+
+        assert!(index.remove_with_accessor(n(1), &accessor));
+
+        let x: Vec<NodeId> = index
+            .nodes
+            .read()
+            .neighbors_at(n(0), 0)
+            .expect("x")
+            .collect();
+        assert!(x.len() <= 3, "pruned back to m_max: {x:?}");
+        assert!(x.contains(&n(5)), "x keeps its far neighbour: {x:?}");
+        // Searching from the cluster still reaches `far`.
+        let results = index.search(&[-10.0, 0.0], 1, &accessor);
+        assert_eq!(results.first().map(|r| r.0), Some(n(5)), "{results:?}");
+    }
+
+    /// Builds an index over `points`, then pins its topology to `layers`
+    /// (per node, its neighbour list on each layer) and `entry`.
+    fn pinned_index(
+        points: &[(u64, [f32; 2])],
+        layers: &[(u64, Vec<Vec<u64>>)],
+        entry: u64,
+        map: &mut HashMap<NodeId, Arc<[f32]>>,
+    ) -> HnswIndex {
+        let index = HnswIndex::with_seed(HnswConfig::new(2, DistanceMetric::Euclidean), 7);
+        for (id, v) in points {
+            map.insert(NodeId::new(*id), v.to_vec().into());
+        }
+        {
+            let accessor = make_accessor(map);
+            for (id, v) in points {
+                index.insert(NodeId::new(*id), v, &accessor);
+            }
+        }
+        {
+            let mut nodes = index.nodes.write();
+            let nodes_map = nodes.as_heap_mut();
+            for (id, node_layers) in layers {
+                nodes_map
+                    .get_mut(&NodeId::new(*id))
+                    .expect("node")
+                    .neighbors = node_layers
+                    .iter()
+                    .map(|layer| layer.iter().map(|&i| NodeId::new(i)).collect())
+                    .collect();
+            }
+        }
+        let top = layers.iter().map(|(_, l)| l.len()).max().unwrap_or(1) - 1;
+        *index.max_level.write() = top;
+        *index.entry_point.write() = Some(NodeId::new(entry));
+        index
+    }
+
+    /// A one-way link into the removed node is repaired: `a` reached `b`
+    /// only through `r`, which never linked back to `a`.
+    #[test]
+    fn remove_relinks_one_way_incoming_links() {
+        let mut map = HashMap::new();
+        let index = pinned_index(
+            &[(0, [0.0, 0.0]), (1, [1.0, 0.0]), (2, [2.0, 0.0])],
+            &[(0, vec![vec![1]]), (1, vec![vec![2]]), (2, vec![vec![1]])],
+            0,
+            &mut map,
+        );
+        let accessor = make_accessor(&map);
+        assert!(index.remove_with_accessor(NodeId::new(1), &accessor));
+        let results = index.search(&[2.0, 0.0], 1, &accessor);
+        assert_eq!(
+            results.first().map(|r| r.0),
+            Some(NodeId::new(2)),
+            "{results:?}"
+        );
+    }
+
+    /// Removing the entry point moves it to a node on the top remaining
+    /// layer, even one the removed node did not link there, and sets
+    /// `max_level` to that layer. Here node 3 reaches layer 2 unlinked, and
+    /// the removed node's highest linked neighbour (1) only reaches layer 1.
+    #[test]
+    fn remove_of_the_entry_point_keeps_it_on_the_top_layer() {
+        let mut map = HashMap::new();
+        let index = pinned_index(
+            &[
+                (0, [0.0, 0.0]),
+                (1, [1.0, 0.0]),
+                (2, [2.0, 0.0]),
+                (3, [3.0, 0.0]),
+            ],
+            &[
+                (0, vec![vec![1], vec![1], vec![]]),
+                (1, vec![vec![0, 2], vec![0]]),
+                (2, vec![vec![1, 3]]),
+                (3, vec![vec![2], vec![], vec![]]),
+            ],
+            0,
+            &mut map,
+        );
+        let accessor = make_accessor(&map);
+        assert!(index.remove_with_accessor(NodeId::new(0), &accessor));
+        assert_eq!(*index.entry_point.read(), Some(NodeId::new(3)));
+        assert_eq!(*index.max_level.read(), 2);
+        for (id, v) in [(1, [1.0, 0.0]), (2, [2.0, 0.0]), (3, [3.0, 0.0])] {
+            let results = index.search(&v, 1, &accessor);
+            assert_eq!(
+                results.first().map(|r| r.0),
+                Some(NodeId::new(id)),
+                "{results:?}"
+            );
+        }
     }
 
     #[test]
