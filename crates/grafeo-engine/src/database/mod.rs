@@ -3795,9 +3795,7 @@ impl GrafeoDB {
             && let Some(reason) = wal.poisoned_reason()
         {
             use grafeo_common::utils::write_outcome::UNTIL_REOPENED;
-            grafeo_warn!(
-                "{api} refused: WAL refuses writes {UNTIL_REOPENED}: {reason}"
-            );
+            grafeo_warn!("{api} refused: WAL refuses writes {UNTIL_REOPENED}: {reason}");
             return true;
         }
         let _ = api;

@@ -119,13 +119,4 @@ impl super::GrafeoDB {
             grafeo_core::index::vector::PropertyVectorAccessor::new(&**graph, property),
         )
     }
-
-    /// True when the named vector column was drained to a spill file by
-    /// `spill_vector_column_to_disk` (G-VECBUILD.1 E1).
-    #[cfg(all(feature = "mmap", not(feature = "temporal")))]
-    pub(super) fn vector_column_is_spilled(&self, label: &str, property: &str) -> bool {
-        self.vector_spill_storages
-            .as_ref()
-            .is_some_and(|map| map.read().contains_key(&format!("{label}:{property}")))
-    }
 }
