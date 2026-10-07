@@ -501,6 +501,32 @@ impl super::GrafeoDB {
         Some(index.quantization_type().unwrap_or(QuantizationType::None))
     }
 
+    /// Whether the vector index on `label`/`property` holds `id` in its
+    /// topology, or `None` when no such index is registered. An inspect
+    /// surface for membership checks (the topology, not the property).
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_contains(
+        &self,
+        label: &str,
+        property: &str,
+        id: grafeo_common::types::NodeId,
+    ) -> Option<bool> {
+        self.lpg_store()
+            .get_vector_index(label, property)
+            .map(|index| index.contains(id))
+    }
+
+    /// The number of nodes in the vector index on `label`/`property`, or
+    /// `None` when no such index is registered.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn vector_index_len(&self, label: &str, property: &str) -> Option<usize> {
+        self.lpg_store()
+            .get_vector_index(label, property)
+            .map(|index| index.len())
+    }
+
     /// Estimated heap memory for a registered vector index (topology + payloads).
     ///
     /// Returns `None` if the index is not registered. Not process RSS.

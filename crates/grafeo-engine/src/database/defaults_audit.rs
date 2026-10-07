@@ -13,7 +13,11 @@
 //! `embedding_dimensions`):
 //!
 //! - every nonempty vector whose components are all `0.0`, with whether the
-//!   vector index on that label and property serves the node;
+//!   vector index on that label and property serves the node. Inline
+//!   properties are read, and every registered vector index's property is
+//!   also read through the serving accessor, which falls back to a ForceDisk
+//!   spill file (a spilled column is absent from the property map). Nothing
+//!   is reloaded or rebuilt;
 //! - every empty string under the keys the caller names;
 //! - every edge whose type, endpoints or properties differ from a trusted
 //!   baseline of edge identities (a swap keeps counts, endpoints and CSR
@@ -132,7 +136,7 @@ impl super::GrafeoDB {
         let string_keys: Vec<PropertyKey> =
             string_keys.iter().map(|k| PropertyKey::new(*k)).collect();
 
-        for label in labels {
+        for &label in &labels {
             for id in store.nodes_by_label(label) {
                 let Some(node) = store.get_node(id) else {
                     continue;
@@ -168,6 +172,42 @@ impl super::GrafeoDB {
                         property: key.as_str().to_string(),
                         dimensions,
                         indexed,
+                    });
+                }
+            }
+        }
+
+        // Vectors the property map does not show: a ForceDisk spill drains
+        // an indexed column out of it. Read every registered index's
+        // property through the serving (spill-aware) accessor.
+        #[cfg(feature = "vector-index")]
+        for (key, index) in self.lpg_store().vector_index_entries() {
+            let Some((label, property)) = key.split_once(':') else {
+                continue;
+            };
+            if !labels.contains(&label) {
+                continue;
+            }
+            let accessor = self.make_vector_accessor(label, property);
+            for id in store.nodes_by_label(label) {
+                let reported = audit
+                    .zero_vectors
+                    .iter()
+                    .any(|z| z.node == id && z.label == label && z.property == property);
+                if reported {
+                    continue;
+                }
+                if let Some(v) =
+                    grafeo_core::index::vector::VectorAccessor::get_vector(&accessor, id)
+                    && !v.is_empty()
+                    && v.iter().all(|x| *x == 0.0)
+                {
+                    audit.zero_vectors.push(ZeroVector {
+                        node: id,
+                        label: label.to_string(),
+                        property: property.to_string(),
+                        dimensions: v.len(),
+                        indexed: Some(index.contains(id)),
                     });
                 }
             }

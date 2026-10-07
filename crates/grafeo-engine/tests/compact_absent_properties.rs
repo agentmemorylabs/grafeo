@@ -278,7 +278,18 @@ mod generation {
                     (n, IndexedVectorRead::Absent) if n != "full" => {}
                     (n, other) => panic!("[{stage}] {quantization:?}: {n} reads {other:?}"),
                 }
+                // The topology itself: only `full` is a member.
+                assert_eq!(
+                    db.vector_index_contains("Doc", "v", id),
+                    Some(name == "full"),
+                    "[{stage}] {quantization:?}: {name} index membership"
+                );
             }
+            assert_eq!(
+                db.vector_index_len("Doc", "v"),
+                Some(1),
+                "[{stage}] {quantization:?}: index length"
+            );
         }
     }
 
@@ -880,5 +891,65 @@ fn identity_and_nulls_survive_compact_recompact_and_generation() {
             before,
             "graph changed by the generation build"
         );
+    }
+}
+
+/// Review r2: the audit finds an all-zero vector a ForceDisk-style spill
+/// drained out of the property map, through the serving accessor, with its
+/// index membership; plain and scalar-quantized indexes.
+#[cfg(all(feature = "vector-index", feature = "mmap"))]
+#[test]
+fn audit_reads_spilled_vectors() {
+    use grafeo_engine::{Config, ZeroVector};
+
+    for quantization in [None, Some("scalar")] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db =
+            GrafeoDB::with_config(Config::in_memory().with_spill_path(dir.path())).expect("db");
+        let real = db
+            .create_node_with_props(&["Unit"], [("embedding", vector(0.5))])
+            .expect("real");
+        let zero = db
+            .create_node_with_props(
+                &["Unit"],
+                [("embedding", Value::Vector(vec![0.0f32; 4].into()))],
+            )
+            .expect("zero");
+        db.create_vector_index(
+            "Unit",
+            "embedding",
+            Some(4),
+            Some("euclidean"),
+            None,
+            None,
+            quantization,
+        )
+        .expect("vector index");
+        let report = db
+            .spill_vector_column_to_disk("Unit", "embedding")
+            .expect("spill");
+        assert_eq!(report.vectors_spilled, 2, "{quantization:?}");
+        assert_eq!(
+            db.get_node(zero)
+                .expect("zero")
+                .properties
+                .get(&PropertyKey::new("embedding")),
+            None,
+            "{quantization:?}: the spill drained the property"
+        );
+        let audit = db.audit_fabricated_defaults(&["Unit"], &[], &[]);
+        assert_eq!(
+            audit.zero_vectors,
+            vec![ZeroVector {
+                node: zero,
+                label: "Unit".into(),
+                property: "embedding".into(),
+                dimensions: 4,
+                indexed: Some(true),
+            }],
+            "{quantization:?}"
+        );
+        assert!(!audit.is_clean());
+        let _ = real;
     }
 }

@@ -23,9 +23,10 @@
 //!
 //! ## Boundedness
 //!
-//! The base cursor walks CompactStore tables row-by-row through the public
-//! per-row accessors (`NodeTable::get_all_properties`, `RelTable::*_node_id`,
-//! `get_all_edge_properties`) and translates dense offsets back to original
+//! The base cursor walks CompactStore tables row-by-row through the
+//! presence-aware row readers (`CompactStore::node_row_properties` /
+//! `edge_row_properties`: an absent cell stays absent, AMH #183) and
+//! `RelTable::*_node_id`, and translates dense offsets back to original
 //! ids through the preserve-id maps. It never materializes all base rows. The
 //! overlay is bounded by the admission budget, so its id snapshot is charged to
 //! that budget rather than the base size.
