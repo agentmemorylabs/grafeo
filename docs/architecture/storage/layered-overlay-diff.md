@@ -64,8 +64,9 @@ Neo4j's TxState model (DESIGN §11.2), adapted to an immutable base:
 - each property: the diff row's value if it has the key (a tombstone means *absent*), else the base value;
 - MVCC visibility (created/deleted epoch, deleting transaction): from the diff row.
 
-A full copy-up is a diff that overrides every property, so **old overlays stay valid** under the new read rule. No
-format migration is needed, and #13, #15 and #38's paths keep working unchanged (§8).
+A persisted full row is **not** read as a diff: a full copy with a physically removed key would resurrect the key.
+Compact files therefore persist overlay rows whole and convert them on load (§8). #13, #15 and #38's paths keep
+working unchanged.
 
 ### 2.1 Removal tombstone
 
@@ -186,19 +187,25 @@ on the diff row.
 
 ### 5.6 Visibility and history
 `is_*_visible_*` and `filter_visible_*` are unchanged, since visibility comes from the diff row.
-`get_*_history` returns the diff row's history merged with the base row as the epoch-0 state.
+`get_*_history` merges each entry of a dirty base node's history with the base row: the diff entry's values over the
+base values, tombstones removed. This applies through `LayeredStore`, `GrafeoDB::get_{node,edge}_history` and
+`Session::get_{node,edge}_history`. `GrafeoDB::get_{node,edge}_at_epoch` read the merged layered epoch reader.
+These APIs are not `temporal`-gated; only the per-property history API below them is.
 
 ### 5.7 Readers that bypass `LayeredStore`
 Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1 handles each one:
 
 | Reader | Slice 1 |
 |---|---|
-| Handoff freeze capture (`epoch_handoff/handoff.rs` `capture_frozen_overlay_payloads`) | captures `LayeredStore::materialize_overlay_node(row)` (§6) |
-| Live-graph build source (`generation_builder/live_graph.rs` `OverlayNodeCursor`) | merges with the base row it skips |
-| Mid-build tier drain (`database/mid_build_drain.rs`) | when the overlay holds diff rows, builds the window from a scratch store of materialized rows (still O(window)) |
+| Handoff freeze capture (`epoch_handoff/handoff.rs` `capture_frozen_overlay_payloads`) | captures **raw** diff rows; the frozen build sources (`epoch_handoff/records.rs`) merge each with its base row as the build consumes it (§6) |
+| Live-graph build source (`generation_builder/live_graph.rs` `OverlayNode/EdgeCursor`) | merges each row with the base row it skips, one record at a time |
+| Mid-build tier drain (`database/mid_build_drain.rs`) | refused unless the base is empty (§6); with an empty base no overlay row is a diff |
+| Compact-file overlay section (`LpgStoreSection`) | persists overlay rows of base entities **whole** (`with_row_materializer`); the load path turns them back into diffs (§8) |
 | `GrafeoDB::{add,remove}_node_label`, `remove_node_property`, `get_node_labels` (`crud.rs`) | routed through `LayeredStore` / the merged `get_node`. This also fixes clean base nodes, where these were no-ops before. |
 | Vector spill consumers | skip diff rows (§5.5) |
-| `GrafeoDB::get_node_at_epoch`, history, temporal property history; `Session::get_*_history` (`active_lpg_store`) | `temporal`-only. They read overlay rows, so a diff row's history lacks unchanged properties. Not in AMH's feature set. **Slice 4** gives them a merged view (the base row is the epoch-0 state). |
+| `GrafeoDB::get_{node,edge}_at_epoch`, `get_{node,edge}_history`; `Session::get_{node,edge}_history` | read through the layered view (§5.6) |
+| `GrafeoDB::get_{node,edge}_property_at_epoch` / property history (`temporal`-only) | still read overlay entries: a diff row's per-property history lacks the base's epoch-0 values. Not in AMH's feature set; **slice 4** |
+| `LayeredStore::vector_search` (planner / `GraphStoreSearch` path) | **interim gap, slice 4**: forwards to the overlay `LpgStore` with an overlay-only accessor. A base node with a diff row is now invisible there, as a clean base node already was. DB-level `vector_search` and `read_indexed_node_vector` use the merged accessor and are unaffected (§5.5) |
 | `export_snapshot`, `iter_nodes`, `save` (`persistence.rs`) | already miss base rows entirely on a layered DB (pre-existing). Unchanged; listed so nobody relies on them. |
 | `LpgStore::find_nodes_by_property` on a mapped index, `property_index_snapshot_entries` | keep diff rows only if the overlay value matches. `LayeredStore` never relies on them (it verifies mapped candidates itself), and generation writers rebuild postings from the layered graph. Direct overlay callers should not use them on a layered store. |
 
@@ -207,9 +214,21 @@ Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1
 - **The builder treats an overlay row as a whole-row replacement.**
   - The base cursor skips every overlay id (`generation_builder/freeze.rs` `node_shadowed`).
   - Duplicate ids are rejected.
-  - So every consumer that feeds overlay rows to a build must feed **materialized** rows: `merge(base row, diff
-    row)`. Slice 1 does this at all three sources (handoff capture, live-graph cursor, mid-build drain).
-  - The cost is reading each touched base row once per compaction, which the build reads anyway.
+  - So every source that feeds overlay rows to a build must yield **materialized** rows: `merge(base row, diff
+    row)`.
+  - **Merged lazily, never held (DESIGN R1).** The handoff freeze captures raw diff rows: a touched base node with a
+    2048-dim embedding costs its diff (measured: ~20 B of payload for a small SET), not its embedding.
+    - The frozen build sources (`FrozenNodeSource` / `FrozenEdgeSource`) and the live-graph cursors merge each
+      record with the (immutable, still current) base row **as the build consumes it**, one record at a time, under
+      the builder's own budget.
+    - The inherited embedding is read once per touched node per compaction, which the build reads anyway, and
+      dropped after the record is staged.
+  - **Tier drains need an empty base.** The final tier-chain build (`tier_chain_sources.rs`) walks tiers + overlay
+    and carries no original base rows, so a drain over a non-empty base was already incomplete, and a diff row
+    cannot be a whole tier row. `drain_overlay_to_tier` refuses a non-empty base before any state changes.
+    - Every in-tree caller drains a fresh build, whose base is empty.
+    - AMH's bulk import ignores the drain's result (`let _ = maybe_midflush(..)`), so a refusal costs memory
+      headroom, not data.
 - **Absorbed rows.**
   - `swap_base_and_repair_overlay` leaves rows the new base absorbed in the overlay, undirtied (as today).
   - Two rules keep them harmless:
@@ -239,15 +258,22 @@ Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1
 - **#13 (journal through overlay delete), #15 (deleted promoted ids in the deletion log), #38 (overlay-only deletes):**
   unchanged code paths. A diff row is an overlay row at a base id, exactly as a copy was.
   - `snapshot_deleted_promoted_*` still lists dirty ids whose overlay row is deleted and whose base row exists.
-- **Old overlays with full copies** (compact-file snapshots, a WAL replayed by an older binary): read correctly,
-  because a full copy is a diff that overrides everything.
-- **The reverse is not true:** a binary *without* D10 that opens an overlay containing diff rows would serve them as
-  full copies and lose the unchanged base properties.
-  - Generation roots never persist the overlay (the WAL is replayed through `ensure_*`), so a downgrade is safe for
-    them.
-  - Compact files that persist an overlay section are not safe to downgrade once written by a D10 binary.
-  -   - Mitigation, if a downgrade is ever needed: run an epoch handoff (or `compact()` / save on the D10 binary)
-    first. It materializes every diff into the base.
+- **Compact files persist overlay rows whole; the load path turns them back into diffs.**
+  - A layered compact file's overlay section is written by `LpgStoreSection::with_row_materializer`: each overlay
+    row of a base entity is merged with its base row (removed keys absent). That is also exactly what pre-D10
+    binaries wrote, since they held full copies and removed keys physically.
+  - On load, `LayeredStore::adopt_persisted_full_rows` writes a `Null` tombstone for every base key such a row
+    lacks.
+  - So one on-disk meaning ("the whole row") serves both binaries, and no format marker is needed.
+  - **Why not read old rows as diffs:** a full copy with a physically removed key would resurrect that key
+    (review r1, must-fix 1). The fixture `tests/fixtures/legacy_layered_overlay.grafeo`, written by fork trunk
+    `850e69f3`, pins this; without the conversion, `a.q` comes back.
+  - **Pre-existing, not D10:** `compact()` after a property removal brings the key back as its column's type
+    default (`""`, zeros). The in-memory CompactStore builder encodes absent string/vector values that way when
+    other rows of the label carry the key. Same on trunk; pinned as an ignored test.
+- **Downgrade:** a pre-D10 binary reading a D10 compact file sees whole rows, so it reads it correctly.
+  Generation roots never persist the overlay (their WAL replays through the mutators), so they are safe in both
+  directions.
 
 ## 9. Slices
 
