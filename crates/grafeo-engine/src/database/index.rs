@@ -764,10 +764,10 @@ impl super::GrafeoDB {
                             id.as_u64(),
                             vector.len()
                         );
-                        index.remove(id);
+                        index.remove_with_accessor(id, &accessor);
                     }
                     _ => {
-                        index.remove(id);
+                        index.remove_with_accessor(id, &accessor);
                     }
                 }
             }

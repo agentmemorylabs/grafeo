@@ -366,9 +366,11 @@ impl super::GrafeoDB {
 
         // Collect matching vector indexes BEFORE deletion removes labels
         #[cfg(feature = "vector-index")]
-        let indexes_to_clean: Vec<
+        let indexes_to_clean: Vec<(
+            String,
+            String,
             std::sync::Arc<grafeo_core::index::vector::VectorIndexKind>,
-        > = self
+        )> = self
             .lpg_store()
             .get_node(id)
             .map(|node| {
@@ -376,8 +378,8 @@ impl super::GrafeoDB {
                 for label in &node.labels {
                     let prefix = format!("{}:", label.as_str());
                     for (key, index) in self.lpg_store().vector_index_entries() {
-                        if key.starts_with(&prefix) {
-                            indexes.push(index);
+                        if let Some(property) = key.strip_prefix(&prefix) {
+                            indexes.push((label.to_string(), property.to_string(), index));
                         }
                     }
                 }
@@ -422,8 +424,12 @@ impl super::GrafeoDB {
         // Remove from vector indexes after successful deletion
         #[cfg(feature = "vector-index")]
         if result {
-            for index in indexes_to_clean {
-                index.remove(id);
+            // AMH #174: reconnect the removed node's former neighbours,
+            // reading their vectors through the merged view + spill (#175).
+            let graph = self.graph_store();
+            for (label, property, index) in indexes_to_clean {
+                let accessor = self.build_vector_accessor(&graph, &label, &property);
+                index.remove_with_accessor(id, &accessor);
             }
         }
 

@@ -701,7 +701,7 @@ impl HnswIndex {
         // pointing at a node whose own neighbor lists were reset. Remove the
         // previous entry and reconnect its former neighbors before indexing the
         // replacement vector.
-        self.remove_for_replacement(id, accessor);
+        self.remove_with_accessor(id, accessor);
 
         let level = self.random_level();
 
@@ -851,15 +851,20 @@ impl HnswIndex {
         }
     }
 
-    /// Remove an existing node before replacing its vector, preserving paths
-    /// between the node's former neighbors.
-    fn remove_for_replacement(&self, id: NodeId, accessor: &impl VectorAccessor) {
+    /// Removes `id` and reconnects its former neighbors, preserving paths
+    /// between them, then prunes them back to the configured degree using
+    /// `accessor` for distances. Returns `true` when `id` was present.
+    ///
+    /// Use this, not [`Self::remove`], whenever the node's neighbours must stay
+    /// reachable: on a chain-like topology (e.g. near-colinear vectors) the
+    /// removed node can be the only path to the rest of the graph (AMH #174).
+    pub fn remove_with_accessor(&self, id: NodeId, accessor: &impl VectorAccessor) -> bool {
         let mut nodes = self.nodes.write();
         let mut entry_point = self.entry_point.write();
         let nodes_map = nodes.as_heap_mut();
 
         let Some(removed) = nodes_map.remove(&id) else {
-            return;
+            return false;
         };
 
         for node in nodes_map.values_mut() {
@@ -941,6 +946,7 @@ impl HnswIndex {
                 .copied()
                 .or_else(|| nodes_map.keys().next().copied());
         }
+        true
     }
 
     /// Searches for the k nearest neighbors to the query vector.
@@ -1238,6 +1244,10 @@ impl HnswIndex {
     /// Removes a vector from the index.
     ///
     /// Returns true if the vector was found and removed.
+    ///
+    /// This does **not** reconnect the removed node's former neighbours, so
+    /// it can disconnect the graph (AMH #174). Callers that have a vector
+    /// accessor should use [`Self::remove_with_accessor`].
     pub fn remove(&self, id: NodeId) -> bool {
         let mut nodes = self.nodes.write();
         let mut entry_point = self.entry_point.write();
