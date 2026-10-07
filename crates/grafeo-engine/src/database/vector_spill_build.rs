@@ -107,8 +107,12 @@ mod imp {
                 }
             };
 
-            if registry.read().contains_key(&key) {
-                let spill_file = spill_file_for_key(&spill_dir, &key);
+            // Held from the check through registration so an epoch-handoff
+            // freeze (which takes the same upgradable read) never sees this
+            // column drained but not yet registered (AMH #167 review).
+            let lifecycle = registry.upgradable_read();
+            if let Some(existing) = lifecycle.get(&key) {
+                let spill_file = existing.path().to_path_buf();
                 return Ok(SpillVectorColumnReport {
                     label: label.to_string(),
                     property: property.to_string(),
@@ -225,12 +229,16 @@ mod imp {
                 )));
             }
 
-            let spill_file = spill_file_for_key(&spill_dir, &key);
-            let mmap_storage = match MmapStorage::create(&spill_file, dims) {
+            let spill_file = super::super::section_consumer::unique_spill_file(&spill_dir, &key);
+            let mmap_storage = match MmapStorage::create_new(&spill_file, dims) {
                 Ok(storage) => storage,
                 Err(e) => {
-                    // Unlink any truncated file the failed create left behind.
-                    let _ = std::fs::remove_file(&spill_file);
+                    // Unlink a partial file the failed create left behind,
+                    // but never a file that already existed: `create_new`
+                    // refused it, so it belongs to someone else.
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        let _ = std::fs::remove_file(&spill_file);
+                    }
                     restore(store, &vectors, &restored);
                     return Err(Error::Internal(format!(
                         "spill_vector_column_to_disk {key}: create {}: {e}",
@@ -274,7 +282,8 @@ mod imp {
                 store.restore_node_property_column(&prop_key, restored.into_iter());
             }
 
-            registry.write().insert(key.clone(), Arc::new(mmap_storage));
+            parking_lot::RwLockUpgradableReadGuard::upgrade(lifecycle)
+                .insert(key.clone(), Arc::new(mmap_storage));
 
             // Re-register the VectorStore consumer bound to the LIVE store.
             // After `compact()` the consumer registered at `with_config` time

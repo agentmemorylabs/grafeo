@@ -222,8 +222,26 @@ impl GrafeoDB {
         maybe_stall_before_capture();
 
         // Capture freeze identity + materialize overlay payloads.
+        //
+        // AMH #167: ForceDisk drains the overlay's vector-indexed columns into
+        // spill files, so the captured property maps lack those vectors.
+        // Snapshot the spill registry at the same point, holding its
+        // upgradable read across capture + snapshot: spill and reload hold
+        // the same lock for their whole drain/register (or reload) lifecycle,
+        // so the capture never sees a column drained but not registered.
+        // The vectors themselves are read per node during the build.
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        let spill_registry = self.vector_spill_storages.clone();
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        let spill_guard = spill_registry.as_ref().map(|r| r.upgradable_read());
         let (freeze, frozen_nodes, frozen_edges) =
             self.capture_frozen_overlay_payloads(frozen_epoch)?;
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        let spilled_vectors = self.snapshot_spilled_vectors(spill_guard.as_deref());
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        drop(spill_guard);
+        #[cfg(not(all(feature = "vector-index", feature = "mmap", not(feature = "temporal"))))]
+        let spilled_vectors = super::types::SpilledVectorSnapshot::default();
 
         // H-ADOPT.6 decision 3: capture catalog + index section state at the
         // SAME instant as the payload source — inside the writer barrier,
@@ -287,6 +305,7 @@ impl GrafeoDB {
             frozen_category_bytes,
             frozen_retained_bytes,
             section_capture,
+            spilled_vectors,
         };
 
         slot.phase = EpochHandoffPhase::FreezeCaptured;
@@ -471,6 +490,38 @@ impl GrafeoDB {
         ))
     }
 
+    /// Captures the spill registry's columns for the freeze (AMH #167).
+    #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+    fn snapshot_spilled_vectors(
+        &self,
+        registry: Option<
+            &std::collections::HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>,
+        >,
+    ) -> super::types::SpilledVectorSnapshot {
+        use grafeo_core::index::vector::VectorStorage as _;
+        let Some(registry) = registry else {
+            return super::types::SpilledVectorSnapshot::default();
+        };
+        let mut columns: Vec<super::types::SpilledVectorColumn> = registry
+            .iter()
+            .filter_map(|(key, storage)| {
+                let (label, property) = key.split_once(':')?;
+                let dimensions = self
+                    .lpg_store()
+                    .get_vector_index(label, property)
+                    .map_or_else(|| storage.dimensions(), |index| index.config().dimensions);
+                Some(super::types::SpilledVectorColumn {
+                    key: key.clone(),
+                    property: grafeo_common::types::PropertyKey::new(property),
+                    dimensions,
+                    storage: Arc::clone(storage),
+                })
+            })
+            .collect();
+        columns.sort_by(|a, b| a.key.cmp(&b.key));
+        super::types::SpilledVectorSnapshot { columns }
+    }
+
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
     fn capture_frozen_overlay_payloads(
         &self,
@@ -579,6 +630,7 @@ impl GrafeoDB {
             let node_src = FrozenNodeSource {
                 nodes: handle.frozen_nodes.clone(),
                 pos: 0,
+                spilled: handle.spilled_vectors.clone(),
             };
             let edge_src = FrozenEdgeSource {
                 edges: handle.frozen_edges.clone(),
@@ -647,11 +699,23 @@ impl GrafeoDB {
         #[cfg(not(feature = "generation-streaming"))]
         let (section, node_count, edge_count) = {
             use grafeo_core::graph::compact::generation::generate_compact_store;
+
+            // AMH #167 review: the eager fallback collects every node (and so
+            // every recovered spilled vector) outside the build budget. Refuse
+            // before allocating rather than hold them all in RAM.
+            if handle.spilled_vectors.column_count() > 0 {
+                return Err(Error::Internal(format!(
+                    "spill-bearing handoff requires generation-streaming (DESIGN R1): \
+                     {} spilled vector column(s) would be collected in RAM by the eager build",
+                    handle.spilled_vectors.column_count()
+                )));
+            }
             use grafeo_storage::file::generation_writer::CompactStoreSectionSource;
 
             let mut nodes = FrozenNodeSource {
                 nodes: handle.frozen_nodes.clone(),
                 pos: 0,
+                spilled: handle.spilled_vectors.clone(),
             };
             let mut edges = FrozenEdgeSource {
                 edges: handle.frozen_edges.clone(),

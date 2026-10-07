@@ -45,7 +45,7 @@ use grafeo_core::index::vector::VectorStorage;
     feature = "mmap",
     not(feature = "temporal")
 ))]
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 #[cfg(all(
     feature = "lpg",
     feature = "vector-index",
@@ -267,6 +267,9 @@ pub struct VectorIndexConsumer {
     /// Map of "label:property" -> MmapStorage for spilled indexes.
     /// Shared with the search path so `SpillableVectorAccessor` can read.
     pub(crate) spilled: Arc<RwLock<HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>>>,
+    /// Spill files whose vectors were restored inline but which could not be
+    /// unlinked. Cleanup-only: never consulted for reads (AMH #167 review).
+    stale_files: parking_lot::Mutex<Vec<PathBuf>>,
 }
 
 #[cfg(all(
@@ -285,6 +288,7 @@ impl VectorIndexConsumer {
             store: Arc::downgrade(store),
             spill_path,
             spilled: Arc::new(RwLock::new(HashMap::new())),
+            stale_files: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -304,6 +308,7 @@ impl VectorIndexConsumer {
             store: Arc::downgrade(store),
             spill_path,
             spilled,
+            stale_files: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -321,19 +326,17 @@ impl VectorIndexConsumer {
         key: &str,
         dimensions: usize,
         vectors: &[(NodeId, Arc<[f32]>)],
-    ) -> Result<(), SpillError> {
+    ) -> Result<Arc<grafeo_core::index::vector::MmapStorage>, SpillError> {
         let spill_dir = self
             .spill_path
             .as_ref()
             .ok_or(SpillError::NoSpillDirectory)?;
         std::fs::create_dir_all(spill_dir).map_err(|e| SpillError::IoError(e.to_string()))?;
 
-        // Sanitize key for filename ("Label:property" -> "Label%3Aproperty")
-        // while preserving label case and underscores.
-        let safe_key = key.replace('%', "%25").replace(':', "%3A");
-        let spill_file = spill_dir.join(format!("vectors_{safe_key}.bin"));
-        let mmap_storage = grafeo_core::index::vector::MmapStorage::create(&spill_file, dimensions)
-            .map_err(|e| SpillError::IoError(e.to_string()))?;
+        let spill_file = unique_spill_file(spill_dir, key);
+        let mmap_storage =
+            grafeo_core::index::vector::MmapStorage::create_new(&spill_file, dimensions)
+                .map_err(|e| SpillError::IoError(e.to_string()))?;
 
         for (id, vector) in vectors {
             mmap_storage
@@ -343,10 +346,7 @@ impl VectorIndexConsumer {
         mmap_storage
             .flush()
             .map_err(|e| SpillError::IoError(e.to_string()))?;
-        self.spilled
-            .write()
-            .insert(key.to_string(), Arc::new(mmap_storage));
-        Ok(())
+        Ok(Arc::new(mmap_storage))
     }
 }
 
@@ -414,7 +414,14 @@ impl MemoryConsumer for VectorIndexConsumer {
         // its vectors by the labels registered for each index. The previous
         // per-index drain made the first HashMap entry consume every label's
         // vectors and left later indexes with empty spill stores.
-        let already_spilled: HashSet<String> = self.spilled.read().keys().cloned().collect();
+        //
+        // The registry's upgradable read is held from before the first drain
+        // until the last registration (AMH #167 review): an epoch-handoff
+        // freeze takes the same upgradable read, so it never observes a
+        // column that is drained but not yet registered. Plain readers
+        // (vector search) are not blocked.
+        let mut registry = self.spilled.upgradable_read();
+        let already_spilled: HashSet<String> = registry.keys().cloned().collect();
         let mut indexes_by_property: HashMap<String, Vec<(String, usize, HashSet<NodeId>)>> =
             HashMap::new();
         for (key, index) in store.vector_index_entries() {
@@ -459,7 +466,12 @@ impl MemoryConsumer for VectorIndexConsumer {
                     continue;
                 }
                 match self.spill_index(&key, dimensions, &vectors) {
-                    Ok(()) => consumed.extend(vectors.iter().map(|(id, _)| *id)),
+                    Ok(storage) => {
+                        let mut write = RwLockUpgradableReadGuard::upgrade(registry);
+                        write.insert(key.clone(), storage);
+                        registry = RwLockWriteGuard::downgrade_to_upgradable(write);
+                        consumed.extend(vectors.iter().map(|(id, _)| *id));
+                    }
                     Err(error) => eprintln!("failed to spill vector index {key}: {error}"),
                 }
             }
@@ -486,30 +498,78 @@ impl MemoryConsumer for VectorIndexConsumer {
             .ok_or(SpillError::IoError("store dropped".to_string()))?;
 
         let mut spilled = self.spilled.write();
-        for (key, mmap_storage) in spilled.drain() {
+
+        // AMH #167 review: read every spilled vector fallibly BEFORE touching
+        // the registry. An unreadable entry fails the reload with the
+        // registry and files intact, instead of being dropped as if the node
+        // were vectorless.
+        let mut exported = Vec::with_capacity(spilled.len());
+        for (key, mmap_storage) in spilled.iter() {
             let property = key
                 .split(':')
                 .nth(1)
                 .ok_or_else(|| SpillError::IoError(format!("invalid index key: {key}")))?;
-            let prop_key = PropertyKey::new(property);
+            let vectors = mmap_storage.try_export_all().map_err(|e| {
+                SpillError::IoError(format!("reload {key}: spilled vector unreadable: {e}"))
+            })?;
+            exported.push((key.clone(), PropertyKey::new(property), vectors));
+        }
 
-            // Export vectors from mmap, restore to property store
-            let vectors = mmap_storage.export_all();
+        for (key, prop_key, vectors) in exported {
             store.restore_node_property_column(
                 &prop_key,
                 vectors
                     .into_iter()
                     .map(|(id, vec_data)| (id, Value::Vector(vec_data))),
             );
-
-            // Delete spill file
-            if let Ok(path) = std::fs::canonicalize(mmap_storage.path()) {
-                let _ = std::fs::remove_file(path);
+            // The values are inline again, so the spill entry stops being an
+            // authority NOW, whether or not its file can be unlinked: a kept
+            // entry would let readers (and a later reload or handoff fill)
+            // resurrect a vector that a WAL-logged removal deleted inline.
+            // A file that can't be unlinked goes on a cleanup-only list.
+            if let Some(storage) = spilled.remove(&key) {
+                let path = storage.path().to_path_buf();
+                if let Err(e) = std::fs::remove_file(&path) {
+                    grafeo_common::grafeo_warn!(
+                        "vector spill reload {key}: could not remove {}: {e}; kept for cleanup",
+                        path.display()
+                    );
+                    self.stale_files.lock().push(path);
+                }
             }
         }
-
+        // Retry earlier failed unlinks (cleanup only; never read).
+        self.stale_files
+            .lock()
+            .retain(|path| std::fs::remove_file(path).is_err() && path.exists());
         Ok(())
     }
+}
+
+/// A fresh spill file path for `key` ("Label:property"), never reused.
+///
+/// A frozen epoch-handoff snapshot may still read an earlier spill file
+/// through its open descriptor, so a re-spill must not truncate that inode
+/// (AMH #167 review). Callers open the path with
+/// [`MmapStorage::create_new`](grafeo_core::index::vector::MmapStorage::create_new).
+#[cfg(all(
+    feature = "lpg",
+    feature = "vector-index",
+    feature = "mmap",
+    not(feature = "temporal")
+))]
+pub(crate) fn unique_spill_file(spill_dir: &std::path::Path, key: &str) -> PathBuf {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    // "Label:property" -> "Label%3Aproperty", preserving case and underscores.
+    let safe_key = key.replace('%', "%25").replace(':', "%3A");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    spill_dir.join(format!(
+        "vectors_{safe_key}.{}-{nanos}-{seq}.bin",
+        std::process::id()
+    ))
 }
 
 /// Dynamic memory consumer for text indexes.

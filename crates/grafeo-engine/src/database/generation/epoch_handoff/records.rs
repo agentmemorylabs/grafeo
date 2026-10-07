@@ -22,6 +22,8 @@ use super::super::publication::PublicationPhaseError;
 pub(super) struct FrozenNodeSource {
     pub(super) nodes: Vec<GenerationNode>,
     pub(super) pos: usize,
+    /// AMH #167: spilled overlay vectors, filled in per node as it streams.
+    pub(super) spilled: super::types::SpilledVectorSnapshot,
 }
 
 impl NodeRecordSource for FrozenNodeSource {
@@ -29,8 +31,9 @@ impl NodeRecordSource for FrozenNodeSource {
         if self.pos >= self.nodes.len() {
             return Ok(None);
         }
-        let n = self.nodes[self.pos].clone();
+        let mut n = self.nodes[self.pos].clone();
         self.pos += 1;
+        self.spilled.fill(&mut n)?;
         Ok(Some(n))
     }
 }
