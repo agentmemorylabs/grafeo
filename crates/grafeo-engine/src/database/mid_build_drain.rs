@@ -302,6 +302,9 @@ impl GrafeoDB {
                     }
                 }
             }
+            // Dictionary entries too: an absent or null row's placeholder
+            // entry (AMH #183) is in the column but in no property value.
+            string_occ.extend(window_store.dictionary_strings());
             let global_strings = collect_and_assign_global_codes(string_occ)
                 .map_err(|e| Error::Internal(format!("global strings: {e}")))?;
             let section = CompactStoreSectionSource::new(window_store, global_strings)

@@ -92,10 +92,10 @@ pub fn serialize_v5_with_string_order(
         }
         for codec in nt.columns().values() {
             if let ColumnCodec::Dict(d) = codec {
-                for i in 0..d.dictionary_size() {
-                    if let Some(s) = d.get(i) {
-                        let _ = intern(s);
-                    }
+                // Every dictionary ENTRY (`get(i)` reads row `i`, which can
+                // miss an entry the first `dictionary_size()` rows lack).
+                for s in d.dictionary_entries().iter() {
+                    let _ = intern(s);
                 }
             }
         }
@@ -115,10 +115,10 @@ pub fn serialize_v5_with_string_order(
         }
         for codec in rt.properties().values() {
             if let ColumnCodec::Dict(d) = codec {
-                for i in 0..d.dictionary_size() {
-                    if let Some(s) = d.get(i) {
-                        let _ = intern(s);
-                    }
+                // Every dictionary ENTRY (`get(i)` reads row `i`, which can
+                // miss an entry the first `dictionary_size()` rows lack).
+                for s in d.dictionary_entries().iter() {
+                    let _ = intern(s);
                 }
             }
         }
@@ -396,6 +396,15 @@ pub fn serialize_v5_with_string_order(
             16,
             code_index_body,
         ));
+    }
+
+    // Presence/null companions (AMH #183), as the canonical emitter writes.
+    let (presence_body, null_body) = store.column_companion_bodies();
+    if let Some(body) = presence_body {
+        segments.push((SegmentKind::ColumnRowPresence, 1, 0, 1, 0, body.to_vec()));
+    }
+    if let Some(body) = null_body {
+        segments.push((SegmentKind::ColumnRowNull, 1, 0, 1, 0, body.to_vec()));
     }
 
     // Sort segments by kind ascending (already mostly ordered; Metadata was inserted at 0).

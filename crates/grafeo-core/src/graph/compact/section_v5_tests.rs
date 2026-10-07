@@ -128,3 +128,70 @@ fn heap_writer_vector_header_matches_the_v1_codec_layout() {
     codec.write_to(&mut v1);
     assert_eq!(ours, v1);
 }
+
+/// A string column whose first `dictionary_size()` rows do not cover every
+/// dictionary entry: `[a, c, a, b]` has entries `[a, c, b]`, and rows 0..3
+/// are `a, c, a`. The writer interned rows `0..dictionary_size()` and then
+/// failed with "dict string not interned: b". (Zone maps intern a column's
+/// min and max, which hid it unless the missed entry is neither; edge
+/// columns get no zone maps from the heap builder at all.)
+#[test]
+fn every_dictionary_entry_is_interned() {
+    let store = crate::graph::compact::CompactStoreBuilder::new()
+        .node_table("L", |t| t.column_dict("s", &["a", "c", "a", "b"]))
+        .build()
+        .expect("build");
+    let bytes = serialize_v5(&store).expect("serialize");
+    let back = deserialize_v5(&Bytes::from(bytes)).expect("deserialize");
+    let nt = back.node_table("L").expect("table");
+    let key = grafeo_common::types::PropertyKey::new("s");
+    let values: Vec<_> = (0..4).map(|row| nt.get_property(row, &key)).collect();
+    let want: Vec<_> = ["a", "c", "a", "b"]
+        .into_iter()
+        .map(|s| Some(grafeo_common::types::Value::from(s)))
+        .collect();
+    assert_eq!(values, want);
+}
+
+/// AMH #183: the heap builder's presence/null companions survive a v5 round
+/// trip, so an absent property stays absent and a stored null stays null.
+#[test]
+fn builder_presence_survives_a_round_trip() {
+    use crate::graph::traits::GraphStore;
+    use grafeo_common::types::{PropertyKey, Value};
+
+    let lpg = crate::graph::lpg::LpgStore::new().expect("lpg");
+    let full = lpg.create_node(&["L"]);
+    lpg.set_node_property(full, "s", Value::from("x"));
+    lpg.set_node_property(full, "n", Value::Int64(5));
+    let bare = lpg.create_node(&["L"]);
+    let null = lpg.create_node(&["L"]);
+    lpg.set_node_property(null, "s", Value::Null);
+    let compact = crate::graph::compact::from_graph_store(&lpg).expect("build");
+    let bytes = serialize_v5(&compact).expect("serialize");
+    let back = deserialize_v5(&Bytes::from(bytes)).expect("deserialize");
+    for store in [&compact, &back] {
+        let nt = store.node_table("L").expect("table");
+        let tid = nt.table_id();
+        let read = |row: u32, key: &str| {
+            let key = PropertyKey::new(key);
+            store.get_property_filtered(tid, row, &key, nt.get_property(row as usize, &key))
+        };
+        // Rows follow the label scan; find them by their own values.
+        let rows: Vec<(Option<Value>, Option<Value>)> =
+            (0..3).map(|r| (read(r, "s"), read(r, "n"))).collect();
+        assert!(
+            rows.contains(&(Some(Value::from("x")), Some(Value::Int64(5)))),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&(None, None)),
+            "absent stays absent: {rows:?}"
+        );
+        assert!(
+            rows.contains(&(Some(Value::Null), None)),
+            "null stays null: {rows:?}"
+        );
+    }
+    let _ = (full, bare, null, GraphStore::node_count(&back));
+}

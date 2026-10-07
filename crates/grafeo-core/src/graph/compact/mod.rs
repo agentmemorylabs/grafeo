@@ -650,6 +650,37 @@ impl CompactStore {
         self.global_dict = global_dict;
     }
 
+    /// Every entry of every dictionary-encoded column (node and edge), in
+    /// table and column order. A writer that maps dictionary entries to
+    /// global string codes must intern all of them: rows a presence/null
+    /// companion marks absent or null still hold a placeholder entry (AMH
+    /// #183), which no visible property value carries.
+    #[must_use]
+    pub fn dictionary_strings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut add = |codec: &column::ColumnCodec| {
+            if let column::ColumnCodec::Dict(d) = codec {
+                out.extend(d.dictionary_entries().iter().map(|s| s.to_string()));
+            }
+        };
+        for nt in &self.node_tables_by_id {
+            nt.columns().values().for_each(&mut add);
+        }
+        for rt in &self.rel_tables_by_id {
+            rt.properties().values().for_each(&mut add);
+        }
+        out
+    }
+
+    /// The installed presence and null companion segment bodies, for writers
+    /// that persist the store (they use this store's column numbering).
+    #[must_use]
+    pub(crate) fn column_companion_bodies(
+        &self,
+    ) -> (Option<&bytes::Bytes>, Option<&bytes::Bytes>) {
+        (self.presence_body.as_ref(), self.null_body.as_ref())
+    }
+
     /// Sets the column index map used to look up presence/null bitmaps.
     pub(crate) fn set_column_index_map(
         &mut self,

@@ -514,6 +514,17 @@ pub fn emit_canonical_descriptors(
         )?);
     }
 
+    // Presence/null companions (AMH #183): a heap store built from rows
+    // where some lack a key, or a mapped store that carried them, must keep
+    // them, or every placeholder body row reads back as a value.
+    let (presence_body, null_body) = store.column_companion_bodies();
+    if let Some(body) = presence_body {
+        descriptors.push(emit(SegmentKind::ColumnRowPresence, 1, 0, 1, 0, body)?);
+    }
+    if let Some(body) = null_body {
+        descriptors.push(emit(SegmentKind::ColumnRowNull, 1, 0, 1, 0, body)?);
+    }
+
     // Sort strictly by segment kind ascending.
     descriptors.sort_by_key(|d| d.kind.as_u16());
     Ok(descriptors)

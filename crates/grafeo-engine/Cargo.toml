@@ -218,6 +218,11 @@ path = "tests/generation_root_overlay_delete_crash.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
 
 [[test]]
+name = "compact_absent_properties"
+path = "tests/compact_absent_properties.rs"
+required-features = ["lpg", "compact-store", "cypher"]
+
+[[test]]
 name = "generation_root_overlay_diff"
 path = "tests/generation_root_overlay_diff.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]

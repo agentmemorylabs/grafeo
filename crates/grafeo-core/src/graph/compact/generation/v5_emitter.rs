@@ -643,6 +643,24 @@ pub fn emit_v5_segments(
         });
     }
 
+    // Presence/null companions (AMH #183), as the canonical emitter writes.
+    let (presence_body, null_body) = store.column_companion_bodies();
+    for (kind, body) in [
+        (SegmentKind::ColumnRowPresence, presence_body),
+        (SegmentKind::ColumnRowNull, null_body),
+    ] {
+        if let Some(body) = body {
+            segments.push(V5Segment {
+                kind,
+                encoding_version: 1,
+                flags: 0,
+                alignment: 1,
+                element_width: 0,
+                bytes: body.to_vec(),
+            });
+        }
+    }
+
     // Sort strictly by segment kind ascending
     segments.sort_by_key(|s| s.kind.as_u16());
     Ok(segments)

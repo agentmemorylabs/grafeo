@@ -55,8 +55,13 @@ impl GraphStore for CompactStore {
 
         let mut edge = Edge::new(id, src, dst, edge_type);
         let props = rt.get_all_edge_properties(pos as usize);
+        // Edge columns carry presence/null companions too (AMH #183): an
+        // edge without the key reads a placeholder body otherwise.
+        let column_table = rel_column_table_id(rel_table_id);
         for (k, v) in props {
-            edge.set_property(k, v);
+            if let Some(filtered) = self.get_property_filtered(column_table, pos, &k, Some(v)) {
+                edge.set_property(k, filtered);
+            }
         }
         Some(edge)
     }
@@ -100,7 +105,10 @@ impl GraphStore for CompactStore {
         let (rel_table_id, csr_position) = self.resolve_edge(id)?;
         let rt = self.resolve_rel_table(rel_table_id)?;
         let row = usize::try_from(csr_position).ok()?;
-        rt.get_edge_property(row, key)
+        let raw = rt.get_edge_property(row, key);
+        let row_u32 = u32::try_from(csr_position).ok()?;
+        // See `get_edge` (AMH #183).
+        self.get_property_filtered(rel_column_table_id(rel_table_id), row_u32, key, raw)
     }
 
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>> {
@@ -629,6 +637,13 @@ impl GraphStoreSearch for CompactStore {
 
         Box::new(per_table.flatten())
     }
+}
+
+/// The table id under which a rel table's columns are keyed in the column
+/// index map (presence/null companions): `0x8000 | rel_table_id`, as the
+/// generation writer's column pass and the v5 reader number them.
+pub(super) const fn rel_column_table_id(rel_table_id: u16) -> u16 {
+    0x8000 | rel_table_id
 }
 
 pub(super) fn value_in_range(
