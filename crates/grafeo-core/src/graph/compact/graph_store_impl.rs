@@ -33,11 +33,8 @@ impl GraphStore for CompactStore {
         for label in self.logical_labels_for_node(table_id, row_u32) {
             node.add_label(label);
         }
-        for key in nt.columns().keys() {
-            let raw = nt.get_property(row, key);
-            if let Some(filtered) = self.get_property_filtered(table_id, row_u32, key, raw) {
-                node.set_property(key.clone(), filtered);
-            }
+        for (key, value) in self.node_row_properties(nt, row) {
+            node.set_property(key, value);
         }
         Some(node)
     }
@@ -54,14 +51,10 @@ impl GraphStore for CompactStore {
         let edge_type = rt.edge_type().clone();
 
         let mut edge = Edge::new(id, src, dst, edge_type);
-        let props = rt.get_all_edge_properties(pos as usize);
         // Edge columns carry presence/null companions too (AMH #183): an
         // edge without the key reads a placeholder body otherwise.
-        let column_table = rel_column_table_id(rel_table_id);
-        for (k, v) in props {
-            if let Some(filtered) = self.get_property_filtered(column_table, pos, &k, Some(v)) {
-                edge.set_property(k, filtered);
-            }
+        for (k, v) in self.edge_row_properties(rel_table_id, rt, pos as usize) {
+            edge.set_property(k, v);
         }
         Some(edge)
     }
@@ -623,11 +616,23 @@ impl GraphStoreSearch for CompactStore {
             let block_zones = nt.block_zone_maps_for(&key);
             let table_id = nt.table_id();
             let store = self;
+            let key = key.clone();
             // reason: usize → u64 fits on every supported target (row count
             // bounded by u32::MAX per the section format).
             #[allow(clippy::cast_possible_truncation)]
             let iter = col
                 .range_iter(block_zones, min, max, min_inclusive, max_inclusive)
+                // The column body holds a placeholder for an absent or
+                // present-null cell (AMH #183); recheck each candidate on its
+                // stored value, as the eager `find_nodes_in_range` does.
+                .filter(move |&offset| {
+                    let Ok(row) = u32::try_from(offset) else {
+                        return false;
+                    };
+                    store
+                        .get_property_filtered(table_id, row, &key, col.get(offset))
+                        .is_some_and(|v| value_in_range(&v, min, max, min_inclusive, max_inclusive))
+                })
                 .map(move |offset| {
                     let compact_id = encode_node_id(table_id, offset as u64);
                     store.to_original_node_id(compact_id)
@@ -664,6 +669,11 @@ pub(super) fn value_in_range(
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
             _ => None,
         }
+    }
+    // A present-null row is in no range, an open one included (a null
+    // comparison is never true).
+    if value.is_null() {
+        return false;
     }
     if let Some(min_val) = min {
         match cmp(value, min_val) {

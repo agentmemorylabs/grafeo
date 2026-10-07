@@ -162,7 +162,7 @@ impl NodeRecordSource for BaseNodeCursor {
             if self.freeze.node_shadowed(original_id) {
                 continue;
             }
-            let properties = nt.get_all_properties(off);
+            let properties = self.base.node_row_properties(nt, off);
             return Ok(Some(GenerationNode {
                 id: OriginalNodeId::new(original_id),
                 labels: vec![nt.label().to_string()],
@@ -282,7 +282,7 @@ impl EdgeRecordSource for BaseEdgeCursor {
                     "rel {rel_table_id} pos {pos} dst has no original id"
                 ))
             })?;
-            let properties = rt.get_all_edge_properties(pos);
+            let properties = self.base.edge_row_properties(rel_table_id, rt, pos);
             return Ok(Some(GenerationEdge {
                 id: OriginalEdgeId::new(original_id),
                 src: OriginalNodeId::new(src),

@@ -752,6 +752,54 @@ impl CompactStore {
         raw_value
     }
 
+    /// The properties of row `row` of node table `nt` as stored: a property
+    /// the row lacks is absent, a present-null one is `Null` (presence/null
+    /// companions, AMH #183).
+    ///
+    /// The one row reader for node rows: point reads and every generation
+    /// row source go through it. `NodeTable::get_all_properties` decodes the
+    /// placeholder body of an absent cell (`""`, `0`, a zero vector) as if it
+    /// were stored, so it must not feed a row.
+    pub(crate) fn node_row_properties(
+        &self,
+        nt: &NodeTable,
+        row: usize,
+    ) -> FxHashMap<grafeo_common::types::PropertyKey, grafeo_common::types::Value> {
+        let mut props = FxHashMap::default();
+        let Ok(row_u32) = u32::try_from(row) else {
+            return props;
+        };
+        for (key, raw) in nt.get_all_properties(row) {
+            if let Some(value) = self.get_property_filtered(nt.table_id(), row_u32, &key, Some(raw))
+            {
+                props.insert(key, value);
+            }
+        }
+        props
+    }
+
+    /// [`node_row_properties`](Self::node_row_properties) for the edge at
+    /// CSR position `pos` of rel table `rel_table_id`; its columns are keyed
+    /// `0x8000 | rel_table_id` in the column index map.
+    pub(crate) fn edge_row_properties(
+        &self,
+        rel_table_id: u16,
+        rt: &RelTable,
+        pos: usize,
+    ) -> FxHashMap<grafeo_common::types::PropertyKey, grafeo_common::types::Value> {
+        let mut props = FxHashMap::default();
+        let Ok(pos_u32) = u32::try_from(pos) else {
+            return props;
+        };
+        let column_table = graph_store_impl::rel_column_table_id(rel_table_id);
+        for (key, raw) in rt.get_all_edge_properties(pos) {
+            if let Some(value) = self.get_property_filtered(column_table, pos_u32, &key, Some(raw)) {
+                props.insert(key, value);
+            }
+        }
+        props
+    }
+
     /// Returns the full logical label codes for one physical node row.
     ///
     /// When no membership companion exists, the old-v5 default applies: the

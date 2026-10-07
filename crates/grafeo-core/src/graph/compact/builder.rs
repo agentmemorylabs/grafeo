@@ -58,6 +58,17 @@ pub enum CompactStoreError {
         /// Maximum allowed value.
         max: u64,
     },
+    /// A property value the compact columns cannot store faithfully (a list
+    /// or a map). Refused rather than stored as its formatted string.
+    #[error("unsupported value in {owner} column {column:?}: {kind} is not a compact column type")]
+    UnsupportedValue {
+        /// The node label or edge type of the column.
+        owner: String,
+        /// Column name.
+        column: String,
+        /// The value's type.
+        kind: &'static str,
+    },
     /// The number of tables exceeds the compact ID encoding limit (15-bit table ID).
     #[error("table count {count} exceeds compact ID limit of {max} ({kind} tables)")]
     TableCountOverflow {
@@ -611,6 +622,30 @@ impl CompactStoreBuilder {
     }
 }
 
+/// Refuses a list or map value in any of `columns` (owned by node label or
+/// edge type `owner`): the compact columns have no codec for them, and the
+/// Dict fallback would store their formatted string instead.
+fn reject_unsupported_values<'a, M>(owner: &str, columns: M) -> Result<(), CompactStoreError>
+where
+    M: IntoIterator<Item = (&'a PropertyKey, &'a Vec<Value>)>,
+{
+    for (key, values) in columns {
+        let kind = values.iter().find_map(|v| match v {
+            Value::List(_) => Some("a list"),
+            Value::Map(_) => Some("a map"),
+            _ => None,
+        });
+        if let Some(kind) = kind {
+            return Err(CompactStoreError::UnsupportedValue {
+                owner: owner.to_string(),
+                column: key.as_str().to_string(),
+                kind,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Hands a column's presence/null bits to `record` when the column needs
 /// them: some row lacks the key, or a present row stores `Value::Null`.
 fn record_presence(
@@ -985,6 +1020,12 @@ pub fn from_graph_store(
         }
     }
 
+    // A list or map would become its formatted string in a Dict column:
+    // refuse it, as the streaming generation builder does.
+    for (label_key, _, props_map, _) in &label_data {
+        reject_unsupported_values(label_key.as_str(), props_map)?;
+    }
+
     // Step 2: Infer column types and build CompactStoreBuilder.
     let mut builder = CompactStoreBuilder::new();
 
@@ -1159,6 +1200,10 @@ pub fn from_graph_store(
                 }
             }
         }
+    }
+
+    for ((edge_type, _, _), props) in &edge_props_groups {
+        reject_unsupported_values(edge_type.as_str(), props)?;
     }
 
     // Step 4: Add relationship tables to the builder.

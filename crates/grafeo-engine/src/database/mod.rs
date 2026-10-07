@@ -33,6 +33,8 @@ mod checkpoint_timer;
 pub mod compact_tiered;
 #[cfg(feature = "lpg")]
 mod crud;
+#[cfg(feature = "lpg")]
+pub mod defaults_audit;
 #[cfg(feature = "embed")]
 mod embed;
 #[cfg(feature = "grafeo-file")]

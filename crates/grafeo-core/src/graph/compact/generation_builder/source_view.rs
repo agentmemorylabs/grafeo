@@ -179,7 +179,7 @@ impl GenerationSourceView for CompactStore {
                 "base node table {table_id} offset {offset} has no original id"
             ))
         })?;
-        let properties = nt.get_all_properties(offset);
+        let properties = self.node_row_properties(nt, offset);
         let labels = vec![nt.label().to_string()];
         let prop_bytes = estimate_props_bytes(properties.iter());
         let estimated = estimate_node_bytes(&labels, prop_bytes);
@@ -245,7 +245,7 @@ impl GenerationSourceView for CompactStore {
                 "rel {rel_table_id} pos {pos} dst has no original id"
             ))
         })?;
-        let properties = rt.get_all_edge_properties(pos);
+        let properties = self.edge_row_properties(rel_table_id, rt, pos);
         let edge_type = rt.edge_type().to_string();
         let prop_bytes = estimate_props_bytes(properties.iter());
         let estimated = (edge_type.len() + prop_bytes) as u64;

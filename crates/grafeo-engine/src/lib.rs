@@ -58,6 +58,10 @@ pub use database::CompactBacking;
 pub use database::GrafeoDB;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 pub use database::IndexedVectorRead;
+#[cfg(feature = "lpg")]
+pub use database::defaults_audit::{
+    DefaultsAudit, EdgeIdentity, EdgeMismatch, EmptyString, ZeroVector,
+};
 #[cfg(all(
     debug_assertions,
     feature = "generation",
