@@ -560,6 +560,21 @@ impl TransactionManager {
             .count()
     }
 
+    /// Returns the number of active transactions that have written anything.
+    ///
+    /// An epoch-handoff freeze refuses while this is non-zero: an open
+    /// transaction's in-place property writes and layered tombstones would be
+    /// captured into the frozen generation and survive its rollback (DESIGN
+    /// G2, §4.2).
+    #[must_use]
+    pub fn active_writers(&self) -> usize {
+        self.transactions
+            .read()
+            .values()
+            .filter(|info| info.state == TransactionState::Active && !info.write_set.is_empty())
+            .count()
+    }
+
     /// Cleans up completed transactions that are no longer needed for conflict detection.
     ///
     /// A committed transaction's write set must be preserved until all transactions

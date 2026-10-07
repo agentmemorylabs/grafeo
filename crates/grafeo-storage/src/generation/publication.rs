@@ -121,14 +121,17 @@ pub fn publish_generation(
     file_ops: &dyn GenerationFileOps,
     #[cfg(test)] fault_hook: Option<&dyn Fn(&str)>,
 ) -> std::result::Result<PublicationResult, PublicationError> {
+    // Every boundary is also a kill-test park point (a no-op unless the
+    // `testing-crash-injection` feature is on and the test names it).
     #[cfg(test)]
-    let hook = |name: &str| {
+    let hook = |name: &'static str| {
+        grafeo_common::testing::crash::park_point(name);
         if let Some(h) = fault_hook {
             h(name);
         }
     };
     #[cfg(not(test))]
-    let hook = |_name: &str| {};
+    let hook = |name: &'static str| grafeo_common::testing::crash::park_point(name);
 
     // Step 0: cut the WAL generation boundary (sync + rotate), unless the
     // caller already froze boundary B at epoch-handoff freeze time (G-EM0.5c).

@@ -9,6 +9,28 @@ use grafeo_core::graph::GraphStore;
 use grafeo_storage::wal::WalRecord;
 
 impl super::GrafeoDB {
+    /// Records a `GrafeoDB`-level mutation of an existing node as a post-freeze
+    /// (epoch N+1) write while an epoch handoff is active, so the install's
+    /// repair keeps it authoritative over the new base (DESIGN G2). These
+    /// writes go to the overlay store directly, bypassing `LayeredStore`'s own
+    /// tracking.
+    #[allow(unused_variables)]
+    fn note_post_freeze_node(&self, id: grafeo_common::types::NodeId) {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            layered.note_post_freeze_node(id);
+        }
+    }
+
+    /// Edge variant of [`Self::note_post_freeze_node`].
+    #[allow(unused_variables)]
+    fn note_post_freeze_edge(&self, id: grafeo_common::types::EdgeId) {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            layered.note_post_freeze_edge(id);
+        }
+    }
+
     // === Node Operations ===
 
     /// Creates a node with the given labels and returns its ID.
@@ -31,6 +53,9 @@ impl super::GrafeoDB {
     /// Returns an error if the WAL log (when enabled) fails to record the
     /// creation.
     pub fn create_node(&self, labels: &[&str]) -> Result<grafeo_common::types::NodeId> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         // Refused before anything is mutated once the WAL is poisoned.
         #[cfg(feature = "wal")]
         self.check_wal_writable()?;
@@ -75,6 +100,9 @@ impl super::GrafeoDB {
             ),
         >,
     ) -> Result<grafeo_common::types::NodeId> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         // Refused before anything is mutated once the WAL is poisoned.
         #[cfg(feature = "wal")]
         self.check_wal_writable()?;
@@ -343,6 +371,9 @@ impl super::GrafeoDB {
     /// Returns an error if the WAL log (when enabled) fails to record the
     /// deletion.
     pub fn delete_node(&self, id: grafeo_common::types::NodeId) -> Result<bool> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         // Refused before anything is mutated once the WAL is poisoned.
         #[cfg(feature = "wal")]
         self.check_wal_writable()?;
@@ -462,6 +493,9 @@ impl super::GrafeoDB {
         key: &str,
         value: grafeo_common::types::Value,
     ) -> Result<()> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         // Refused before anything is mutated once the WAL is poisoned.
         #[cfg(feature = "wal")]
         self.check_wal_writable()?;
@@ -589,6 +623,10 @@ impl super::GrafeoDB {
     /// If WAL is enabled, the operation is logged as its own WAL group; see
     /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn add_node_label(&self, id: grafeo_common::types::NodeId, label: &str) -> bool {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
+        self.note_post_freeze_node(id);
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("add_node_label") {
             return false;
@@ -663,6 +701,10 @@ impl super::GrafeoDB {
     /// If WAL is enabled, the operation is logged as its own WAL group; see
     /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn remove_node_label(&self, id: grafeo_common::types::NodeId, label: &str) -> bool {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
+        self.note_post_freeze_node(id);
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("remove_node_label") {
             return false;
@@ -755,6 +797,9 @@ impl super::GrafeoDB {
         dst: grafeo_common::types::NodeId,
         edge_type: &str,
     ) -> grafeo_common::types::EdgeId {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("create_edge") {
             return grafeo_common::types::EdgeId::INVALID;
@@ -803,6 +848,9 @@ impl super::GrafeoDB {
             ),
         >,
     ) -> grafeo_common::types::EdgeId {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("create_edge_with_props") {
             return grafeo_common::types::EdgeId::INVALID;
@@ -894,6 +942,9 @@ impl super::GrafeoDB {
             &str,
         )],
     ) -> Vec<grafeo_common::types::EdgeId> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         self.lpg_store().batch_create_edges(edges)
     }
 
@@ -927,6 +978,9 @@ impl super::GrafeoDB {
             >,
         )],
     ) -> grafeo_common::utils::error::Result<Vec<grafeo_common::types::EdgeId>> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         use grafeo_common::utils::hash::FxHashMap;
 
         let rows: Vec<(
@@ -973,6 +1027,9 @@ impl super::GrafeoDB {
     /// If WAL is enabled, the operation is logged as its own WAL group; see
     /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn delete_edge(&self, id: grafeo_common::types::EdgeId) -> bool {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("delete_edge") {
             return false;
@@ -1024,6 +1081,9 @@ impl super::GrafeoDB {
         key: &str,
         value: grafeo_common::types::Value,
     ) {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("set_edge_property") {
             return;
@@ -1082,6 +1142,10 @@ impl super::GrafeoDB {
     /// If WAL is enabled, the operation is logged as its own WAL group; see
     /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn remove_node_property(&self, id: grafeo_common::types::NodeId, key: &str) -> bool {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
+        self.note_post_freeze_node(id);
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("remove_node_property") {
             return false;
@@ -1121,6 +1185,10 @@ impl super::GrafeoDB {
     /// If WAL is enabled, the operation is logged as its own WAL group; see
     /// [Durability of direct writes](Self#durability-of-direct-writes).
     pub fn remove_edge_property(&self, id: grafeo_common::types::EdgeId, key: &str) -> bool {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
+        self.note_post_freeze_edge(id);
         // Refused before anything is mutated once the WAL is poisoned.
         if self.refuse_write_if_wal_poisoned("remove_edge_property") {
             return false;
@@ -1172,6 +1240,9 @@ impl super::GrafeoDB {
         property: &str,
         vectors: Vec<Vec<f32>>,
     ) -> Vec<grafeo_common::types::NodeId> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         use grafeo_common::types::{PropertyKey, Value};
 
         if self.refuse_write_if_wal_poisoned("batch_create_nodes") {
@@ -1273,6 +1344,9 @@ impl super::GrafeoDB {
             >,
         >,
     ) -> Vec<grafeo_common::types::NodeId> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         let (ids, wal_result) = self.batch_create_nodes_with_props_logged(label, properties_list);
         if let Err(e) = wal_result {
             grafeo_common::grafeo_warn!("batch_create_nodes_with_props: {e}");
@@ -1300,6 +1374,9 @@ impl super::GrafeoDB {
             >,
         >,
     ) -> Result<Vec<grafeo_common::types::NodeId>> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         let (ids, wal_result) = self.batch_create_nodes_with_props_logged(label, properties_list);
         wal_result.map(|()| ids)
     }
@@ -1475,6 +1552,9 @@ impl super::GrafeoDB {
             >,
         >,
     ) -> Result<Vec<grafeo_common::types::NodeId>> {
+        // DESIGN G2: a write lands entirely before or after an
+        // epoch-handoff freeze (see `GrafeoDB::handoff_gate`).
+        let _handoff_gate = self.handoff_gate.read_recursive();
         use grafeo_common::utils::hash::FxHashMap;
 
         let rows = properties_list

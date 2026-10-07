@@ -102,21 +102,17 @@ impl HandoffRootLock<'_> {
 impl GrafeoDB {
     /// Freeze epoch N at WAL boundary B and open bounded epoch N+1 for writes.
     ///
-    /// # Writers must be drained first
+    /// # Writers keep running (DESIGN G2)
     ///
-    /// The caller must stop admitting writes and let every outstanding
-    /// mutation and transaction commit or abort finish before calling this.
-    /// The freeze holds the layered store's merge-guard write barrier, but
-    /// that only excludes a store mutation in progress, not an open
-    /// transaction. Since the #411 port a transaction's WAL records are
-    /// written as one group at its commit, in one append that the cut's
-    /// rotation cannot split, so the pre-boundary log no longer ends
-    /// mid-transaction. But an open transaction's base tombstones and
-    /// copy-ups are already in the live layered store and can be captured
-    /// into G(N), while its group (if it commits) lands after the cut and is
-    /// replayed on top of G(N), and if it rolls back G(N) keeps them.
-    /// (Downstream drains writers in its maintenance window before handing
-    /// off.)
+    /// The freeze is atomic against every write: it holds the handoff gate
+    /// (direct `GrafeoDB` writes), the commit-order lock (session commits)
+    /// and the layered merge guard (store mutations) across the WAL cut and
+    /// the capture. Each write lands wholly in G(N) or wholly after the cut,
+    /// and writes resume as soon as the freeze returns. An open write
+    /// transaction's base tombstones and copy-ups are already in the layered
+    /// store and would be captured into G(N) whether it commits or rolls
+    /// back, so the freeze refuses with [`Error::AdmissionRetryable`] while
+    /// one is open; retry once it ends.
     ///
     /// # Errors
     ///
@@ -165,16 +161,30 @@ impl GrafeoDB {
         // concurrent GraphStoreMut store mutation (each holds the guard as
         // `.read()` while it mutates the store) can interleave with the
         // capture: a store mutation is either captured into G(N) or lands in
-        // epoch N+1. It does not exclude an open transaction, whose WAL group
-        // is written at its commit, after the cut, while its layered changes
-        // can be captured now. That is why callers must drain writers first
-        // (see this function's docs). The barrier is
-        // dropped right after the handoff install (build/publish stay
-        // concurrent — only the capture must be atomic).
+        // epoch N+1. The barrier is dropped right after the handoff install
+        // (build/publish stay concurrent — only the capture must be atomic).
+        // DESIGN G2: writers keep running across a handoff, so the freeze must
+        // be atomic against every write, not only store mutations:
+        // - the handoff gate excludes `GrafeoDB`-level writes, which mutate
+        //   first and append their implicit WAL group afterwards;
+        // - the commit-order lock excludes session commits, which assign the
+        //   commit epoch and append their WAL group under it.
+        // So each write lands wholly before the cut (epoch <= N, WAL < B,
+        // captured) or wholly after it (epoch >= N+1, WAL >= B, replayed over
+        // G(N)). Lock order: gate -> commit order -> merge guard.
+        let _gate = self.handoff_gate.write();
+        #[cfg(feature = "wal")]
+        let _commit_order = self.wal_commit_order.lock();
         let _barrier = self
             .layered_store
             .as_ref()
             .map(|l| l.freeze_write_barrier());
+
+        // An open transaction's in-place property writes and layered
+        // tombstones would be captured into G(N) and survive its rollback.
+        // Refuse (retryable) until no open transaction has written; with the
+        // locks above held, none can start writing or commit meanwhile.
+        self.refuse_open_write_transactions("freeze")?;
 
         let wal_boundary = {
             let _lock = self.handoff_root_lock(&generation_root)?;
@@ -220,6 +230,7 @@ impl GrafeoDB {
         // Debug test seam: parks here (barrier still held) so tests can prove
         // concurrent writers cannot interleave with the capture.
         maybe_stall_before_capture();
+        grafeo_common::testing::crash::park_point("handoff_freeze");
 
         // Capture freeze identity + materialize overlay payloads.
         //
@@ -290,9 +301,11 @@ impl GrafeoDB {
         }
 
         // Freeze capture + install complete: release the writer barrier so
-        // N+1 store mutations proceed after the capture. (Open transactions
-        // relative to the cut still rely on drained writers.)
+        // N+1 writes proceed after the capture.
         drop(_barrier);
+        #[cfg(feature = "wal")]
+        drop(_commit_order);
+        drop(_gate);
 
         let handle = FrozenEpochHandle {
             frozen_epoch,
@@ -367,6 +380,7 @@ impl GrafeoDB {
         ) = self.retire_frozen_prefix(&handle)?;
 
         maybe_abort("after_retire");
+        grafeo_common::testing::crash::park_point("handoff_retired");
 
         {
             let mut slot = self.epoch_handoff.slot.lock();
@@ -418,8 +432,7 @@ impl GrafeoDB {
 
     /// One-shot freeze → build → publish → retire.
     ///
-    /// Writers must be drained first; see
-    /// [`GrafeoDB::freeze_epoch_for_handoff`].
+    /// Writers may keep running; see [`GrafeoDB::freeze_epoch_for_handoff`].
     ///
     /// # Errors
     ///
@@ -431,7 +444,9 @@ impl GrafeoDB {
         self.complete_epoch_handoff(handle, request)
     }
 
-    /// Cancel an in-progress pre-commit handoff. No-op when idle/retired.
+    /// Cancel an in-progress pre-commit handoff. No-op when idle. After
+    /// retire it drops the pending install: the published generation stays
+    /// on disk (reopen selects it), but the live base does not move to it.
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
     pub fn cancel_epoch_handoff(&self) {
         self.cancel_epoch_handoff_inner(EpochHandoffPhase::Cancelled);
@@ -450,6 +465,29 @@ impl GrafeoDB {
     }
 
     // ── internals ──────────────────────────────────────────────────
+
+    /// Refuses (retryable) a handoff step while a write transaction is open
+    /// (DESIGN G2: the freeze capture and the install repair read committed
+    /// state only). Call with the handoff gate and the commit-order lock
+    /// held, so no transaction starts writing or commits meanwhile.
+    ///
+    /// Checks the layered undo journal too: a transaction's delete journals
+    /// its base tombstone before the write set records it.
+    pub(super) fn refuse_open_write_transactions(&self, step: &str) -> Result<()> {
+        let open_writers = self.transaction_manager.active_writers();
+        let pending_layer_changes = self
+            .layered_store
+            .as_ref()
+            .is_some_and(|layered| layered.has_pending_layer_changes());
+        if open_writers > 0 || pending_layer_changes {
+            return Err(Error::AdmissionRetryable(format!(
+                "epoch handoff {step} deferred: {open_writers} open write transaction(s) \
+                 (pending layered changes: {pending_layer_changes}); retry when they \
+                 commit or roll back"
+            )));
+        }
+        Ok(())
+    }
 
     #[cfg(all(feature = "generation", feature = "lpg", feature = "compact-store"))]
     fn cancel_epoch_handoff_inner(&self, phase: EpochHandoffPhase) {

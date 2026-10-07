@@ -138,6 +138,37 @@ mod inner {
         IO_FAILURE_STICKY.with(|s| s.set(false));
         IO_FAILURE_COUNTER.with(|c| c.set(u64::MAX));
     }
+
+    /// Environment variable naming the [`park_point`] a process parks at.
+    pub const PARK_AT_ENV: &str = "GRAFEO_TEST_PARK_AT";
+
+    /// Line [`park_point`] prints to stderr when it parks, followed by the
+    /// point name.
+    pub const PARKED_MARKER: &str = "GRAFEO_PARKED";
+
+    /// Parks the whole process for good at `point` when the
+    /// `GRAFEO_TEST_PARK_AT` environment variable names it.
+    ///
+    /// For kill tests: a parent test runs a child process with the variable
+    /// set, waits for the `GRAFEO_PARKED <point>` line on the child's stderr,
+    /// and SIGKILLs it there. The parked thread holds whatever locks it holds
+    /// at `point`; other threads keep running until the kill.
+    pub fn park_point(point: &'static str) {
+        static TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let target = TARGET.get_or_init(|| std::env::var(PARK_AT_ENV).ok());
+        if target.as_deref() != Some(point) {
+            return;
+        }
+        {
+            use std::io::Write;
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(err, "{PARKED_MARKER} {point}");
+            let _ = err.flush();
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
 }
 
 #[cfg(not(feature = "testing-crash-injection"))]
@@ -170,6 +201,10 @@ mod inner {
 
     /// No-op when crash injection is disabled.
     pub fn disable_io_failure() {}
+
+    /// No-op when crash injection is disabled.
+    #[inline(always)]
+    pub fn park_point(_point: &'static str) {}
 }
 
 pub use inner::*;

@@ -4,13 +4,12 @@
 //! quiesced maintenance caller uses to install a completed epoch handoff as
 //! the live base of a writable generation-root database:
 //!
-//! 1. **Real zero-writer assertion** (fail-closed, before anything is
-//!    published): the report must be `EpochRetired`, carry its publication
-//!    descriptor, and its `post_freeze_*` sets — the live handoff's
-//!    post-freeze identity snapshotted under the handoff lock at retire —
-//!    must be EMPTY. Any write recorded between freeze and retire is a real
-//!    invariant violation (the caller's maintenance window must quiesce
-//!    writers); nothing is published or swapped.
+//! 1. **Preconditions** (fail-closed, before anything is published): the
+//!    report must be `EpochRetired` and carry its publication descriptor,
+//!    and the layered store must hold the retired handoff's live state.
+//!    Writers keep running from the freeze to here (DESIGN G2); the install
+//!    stops them briefly — the handoff gate and the commit-order lock — and
+//!    refuses (retryable) while a write transaction is open.
 //! 2. **Leases publish**: the generation container is already durable (the
 //!    handoff's publication committed it to the manifest); the registry's
 //!    [`GenerationLeaseRegistry::publish`] atomically redirects new
@@ -18,8 +17,8 @@
 //!    immutable bytes. Durable-first: a crash between publish and swap loses
 //!    nothing (reopen re-derives the registry from the manifest).
 //! 3. **Base swap**: `lease.store()` becomes the layered store's new base
-//!    via [`LayeredStore::swap_base_and_repair_overlay`] with the report's
-//!    freeze/post-freeze identity sets (selective undirty — G-EM0.5d).
+//!    via [`LayeredStore::install_handoff_base`], which repairs the overlay
+//!    with every write made since the freeze: N+1 wins over the new base.
 //!
 //! The install runs entirely under the DB-lifetime exclusive root lock held
 //! by [`super::super::GenerationRootOwnership`] (the handoff's freeze/build
@@ -28,7 +27,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use grafeo_common::types::{EdgeId, NodeId};
+use grafeo_common::types::PropertyKey;
 use grafeo_common::utils::error::{Error, Result};
 use grafeo_common::utils::hash::FxHashSet;
 
@@ -89,20 +88,10 @@ pub enum HandoffInstallError {
         /// The report's phase (pre-publication phase).
         phase: EpochHandoffPhase,
     },
-    /// THE zero-writer assertion: writes were recorded between freeze and
-    /// retire, so the published generation does not represent the live
-    /// overlay and the repair swap could shadow accepted N+1 values.
-    #[error(
-        "writes occurred during the handoff window: {nodes} post-freeze node(s) \
-         and {edges} post-freeze edge(s) were recorded between freeze and \
-         retire; quiesce writers before publish_and_install_handoff"
-    )]
-    WritesDuringWindow {
-        /// Number of post-freeze node ids recorded on the report.
-        nodes: usize,
-        /// Number of post-freeze edge ids recorded on the report.
-        edges: usize,
-    },
+    /// The layered store holds no retired handoff waiting for its install
+    /// (the report was already installed, or the handoff was cancelled).
+    #[error("publish_and_install_handoff: no retired handoff is waiting for its install")]
+    NothingToInstall,
     /// The generation-root database has no layered store (never happens
     /// through [`crate::database::GrafeoDB::open_generation_root`], which
     /// installs one fail-closed).
@@ -117,14 +106,15 @@ impl From<HandoffInstallError> for Error {
 }
 
 impl GrafeoDB {
-    /// Combined production handoff install: assert the quiesced zero-writer
-    /// invariant, publish the handoff generation through the lease registry,
-    /// and swap it in as the layered base.
+    /// Combined production handoff install: publish the handoff generation
+    /// through the lease registry and swap it in as the layered base,
+    /// repairing the overlay with the writes made since the freeze.
     ///
     /// The caller must have completed an epoch handoff on THIS database
     /// (freeze → build → publish → retire, e.g. via
-    /// [`GrafeoDB::run_epoch_handoff`]) inside a quiesced maintenance window
-    /// and pass the returned [`EpochHandoffReport`].
+    /// [`GrafeoDB::run_epoch_handoff`]) and pass the returned
+    /// [`EpochHandoffReport`]. Writers may run throughout (DESIGN G2): the
+    /// install stops them only for the publish and swap.
     ///
     /// # Errors
     ///
@@ -133,12 +123,11 @@ impl GrafeoDB {
     /// [`HandoffInstallError::NotRetired`] when the database phase is not
     /// `EpochRetired`, [`HandoffInstallError::MissingPublication`] when the
     /// report carries no publication descriptor,
-    /// [`HandoffInstallError::WritesDuringWindow`] when the report's
-    /// post-freeze identity sets are non-empty (a real zero-writer
-    /// violation — nothing is published or swapped), or
-    /// [`HandoffInstallError::NoLayeredStore`] when the layered store is
-    /// absent. Propagates lease-registry publication errors as
-    /// `Error::Internal` (typed
+    /// [`HandoffInstallError::NothingToInstall`] when the layered store holds
+    /// no retired handoff, or [`HandoffInstallError::NoLayeredStore`] when the
+    /// layered store is absent. Returns [`Error::AdmissionRetryable`] while a
+    /// write transaction is open (nothing is published or swapped).
+    /// Propagates lease-registry publication errors as `Error::Internal` (typed
     /// [`crate::database::generation::lease::GenerationTransitionError`]
     /// inside).
     #[cfg(all(
@@ -177,35 +166,36 @@ impl GrafeoDB {
                     phase: report.phase,
                 })?;
 
-        // THE zero-writer assertion. The report's post-freeze identity is
-        // snapshotted from the live handoff state under the handoff lock at
-        // retire (complete_epoch_handoff), so any non-empty set is proof that
-        // a write landed between freeze and retire — an invariant violation
-        // the repair swap cannot honor. Fail closed: no publish, no swap.
-        if !report.post_freeze_nodes.is_empty() || !report.post_freeze_edges.is_empty() {
-            return Err(HandoffInstallError::WritesDuringWindow {
-                nodes: report.post_freeze_nodes.len(),
-                edges: report.post_freeze_edges.len(),
-            }
-            .into());
-        }
-        // Defense-in-depth: if a live handoff slot still exists (a state the
-        // retire path should have cleared), its post-freeze identity must
-        // also be empty — read under the handoff lock.
-        if let Some(layered) = self.layered_store.as_ref()
-            && let Some(live) = layered.handoff_live()
-            && (!live.post_freeze_nodes.is_empty() || !live.post_freeze_edges.is_empty())
-        {
-            return Err(HandoffInstallError::WritesDuringWindow {
-                nodes: live.post_freeze_nodes.len(),
-                edges: live.post_freeze_edges.len(),
-            }
-            .into());
-        }
         let layered = self
             .layered_store
             .as_ref()
             .ok_or(HandoffInstallError::NoLayeredStore)?;
+
+        // Brief writer stop (DESIGN G2): the gate holds direct writes, the
+        // commit-order lock holds commits, and the swap below takes the
+        // merge guard. The repair reads committed state only, so an open
+        // write transaction defers the install (retryable).
+        let _gate = self.handoff_gate.write();
+        #[cfg(feature = "wal")]
+        let _commit_order = self.wal_commit_order.lock();
+        self.refuse_open_write_transactions("install")?;
+        if !layered.handoff_live().is_some_and(|live| live.retired) {
+            return Err(HandoffInstallError::NothingToInstall.into());
+        }
+        // Spilled vectors live outside the overlay rows (ForceDisk); held for
+        // the whole swap so no spill or reload moves them meanwhile.
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        let spill_guard = self.vector_spill_storages.as_ref().map(|r| r.read());
+        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+        let spilled_properties: FxHashSet<PropertyKey> = spill_guard
+            .as_deref()
+            .into_iter()
+            .flat_map(|registry| registry.keys())
+            .filter_map(|key| key.split_once(':').map(|(_, property)| PropertyKey::new(property)))
+            .collect();
+        #[cfg(not(all(feature = "vector-index", feature = "mmap", not(feature = "temporal"))))]
+        let spilled_properties: FxHashSet<PropertyKey> = FxHashSet::default();
+        grafeo_common::testing::crash::park_point("handoff_install");
 
         // ── (b) Leases publish (durable-first: the container is already on
         //        disk and manifest-selected; reopen re-derives the registry
@@ -220,19 +210,13 @@ impl GrafeoDB {
             generation_abs_path.clone(),
         )?;
 
-        // ── (c) Base swap (selective undirty, G-EM0.5d) ───────────────────
+        // ── (c) Base swap + repair (N+1 wins over the new base) ───────────
         let new_base = lease.store();
-        let frozen_node_ids = to_node_ids(&report.freeze_node_ids);
-        let frozen_edge_ids = to_edge_ids(&report.freeze_edge_ids);
-        let post_freeze_node_ids = to_node_ids(&report.post_freeze_nodes);
-        let post_freeze_edge_ids = to_edge_ids(&report.post_freeze_edges);
-        let _old_base = layered.swap_base_and_repair_overlay(
-            Arc::clone(&new_base),
-            &frozen_node_ids,
-            &frozen_edge_ids,
-            &post_freeze_node_ids,
-            &post_freeze_edge_ids,
-        );
+        let (_old_base, _live) = layered
+            .install_handoff_base(Arc::clone(&new_base), &|_, key| {
+                spilled_properties.contains(key)
+            })
+            .map_err(Error::Internal)?;
 
         Ok(HandoffInstallReport {
             publication_sequence,
@@ -242,15 +226,4 @@ impl GrafeoDB {
             base_edge_count: new_base.total_edges(),
         })
     }
-}
-
-/// Convert a report's raw `u64` id set to `NodeId`s (freeze/post-freeze
-/// identity is stored raw on the report; the repair swap keys on `NodeId`).
-fn to_node_ids(raw: &FxHashSet<u64>) -> FxHashSet<NodeId> {
-    raw.iter().map(|id| NodeId::new(*id)).collect()
-}
-
-/// Edge variant of [`to_node_ids`].
-fn to_edge_ids(raw: &FxHashSet<u64>) -> FxHashSet<EdgeId> {
-    raw.iter().map(|id| EdgeId::new(*id)).collect()
 }

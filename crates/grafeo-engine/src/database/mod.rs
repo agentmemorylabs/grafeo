@@ -287,6 +287,12 @@ pub struct GrafeoDB {
     /// that saw another's committed writes always lands after it (#411).
     #[cfg(feature = "wal")]
     pub(super) wal_commit_order: Arc<parking_lot::Mutex<()>>,
+    /// Epoch-handoff write gate (DESIGN G2). `GrafeoDB`-level writes hold it
+    /// shared from their store mutation until their implicit WAL group is
+    /// appended (they don't take `wal_commit_order`); a freeze holds it
+    /// exclusively across its WAL cut, epoch sync and capture, so every write
+    /// lands entirely before the frozen boundary or entirely after it.
+    pub(super) handoff_gate: parking_lot::RwLock<()>,
     /// Query cache for parsed and optimized plans.
     pub(super) query_cache: Arc<QueryCache>,
     /// Shared commit counter for auto-GC across sessions.
@@ -880,6 +886,7 @@ impl GrafeoDB {
             wal,
             #[cfg(feature = "wal")]
             wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
+            handoff_gate: parking_lot::RwLock::new(()),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1144,6 +1151,7 @@ impl GrafeoDB {
             wal: None,
             #[cfg(feature = "wal")]
             wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
+            handoff_gate: parking_lot::RwLock::new(()),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1522,6 +1530,7 @@ impl GrafeoDB {
             wal: None,
             #[cfg(feature = "wal")]
             wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
+            handoff_gate: parking_lot::RwLock::new(()),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),
@@ -1643,6 +1652,7 @@ impl GrafeoDB {
             wal: None,
             #[cfg(feature = "wal")]
             wal_commit_order: Arc::new(parking_lot::Mutex::new(())),
+            handoff_gate: parking_lot::RwLock::new(()),
             query_cache,
             commit_counter: Arc::new(AtomicUsize::new(0)),
             is_open: RwLock::new(true),

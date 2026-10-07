@@ -226,6 +226,21 @@ pub struct OverlayHandoffLive {
     /// the next cycle's live working set) so the budget neither ratchets nor
     /// leaks across handoffs (G-EM0.5c MAJOR-4).
     pub next_epoch_charged_bytes: u64,
+    /// Set once G(N) is published and its frozen prefix retired. Tracking of
+    /// post-freeze writes continues until the install
+    /// ([`LayeredStore::install_handoff_base`]) consumes this state (DESIGN
+    /// G2): writers keep running between retire and install, and the repair
+    /// must see their writes too.
+    pub retired: bool,
+}
+
+/// Freeze and post-freeze identity a handoff repair swap works from.
+#[derive(Clone, Copy)]
+struct HandoffIds<'a> {
+    frozen_nodes: &'a FxHashSet<NodeId>,
+    frozen_edges: &'a FxHashSet<EdgeId>,
+    post_freeze_nodes: &'a FxHashSet<NodeId>,
+    post_freeze_edges: &'a FxHashSet<EdgeId>,
 }
 
 impl std::fmt::Debug for LayeredStore {
@@ -532,13 +547,12 @@ impl LayeredStore {
         // MutationPayload for the surviving N+1 working set (MAJOR-4).
         let mut charged = category;
         if category == RetainedCategory::MutationPayload {
+            // After retire the N+1 working set is plain live payload again
+            // (retire re-attributed it), so later writes charge it directly.
             let mut handoff = self.handoff.write();
-            if handoff.is_some() {
+            if let Some(h) = handoff.as_mut().filter(|h| !h.retired) {
                 charged = RetainedCategory::NextEpoch;
-                if let Some(h) = handoff.as_mut() {
-                    h.next_epoch_charged_bytes =
-                        h.next_epoch_charged_bytes.saturating_add(bytes as u64);
-                }
+                h.next_epoch_charged_bytes = h.next_epoch_charged_bytes.saturating_add(bytes as u64);
             }
         }
         if let Some(ctl) = self.admission_slot.read().as_ref() {
@@ -631,7 +645,30 @@ impl LayeredStore {
         }
     }
 
-    /// True when a dual-epoch handoff freeze is active.
+    /// Records a mutation made directly on the overlay store (outside this
+    /// type's mutators) as a post-freeze write while a handoff is active.
+    pub fn note_post_freeze_node(&self, id: NodeId) {
+        self.record_post_freeze_node(id);
+    }
+
+    /// Edge variant of [`Self::note_post_freeze_node`].
+    pub fn note_post_freeze_edge(&self, id: EdgeId) {
+        self.record_post_freeze_edge(id);
+    }
+
+    /// True while an open transaction owns a change to the layered
+    /// bookkeeping (a base tombstone or copy-up) that its rollback would undo.
+    ///
+    /// A transaction journals these inside the mutation, which can come
+    /// before it records the write in its write set (deletes record after),
+    /// so a handoff checks both before it captures or repairs state.
+    #[must_use]
+    pub fn has_pending_layer_changes(&self) -> bool {
+        self.txn_journal_pending.load(Ordering::SeqCst)
+    }
+
+    /// True from a dual-epoch handoff freeze until its install (or cancel):
+    /// a retired handoff still tracks post-freeze writes.
     #[must_use]
     pub fn handoff_active(&self) -> bool {
         self.handoff.read().is_some()
@@ -664,16 +701,19 @@ impl LayeredStore {
 
     /// Installs live handoff tracking after the engine freezes epoch N.
     ///
-    /// Fails closed when a handoff is already active. Does not mutate overlay
+    /// Fails closed when a handoff is already active. A retired handoff whose
+    /// generation was never installed is replaced: its generation stays
+    /// published on disk, but the live base never moved to it, and the new
+    /// freeze captures everything it held (DESIGN G2). Does not mutate overlay
     /// payloads; concurrent readers keep seeing frozen + next-epoch state on
-    /// the single live overlay until retirement.
+    /// the single live overlay until the install.
     ///
     /// # Errors
     ///
     /// Returns `Err` when a handoff is already in progress.
     pub fn begin_epoch_handoff(&self, state: OverlayHandoffLive) -> Result<(), String> {
         let mut slot = self.handoff.write();
-        if slot.is_some() {
+        if slot.as_ref().is_some_and(|h| !h.retired) {
             return Err("epoch handoff already active".into());
         }
         if let Some(ctl) = self.admission_slot.read().as_ref() {
@@ -729,7 +769,9 @@ impl LayeredStore {
     ///   [`RetainedCategory::MutationPayload`] (the N+1 entities stay live on
     ///   the overlay and become the next cycle's working set; the aggregate
     ///   retained total is unchanged — no ratchet, no leak); G-EM0.5c MAJOR-4
-    /// - marks the handoff slot complete/cleared.
+    /// - marks the handoff slot retired. The slot stays: writes between
+    ///   retire and install are post-freeze writes too, and
+    ///   [`Self::install_handoff_base`] consumes the slot (DESIGN G2).
     ///
     /// Absorbed/retained counts are computed by the caller as pure set
     /// arithmetic over the freeze and post-freeze id sets; no live state is
@@ -737,13 +779,19 @@ impl LayeredStore {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when no handoff is active.
+    /// Returns `Err` when no handoff is active (or it is already retired).
     pub fn retire_frozen_overlay_prefix(&self) -> Result<OverlayHandoffLive, String> {
-        let state = self
-            .handoff
-            .write()
-            .take()
-            .ok_or_else(|| "no active epoch handoff to retire".to_string())?;
+        let state = {
+            let mut slot = self.handoff.write();
+            let live = slot
+                .as_mut()
+                .filter(|h| !h.retired)
+                .ok_or_else(|| "no active epoch handoff to retire".to_string())?;
+            let state = live.clone();
+            live.retired = true;
+            live.next_epoch_charged_bytes = 0;
+            state
+        };
 
         if let Some(ctl) = self.admission_slot.read().as_ref() {
             // (a) Release the frozen (absorbed) epoch-N accounting.
@@ -895,7 +943,9 @@ impl LayeredStore {
     }
 
     /// Publish a **handoff** generation (`old base + epoch-N frozen overlay`) as
-    /// the live base, repairing overlay bookkeeping — G-EM0.5d (Milestone W).
+    /// the live base, repairing overlay bookkeeping — G-EM0.5d (Milestone W),
+    /// generalized for writers that keep running across the handoff (DESIGN
+    /// G2).
     ///
     /// Unlike [`Self::swap_base_and_reset_overlay`], the handoff build
     /// (`complete_epoch_handoff`) produces a generation that contains the **old
@@ -913,29 +963,32 @@ impl LayeredStore {
     /// resident/dirtied in the overlay at freeze ⇒ absorbed into this
     /// generation). `post_freeze_node_ids`/`post_freeze_edge_ids` are **every
     /// id mutated after the freeze** (epoch N+1), as recorded by the mutation
-    /// paths on this store during the handoff. `complete_epoch_handoff`
-    /// propagates both sets on its report.
+    /// paths on this store during the handoff.
     ///
-    /// Under the `merge_guard` writer barrier this swaps the base and retains
-    /// dirty for exactly two classes:
+    /// Under the `merge_guard` writer barrier this swaps the base and applies
+    /// the repair rule: **N+1 wins over the new base**. For each post-freeze
+    /// entity the new base holds:
     ///
-    /// - **post-freeze mutations** (`post_freeze_*`): the new base holds at
-    ///   most the entity's frozen value, so the overlay (or its absence, for a
-    ///   post-freeze deletion) must stay authoritative. Clearing dirty here
-    ///   would silently serve the stale frozen value or resurrect a deleted
-    ///   entity.
-    /// - **base-resident entities mutated post-freeze but not frozen** (not in
-    ///   `frozen_*`, present in the old base): the base merge could not absorb
-    ///   the new value; retaining dirty keeps dispatch on the overlay.
+    /// - deleted after the freeze → a base tombstone, so the frozen copy in
+    ///   the new base stays hidden;
+    /// - otherwise its overlay row becomes a diff against the new base: every
+    ///   new-base property the row lacks gets the value the entity had before
+    ///   the swap, or a `Null` tombstone when it had none (a property removed
+    ///   after the freeze, or one only the frozen copy carried), and the id
+    ///   is marked dirty so reads merge the row over the new base.
     ///
-    /// Everything else (frozen-absorbed with no post-freeze mutation, and
-    /// post-freeze *creates* absent from the base) is cleared: absorbed
-    /// entities are shadowed by the new base, and post-freeze creates resolve
-    /// via base-miss → overlay fallthrough.
+    /// Dirty is otherwise retained for post-freeze ids and for unfrozen base
+    /// entities, and cleared for frozen entities with no post-freeze write
+    /// (the new base holds their values) and post-freeze creates (served by
+    /// base-miss fallthrough).
     ///
     /// Base-deletion tombstones (`deleted_from_base_*`) are intentionally left
     /// intact: the handoff build may have absorbed an entity whose tombstone
     /// postdates the freeze, and the tombstone is what keeps it hidden.
+    ///
+    /// Callers must hold writers off the overlay's uncommitted state: the
+    /// repair reads and writes committed rows only (the engine refuses the
+    /// install while a write transaction is open).
     ///
     /// Returns the previous base `Arc`.
     #[cfg(feature = "lpg")]
@@ -948,24 +1001,166 @@ impl LayeredStore {
         post_freeze_edge_ids: &FxHashSet<EdgeId>,
     ) -> Arc<CompactStore> {
         let _barrier = self.merge_guard.write();
-        let old_base = self.base.swap(new_base);
-        // Selective undirty (see method docs): retain dirty for every
-        // post-freeze mutation and for unfrozen base entities re-mutated
-        // post-freeze; clear it for absorbed (frozen, unmodified) entities and
-        // for post-freeze creates served by base-miss fallthrough.
-        {
-            let mut dirty = self.dirty_node_ids.write();
-            dirty.retain(|id| {
-                post_freeze_node_ids.contains(id)
-                    || (!frozen_node_ids.contains(id) && old_base.get_node(*id).is_some())
-            });
+        self.repair_swap_locked(
+            new_base,
+            HandoffIds {
+                frozen_nodes: frozen_node_ids,
+                frozen_edges: frozen_edge_ids,
+                post_freeze_nodes: post_freeze_node_ids,
+                post_freeze_edges: post_freeze_edge_ids,
+            },
+            &|_, _| false,
+        )
+    }
+
+    /// Installs a retired handoff's generation as the live base (DESIGN G2):
+    /// takes the live handoff state, with every write recorded from the
+    /// freeze up to now, and runs the repair swap of
+    /// [`Self::swap_base_and_repair_overlay`] on it, all under the writer
+    /// barrier, so no write falls between the two.
+    ///
+    /// `spilled` says whether a node property is held outside the overlay
+    /// row (a ForceDisk-spilled vector): the row lacking it says nothing
+    /// about its value, so the repair leaves that key alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no retired handoff is waiting for its install.
+    #[cfg(feature = "lpg")]
+    pub fn install_handoff_base(
+        &self,
+        new_base: Arc<CompactStore>,
+        spilled: &dyn Fn(&Node, &PropertyKey) -> bool,
+    ) -> Result<(Arc<CompactStore>, OverlayHandoffLive), String> {
+        let _barrier = self.merge_guard.write();
+        let state = {
+            let mut slot = self.handoff.write();
+            if !slot.as_ref().is_some_and(|h| h.retired) {
+                return Err("no retired epoch handoff to install".into());
+            }
+            slot.take().expect("checked above")
+        };
+        let ids = |raw: &FxHashSet<u64>| raw.iter().map(|id| NodeId::new(*id)).collect();
+        let edge_ids = |raw: &FxHashSet<u64>| raw.iter().map(|id| EdgeId::new(*id)).collect();
+        let frozen_nodes: FxHashSet<NodeId> = ids(&state.freeze_node_ids);
+        let frozen_edges: FxHashSet<EdgeId> = edge_ids(&state.freeze_edge_ids);
+        let post_nodes: FxHashSet<NodeId> = ids(&state.post_freeze_nodes);
+        let post_edges: FxHashSet<EdgeId> = edge_ids(&state.post_freeze_edges);
+        let old_base = self.repair_swap_locked(
+            new_base,
+            HandoffIds {
+                frozen_nodes: &frozen_nodes,
+                frozen_edges: &frozen_edges,
+                post_freeze_nodes: &post_nodes,
+                post_freeze_edges: &post_edges,
+            },
+            spilled,
+        );
+        Ok((old_base, state))
+    }
+
+    /// Body of [`Self::swap_base_and_repair_overlay`]; the caller holds
+    /// `merge_guard.write()`.
+    #[cfg(feature = "lpg")]
+    fn repair_swap_locked(
+        &self,
+        new_base: Arc<CompactStore>,
+        ids: HandoffIds<'_>,
+        spilled: &dyn Fn(&Node, &PropertyKey) -> bool,
+    ) -> Arc<CompactStore> {
+        // Before the swap: whether each post-freeze entity the new base holds
+        // is still visible (`false` = deleted after the freeze).
+        let nodes: Vec<(NodeId, bool)> = ids
+            .post_freeze_nodes
+            .iter()
+            .filter(|id| new_base.contains_node(**id))
+            .map(|id| (*id, self.get_node(*id).is_some()))
+            .collect();
+        let edges: Vec<(EdgeId, bool)> = ids
+            .post_freeze_edges
+            .iter()
+            .filter(|id| new_base.contains_edge(**id))
+            .map(|id| (*id, self.get_edge(*id).is_some()))
+            .collect();
+
+        let old_base = self.base.swap(Arc::clone(&new_base));
+        self.dirty_node_ids.write().retain(|id| {
+            ids.post_freeze_nodes.contains(id)
+                || (!ids.frozen_nodes.contains(id) && old_base.get_node(*id).is_some())
+        });
+        self.dirty_edge_ids.write().retain(|id| {
+            ids.post_freeze_edges.contains(id)
+                || (!ids.frozen_edges.contains(id) && old_base.get_edge(*id).is_some())
+        });
+
+        let overlay = self.overlay.load();
+        let mut tombstones = 0usize;
+        for (id, live) in nodes {
+            if !live {
+                if self.deleted_from_base_nodes.write().insert(id) {
+                    tombstones += 1;
+                }
+                continue;
+            }
+            let (Some(row), Some(base_row)) = (overlay.get_node(id), new_base.get_node(id)) else {
+                // No overlay row: the entity was only noted (its base copy is
+                // unchanged), and the new base serves it.
+                continue;
+            };
+            for (key, value) in base_row.properties.iter() {
+                if row.properties.contains_key(key) || spilled(&row, key) {
+                    continue;
+                }
+                // The row inherited `key` from the old base (or, for an
+                // entity the old base lacks, did not have it).
+                let before = if old_base.contains_node(id) {
+                    old_base.get_node_property(id, key)
+                } else {
+                    None
+                };
+                if before.as_ref() != Some(value) {
+                    let fill = before.unwrap_or(Value::Null);
+                    let cost = overlay_cost::property_retained_bytes(key.as_str(), &fill);
+                    overlay.set_node_property(id, key.as_str(), fill);
+                    self.charge_retained(RetainedCategory::MutationPayload, cost);
+                }
+            }
+            self.dirty_node_ids.write().insert(id);
         }
-        {
-            let mut dirty = self.dirty_edge_ids.write();
-            dirty.retain(|id| {
-                post_freeze_edge_ids.contains(id)
-                    || (!frozen_edge_ids.contains(id) && old_base.get_edge(*id).is_some())
-            });
+        for (id, live) in edges {
+            if !live {
+                if self.deleted_from_base_edges.write().insert(id) {
+                    tombstones += 1;
+                }
+                continue;
+            }
+            let (Some(row), Some(base_row)) = (overlay.get_edge(id), new_base.get_edge(id)) else {
+                continue;
+            };
+            for (key, value) in base_row.properties.iter() {
+                if row.properties.contains_key(key) {
+                    continue;
+                }
+                let before = if old_base.contains_edge(id) {
+                    old_base.get_edge_property(id, key)
+                } else {
+                    None
+                };
+                if before.as_ref() != Some(value) {
+                    let fill = before.unwrap_or(Value::Null);
+                    let cost = overlay_cost::property_retained_bytes(key.as_str(), &fill);
+                    overlay.set_edge_property(id, key.as_str(), fill);
+                    self.charge_retained(RetainedCategory::MutationPayload, cost);
+                }
+            }
+            self.dirty_edge_ids.write().insert(id);
+        }
+        if tombstones > 0 {
+            self.deletions_dirty.store(true, Ordering::Release);
+            self.charge_retained(
+                RetainedCategory::DeletionSets,
+                tombstones * overlay_cost::deletion_entry_retained_bytes(),
+            );
         }
         old_base
     }
@@ -3251,7 +3446,11 @@ impl LayeredStore {
             return; // deleted: never copy it back
         }
         let Some(base_node) = self.base.load().get_node(id) else {
-            return; // not in base either (new node case handled by caller)
+            // Not in base either: an overlay-only row, written in place by the
+            // caller. During a handoff the frozen copy of it may be baked into
+            // the new base, so the repair swap must see this write.
+            self.record_post_freeze_node(id);
+            return;
         };
 
         // Copy the node into the overlay at the same ID, created at epoch 0
@@ -3290,6 +3489,8 @@ impl LayeredStore {
             return; // deleted: never copy it back
         }
         let Some(base_edge) = self.base.load().get_edge(id) else {
+            // Overlay-only: see `ensure_in_overlay`.
+            self.record_post_freeze_edge(id);
             return;
         };
 
