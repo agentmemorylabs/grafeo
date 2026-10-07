@@ -2,6 +2,47 @@
 //!
 //! Shared by ANN search and exact indexed vector reads so both paths use the
 //! same committed inline/ForceDisk accessor seam.
+//!
+//! Every write-side HNSW insert must use it too (AMH #175): an insert reads
+//! its neighbours' vectors to link the new node and prune neighbour lists.
+//! Once a ForceDisk open has drained the column into a spill file, a
+//! property-only accessor sees every existing node as vectorless, so the new
+//! node is never linked and pruning drops edges of existing nodes.
+
+/// Spilled vector storages by `label:property`, shared by the database and
+/// its sessions.
+#[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+pub(crate) type VectorSpillRegistry = std::sync::Arc<
+    parking_lot::RwLock<
+        std::collections::HashMap<String, std::sync::Arc<grafeo_core::index::vector::MmapStorage>>,
+    >,
+>;
+
+/// Accessor over `store` that falls back to the spill registered for
+/// `label:property` (inline values win: written after the spill).
+#[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+pub(crate) fn spill_aware_accessor<'a>(
+    store: &'a dyn grafeo_core::graph::GraphStore,
+    registry: Option<&VectorSpillRegistry>,
+    label: &str,
+    property: &str,
+) -> grafeo_core::index::vector::VectorAccessorKind<'a> {
+    if let Some(registry) = registry
+        && let Some(storage) = registry.read().get(&format!("{label}:{property}"))
+    {
+        return grafeo_core::index::vector::VectorAccessorKind::Spilled(
+            grafeo_core::index::vector::SpillableVectorAccessor::new(
+                store,
+                property,
+                std::sync::Arc::clone(storage)
+                    as std::sync::Arc<dyn grafeo_core::index::vector::VectorStorage>,
+            ),
+        );
+    }
+    grafeo_core::index::vector::VectorAccessorKind::Property(
+        grafeo_core::index::vector::PropertyVectorAccessor::new(store, property),
+    )
+}
 
 #[cfg(feature = "vector-index")]
 impl super::GrafeoDB {
@@ -13,26 +54,19 @@ impl super::GrafeoDB {
         label: &str,
         property: &str,
     ) -> grafeo_core::index::vector::VectorAccessorKind<'a> {
-        let key = format!("{label}:{property}");
-        if let Some(ref spill_map) = self.vector_spill_storages {
-            let map = spill_map.read();
-            if let Some(storage) = map.get(&key) {
-                return grafeo_core::index::vector::VectorAccessorKind::Spilled(
-                    grafeo_core::index::vector::SpillableVectorAccessor::new(
-                        self.graph_store_ref(),
-                        property,
-                        std::sync::Arc::clone(storage)
-                            as std::sync::Arc<dyn grafeo_core::index::vector::VectorStorage>,
-                    ),
-                );
-            }
-        }
-        grafeo_core::index::vector::VectorAccessorKind::Property(
-            grafeo_core::index::vector::PropertyVectorAccessor::new(
-                self.graph_store_ref(),
-                property,
-            ),
+        spill_aware_accessor(
+            self.graph_store_ref(),
+            self.vector_spill_storages.as_ref(),
+            label,
+            property,
         )
+    }
+
+    /// The spill registry, for sessions (AMH #175): their commit-time HNSW
+    /// inserts must read neighbour vectors through the same accessor.
+    #[cfg(all(feature = "mmap", not(feature = "temporal")))]
+    pub(crate) fn vector_spill_registry(&self) -> Option<VectorSpillRegistry> {
+        self.vector_spill_storages.clone()
     }
 
     /// Creates a vector accessor (no spill support when mmap or temporal unavailable).
