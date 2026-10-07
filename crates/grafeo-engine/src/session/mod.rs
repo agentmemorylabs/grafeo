@@ -135,6 +135,16 @@ pub struct Session {
     /// commit, rollback and savepoint rollback also drive them through it.
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
     layered_store: Option<Arc<grafeo_core::graph::compact::layered::LayeredStore>>,
+    /// The database's spilled-vector registry (ForceDisk tier), so commit-time
+    /// HNSW inserts read spill-only neighbour vectors (AMH #175). Applies to
+    /// the default graph's store only: that is the store the spill drained.
+    #[cfg(all(
+        feature = "lpg",
+        feature = "vector-index",
+        feature = "mmap",
+        not(feature = "temporal")
+    ))]
+    vector_spill_storages: Option<crate::database::VectorSpillRegistry>,
     /// Schema and metadata catalog shared across sessions.
     catalog: Arc<Catalog>,
     /// RDF triple store (if RDF feature is enabled).
@@ -337,6 +347,13 @@ impl Session {
             graph_store_mut,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
+            #[cfg(all(
+                feature = "lpg",
+                feature = "vector-index",
+                feature = "mmap",
+                not(feature = "temporal")
+            ))]
+            vector_spill_storages: None,
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -393,6 +410,20 @@ impl Session {
     ) {
         self.graph_store = read_store;
         self.graph_store_mut = write_store;
+    }
+
+    /// Hands the session the database's spilled-vector registry (AMH #175).
+    #[cfg(all(
+        feature = "lpg",
+        feature = "vector-index",
+        feature = "mmap",
+        not(feature = "temporal")
+    ))]
+    pub(crate) fn set_vector_spill_storages(
+        &mut self,
+        registry: Option<crate::database::VectorSpillRegistry>,
+    ) {
+        self.vector_spill_storages = registry;
     }
 
     /// Hands the session the raw layered store, so the direct node/edge APIs
@@ -610,6 +641,13 @@ impl Session {
             graph_store_mut: write_store,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
+            #[cfg(all(
+                feature = "lpg",
+                feature = "vector-index",
+                feature = "mmap",
+                not(feature = "temporal")
+            ))]
+            vector_spill_storages: None,
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
             rdf_store: Arc::new(RdfStore::new()),
@@ -5321,6 +5359,20 @@ impl Session {
                                 node_id.0
                             )));
                         }
+                        // Spill-aware (AMH #175): under ForceDisk the
+                        // neighbours' vectors may live only in the spill.
+                        #[cfg(all(feature = "mmap", not(feature = "temporal")))]
+                        let accessor = crate::database::vector_access::spill_aware_accessor(
+                            read,
+                            if Arc::ptr_eq(&store, &self.store) {
+                                self.vector_spill_storages.as_ref()
+                            } else {
+                                None
+                            },
+                            label.as_str(),
+                            property.as_str(),
+                        );
+                        #[cfg(not(all(feature = "mmap", not(feature = "temporal"))))]
                         let accessor = grafeo_core::index::vector::PropertyVectorAccessor::new(
                             read,
                             property.as_str(),
