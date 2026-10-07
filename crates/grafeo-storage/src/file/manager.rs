@@ -1521,7 +1521,7 @@ mod tests {
 
         // Write two sections: one data (LPG), one index (VectorStore)
         let lpg_data = b"lpg node data here";
-        let vector_data = vec![0x42u8; 8192]; // 8 KiB of vector embeddings
+        let vector_data: Vec<u8> = (0..(3 * 64 * 1024 + 17)).map(|i| (i % 251) as u8).collect(); // crosses CRC buffer boundaries with a partial tail
 
         manager
             .write_sections(
