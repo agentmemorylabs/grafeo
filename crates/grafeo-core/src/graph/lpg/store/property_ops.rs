@@ -5,7 +5,7 @@ use super::PropertyUndoEntry;
 #[cfg(feature = "temporal")]
 use grafeo_common::types::EpochId;
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey, TransactionId, Value};
-use grafeo_common::utils::hash::FxHashMap;
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::Ordering;
 
 impl LpgStore {
@@ -750,6 +750,33 @@ impl LpgStore {
             .read()
             .get(&transaction_id)
             .map_or(0, Vec::len)
+    }
+
+    /// Nodes whose properties or labels `transaction_id` changed after undo
+    /// log position `since`, deduplicated.
+    ///
+    /// Read before a rollback replays the log: a layered store re-syncs the
+    /// text documents of base nodes among them against its merged view
+    /// afterwards (`LayeredStore::reconcile_text_documents`), because the
+    /// overlay undo of an inherited property has no old value to restore.
+    #[must_use]
+    pub fn undo_log_node_ids(&self, transaction_id: TransactionId, since: usize) -> Vec<NodeId> {
+        let log = self.property_undo_log.read();
+        let Some(entries) = log.get(&transaction_id) else {
+            return Vec::new();
+        };
+        let mut seen = FxHashSet::default();
+        entries
+            .iter()
+            .skip(since)
+            .filter_map(|entry| match entry {
+                PropertyUndoEntry::NodeProperty { node_id, .. }
+                | PropertyUndoEntry::LabelAdded { node_id, .. }
+                | PropertyUndoEntry::LabelRemoved { node_id, .. } => Some(*node_id),
+                _ => None,
+            })
+            .filter(|id| seen.insert(*id))
+            .collect()
     }
 
     /// Rolls back property mutations recorded after position `since` in the undo log.

@@ -376,11 +376,13 @@ fn spill_is_idempotent_and_empty_is_noop() {
     assert!(!empty.already_spilled);
 }
 
-/// Fail-closed guards: quantized construction over a spilled column is
-/// rejected (the quantized branch reads the heap guard and would insert
-/// nothing), and a dimension mismatch restores the drained column.
+/// Quantized construction over a spilled column builds every vector (AMH
+/// #175): the quantized branch reads through the same spill-aware build
+/// accessor as the plain HNSW branch, so a ForceDisk graph can rebuild its
+/// scalar index. (It used to fail closed, because that branch read the heap
+/// property guard and would have inserted nothing.)
 #[test]
-fn quantized_over_spilled_column_fails_closed() {
+fn quantized_over_spilled_column_builds_every_vector() {
     let dir = TempDir::new().unwrap();
     let mut db = GrafeoDB::with_config(
         grafeo_engine::Config::in_memory().with_spill_path(dir.path().join("spill")),
@@ -388,32 +390,46 @@ fn quantized_over_spilled_column_fails_closed() {
     .expect("open transient db");
     db.compact().expect("compact");
 
+    let mut ids = Vec::new();
     for i in 0..8usize {
-        db.create_node_with_props(
-            &[LABEL],
-            [(PROP, Value::Vector(seeded_vector(i as u64).into()))],
-        )
-        .expect("create");
+        ids.push(
+            db.create_node_with_props(
+                &[LABEL],
+                [(PROP, Value::Vector(seeded_vector(i as u64).into()))],
+            )
+            .expect("create"),
+        );
     }
 
     db.spill_vector_column_to_disk(LABEL, PROP).expect("spill");
 
-    let err = db
-        .create_vector_index(
-            LABEL,
-            PROP,
-            Some(DIMS),
-            Some("cosine"),
-            None,
-            None,
-            Some("scalar"),
-        )
-        .expect_err("quantized build over spilled column must fail closed");
-    assert!(
-        err.to_string().contains("spilled vector column"),
-        "guard error names the cause: {err}"
+    db.create_vector_index(
+        LABEL,
+        PROP,
+        Some(DIMS),
+        Some("cosine"),
+        None,
+        None,
+        Some("scalar"),
+    )
+    .expect("scalar build over spilled column");
+    assert_eq!(
+        db.vector_index_quantization(LABEL, PROP).map(|m| m.name()),
+        Some("scalar")
     );
+    for (i, id) in ids.iter().enumerate() {
+        let hits = db
+            .vector_search(LABEL, PROP, &seeded_vector(i as u64), 1, Some(64), None)
+            .expect("search");
+        assert_eq!(
+            hits.first().map(|h| h.0),
+            Some(*id),
+            "node {i} is its own top hit"
+        );
+    }
+
     // Plain HNSW over the same spilled column still works (A1 path).
+    assert!(db.drop_vector_index(LABEL, PROP));
     db.create_vector_index(LABEL, PROP, Some(DIMS), Some("cosine"), None, None, None)
         .expect("plain HNSW over spilled column");
 }

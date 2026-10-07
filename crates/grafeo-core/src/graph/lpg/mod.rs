@@ -31,7 +31,7 @@ pub use property::{CompareOp, PropertyStorage};
 
 // Store and section require the lpg feature
 #[cfg(feature = "lpg")]
-pub use section::LpgStoreSection;
+pub use section::{EdgeRowMaterializer, LpgStoreSection, NodeRowMaterializer};
 #[cfg(feature = "lpg")]
 pub use store::batch_ops::{BatchEdgeCreate, BatchNodeCreate};
 pub use store::{LpgStore, PropertyUndoEntry};

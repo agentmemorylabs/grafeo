@@ -1681,8 +1681,15 @@ fn test_temporal_rollback_restores_property_index_postings() {
     let savepoint = store.property_undo_log_position(tx2);
     store.set_node_property_versioned(n, "k", Value::from("c"), tx2);
     store.rollback_transaction_properties_to(tx2, savepoint);
-    assert_eq!(find("a"), vec![n], "original posting back after savepoint rollback");
-    assert!(find("c").is_empty(), "no posting rolled back to the savepoint");
+    assert_eq!(
+        find("a"),
+        vec![n],
+        "original posting back after savepoint rollback"
+    );
+    assert!(
+        find("c").is_empty(),
+        "no posting rolled back to the savepoint"
+    );
 }
 
 /// With `temporal`, a checkpoint must not persist an open transaction's

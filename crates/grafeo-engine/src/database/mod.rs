@@ -71,7 +71,18 @@ pub(crate) mod section_consumer;
 ))]
 pub(crate) mod tier_chain_sources;
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
-mod vector_access;
+pub(crate) mod vector_access;
+
+/// Spilled vector storages by `label:property`, shared by the database and
+/// its sessions. Gated like the `vector_spill_storages` field, which needs it
+/// without `lpg`; `vector_access` re-exports it.
+#[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+pub(crate) type VectorSpillRegistry = std::sync::Arc<
+    parking_lot::RwLock<
+        std::collections::HashMap<String, std::sync::Arc<grafeo_core::index::vector::MmapStorage>>,
+    >,
+>;
+
 #[cfg(all(feature = "lpg", feature = "vector-index"))]
 mod vector_read;
 #[cfg(all(
@@ -302,13 +313,7 @@ pub struct GrafeoDB {
     /// Shared registry of spilled vector storages.
     /// Used by the search path to create `SpillableVectorAccessor` instances.
     #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
-    vector_spill_storages: Option<
-        Arc<
-            parking_lot::RwLock<
-                std::collections::HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>,
-            >,
-        >,
-    >,
+    vector_spill_storages: Option<VectorSpillRegistry>,
     /// External read-only graph store (when using with_store() or with_read_store()).
     /// When set, sessions route queries through this store instead of the built-in LpgStore.
     pub(super) external_read_store: Option<Arc<dyn GraphStoreSearch>>,
@@ -934,9 +939,6 @@ impl GrafeoDB {
             mid_build_drain_seq: 0,
         };
 
-        // Register storage sections as memory consumers for pressure tracking
-        db.register_section_consumers();
-
         // Phase 5e: if the loaded file has a CompactStore section, the
         // database was previously compacted. Reconstruct the LayeredStore
         // wiring (base + overlay + tier wrapper + consumers) so the
@@ -947,6 +949,12 @@ impl GrafeoDB {
             db.compact_backing = Some(loaded.backing);
             db.wire_layered_after_load(loaded.store, loaded_overlay_deletions)?;
         }
+
+        // Register storage sections as memory consumers for pressure
+        // tracking. After the layered wiring, as on a generation root: the
+        // vector consumer binds the layered store there, so its spill keeps
+        // the vectors of base nodes' diff rows in the overlay (D10).
+        db.register_section_consumers();
 
         // After Catalog shells + VectorStore topology + WAL + layered wiring,
         // rehydrate Quantized payloads from LPG embeddings via graph_store().
@@ -2370,11 +2378,13 @@ impl GrafeoDB {
             }
         }
 
-        // Adopt the loaded base + the loaded overlay.
+        // Adopt the loaded base + the loaded overlay. Its rows of base
+        // entities are whole rows on disk; make them diffs (D10).
         let layered = Arc::new(LayeredStore::with_overlay(
             Arc::clone(&compact_base),
             Arc::clone(overlay_store),
         ));
+        layered.adopt_persisted_full_rows();
 
         // Restore base-entity tombstones from the persisted deletion log,
         // if the file carried one. Without this, base nodes/edges deleted
@@ -3005,6 +3015,8 @@ impl GrafeoDB {
             let write_store: Arc<dyn GraphStoreMut> = layered_arc as Arc<dyn GraphStoreMut>;
             session.override_stores(read_store, Some(write_store));
             session.set_layered_store(Arc::clone(layered));
+            #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+            session.set_vector_spill_storages(self.vector_spill_registry());
             // Attach the same buffer without re-wrapping the store (the write
             // store above is already wrapped around it).
             #[cfg(feature = "wal")]
@@ -3040,6 +3052,14 @@ impl GrafeoDB {
         if let Some(buffer) = self.new_wal_buffer() {
             session.set_wal(buffer);
         }
+
+        #[cfg(all(
+            feature = "lpg",
+            feature = "vector-index",
+            feature = "mmap",
+            not(feature = "temporal")
+        ))]
+        session.set_vector_spill_storages(self.vector_spill_registry());
 
         #[cfg(feature = "cdc")]
         {
@@ -3465,6 +3485,17 @@ impl GrafeoDB {
         &**self.lpg_store()
     }
 
+    /// Whether the layered base has a row for `id`, i.e. an overlay row at
+    /// `id` is a diff row (D10). `false` without a layered store.
+    #[allow(unused_variables)]
+    pub(crate) fn is_layered_base_node(&self, id: grafeo_common::types::NodeId) -> bool {
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.base_contains_node(id);
+        }
+        false
+    }
+
     /// Returns whether a `LayeredStore` (compact base + overlay) is installed.
     #[cfg(feature = "lpg")]
     fn is_layered(&self) -> bool {
@@ -3791,9 +3822,7 @@ impl GrafeoDB {
             && let Some(reason) = wal.poisoned_reason()
         {
             use grafeo_common::utils::write_outcome::UNTIL_REOPENED;
-            grafeo_warn!(
-                "{api} refused: WAL refuses writes {UNTIL_REOPENED}: {reason}"
-            );
+            grafeo_warn!("{api} refused: WAL refuses writes {UNTIL_REOPENED}: {reason}");
             return true;
         }
         let _ = api;
@@ -4037,9 +4066,10 @@ impl GrafeoDB {
         ))]
         if let Some(store) = store_ref {
             let spill_path = self.buffer_manager.config().spill_path.clone();
-            let consumer = Arc::new(section_consumer::VectorIndexConsumer::new(
-                store, spill_path,
-            ));
+            let consumer = section_consumer::VectorIndexConsumer::new(store, spill_path);
+            #[cfg(feature = "compact-store")]
+            let consumer = consumer.with_layered(self.layered_store.as_ref());
+            let consumer = Arc::new(consumer);
             // Share the spill registry with the search path
             self.vector_spill_storages = Some(Arc::clone(consumer.spilled_storages()));
             self.buffer_manager.register_consumer(consumer);
@@ -4238,9 +4268,16 @@ impl GrafeoDB {
             sections.push(Box::new(compact_section));
 
             // Overlay LPG section (post-compact mutations; may be empty).
+            // Its rows of base entities are diffs (D10); persist them whole
+            // (see `LpgStoreSection::with_row_materializer`).
             let overlay = layered.overlay_store();
+            let (for_nodes, for_edges) = (Arc::clone(layered), Arc::clone(layered));
             let overlay_section =
-                grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(&overlay));
+                grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(&overlay))
+                    .with_row_materializer(
+                        Arc::new(move |row| for_nodes.materialize_overlay_node(row)),
+                        Arc::new(move |row| for_edges.materialize_overlay_edge(row)),
+                    );
             sections.push(Box::new(overlay_section));
 
             // Catalog (vector/text shells + schema) lives on the overlay store.

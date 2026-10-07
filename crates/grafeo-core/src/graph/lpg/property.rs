@@ -1227,11 +1227,7 @@ impl<Id: EntityId> PropertyColumn<Id> {
         // Hot buffer: FxHashMap<Id, Value> capacity
         let hot_bytes =
             self.values.capacity() * (std::mem::size_of::<Id>() + std::mem::size_of::<Value>() + 1);
-        let payload_bytes: usize = self
-            .values
-            .values()
-            .map(Value::estimated_size_bytes)
-            .sum();
+        let payload_bytes: usize = self.values.values().map(Value::estimated_size_bytes).sum();
         // Compressed data
         let compressed_bytes = self.compressed.as_ref().map_or(0, |c| c.memory_usage());
         hot_bytes + payload_bytes + compressed_bytes

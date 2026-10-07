@@ -213,6 +213,16 @@ path = "tests/compact_absent_properties.rs"
 required-features = ["lpg", "compact-store", "cypher"]
 
 [[test]]
+name = "generation_root_overlay_diff"
+path = "tests/generation_root_overlay_diff.rs"
+required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]
+
+[[test]]
+name = "layered_overlay_diff_compact_file"
+path = "tests/layered_overlay_diff_compact_file.rs"
+required-features = ["lpg", "compact-store", "grafeo-file", "cypher"]
+
+[[test]]
 name = "epoch_handoff_wal_boundary"
 path = "tests/epoch_handoff_wal_boundary.rs"
 required-features = ["generation", "generation-streaming", "lpg", "compact-store", "mmap", "wal", "cypher"]

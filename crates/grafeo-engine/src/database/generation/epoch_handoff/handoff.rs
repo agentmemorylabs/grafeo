@@ -571,6 +571,10 @@ impl GrafeoDB {
             node_ids.sort_unstable();
             for raw in node_ids {
                 if let Some(n) = overlay.get_node(NodeId::new(raw)) {
+                    // Raw: a diff row of a base node (D10) stays a diff here
+                    // and is merged with its base row by the frozen source as
+                    // the build consumes it, so the freeze never holds the
+                    // inherited properties (embeddings) of touched base rows.
                     nodes.push(node_to_generation(&n));
                 }
             }
@@ -579,6 +583,7 @@ impl GrafeoDB {
             edge_ids.sort_unstable();
             for raw in edge_ids {
                 if let Some(e) = overlay.get_edge(EdgeId::new(raw)) {
+                    // Raw, like the nodes above.
                     edges.push(edge_to_generation(&e));
                 }
             }
@@ -631,10 +636,12 @@ impl GrafeoDB {
                 nodes: handle.frozen_nodes.clone(),
                 pos: 0,
                 spilled: handle.spilled_vectors.clone(),
+                base: base.clone(),
             };
             let edge_src = FrozenEdgeSource {
                 edges: handle.frozen_edges.clone(),
                 pos: 0,
+                base: base.clone(),
             };
 
             // When a base exists, merge base (honoring freeze shadows) + frozen overlay.
@@ -712,14 +719,17 @@ impl GrafeoDB {
             }
             use grafeo_storage::file::generation_writer::CompactStoreSectionSource;
 
+            let base = self.layered_store.as_ref().map(|l| l.base_store_arc());
             let mut nodes = FrozenNodeSource {
                 nodes: handle.frozen_nodes.clone(),
                 pos: 0,
                 spilled: handle.spilled_vectors.clone(),
+                base: base.clone(),
             };
             let mut edges = FrozenEdgeSource {
                 edges: handle.frozen_edges.clone(),
                 pos: 0,
+                base,
             };
             // Feature-off path: overlay-only freeze is the full graph for pure LPG tests.
             let generated = generate_compact_store(

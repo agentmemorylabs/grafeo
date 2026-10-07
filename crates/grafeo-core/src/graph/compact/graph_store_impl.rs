@@ -646,7 +646,7 @@ pub(super) const fn rel_column_table_id(rel_table_id: u16) -> u16 {
     0x8000 | rel_table_id
 }
 
-fn value_in_range(
+pub(super) fn value_in_range(
     value: &Value,
     min: Option<&Value>,
     max: Option<&Value>,
