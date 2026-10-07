@@ -41,6 +41,8 @@ impl Session {
             graph_store_mut,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
+            #[cfg(all(feature = "lpg", feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+            vector_spill_storages: None,
             catalog: cfg.catalog,
             rdf_store,
             transaction_manager: cfg.transaction_manager,
