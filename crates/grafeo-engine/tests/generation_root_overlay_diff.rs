@@ -1414,3 +1414,270 @@ fn batch_creates_over_base_diff_rows_are_searchable() {
         }
     }
 }
+
+// ── #190: rollback repairs of inherited secondaries ───────────────────
+
+/// Exact heap-equality lookups of the published `updated_at_ms` values:
+/// `e{i}` is the one node with `1000 + i`, and nothing has `stray`.
+fn assert_postings(db: &GrafeoDB, stray: i64, stage: &str) {
+    let store = db.graph_store();
+    for i in 0..3 {
+        assert_eq!(
+            store.find_nodes_by_property("updated_at_ms", &Value::Int64(1_000 + i)),
+            vec![id_of(db, &format!("e{i}"))],
+            "[{stage}] updated_at_ms = {}",
+            1_000 + i
+        );
+    }
+    assert_eq!(
+        store.find_nodes_by_property("updated_at_ms", &Value::Int64(stray)),
+        Vec::<NodeId>::new(),
+        "[{stage}] updated_at_ms = {stray}"
+    );
+}
+
+/// #190 R3-F1: a rolled-back SET of an inherited, heap-indexed property
+/// keeps the node in its posting. The diff row has no old value for it, so
+/// the overlay undo drops the node from the posting of the value it wrote;
+/// the rollback repair puts it back under the merged value. Same value,
+/// another value and back, savepoint rollback, and a rollback onto a
+/// committed diff.
+#[test]
+fn rollback_keeps_heap_equality_postings_of_inherited_properties() {
+    let (_dir, root) = fresh_root(3, DIMS);
+    let db = open(&root);
+    db.create_property_index("updated_at_ms");
+    assert_postings(&db, 5, "indexed");
+    let e0 = id_of(&db, "e0");
+    let mut session = db.session();
+
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.updated_at_ms = 1000")
+        .expect("same-value SET");
+    session.rollback().expect("rollback");
+    assert_postings(&db, 5, "same-value SET rolled back");
+
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.updated_at_ms = 5")
+        .expect("SET 5");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.updated_at_ms = 1000")
+        .expect("SET back");
+    session.rollback().expect("rollback");
+    assert_postings(&db, 5, "SET and back rolled back");
+
+    session.begin_transaction().expect("begin");
+    session.savepoint("s").expect("savepoint");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.updated_at_ms = 5")
+        .expect("SET 5");
+    session
+        .rollback_to_savepoint("s")
+        .expect("rollback to savepoint");
+    assert_postings(&db, 5, "savepoint rollback");
+    session.commit().expect("commit");
+    assert_postings(&db, 5, "commit after savepoint rollback");
+
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'diff'")
+        .expect("committed diff");
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.updated_at_ms = 5")
+        .expect("SET 5");
+    session.rollback().expect("rollback");
+    assert_postings(&db, 5, "rollback onto a committed diff");
+    assert_entity(
+        &db,
+        e0,
+        0,
+        &[("observations_json", Some(Value::from("diff")))],
+        "rollback onto a committed diff",
+    );
+}
+
+/// #190 R3-F2: a rolled-back DELETE of a base node gives it back its
+/// inherited text document and heap posting, with and without a committed
+/// diff row, by full and by savepoint rollback.
+#[cfg(feature = "text-index")]
+#[test]
+fn delete_rollback_restores_inherited_secondaries() {
+    const ALL: [&str; 3] = ["e0", "e1", "e2"];
+    const DELETE_E0: &str = "MATCH (m:MemoryEntity {name: 'e0'}) DETACH DELETE m";
+    for committed_diff in [false, true] {
+        let (_dir, root) = fresh_root(3, DIMS);
+        let db = open(&root);
+        db.create_text_index("MemoryEntity", "observations_json")
+            .expect("text index");
+        db.create_property_index("updated_at_ms");
+        let stage = |s: &str| format!("committed_diff={committed_diff}: {s}");
+        let mut overrides = Vec::new();
+        if committed_diff {
+            db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.account_id = 'other'")
+                .expect("committed non-text diff");
+            overrides.push(("account_id", Some(Value::from("other"))));
+        }
+        let e0 = id_of(&db, "e0");
+        let mut session = db.session();
+
+        session.begin_transaction().expect("begin");
+        session.execute_cypher(DELETE_E0).expect("DELETE");
+        session.rollback().expect("rollback");
+        assert_text(&db, &ALL, &[], &stage("DELETE rolled back"));
+        assert_postings(&db, 5, &stage("DELETE rolled back"));
+        assert_entity(&db, e0, 0, &overrides, &stage("DELETE rolled back"));
+
+        session.begin_transaction().expect("begin");
+        session.savepoint("s").expect("savepoint");
+        session.execute_cypher(DELETE_E0).expect("DELETE");
+        session
+            .rollback_to_savepoint("s")
+            .expect("rollback to savepoint");
+        assert_text(&db, &ALL, &[], &stage("savepoint rollback"));
+        assert_postings(&db, 5, &stage("savepoint rollback"));
+        session.commit().expect("commit");
+        assert_text(&db, &ALL, &[], &stage("commit after savepoint rollback"));
+        assert_entity(
+            &db,
+            e0,
+            0,
+            &overrides,
+            &stage("commit after savepoint rollback"),
+        );
+    }
+}
+
+/// #190 R3-F3: exact history records for a controlled sequence. Without
+/// `temporal` a row has one version, created at epoch 0 for a base node's
+/// diff row, never deleted while live, whose payload is the current merged
+/// row. The record list is pinned whole at every step: clean (none), each
+/// committed write, a rolled-back write, reopen, and after an install
+/// absorbed the row (none again).
+#[test]
+fn history_records_are_exact_for_a_controlled_sequence() {
+    let (_dir, root) = fresh_root(3, DIMS);
+    type Record = (u64, Option<u64>, Vec<String>, BTreeMap<String, Value>);
+    let records = |db: &GrafeoDB, id: NodeId| -> [Vec<Record>; 2] {
+        let as_records = |h: Vec<(
+            grafeo_common::types::EpochId,
+            Option<grafeo_common::types::EpochId>,
+            grafeo_core::graph::lpg::Node,
+        )>| {
+            h.into_iter()
+                .map(|(c, d, n)| {
+                    let mut labels: Vec<String> =
+                        n.labels.iter().map(ToString::to_string).collect();
+                    labels.sort();
+                    (
+                        c.as_u64(),
+                        d.map(|d| d.as_u64()),
+                        labels,
+                        props_map(&n.properties),
+                    )
+                })
+                .collect()
+        };
+        [
+            as_records(db.get_node_history(id)),
+            as_records(db.session().get_node_history(id)),
+        ]
+    };
+    let one = |labels: &[&str], overrides: &[(&str, Option<Value>)]| -> [Vec<Record>; 2] {
+        let mut props = published_entity(0);
+        for (k, v) in overrides {
+            match v {
+                Some(v) => props.insert((*k).to_string(), v.clone()),
+                None => props.remove(*k),
+            };
+        }
+        let record = vec![(
+            0,
+            None,
+            labels.iter().map(ToString::to_string).collect(),
+            props,
+        )];
+        [record.clone(), record]
+    };
+    let none: [Vec<Record>; 2] = [Vec::new(), Vec::new()];
+
+    let db = open(&root);
+    let e0 = id_of(&db, "e0");
+    assert_eq!(records(&db, e0), none, "clean");
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'one'")
+        .expect("SET");
+    let mut o = vec![("observations_json", Some(Value::from("one")))];
+    assert_eq!(records(&db, e0), one(&["MemoryEntity"], &o), "SET");
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) REMOVE m.embedding_provider")
+        .expect("REMOVE");
+    o.push(("embedding_provider", None));
+    assert_eq!(records(&db, e0), one(&["MemoryEntity"], &o), "REMOVE");
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.updated_at_ms = 5, m:Pinned")
+        .expect("SET in a transaction");
+    session.rollback().expect("rollback");
+    assert_eq!(records(&db, e0), one(&["MemoryEntity"], &o), "rolled back");
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.updated_at_ms = 5, m:Pinned")
+        .expect("SET + label");
+    o.push(("updated_at_ms", Some(Value::Int64(5))));
+    let labels = ["MemoryEntity", "Pinned"];
+    assert_eq!(records(&db, e0), one(&labels, &o), "SET + label");
+    drop(session);
+    db.close().expect("close");
+    drop(db);
+    let db = open(&root);
+    let e0 = id_of(&db, "e0");
+    assert_eq!(records(&db, e0), one(&labels, &o), "reopen");
+    handoff(&db, &root, "g2");
+    assert_eq!(records(&db, e0), none, "absorbed by the install");
+    let node = db.get_node(e0).expect("e0");
+    let mut want = published_entity(0);
+    want.insert("observations_json".into(), Value::from("one"));
+    want.remove("embedding_provider");
+    want.insert("updated_at_ms".into(), Value::Int64(5));
+    assert_eq!(props_map(&node.properties), want, "absorbed row");
+}
+
+/// #190 R3-F3: nested savepoints over an inherited text property. Each
+/// rollback restores exactly the text document of the savepoint it returns
+/// to, down to the base text.
+#[cfg(feature = "text-index")]
+#[test]
+fn nested_savepoints_restore_the_text_document_of_each_level() {
+    let (_dir, root) = fresh_root(3, DIMS);
+    let db = open(&root);
+    db.create_text_index("MemoryEntity", "observations_json")
+        .expect("text index");
+    let hits = |q: &str| text_hits(&db, q);
+    let set = |session: &grafeo_engine::Session, text: &str| {
+        session
+            .execute_cypher(&format!(
+                "MATCH (m:MemoryEntity {{name: 'e0'}}) SET m.observations_json = '{text}'"
+            ))
+            .expect("SET");
+    };
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    set(&session, "firstterm");
+    session.savepoint("s1").expect("s1");
+    set(&session, "secondterm");
+    session.savepoint("s2").expect("s2");
+    session
+        .execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) REMOVE m.observations_json")
+        .expect("REMOVE");
+    assert_eq!(hits("o0"), ["e1", "e2"], "removed");
+    assert_eq!(hits("secondterm"), Vec::<String>::new(), "removed");
+    session.rollback_to_savepoint("s2").expect("to s2");
+    assert_eq!(hits("secondterm"), ["e0"], "s2");
+    assert_eq!(hits("firstterm"), Vec::<String>::new(), "s2");
+    assert_eq!(hits("o0"), ["e1", "e2"], "s2");
+    session.rollback_to_savepoint("s1").expect("to s1");
+    assert_eq!(hits("firstterm"), ["e0"], "s1");
+    assert_eq!(hits("secondterm"), Vec::<String>::new(), "s1");
+    assert_eq!(hits("o0"), ["e1", "e2"], "s1");
+    session.rollback().expect("rollback");
+    assert_eq!(hits("o0"), ["e0", "e1", "e2"], "rollback");
+    assert_eq!(hits("firstterm"), Vec::<String>::new(), "rollback");
+}

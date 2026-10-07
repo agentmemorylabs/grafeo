@@ -308,6 +308,22 @@ impl LpgStore {
         }
     }
 
+    /// Adds `node_id` to the posting of `value` in the heap equality index
+    /// on `key`, if there is one. Idempotent.
+    ///
+    /// For a layered store's rollback repair: the overlay undo of a property
+    /// a diff row inherited removes the node from its posting and has no old
+    /// value to put back (`LayeredStore::reconcile_rolled_back_secondaries`).
+    #[doc(hidden)]
+    pub fn ensure_property_index_posting(&self, node_id: NodeId, key: &PropertyKey, value: &Value) {
+        if let Some(index) = self.property_indexes.read().get(key) {
+            index
+                .entry(HashableValue::new(value.clone()))
+                .or_insert_with(FxHashSet::default)
+                .insert(node_id);
+        }
+    }
+
     /// Updates property indexes when a property is removed.
     pub(super) fn update_property_index_on_remove(&self, node_id: NodeId, key: &PropertyKey) {
         let indexes = self.property_indexes.read();

@@ -752,13 +752,14 @@ impl LpgStore {
             .map_or(0, Vec::len)
     }
 
-    /// Nodes whose properties or labels `transaction_id` changed after undo
-    /// log position `since`, deduplicated.
+    /// Nodes whose properties or labels `transaction_id` changed, or that it
+    /// deleted, after undo log position `since`, deduplicated.
     ///
-    /// Read before a rollback replays the log: a layered store re-syncs the
-    /// text documents of base nodes among them against its merged view
-    /// afterwards (`LayeredStore::reconcile_text_documents`), because the
-    /// overlay undo of an inherited property has no old value to restore.
+    /// Read before a rollback replays the log: a layered store repairs the
+    /// secondary index entries of base nodes among them against its merged
+    /// view afterwards (`LayeredStore::reconcile_rolled_back_secondaries`),
+    /// because the overlay undo of an inherited property, or the restore of
+    /// a deleted diff row, has no inherited value to restore.
     #[must_use]
     pub fn undo_log_node_ids(&self, transaction_id: TransactionId, since: usize) -> Vec<NodeId> {
         let log = self.property_undo_log.read();
@@ -772,7 +773,8 @@ impl LpgStore {
             .filter_map(|entry| match entry {
                 PropertyUndoEntry::NodeProperty { node_id, .. }
                 | PropertyUndoEntry::LabelAdded { node_id, .. }
-                | PropertyUndoEntry::LabelRemoved { node_id, .. } => Some(*node_id),
+                | PropertyUndoEntry::LabelRemoved { node_id, .. }
+                | PropertyUndoEntry::NodeDeleted { node_id, .. } => Some(*node_id),
                 _ => None,
             })
             .filter(|id| seen.insert(*id))

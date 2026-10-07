@@ -448,10 +448,10 @@ impl Session {
         })
     }
 
-    /// Nodes whose properties or labels the layered overlay will undo for
-    /// `transaction_id` from undo log position `since`. Read before the
-    /// undo replays, for [`Self::reconcile_layered_text`].
-    #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+    /// Nodes whose properties, labels or deletion the layered overlay will
+    /// undo for `transaction_id` from undo log position `since`. Read before
+    /// the undo replays, for [`Self::reconcile_layered_secondaries`].
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
     fn layered_undo_nodes(&self, transaction_id: TransactionId, since: usize) -> Vec<NodeId> {
         self.layered_store
             .as_ref()
@@ -462,15 +462,16 @@ impl Session {
             })
     }
 
-    /// After a rollback, re-syncs the text documents of the base nodes it
-    /// touched against the merged view (an undone `SET` of an inherited text
-    /// property has no old value in the overlay to restore; D10).
-    #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
-    fn reconcile_layered_text(&self, nodes: &[NodeId]) {
+    /// After a rollback, repairs the secondary index entries (heap equality
+    /// postings, text documents) of the base nodes it touched against the
+    /// merged view: the undo of an inherited property has no old value in
+    /// the overlay to restore (D10).
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    fn reconcile_layered_secondaries(&self, nodes: &[NodeId]) {
         if let Some(layered) = &self.layered_store
             && !nodes.is_empty()
         {
-            layered.reconcile_text_documents(nodes);
+            layered.reconcile_rolled_back_secondaries(nodes);
         }
     }
 
@@ -4736,7 +4737,7 @@ impl Session {
     ) -> AbortOutcome {
         *self.read_only_tx.lock() = self.db_read_only;
 
-        #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
         let undone_nodes = self.layered_undo_nodes(transaction_id, 0);
 
         // Discard uncommitted versions in ALL touched LPG stores (cross-graph atomicity).
@@ -4751,8 +4752,8 @@ impl Session {
         let unrestored = self.rollback_layered_bookkeeping(transaction_id);
         #[cfg(not(all(feature = "compact-store", feature = "lpg")))]
         let unrestored = 0;
-        #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
-        self.reconcile_layered_text(&undone_nodes);
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        self.reconcile_layered_secondaries(&undone_nodes);
 
         #[cfg(feature = "triple-store")]
         self.rollback_rdf_transaction(transaction_id);
@@ -4881,7 +4882,7 @@ impl Session {
 
         // The layered overlay's undo range: from its captured position, or
         // all of it when it was first touched after the savepoint.
-        #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
         let undone_nodes = {
             let since = self.layered_store.as_ref().and_then(|layered| {
                 let overlay = layered.overlay_store();
@@ -4922,8 +4923,8 @@ impl Session {
         let unrestored = self.layered_store.as_ref().map_or(0, |layered| {
             layered.rollback_transaction_layers_to(transaction_id, sp_state.layered_position)
         });
-        #[cfg(all(feature = "compact-store", feature = "lpg", feature = "text-index"))]
-        self.reconcile_layered_text(&undone_nodes);
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        self.reconcile_layered_secondaries(&undone_nodes);
 
         // Truncate CDC event buffer to the savepoint position.
         #[cfg(feature = "cdc")]

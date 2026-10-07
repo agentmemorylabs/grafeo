@@ -1244,20 +1244,41 @@ impl LayeredStore {
         forgotten
     }
 
-    /// Re-syncs the overlay's text documents of `nodes` against the merged
-    /// view, after a rollback or savepoint rollback has undone their writes.
+    /// Repairs the overlay's secondary index entries of `nodes` against the
+    /// merged view, after a rollback or savepoint rollback has undone their
+    /// writes or deletion.
     ///
-    /// A diff row (D10) does not carry the base properties it inherits, so
-    /// the overlay undo of a `SET` on an inherited text property records no
-    /// old value: it removes the replacement document and has nothing to
-    /// reinsert. The row then reads back the base text again, so the
-    /// document is rebuilt from that merged read. Nodes the base lacks are
-    /// whole overlay rows, which the overlay undo already restores exactly.
-    #[cfg(feature = "text-index")]
-    pub fn reconcile_text_documents(&self, nodes: &[NodeId]) {
+    /// A diff row (D10) does not carry the base properties it inherits. The
+    /// overlay undo of a `SET` on an inherited property therefore records no
+    /// old value: it drops the node from the property's heap equality
+    /// posting and its text document, and has nothing to put back. Restoring
+    /// a deleted diff row likewise brings back only the diff's own values.
+    /// The row reads back the base values again, so the entries are rebuilt
+    /// from that merged read:
+    /// - heap equality postings: the node is added to the posting of its
+    ///   merged value for every indexed key it has. A stale posting under
+    ///   another value may remain; every layered probe verifies overlay
+    ///   candidates of base ids against the merged value, so it never
+    ///   matches.
+    /// - text documents: rebuilt from the merged text, or removed.
+    ///
+    /// Nodes the base lacks are whole overlay rows, which the overlay undo
+    /// already restores exactly; they are skipped. Inherited payloads are
+    /// never copied into the overlay.
+    pub fn reconcile_rolled_back_secondaries(&self, nodes: &[NodeId]) {
         let overlay = self.overlay.load();
-        let entries = overlay.text_index_entries();
-        if entries.is_empty() {
+        let property_keys: Vec<PropertyKey> = overlay
+            .property_index_keys()
+            .into_iter()
+            .map(PropertyKey::new)
+            .collect();
+        #[cfg(feature = "text-index")]
+        let text_entries = overlay.text_index_entries();
+        #[cfg(feature = "text-index")]
+        let has_text = !text_entries.is_empty();
+        #[cfg(not(feature = "text-index"))]
+        let has_text = false;
+        if property_keys.is_empty() && !has_text {
             return;
         }
         for &id in nodes {
@@ -1265,7 +1286,15 @@ impl LayeredStore {
                 continue;
             }
             let node = GraphStore::get_node(self, id);
-            for (key, index) in &entries {
+            if let Some(node) = &node {
+                for key in &property_keys {
+                    if let Some(value) = node.properties.get(key) {
+                        overlay.ensure_property_index_posting(id, key, value);
+                    }
+                }
+            }
+            #[cfg(feature = "text-index")]
+            for (key, index) in &text_entries {
                 let Some((label, property)) = key.split_once(':') else {
                     continue;
                 };

@@ -156,6 +156,10 @@ on the diff row.
   - Every candidate from this path is therefore verified against the merged value, as the mapped path already does
     (`mapped_property_index_candidates`).
   - Tombstones (`Null`) are never returned as matches.
+  - **Rollback** (AMH #190 R3-F1): the overlay undo of a `SET` on an inherited, heap-indexed property has no old
+    value, so it drops the node from the posting of the value it wrote and puts nothing back, even when the value was
+    unchanged. A *missing* posting is not caught by verification, so the rollback repair (§7) re-adds the node under
+    its merged value. A stale extra posting can remain; verification filters it.
 - **Zone maps** (`node_property_might_match`) are an OR of both layers. They stay correct (conservative).
 
 ### 5.4 Text index
@@ -168,10 +172,13 @@ on the diff row.
 - **Rollback is the exception.** The overlay undo of a `SET` on an *inherited* text property has no old value (the
   diff row never held it), so it removes the replacement document and has nothing to reinsert. After every
   rollback and savepoint rollback, the session therefore re-syncs the text documents of the base nodes the undone
-  entries touched against the merged row (`LayeredStore::reconcile_text_documents`, node ids from
-  `LpgStore::undo_log_node_ids`, read before the undo runs). Nothing is copied back into the overlay, embeddings
-  included. Pinned by `rollback_of_an_inherited_text_property_restores_its_document` (full rollback, savepoint
-  rollback, rollback onto a committed diff, exact `text_search` results).
+  entries touched against the merged row (the rollback repair, §7). Nothing is copied back into the overlay,
+  embeddings included. Pinned by `rollback_of_an_inherited_text_property_restores_its_document` (full rollback,
+  savepoint rollback, rollback onto a committed diff, exact `text_search` results) and
+  `nested_savepoints_restore_the_text_document_of_each_level`.
+- **Rolled-back deletes** (AMH #190 R3-F2): restoring a deleted diff row restores only the diff's own values, so an
+  inherited text document stayed missing. The repair includes deleted nodes. Pinned by
+  `delete_rollback_restores_inherited_secondaries`.
 
 ### 5.5 Vector search
 - **Vector reads that go through the layered view are unaffected:** the accessor and `read_indexed_node_vector`
@@ -268,8 +275,12 @@ Engine code that reads the overlay `LpgStore` itself sees only the diff. Slice 1
 
 - **Property writes on a diff row** are overlay property writes, undone by the overlay's property undo log as today.
   This includes tombstones (§2.1).
-- **Secondary text documents** of the touched base nodes are re-synced against the merged row afterwards, because the
-  undo of an inherited property has no old value to restore (§5.4).
+- **The rollback repair.** Before the undo runs, the session reads the nodes whose properties or labels the
+  transaction changed, or that it deleted, from the overlay's undo log (`LpgStore::undo_log_node_ids`, from the
+  savepoint's position for a savepoint rollback). After the property undo and the layer undo,
+  `LayeredStore::reconcile_rolled_back_secondaries` repairs the secondary entries of the base nodes among them
+  against the merged row: heap equality postings (§5.3) and text documents (§5.4). The undo of an inherited
+  property, or the restore of a deleted diff row, has no inherited value to restore.
 - **The diff row itself** is a copy-up journal entry: rollback of its only owner purges it, as today. Because it
   carries no base data, a purge that races a reader's "miss on dirty id" re-check falls back to the identical base row.
 - **Base tombstones, overlay deletes, label writes:** unchanged (fork #14, #38).
