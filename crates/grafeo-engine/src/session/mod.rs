@@ -138,7 +138,12 @@ pub struct Session {
     /// The database's spilled-vector registry (ForceDisk tier), so commit-time
     /// HNSW inserts read spill-only neighbour vectors (AMH #175). Applies to
     /// the default graph's store only: that is the store the spill drained.
-    #[cfg(all(feature = "lpg", feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+    #[cfg(all(
+        feature = "lpg",
+        feature = "vector-index",
+        feature = "mmap",
+        not(feature = "temporal")
+    ))]
     vector_spill_storages: Option<crate::database::vector_access::VectorSpillRegistry>,
     /// Schema and metadata catalog shared across sessions.
     catalog: Arc<Catalog>,
@@ -350,7 +355,12 @@ impl Session {
             graph_store_mut,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
-            #[cfg(all(feature = "lpg", feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+            #[cfg(all(
+                feature = "lpg",
+                feature = "vector-index",
+                feature = "mmap",
+                not(feature = "temporal")
+            ))]
             vector_spill_storages: None,
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
@@ -417,7 +427,12 @@ impl Session {
     /// commit, rollback and savepoint rollback drive its transaction-scoped
     /// bookkeeping.
     /// Hands the session the database's spilled-vector registry (AMH #175).
-    #[cfg(all(feature = "lpg", feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+    #[cfg(all(
+        feature = "lpg",
+        feature = "vector-index",
+        feature = "mmap",
+        not(feature = "temporal")
+    ))]
     pub(crate) fn set_vector_spill_storages(
         &mut self,
         registry: Option<crate::database::vector_access::VectorSpillRegistry>,
@@ -603,7 +618,12 @@ impl Session {
             graph_store_mut: write_store,
             #[cfg(all(feature = "compact-store", feature = "lpg"))]
             layered_store: None,
-            #[cfg(all(feature = "lpg", feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
+            #[cfg(all(
+                feature = "lpg",
+                feature = "vector-index",
+                feature = "mmap",
+                not(feature = "temporal")
+            ))]
             vector_spill_storages: None,
             catalog: cfg.catalog,
             #[cfg(feature = "triple-store")]
