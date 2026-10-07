@@ -2048,7 +2048,15 @@ impl GraphStore for LayeredStore {
                 .into_iter()
                 .filter(|id| self.merged_property_is(*id, &key, value)),
         );
-        results.extend(overlay.find_nodes_by_property(property, value));
+        // Overlay hits of a base node are diff values: a removal tombstone
+        // (`Null`) must not match, so verify them on the merged view too.
+        let base = self.base.load();
+        results.extend(
+            overlay
+                .find_nodes_by_property(property, value)
+                .into_iter()
+                .filter(|id| !base.contains_node(*id) || self.merged_property_is(*id, &key, value)),
+        );
         results.sort_unstable();
         results.dedup();
         results
@@ -2218,13 +2226,27 @@ impl GraphStore for LayeredStore {
                 super::graph_store_impl::value_in_range(&v, min, max, min_inclusive, max_inclusive)
             })
         }));
-        results.extend(self.overlay.load().find_nodes_in_range(
-            property,
-            min,
-            max,
-            min_inclusive,
-            max_inclusive,
-        ));
+        // Overlay hits of a base node: verify on the merged view, so a
+        // removal tombstone (`Null`) never matches an open range.
+        let base = self.base.load();
+        results.extend(
+            self.overlay
+                .load()
+                .find_nodes_in_range(property, min, max, min_inclusive, max_inclusive)
+                .into_iter()
+                .filter(|id| {
+                    !base.contains_node(*id)
+                        || self.get_node_property(*id, &key).is_some_and(|v| {
+                            super::graph_store_impl::value_in_range(
+                                &v,
+                                min,
+                                max,
+                                min_inclusive,
+                                max_inclusive,
+                            )
+                        })
+                }),
+        );
         results.sort_unstable();
         results.dedup();
         results
@@ -2475,8 +2497,18 @@ impl GraphStore for LayeredStore {
     fn get_node_history(&self, id: NodeId) -> Vec<(EpochId, Option<EpochId>, Node)> {
         // The base keeps no versions; an untracked overlay-only row (AMH
         // #161) has its history in the overlay like a dirty one.
+        // A dirty base node's entries are diff rows: merge each with the
+        // base row (D10).
         if self.is_node_dirty(id) || !self.base.load().contains_node(id) {
-            return self.overlay.load().get_node_history(id);
+            return self
+                .overlay
+                .load()
+                .get_node_history(id)
+                .into_iter()
+                .map(|(created, deleted, row)| {
+                    (created, deleted, self.materialize_overlay_node(row))
+                })
+                .collect();
         }
         Vec::new()
     }
@@ -2484,7 +2516,15 @@ impl GraphStore for LayeredStore {
     fn get_edge_history(&self, id: EdgeId) -> Vec<(EpochId, Option<EpochId>, Edge)> {
         // See `get_node_history`.
         if self.is_edge_dirty(id) || !self.base.load().contains_edge(id) {
-            return self.overlay.load().get_edge_history(id);
+            return self
+                .overlay
+                .load()
+                .get_edge_history(id)
+                .into_iter()
+                .map(|(created, deleted, row)| {
+                    (created, deleted, self.materialize_overlay_edge(row))
+                })
+                .collect();
         }
         Vec::new()
     }
@@ -3022,24 +3062,47 @@ impl LayeredStore {
         node
     }
 
+    /// Turns the overlay rows of base entities that a compact file persisted
+    /// back into diff rows (D10). Call once, right after adopting a loaded
+    /// overlay with [`Self::with_overlay`], before any write.
+    ///
+    /// A persisted overlay row of a base entity is a whole row: binaries
+    /// before D10 copied the entity up and removed properties physically,
+    /// and D10 binaries persist the merged row
+    /// (`LpgStoreSection::with_row_materializer`). A base property such a row
+    /// lacks was therefore removed, so it becomes a `Null` tombstone, or the
+    /// merged read would bring the base value back. Generation roots never
+    /// persist the overlay (their WAL replay writes diffs) and must not call
+    /// this.
+    pub fn adopt_persisted_full_rows(&self) {
+        let base = self.base.load();
+        let overlay = self.overlay.load();
+        for id in overlay.all_node_ids() {
+            let Some(base_row) = base.get_node(id) else {
+                continue;
+            };
+            for (key, _) in base_row.properties.iter() {
+                if overlay.get_node_property(id, key).is_none() {
+                    overlay.set_node_property(id, key.as_str(), Value::Null);
+                }
+            }
+        }
+        for edge in overlay.all_edges() {
+            let Some(base_row) = base.get_edge(edge.id) else {
+                continue;
+            };
+            for (key, _) in base_row.properties.iter() {
+                if overlay.get_edge_property(edge.id, key).is_none() {
+                    overlay.set_edge_property(edge.id, key.as_str(), Value::Null);
+                }
+            }
+        }
+    }
+
     /// Whether the base has a row for `id` (deleted or not).
     #[must_use]
     pub fn base_contains_node(&self, id: NodeId) -> bool {
         self.base.load().contains_node(id)
-    }
-
-    /// Whether any overlay node or edge is a diff row of a base entity (its
-    /// id is also in the base). Consumers that cannot merge use this to pick
-    /// a path.
-    #[must_use]
-    pub fn overlay_has_base_rows(&self) -> bool {
-        let base = self.base.load();
-        let overlay = self.overlay.load();
-        overlay
-            .all_node_ids()
-            .into_iter()
-            .any(|id| base.contains_node(id))
-            || overlay.all_edges().any(|e| base.contains_edge(e.id))
     }
 
     /// Whether `id`'s merged value of `key` equals `value` (strict

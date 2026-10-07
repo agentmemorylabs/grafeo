@@ -221,6 +221,12 @@ impl super::GrafeoDB {
         id: grafeo_common::types::NodeId,
         epoch: grafeo_common::types::EpochId,
     ) -> Option<grafeo_core::graph::lpg::Node> {
+        // On a layered database through the merged view: the overlay holds
+        // only a diff for a base node (D10).
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.get_node_at_epoch(id, epoch);
+        }
         self.lpg_store().get_node_at_epoch(id, epoch)
     }
 
@@ -233,6 +239,11 @@ impl super::GrafeoDB {
         id: grafeo_common::types::EdgeId,
         epoch: grafeo_common::types::EpochId,
     ) -> Option<grafeo_core::graph::lpg::Edge> {
+        // See `get_node_at_epoch`.
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.get_edge_at_epoch(id, epoch);
+        }
         self.lpg_store().get_edge_at_epoch(id, epoch)
     }
 
@@ -248,6 +259,11 @@ impl super::GrafeoDB {
         Option<grafeo_common::types::EpochId>,
         grafeo_core::graph::lpg::Node,
     )> {
+        // See `get_node_at_epoch`.
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.get_node_history(id);
+        }
         self.lpg_store().get_node_history(id)
     }
 
@@ -263,6 +279,11 @@ impl super::GrafeoDB {
         Option<grafeo_common::types::EpochId>,
         grafeo_core::graph::lpg::Edge,
     )> {
+        // See `get_node_at_epoch`.
+        #[cfg(all(feature = "compact-store", feature = "lpg"))]
+        if let Some(layered) = self.layered_store.as_ref() {
+            return layered.get_edge_history(id);
+        }
         self.lpg_store().get_edge_history(id)
     }
 

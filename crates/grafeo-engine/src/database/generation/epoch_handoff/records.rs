@@ -7,15 +7,19 @@
 //! fallback (no layered base) also lives here so the handoff orchestrator
 //! stays focused on the state machine.
 
-use grafeo_common::types::{PropertyKey, Value};
+use std::sync::Arc;
+
+use grafeo_common::types::{EdgeId, NodeId, PropertyKey, Value};
 use grafeo_common::utils::error::{Error, Result};
 use grafeo_common::utils::hash::FxHashMap;
+use grafeo_core::graph::compact::CompactStore;
 use grafeo_core::graph::compact::generation::{
     EdgeRecordSource, GenerationEdge, GenerationError, GenerationNode, NodeRecordSource,
     OriginalEdgeId, OriginalNodeId,
 };
 use grafeo_core::graph::compact::generation_builder::FrozenOverlayEpoch;
 use grafeo_core::graph::lpg::{Edge, LpgStore, Node};
+use grafeo_core::graph::traits::GraphStore;
 
 use super::super::publication::PublicationPhaseError;
 
@@ -24,6 +28,10 @@ pub(super) struct FrozenNodeSource {
     pub(super) pos: usize,
     /// AMH #167: spilled overlay vectors, filled in per node as it streams.
     pub(super) spilled: super::types::SpilledVectorSnapshot,
+    /// The base the frozen overlay sits on. A frozen row whose id the base
+    /// has is a diff row (D10): it is merged with its base row here, one
+    /// record at a time as the build consumes it, never in the freeze.
+    pub(super) base: Option<Arc<CompactStore>>,
 }
 
 impl NodeRecordSource for FrozenNodeSource {
@@ -33,7 +41,15 @@ impl NodeRecordSource for FrozenNodeSource {
         }
         let mut n = self.nodes[self.pos].clone();
         self.pos += 1;
+        // Fill spilled vectors on the raw row first (a diff row's `Null`
+        // tombstone counts as present, so it blocks a fill), then merge a
+        // diff row with its base row (D10).
         self.spilled.fill(&mut n)?;
+        if let Some(base) = self.base.as_ref()
+            && let Some(row) = base.get_node(NodeId::new(n.id.as_u64()))
+        {
+            n.properties = merge_into_base(&row.properties, n.properties);
+        }
         Ok(Some(n))
     }
 }
@@ -41,6 +57,8 @@ impl NodeRecordSource for FrozenNodeSource {
 pub(super) struct FrozenEdgeSource {
     pub(super) edges: Vec<GenerationEdge>,
     pub(super) pos: usize,
+    /// See [`FrozenNodeSource::base`].
+    pub(super) base: Option<Arc<CompactStore>>,
 }
 
 impl EdgeRecordSource for FrozenEdgeSource {
@@ -48,10 +66,33 @@ impl EdgeRecordSource for FrozenEdgeSource {
         if self.pos >= self.edges.len() {
             return Ok(None);
         }
-        let e = self.edges[self.pos].clone();
+        let mut e = self.edges[self.pos].clone();
         self.pos += 1;
+        if let Some(base) = self.base.as_ref()
+            && let Some(row) = base.get_edge(EdgeId::new(e.id.as_u64()))
+        {
+            e.properties = merge_into_base(&row.properties, e.properties);
+        }
         Ok(Some(e))
     }
+}
+
+/// A diff row's properties over its base row's (D10): a diff value replaces
+/// the base value, a `Null` removes the base property.
+fn merge_into_base(
+    base: &grafeo_common::types::PropertyMap,
+    diff: FxHashMap<PropertyKey, Value>,
+) -> FxHashMap<PropertyKey, Value> {
+    let mut merged: FxHashMap<PropertyKey, Value> =
+        base.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (key, value) in diff {
+        if matches!(value, Value::Null) {
+            merged.remove(&key);
+        } else {
+            merged.insert(key, value);
+        }
+    }
+    merged
 }
 
 pub(super) fn map_generation_error(err: GenerationError) -> Error {

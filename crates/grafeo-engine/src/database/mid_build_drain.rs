@@ -140,6 +140,21 @@ impl GrafeoDB {
                 "drain_overlay_to_tier: epoch handoff already active".into(),
             ));
         }
+        // Builder-only contract: tiers chain over an EMPTY base. The final
+        // tier-chain build walks tiers + overlay only, so original base rows
+        // would be left out, and an overlay row of a base node is a diff
+        // (D10) that a tier cannot hold whole. Refused before any state
+        // changes.
+        let base = layered.base_store_arc();
+        if base.total_nodes() > 0 || base.total_edges() > 0 {
+            return Err(Error::Internal(format!(
+                "drain_overlay_to_tier requires an empty base (it has {} node(s), {} edge(s)): \
+                 a tier chain carries no original base rows",
+                base.total_nodes(),
+                base.total_edges()
+            )));
+        }
+        drop(base);
 
         let anon_before = layered.overlay_memory_bytes() as u64;
 
@@ -206,18 +221,9 @@ impl GrafeoDB {
         let overlay_arc = layered.overlay_store();
         let window_store = {
             // Use the overlay LpgStore directly as the GraphStore source.
-            // This is O(window) by construction. A tier serves whole rows,
-            // so diff rows of base nodes (D10) are first materialized into a
-            // scratch store, still O(window).
-            let materialized = if layered.overlay_has_base_rows() {
-                Some(materialize_overlay_window(&layered, &overlay_arc)?)
-            } else {
-                None
-            };
-            let src: &dyn grafeo_core::graph::traits::GraphStore = match materialized.as_ref() {
-                Some(store) => store,
-                None => overlay_arc.as_ref(),
-            };
+            // This is O(window) by construction. The base is empty (checked
+            // above), so every overlay row is whole.
+            let src: &dyn grafeo_core::graph::traits::GraphStore = overlay_arc.as_ref();
             grafeo_core::graph::compact::from_graph_store_preserving_ids(src)
                 .map_err(|e| Error::Internal(format!("window CompactStore build: {e}")))?
         };
@@ -373,37 +379,4 @@ impl GrafeoDB {
             .as_ref()
             .map(|l| l.overlay_memory_bytes())
     }
-}
-
-/// A scratch copy of the overlay's live rows with every diff row of a base
-/// node or edge merged with its base row (D10), at the same ids.
-fn materialize_overlay_window(
-    layered: &grafeo_core::graph::compact::layered::LayeredStore,
-    overlay: &grafeo_core::graph::lpg::LpgStore,
-) -> Result<grafeo_core::graph::lpg::LpgStore> {
-    let window = grafeo_core::graph::lpg::LpgStore::new()
-        .map_err(|e| Error::Internal(format!("window scratch store: {e}")))?;
-    for id in overlay.all_node_ids() {
-        let Some(row) = overlay.get_node(id) else {
-            continue;
-        };
-        let node = layered.materialize_overlay_node(row);
-        let labels: Vec<&str> = node.labels.iter().map(|l| l.as_str()).collect();
-        window
-            .create_node_with_id(id, &labels)
-            .map_err(|e| Error::Internal(format!("window scratch node {id:?}: {e}")))?;
-        for (key, value) in node.properties.iter() {
-            window.set_node_property(id, key.as_str(), value.clone());
-        }
-    }
-    for edge in overlay.all_edges() {
-        let edge = layered.materialize_overlay_edge(edge);
-        window
-            .create_edge_with_id(edge.id, edge.src, edge.dst, edge.edge_type.as_str())
-            .map_err(|e| Error::Internal(format!("window scratch edge {:?}: {e}", edge.id)))?;
-        for (key, value) in edge.properties.iter() {
-            window.set_edge_property(edge.id, key.as_str(), value.clone());
-        }
-    }
-    Ok(window)
 }

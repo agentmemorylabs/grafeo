@@ -1047,6 +1047,11 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[must_use]
     pub fn get_node_history(&self, id: NodeId) -> Vec<(EpochId, Option<EpochId>, Node)> {
+        // The layered target merges a base node's diff rows (D10).
+        #[cfg(feature = "compact-store")]
+        if let direct_store::DirectStore::Layered { read, .. } = self.direct_store() {
+            return read.get_node_history(id);
+        }
         self.active_lpg_store().get_node_history(id)
     }
 
@@ -1056,6 +1061,11 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[must_use]
     pub fn get_edge_history(&self, id: EdgeId) -> Vec<(EpochId, Option<EpochId>, Edge)> {
+        // See `get_node_history`.
+        #[cfg(feature = "compact-store")]
+        if let direct_store::DirectStore::Layered { read, .. } = self.direct_store() {
+            return read.get_edge_history(id);
+        }
         self.active_lpg_store().get_edge_history(id)
     }
 

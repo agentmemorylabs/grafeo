@@ -22,6 +22,7 @@
     feature = "cypher"
 ))]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use grafeo_common::types::{NodeId, PropertyKey, Value};
@@ -44,6 +45,12 @@ fn vector(seed: usize, dims: usize) -> Value {
 /// observations, provenance, an embedding of `dims`) plus one relation
 /// `e0 -> e1`.
 fn publish(root: &Path, count: usize, dims: usize) {
+    publish_with(root, count, dims, false);
+}
+
+/// [`publish`], optionally with a vector index on `MemoryEntity.embedding`
+/// carried in the generation (so it exists at every open).
+fn publish_with(root: &Path, count: usize, dims: usize, vector_index: bool) {
     std::fs::create_dir_all(root).expect("create root");
     let source = GrafeoDB::new_in_memory();
     let mut ids = Vec::with_capacity(count);
@@ -75,6 +82,22 @@ fn publish(root: &Path, count: usize, dims: usize) {
             ],
         );
     }
+    #[cfg(feature = "vector-index")]
+    if vector_index {
+        source
+            .create_vector_index(
+                "MemoryEntity",
+                "embedding",
+                Some(dims),
+                Some("cosine"),
+                None,
+                None,
+                None,
+            )
+            .expect("vector index");
+    }
+    #[cfg(not(feature = "vector-index"))]
+    let _ = vector_index;
     source
         .build_and_publish_generation(generation_build_request(root, "g1"))
         .expect("publish base generation");
@@ -124,28 +147,79 @@ fn prop(db: &GrafeoDB, id: NodeId, key: &str) -> Option<Value> {
         .get_node_property(id, &PropertyKey::new(key))
 }
 
-/// Every base property of `e{i}` as published, except those in `skip`.
-fn assert_base_props(db: &GrafeoDB, id: NodeId, i: usize, skip: &[&str], stage: &str) {
-    let want = [
+/// A property map in a comparable, ordered form.
+fn props_map(props: &grafeo_common::types::PropertyMap) -> BTreeMap<String, Value> {
+    props
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.clone()))
+        .collect()
+}
+
+/// `e{i}` as published.
+fn published_entity(i: usize) -> BTreeMap<String, Value> {
+    [
         ("name", Value::from(format!("e{i}"))),
         ("account_id", Value::from("acct")),
         ("observations_json", Value::from("[\"o0\"]")),
         ("embedding_provider", Value::from("voyage")),
         ("updated_at_ms", Value::Int64(1_000 + i as i64)),
         ("embedding", vector(i, DIMS)),
-    ];
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// Exact-state oracle: `e{i}` as published with `overrides` applied (`Some`
+/// = written value, `None` = removed) is exactly what every reader sees:
+/// `get_node` (labels and the whole property map, no extra or missing key),
+/// `get_node_property` per key (removed keys absent), the epoch read at the
+/// current epoch, and the latest history entry when there is one.
+fn assert_entity(
+    db: &GrafeoDB,
+    id: NodeId,
+    i: usize,
+    overrides: &[(&str, Option<Value>)],
+    stage: &str,
+) {
+    let mut want = published_entity(i);
+    for (key, value) in overrides {
+        match value {
+            Some(v) => want.insert((*key).to_string(), v.clone()),
+            None => want.remove(*key),
+        };
+    }
     let node = db.get_node(id).unwrap_or_else(|| panic!("[{stage}] node"));
-    for (key, value) in want.iter().filter(|(k, _)| !skip.contains(k)) {
+    let mut labels: Vec<String> = node.labels.iter().map(|l| l.to_string()).collect();
+    labels.sort();
+    assert_eq!(labels, vec!["MemoryEntity".to_string()], "[{stage}] labels");
+    assert_eq!(props_map(&node.properties), want, "[{stage}] get_node");
+    for key in published_entity(i).keys().chain(want.keys()) {
         assert_eq!(
             prop(db, id, key).as_ref(),
-            Some(value),
+            want.get(key),
             "[{stage}] get_node_property {key}"
         );
-        assert_eq!(
-            node.properties.get(&PropertyKey::new(*key)),
-            Some(value),
-            "[{stage}] get_node {key}"
-        );
+    }
+    let at_epoch = db
+        .get_node_at_epoch(id, db.current_epoch())
+        .unwrap_or_else(|| panic!("[{stage}] get_node_at_epoch"));
+    assert_eq!(
+        props_map(&at_epoch.properties),
+        want,
+        "[{stage}] get_node_at_epoch"
+    );
+    for (what, history) in [
+        ("db", db.get_node_history(id)),
+        ("session", db.session().get_node_history(id)),
+    ] {
+        if let Some((_, _, latest)) = history.last() {
+            assert_eq!(
+                props_map(&latest.properties),
+                want,
+                "[{stage}] {what} history"
+            );
+        }
     }
 }
 
@@ -171,7 +245,13 @@ fn set_keeps_unchanged_base_properties() {
         db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'new'")
             .expect("SET");
         assert_eq!(prop(&db, e0, "observations_json"), Some(Value::from("new")));
-        assert_base_props(&db, e0, 0, &["observations_json"], "after SET");
+        assert_entity(
+            &db,
+            e0,
+            0,
+            &[("observations_json", Some(Value::from("new")))],
+            "after SET",
+        );
         assert_not_copied(&db, e0, "embedding", "after SET");
         assert_eq!(
             count(
@@ -189,7 +269,13 @@ fn set_keeps_unchanged_base_properties() {
         Some(Value::from("new")),
         "[reopen]"
     );
-    assert_base_props(&db, e0, 0, &["observations_json"], "reopen");
+    assert_entity(
+        &db,
+        e0,
+        0,
+        &[("observations_json", Some(Value::from("new")))],
+        "reopen",
+    );
     assert_not_copied(&db, e0, "embedding", "reopen");
     handoff(&db, &root, "g2");
     assert_eq!(
@@ -197,7 +283,13 @@ fn set_keeps_unchanged_base_properties() {
         Some(Value::from("new")),
         "[handoff]"
     );
-    assert_base_props(&db, e0, 0, &["observations_json"], "handoff");
+    assert_entity(
+        &db,
+        e0,
+        0,
+        &[("observations_json", Some(Value::from("new")))],
+        "handoff",
+    );
     db.close().expect("close");
     // The root lock is released when the handle drops, not at close.
     drop(db);
@@ -208,7 +300,13 @@ fn set_keeps_unchanged_base_properties() {
         Some(Value::from("new")),
         "[reopen 2]"
     );
-    assert_base_props(&db, e0, 0, &["observations_json"], "reopen 2");
+    assert_entity(
+        &db,
+        e0,
+        0,
+        &[("observations_json", Some(Value::from("new")))],
+        "reopen 2",
+    );
 }
 
 /// AMH's provenance `REMOVE` on a base entity: the property is gone from
@@ -239,7 +337,7 @@ fn remove_of_a_base_property_is_a_tombstone() {
             1,
             "[{stage}] Cypher IS NULL"
         );
-        assert_base_props(db, e1, 1, &["embedding_provider"], stage);
+        assert_entity(db, e1, 1, &[("embedding_provider", None)], stage);
     };
     {
         let db = open(&root);
@@ -273,11 +371,11 @@ fn rollback_restores_the_base_view() {
         )
         .expect("SET + REMOVE");
     session.rollback().expect("rollback");
-    assert_base_props(&db, e2, 2, &[], "rollback");
+    assert_entity(&db, e2, 2, &[], "rollback");
     drop(session);
     db.close().expect("close");
     drop(db);
-    assert_base_props(&open(&root), e2, 2, &[], "reopen");
+    assert_entity(&open(&root), e2, 2, &[], "reopen");
 }
 
 /// Property lookups merge base postings of diff rows (the base value still
@@ -359,8 +457,8 @@ fn relation_create_between_base_entities_keeps_both() {
     )
     .expect("create relation");
     let (e1, e2) = (id_of(&db, "e1"), id_of(&db, "e2"));
-    assert_base_props(&db, e1, 1, &[], "src");
-    assert_base_props(&db, e2, 2, &[], "dst");
+    assert_entity(&db, e1, 1, &[], "src");
+    assert_entity(&db, e2, 2, &[], "dst");
     assert_not_copied(&db, e1, "embedding", "src");
     assert_not_copied(&db, e2, "embedding", "dst");
     // Slice 3: an endpoint whose only change is a new edge gets no overlay
@@ -376,8 +474,8 @@ fn relation_create_between_base_entities_keeps_both() {
         1
     );
     handoff(&db, &root, "g2");
-    assert_base_props(&db, e1, 1, &[], "handoff src");
-    assert_base_props(&db, e2, 2, &[], "handoff dst");
+    assert_entity(&db, e1, 1, &[], "handoff src");
+    assert_entity(&db, e2, 2, &[], "handoff dst");
 }
 
 /// The DB-level label and property-removal APIs edit a base node through
@@ -399,24 +497,34 @@ fn database_label_and_removal_apis_on_base_nodes() {
         labels,
         vec!["MemoryEntity".to_string(), "Pinned".to_string()]
     );
-    assert_base_props(&db, e0, 0, &["embedding_provider"], "after label + remove");
     assert!(db.remove_node_label(e0, "Pinned"), "remove_node_label");
     assert_eq!(
         db.get_node_labels(e0).expect("labels"),
         vec!["MemoryEntity".to_string()]
     );
+    assert_entity(
+        &db,
+        e0,
+        0,
+        &[("embedding_provider", None)],
+        "after label + remove",
+    );
 }
 
-/// A diff row's new vector survives a ForceDisk reopen. The open spills
-/// overlay vectors; a diff row's must stay in the overlay, or the merged
-/// read would serve the stale base vector.
+/// A diff row's new vector survives a ForceDisk reopen. The base carries
+/// the vector index, so the open's ForceDisk spill runs over the replayed
+/// overlay; a diff row's vector must stay in the overlay, or the merged read
+/// would serve the stale base vector. Checked through the exact indexed read
+/// and ANN membership, not only the inline property.
 #[cfg(all(feature = "vector-index", not(feature = "temporal")))]
 #[test]
 fn force_disk_reopen_keeps_a_diff_row_vector() {
     use grafeo_common::storage::{SectionType, TierOverride};
-    use grafeo_engine::Config;
+    use grafeo_engine::{Config, IndexedVectorRead};
 
-    let (dir, root) = fresh_root(3, DIMS);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("fd.grafeo.d");
+    publish_with(&root, 3, DIMS, true);
     let spill = dir.path().join("spill");
     let force_disk = || {
         GrafeoDB::open_generation_root_with_config(
@@ -429,16 +537,6 @@ fn force_disk_reopen_keeps_a_diff_row_vector() {
     let new_vector = vector(99, DIMS);
     {
         let db = force_disk();
-        db.create_vector_index(
-            "MemoryEntity",
-            "embedding",
-            Some(DIMS),
-            Some("cosine"),
-            None,
-            None,
-            None,
-        )
-        .expect("vector index");
         let e0 = id_of(&db, "e0");
         db.session()
             .set_node_property(e0, "embedding", new_vector.clone())
@@ -447,13 +545,38 @@ fn force_disk_reopen_keeps_a_diff_row_vector() {
     }
     let db = force_disk();
     let e0 = id_of(&db, "e0");
-    assert_eq!(
-        prop(&db, e0, "embedding"),
-        Some(new_vector),
-        "diff vector after ForceDisk reopen"
+    let e1 = id_of(&db, "e1");
+    assert_entity(
+        &db,
+        e0,
+        0,
+        &[("embedding", Some(new_vector.clone()))],
+        "ForceDisk reopen",
     );
-    assert_base_props(&db, e0, 0, &["embedding"], "ForceDisk reopen");
-    assert_base_props(&db, id_of(&db, "e1"), 1, &[], "untouched base node");
+    assert_entity(&db, e1, 1, &[], "untouched base node");
+    let Value::Vector(want) = &new_vector else {
+        unreachable!()
+    };
+    match db
+        .read_indexed_node_vector("MemoryEntity", "embedding", e0)
+        .expect("indexed read")
+    {
+        IndexedVectorRead::Found(got) => assert_eq!(&got[..], &want[..], "indexed read of e0"),
+        other => panic!("indexed read of e0: {other:?}"),
+    }
+    for (id, query) in [(e0, new_vector.clone()), (e1, vector(1, DIMS))] {
+        let Value::Vector(q) = query else {
+            unreachable!()
+        };
+        let hits = db
+            .vector_search("MemoryEntity", "embedding", &q, 3, Some(64), None)
+            .expect("vector search");
+        assert_eq!(
+            hits.first().map(|(hit, _)| *hit),
+            Some(id),
+            "{id:?} is the nearest neighbour of its own vector: {hits:?}"
+        );
+    }
 }
 
 /// What one small update of a base entity costs. Before D10 every touched
@@ -547,29 +670,46 @@ fn edge_prop(db: &GrafeoDB, key: &str) -> Option<Value> {
         .get_edge_property(base_rel_id(db), &PropertyKey::new(key))
 }
 
-/// The base relation's properties, as published, except those in `skip`.
-fn assert_base_rel(db: &GrafeoDB, skip: &[&str], stage: &str) {
-    let want = [
+/// Exact-state oracle for the base relation: as published with `overrides`
+/// applied, through `get_edge` (whole map), `get_edge_property` per key, and
+/// the epoch read at the current epoch.
+fn assert_base_rel(db: &GrafeoDB, overrides: &[(&str, Option<Value>)], stage: &str) {
+    let published: BTreeMap<String, Value> = [
         ("rel_type", Value::from("base")),
         ("since", Value::Int64(2020)),
         ("weight", Value::Float64(0.5)),
-    ];
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    let mut want = published.clone();
+    for (key, value) in overrides {
+        match value {
+            Some(v) => want.insert((*key).to_string(), v.clone()),
+            None => want.remove(*key),
+        };
+    }
+    let id = base_rel_id(db);
     let edge = db
         .graph_store()
-        .get_edge(base_rel_id(db))
+        .get_edge(id)
         .unwrap_or_else(|| panic!("[{stage}] edge"));
-    for (key, value) in want.iter().filter(|(k, _)| !skip.contains(k)) {
+    assert_eq!(props_map(&edge.properties), want, "[{stage}] get_edge");
+    for key in published.keys() {
         assert_eq!(
             edge_prop(db, key).as_ref(),
-            Some(value),
+            want.get(key),
             "[{stage}] get_edge_property {key}"
         );
-        assert_eq!(
-            edge.properties.get(&PropertyKey::new(*key)),
-            Some(value),
-            "[{stage}] get_edge {key}"
-        );
     }
+    let at_epoch = db
+        .get_edge_at_epoch(id, db.current_epoch())
+        .unwrap_or_else(|| panic!("[{stage}] get_edge_at_epoch"));
+    assert_eq!(
+        props_map(&at_epoch.properties),
+        want,
+        "[{stage}] get_edge_at_epoch"
+    );
 }
 
 /// SET and REMOVE on a base relation keep its other properties, never copy
@@ -592,7 +732,11 @@ fn edge_set_and_remove_keep_the_other_base_properties() {
             1,
             "[{stage}] Cypher"
         );
-        assert_base_rel(db, &["weight", "since"], stage);
+        assert_base_rel(
+            db,
+            &[("weight", Some(Value::Float64(0.9))), ("since", None)],
+            stage,
+        );
     };
     {
         let db = open(&root);
@@ -641,7 +785,7 @@ fn database_edge_property_removal_on_a_base_relation() {
         "remove_edge_property"
     );
     assert_eq!(edge_prop(&db, "weight"), None);
-    assert_base_rel(&db, &["weight"], "after removal");
+    assert_base_rel(&db, &[("weight", None)], "after removal");
 }
 
 /// What one relation between two base entities costs. Before D10 it copied
@@ -674,5 +818,206 @@ fn relation_between_base_entities_does_not_copy_their_embeddings() {
     assert!(
         per < 2048,
         "overlay grows {per} B per relation; endpoints are being copied"
+    );
+}
+
+// ── r2: review follow-ups ─────────────────────────────────────────────
+
+/// A removed base property is never a property-lookup match, indexed or
+/// not: not for `Null`, not for an open range.
+#[test]
+fn removed_property_is_not_a_lookup_match() {
+    for indexed in [false, true] {
+        let (_dir, root) = fresh_root(3, DIMS);
+        let db = open(&root);
+        if indexed {
+            db.create_property_index("updated_at_ms");
+        }
+        let stage = if indexed { "indexed" } else { "scan" };
+        db.execute_cypher("MATCH (m:MemoryEntity {name: 'e1'}) REMOVE m.updated_at_ms")
+            .expect("REMOVE");
+        let e1 = id_of(&db, "e1");
+        let store = db.graph_store();
+        assert!(
+            !store
+                .find_nodes_by_property("updated_at_ms", &Value::Null)
+                .contains(&e1),
+            "[{stage}] Null equality matched a removed property"
+        );
+        assert!(
+            !store
+                .find_nodes_in_range("updated_at_ms", None, None, true, true)
+                .contains(&e1),
+            "[{stage}] open range matched a removed property"
+        );
+        let mut in_range = store.find_nodes_in_range("updated_at_ms", None, None, true, true);
+        in_range.sort();
+        let mut want = vec![id_of(&db, "e0"), id_of(&db, "e2")];
+        want.sort();
+        assert_eq!(in_range, want, "[{stage}] open range: the other two");
+        assert_entity(&db, e1, 1, &[("updated_at_ms", None)], stage);
+    }
+}
+
+/// Rolling back a second write restores an already-committed, non-empty
+/// diff (not the bare base row).
+#[test]
+fn rollback_to_a_committed_diff() {
+    let (_dir, root) = fresh_root(3, DIMS);
+    let db = open(&root);
+    db.execute_cypher(
+        "MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'one' REMOVE m.embedding_provider",
+    )
+    .expect("committed diff");
+    let committed = [
+        ("observations_json", Some(Value::from("one"))),
+        ("embedding_provider", None),
+    ];
+    let e0 = id_of(&db, "e0");
+    assert_entity(&db, e0, 0, &committed, "committed");
+    let mut session = db.session();
+    session.begin_transaction().expect("begin");
+    session
+        .execute_cypher(
+            "MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'two', \
+             m.embedding_provider = 'other' REMOVE m.account_id",
+        )
+        .expect("second write");
+    session.rollback().expect("rollback");
+    assert_entity(&db, e0, 0, &committed, "rollback");
+    drop(session);
+    db.close().expect("close");
+    drop(db);
+    let db = open(&root);
+    assert_entity(&db, id_of(&db, "e0"), 0, &committed, "reopen");
+}
+
+/// SET and REMOVE between the freeze and the install: the install refuses
+/// (writes during the window), and a reopen replays them over the
+/// published base.
+#[test]
+fn writes_after_the_freeze_are_refused_at_install_and_replayed() {
+    let (_dir, root) = fresh_root(3, DIMS);
+    let db = open(&root);
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'pre'")
+        .expect("pre-freeze write");
+    let handle = db.freeze_epoch_for_handoff(&root).expect("freeze");
+    db.execute_cypher(
+        "MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'post' REMOVE m.embedding_provider",
+    )
+    .expect("post-freeze write on a frozen diff row");
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e1'}) SET m.observations_json = 'post'")
+        .expect("post-freeze write on a clean base row");
+    let want_e0 = [
+        ("observations_json", Some(Value::from("post"))),
+        ("embedding_provider", None),
+    ];
+    let want_e1 = [("observations_json", Some(Value::from("post")))];
+    let report = db
+        .complete_epoch_handoff(handle, generation_build_request(&root, "g2"))
+        .expect("complete handoff");
+    let err = db
+        .publish_and_install_handoff(report)
+        .expect_err("install must refuse writes made after the freeze");
+    assert!(
+        err.to_string()
+            .contains("writes occurred during the handoff window"),
+        "{err}"
+    );
+    assert_entity(&db, id_of(&db, "e0"), 0, &want_e0, "refused install");
+    assert_entity(&db, id_of(&db, "e1"), 1, &want_e1, "refused install");
+    db.close().expect("close");
+    drop(db);
+    let db = open(&root);
+    assert_entity(&db, id_of(&db, "e0"), 0, &want_e0, "reopen");
+    assert_entity(&db, id_of(&db, "e1"), 1, &want_e1, "reopen");
+    assert_entity(&db, id_of(&db, "e2"), 2, &[], "reopen, untouched");
+}
+
+/// The freeze holds diff rows only: capturing N touched base entities with a
+/// 2048-dim embedding must not hold N embeddings (R1). The build merges each
+/// row with its base row as it consumes it, and the result is whole.
+#[test]
+fn freeze_captures_diffs_not_inherited_embeddings() {
+    const N: usize = 400;
+    const WIDE: usize = 2048;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("freeze.grafeo.d");
+    publish(&root, N, WIDE);
+    let db = open(&root);
+    for i in 0..N {
+        db.execute_cypher(&format!(
+            "MATCH (m:MemoryEntity {{name: 'e{i}'}}) SET m.observations_json = 'x{i}'"
+        ))
+        .expect("touch");
+    }
+    let handle = db.freeze_epoch_for_handoff(&root).expect("freeze");
+    let captured: usize = handle
+        .frozen_nodes
+        .iter()
+        .map(|n| {
+            n.properties
+                .iter()
+                .map(|(k, v)| {
+                    k.as_str().len()
+                        + match v {
+                            Value::Vector(x) => x.len() * 4,
+                            Value::String(x) => x.len(),
+                            _ => 8,
+                        }
+                })
+                .sum::<usize>()
+        })
+        .sum();
+    eprintln!(
+        "D10 freeze capture: {} frozen nodes, {captured} B of property payload ({} B per node; a {WIDE}-dim embedding is {} B)",
+        handle.frozen_nodes.len(),
+        captured / N,
+        WIDE * 4
+    );
+    assert!(
+        captured < N * 1024,
+        "the freeze holds {captured} B for {N} small diffs: inherited embeddings are being captured"
+    );
+    let report = db
+        .complete_epoch_handoff(handle, generation_build_request(&root, "g2"))
+        .expect("complete handoff");
+    db.publish_and_install_handoff(report).expect("install");
+    db.close().expect("close");
+    drop(db);
+    let db = open(&root);
+    let e7 = id_of(&db, "e7");
+    assert_eq!(prop(&db, e7, "observations_json"), Some(Value::from("x7")));
+    assert_eq!(
+        prop(&db, e7, "embedding"),
+        Some(vector(7, WIDE)),
+        "embedding carried into the new base"
+    );
+}
+
+/// A tier drain needs an empty base: the final tier-chain build carries no
+/// original base rows, and an overlay row of a base node is a diff. It is
+/// refused before any state changes.
+#[test]
+fn tier_drain_refuses_a_non_empty_base() {
+    let (dir, root) = fresh_root(3, DIMS);
+    let mut db = open(&root);
+    db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'd'")
+        .expect("write");
+    let err = db
+        .drain_overlay_to_tier(&dir.path().join("tiers"), "refused")
+        .expect_err("drain over a non-empty base");
+    assert!(err.to_string().contains("requires an empty base"), "{err}");
+    assert!(
+        !dir.path().join("tiers").exists()
+            || std::fs::read_dir(dir.path().join("tiers")).map_or(true, |mut d| d.next().is_none()),
+        "no tier written"
+    );
+    assert_entity(
+        &db,
+        id_of(&db, "e0"),
+        0,
+        &[("observations_json", Some(Value::from("d")))],
+        "after refusal",
     );
 }
