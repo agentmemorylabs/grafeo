@@ -182,16 +182,24 @@ impl GrafeoDB {
         if !layered.handoff_live().is_some_and(|live| live.retired) {
             return Err(HandoffInstallError::NothingToInstall.into());
         }
-        // Spilled vectors live outside the overlay rows (ForceDisk); held for
-        // the whole swap so no spill or reload moves them meanwhile.
+        // Spilled vectors live outside the overlay rows (ForceDisk). Held for
+        // the whole swap: a spill drains columns under its own upgradable
+        // read, which a plain read would not exclude, and a reload takes the
+        // write lock.
         #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
-        let spill_guard = self.vector_spill_storages.as_ref().map(|r| r.read());
+        let spill_guard = self
+            .vector_spill_storages
+            .as_ref()
+            .map(|r| r.upgradable_read());
         #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
         let spilled_properties: FxHashSet<PropertyKey> = spill_guard
             .as_deref()
             .into_iter()
             .flat_map(|registry| registry.keys())
-            .filter_map(|key| key.split_once(':').map(|(_, property)| PropertyKey::new(property)))
+            .filter_map(|key| {
+                key.split_once(':')
+                    .map(|(_, property)| PropertyKey::new(property))
+            })
             .collect();
         #[cfg(not(all(feature = "vector-index", feature = "mmap", not(feature = "temporal"))))]
         let spilled_properties: FxHashSet<PropertyKey> = FxHashSet::default();

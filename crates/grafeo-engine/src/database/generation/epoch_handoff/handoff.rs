@@ -296,6 +296,7 @@ impl GrafeoDB {
                 frozen_retained_bytes,
                 frozen_category_bytes,
                 next_epoch_charged_bytes: 0,
+                retired: false,
             };
             layered.begin_epoch_handoff(live).map_err(Error::Internal)?;
         }

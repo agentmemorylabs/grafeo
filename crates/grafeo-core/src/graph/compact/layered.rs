@@ -552,7 +552,8 @@ impl LayeredStore {
             let mut handoff = self.handoff.write();
             if let Some(h) = handoff.as_mut().filter(|h| !h.retired) {
                 charged = RetainedCategory::NextEpoch;
-                h.next_epoch_charged_bytes = h.next_epoch_charged_bytes.saturating_add(bytes as u64);
+                h.next_epoch_charged_bytes =
+                    h.next_epoch_charged_bytes.saturating_add(bytes as u64);
             }
         }
         if let Some(ctl) = self.admission_slot.read().as_ref() {

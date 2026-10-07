@@ -1109,11 +1109,11 @@ fn rollback_to_a_committed_diff() {
     assert_entity(&db, id_of(&db, "e0"), 0, &committed, "reopen");
 }
 
-/// SET and REMOVE between the freeze and the install: the install refuses
-/// (writes during the window), and a reopen replays them over the
-/// published base.
+/// SET and REMOVE between the freeze and the install (DESIGN G2): the install
+/// keeps them over the published base, which holds the frozen values, and a
+/// reopen replays them over it.
 #[test]
-fn writes_after_the_freeze_are_refused_at_install_and_replayed() {
+fn writes_after_the_freeze_survive_install_and_replay() {
     let (_dir, root) = fresh_root(3, DIMS);
     let db = open(&root);
     db.execute_cypher("MATCH (m:MemoryEntity {name: 'e0'}) SET m.observations_json = 'pre'")
@@ -1133,16 +1133,10 @@ fn writes_after_the_freeze_are_refused_at_install_and_replayed() {
     let report = db
         .complete_epoch_handoff(handle, generation_build_request(&root, "g2"))
         .expect("complete handoff");
-    let err = db
-        .publish_and_install_handoff(report)
-        .expect_err("install must refuse writes made after the freeze");
-    assert!(
-        err.to_string()
-            .contains("writes occurred during the handoff window"),
-        "{err}"
-    );
-    assert_entity(&db, id_of(&db, "e0"), 0, &want_e0, "refused install");
-    assert_entity(&db, id_of(&db, "e1"), 1, &want_e1, "refused install");
+    db.publish_and_install_handoff(report)
+        .expect("install keeps writes made after the freeze");
+    assert_entity(&db, id_of(&db, "e0"), 0, &want_e0, "install");
+    assert_entity(&db, id_of(&db, "e1"), 1, &want_e1, "install");
     db.close().expect("close");
     drop(db);
     let db = open(&root);
